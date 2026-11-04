@@ -7,7 +7,7 @@ Run with: python -m stratakb
 
 from __future__ import annotations
 
-import asyncio
+import threading
 from contextlib import asynccontextmanager
 
 import structlog
@@ -36,9 +36,13 @@ logger = structlog.get_logger()
 
 @asynccontextmanager
 async def _lifespan(server: FastMCP):
-    """Warm up DB pool and embedding model before accepting tool calls."""
+    """Warm up the DB pool, then answer the client while the model loads.
 
-    # Pre-warm DB connection pool (fast — ~1s)
+    The MCP SDK reads no message until this yields, so only the fast database
+    steps are awaited here.
+    """
+
+    # Pre-warm DB connection pool (fast, ~1s; ~2s to fail when refused)
     try:
         pool = await get_pool(_settings.database_url)
         async with pool.acquire() as conn:
@@ -46,22 +50,25 @@ async def _lifespan(server: FastMCP):
         logger.info("db_pool_warmed")
     except Exception as e:
         logger.warning("db_warmup_failed", error=str(e))
-
-    # Bring an existing database up to the current schema (no-op when current)
-    try:
-        await ensure_ingestion_schema(_settings.database_url)
-    except Exception as e:
-        logger.warning("db_migration_failed", error=str(e))
-
-    # Pre-load embedding model in thread (17s+ for PyTorch import on first call).
-    # Must complete before yielding — otherwise the first tool call races with
-    # model loading, blocks the event loop on _local_model_lock, and causes
-    # MCP transport timeout.
-    if _settings.embedding_backend == "local":
+    else:
+        # Bring an existing database up to the current schema (no-op when
+        # current). Skipped when the database is unreachable: ingestion runs
+        # it on first use anyway.
         try:
-            await asyncio.to_thread(_preload_embedding_model_sync)
+            await ensure_ingestion_schema(_settings.database_url)
         except Exception as e:
-            logger.warning("embedding_preload_failed", error=str(e))
+            logger.warning("db_migration_failed", error=str(e))
+
+    # Load the embedding model in the background (17s+ for the PyTorch import
+    # on a cold start). A search that arrives first waits for it in its worker
+    # thread on _local_model_lock, never on the event loop. A daemon thread
+    # does not hold the process open on shutdown.
+    if _settings.embedding_backend == "local":
+        threading.Thread(
+            target=_preload_embedding_model_sync,
+            name="embedding-preload",
+            daemon=True,
+        ).start()
 
     try:
         yield {}
@@ -71,12 +78,15 @@ async def _lifespan(server: FastMCP):
 
 
 def _preload_embedding_model_sync() -> None:
-    """Load the sentence-transformers model (runs in thread to avoid blocking)."""
-    from stratakb.knowledge.embeddings import _get_local_model
+    """Load the sentence-transformers model (runs in a background thread)."""
+    try:
+        from stratakb.knowledge.embeddings import _get_local_model
 
-    logger.info("preloading_embedding_model", model=_settings.embedding_model)
-    _get_local_model(_settings.embedding_model)
-    logger.info("embedding_model_ready", model=_settings.embedding_model)
+        logger.info("preloading_embedding_model", model=_settings.embedding_model)
+        _get_local_model(_settings.embedding_model)
+        logger.info("embedding_model_ready", model=_settings.embedding_model)
+    except Exception as e:
+        logger.warning("embedding_preload_failed", error=str(e))
 
 
 # Initialize MCP server with lifespan for async warmup
@@ -281,7 +291,8 @@ def main() -> None:
         role=settings.strata_role,
     )
 
-    # lifespan handles warmup (DB + embedding model) after transport is ready
+    # lifespan warms up the DB, then starts the embedding model load in the
+    # background so the client gets its first answer at once
     mcp.run(transport="stdio")
 
 

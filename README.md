@@ -40,6 +40,14 @@ flowchart LR
     server <--> pg[("PostgreSQL + pgvector<br/>layers, chunks, learning, audit")]
 ```
 
+**Start**
+
+```mermaid
+flowchart LR
+    start["python -m stratakb"] --> db["Connect to PostgreSQL,<br/>update the schema"] --> ready["Answer the client"]
+    db -.->|"background"| m["Load the embedding model"] -.-> s["First search<br/>(waits if still loading)"]
+```
+
 **Ingest**
 
 ```mermaid
@@ -81,7 +89,7 @@ docker compose up -d        # PostgreSQL 16 + pgvector on port 5433, schemas cre
 uv sync
 ```
 
-The first search downloads the embedding model (about 420 MB) and the reranker (about 90 MB) into your Hugging Face cache.
+The server answers its client at once and loads the embedding model in the background; a search sent before the model is ready waits for it. The first start downloads the embedding model (about 420 MB) and the first `strata_ask` downloads the reranker (about 90 MB), both into your Hugging Face cache.
 
 ### Connect an MCP client
 
