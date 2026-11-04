@@ -21,7 +21,8 @@ SQL_DIR = Path(__file__).parent / "sql"
 _MIGRATION_LOCK_KEY = 0x5354524154414B42
 
 # (version, file name in SQL_DIR, query that is true when the file's objects
-# already exist). Keep sorted by version: 05 records 04 as well.
+# already exist). Keep sorted by version: 05 records 04 as well. Presence
+# queries run before any file, so they must not fail on an older schema.
 MIGRATIONS: list[tuple[int, str, str]] = [
     (
         4,
@@ -46,6 +47,48 @@ MIGRATIONS: list[tuple[int, str, str]] = [
               AND table_name = 'knowledge_layers'
               AND column_name = 'root_path'
         )
+        """,
+    ),
+    # Uses the role's OID, so a database without strata_readonly reads as
+    # present and records 06 without running it
+    (
+        6,
+        "06_readonly_grants.sql",
+        """
+        SELECT COALESCE((
+            SELECT COALESCE(has_table_privilege(
+                    r.oid, to_regclass('strata_core.knowledge_layers'), 'SELECT'), false)
+                AND COALESCE(has_table_privilege(
+                    r.oid, to_regclass('strata_core.ingestion_runs'), 'SELECT'), false)
+                AND COALESCE(has_table_privilege(
+                    r.oid, to_regclass('strata_core.ingested_files'), 'SELECT'), false)
+                AND COALESCE(has_table_privilege(
+                    r.oid, to_regclass('strata_vectors.chunks'), 'SELECT'), false)
+                AND has_schema_privilege(r.oid, 'strata_core', 'USAGE')
+                AND has_schema_privilege(r.oid, 'strata_vectors', 'USAGE')
+                AND NOT has_schema_privilege(r.oid, 'strata_learning', 'USAGE')
+                AND NOT EXISTS (
+                    SELECT 1 FROM pg_class c
+                    JOIN pg_namespace n ON n.oid = c.relnamespace
+                    WHERE n.nspname IN ('strata_core', 'strata_vectors', 'strata_learning')
+                      AND c.relkind IN ('r', 'p', 'v', 'm', 'f')
+                      AND (n.nspname, c.relname) NOT IN (
+                          ('strata_core', 'knowledge_layers'),
+                          ('strata_core', 'ingestion_runs'),
+                          ('strata_core', 'ingested_files'),
+                          ('strata_vectors', 'chunks')
+                      )
+                      AND has_table_privilege(r.oid, c.oid, 'SELECT')
+                )
+                AND NOT EXISTS (
+                    SELECT 1 FROM pg_default_acl d
+                    JOIN pg_namespace n ON n.oid = d.defaclnamespace
+                    CROSS JOIN LATERAL aclexplode(d.defaclacl) a
+                    WHERE n.nspname IN ('strata_core', 'strata_vectors', 'strata_learning')
+                      AND a.grantee = r.oid
+                )
+            FROM pg_roles r WHERE r.rolname = 'strata_readonly'
+        ), true)
         """,
     ),
 ]

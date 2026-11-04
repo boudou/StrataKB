@@ -24,7 +24,8 @@ Reports about these areas are especially welcome:
   A read-only transaction still allows reading functions such as `pg_read_file()` when
   the connection is a superuser, so the SQL tools are only registered when
   `READONLY_DATABASE_URL` is set; point it at the `strata_readonly` role from
-  `db/03_readonly_role.sql`, which can only `SELECT` from the StrataKB schemas. At startup
-  the server removes the SQL tools when that role is a superuser, a member of a
+  `db/03_readonly_role.sql`, which can only `SELECT` from the layer, ingestion-run,
+  ingested-file and chunk tables (not the audit log, users or learning tables). At
+  startup the server removes the SQL tools when that role is a superuser, a member of a
   superuser role, or a member of `pg_read_server_files`, `pg_write_server_files`, `pg_execute_server_program` or
   `pg_signal_backend`, or when the check cannot run.

@@ -76,18 +76,18 @@ def _with_extra(version: int, name: str, sql: str):
 
 
 async def test_sql_files_apply_twice(db_url):
-    for name in ("04_ingested_files.sql", "05_add_folder.sql"):
+    for name in ("04_ingested_files.sql", "05_add_folder.sql", "06_readonly_grants.sql"):
         sql = migrations._load_sql(name)
         await _owner_execute(db_url, sql)
         await _owner_execute(db_url, sql)
-    assert {4, 5} <= await _recorded(db_url)
+    assert {4, 5, 6} <= await _recorded(db_url)
 
 
 async def test_records_existing_objects_without_running(db_url):
     await _owner_execute(db_url, "DROP TABLE strata_core.schema_migrations")
     with patch.object(migrations, "_load_sql", side_effect=AssertionError("file was run")):
         await migrations.ensure_schema(db_url)
-    assert await _recorded(db_url) == {4, 5}
+    assert await _recorded(db_url) == {4, 5, 6}
     assert db_url in migrations._checked
 
 
@@ -128,13 +128,13 @@ async def test_applies_missing_05(db_url):
         await conn.close()
     assert {"origin", "owner", "root_path"} <= columns
     assert index == "strata_core.knowledge_layers_root_path_key"
-    assert await _recorded(db_url) == {4, 5}
+    assert await _recorded(db_url) == {4, 5, 6}
 
 
 async def test_concurrent_calls(db_url):
     await _owner_execute(db_url, "DROP TABLE strata_core.schema_migrations")
     await asyncio.gather(migrations.ensure_schema(db_url), migrations.ensure_schema(db_url))
-    assert await _recorded(db_url) == {4, 5}
+    assert await _recorded(db_url) == {4, 5, 6}
 
 
 async def test_broken_file_raises_naming_it(db_url):
@@ -167,11 +167,11 @@ async def test_non_owner_schema_present(db_url, readonly_url):
             await migrations.ensure_schema(readonly_url)
         events = [entry for entry in logs if entry["event"] == "migration_not_recorded"]
         assert len(events) == 1
-        assert events[0]["versions"] == [4, 5]
+        assert events[0]["versions"] == [4, 5, 6]
         assert readonly_url in migrations._checked
     finally:
         await migrations.ensure_schema(db_url)
-    assert await _recorded(db_url) == {4, 5}
+    assert await _recorded(db_url) == {4, 5, 6}
 
 
 async def test_non_owner_schema_missing(db_url, readonly_url):
@@ -188,3 +188,149 @@ async def test_non_owner_schema_missing(db_url, readonly_url):
         await migrations.ensure_schema(readonly_url)
     assert "92_probe.sql" in str(exc.value)
     assert readonly_url not in migrations._checked
+
+
+_READABLE = (
+    "strata_core.knowledge_layers",
+    "strata_core.ingestion_runs",
+    "strata_core.ingested_files",
+    "strata_vectors.chunks",
+)
+
+# The grants db/03_readonly_role.sql made before 06
+_OLD_GRANTS = """
+GRANT USAGE ON SCHEMA strata_core, strata_vectors, strata_learning TO strata_readonly;
+GRANT SELECT ON ALL TABLES IN SCHEMA strata_core, strata_vectors, strata_learning
+    TO strata_readonly;
+ALTER DEFAULT PRIVILEGES IN SCHEMA strata_core, strata_vectors, strata_learning
+    GRANT SELECT ON TABLES TO strata_readonly;
+DELETE FROM strata_core.schema_migrations WHERE version = 6;
+"""
+
+
+def _presence_query(version: int) -> str:
+    return next(query for v, _, query in migrations.MIGRATIONS if v == version)
+
+
+@pytest.fixture
+async def readonly_role(db_url):
+    """Skip unless the strata_readonly role exists; restore 06's grants afterwards."""
+    conn = await asyncpg.connect(db_url)
+    try:
+        exists = await conn.fetchval("SELECT 1 FROM pg_roles WHERE rolname = 'strata_readonly'")
+    finally:
+        await conn.close()
+    if not exists:
+        pytest.skip("the strata_readonly role does not exist")
+    yield
+    await _owner_execute(db_url, migrations._load_sql("06_readonly_grants.sql"))
+
+
+async def _readonly_privileges(db_url: str) -> dict:
+    conn = await asyncpg.connect(db_url)
+    try:
+        tables = {
+            row["t"]: row["readable"]
+            for row in await conn.fetch(
+                """
+                SELECT format('%I.%I', n.nspname, c.relname) AS t,
+                       has_table_privilege('strata_readonly', c.oid, 'SELECT') AS readable
+                FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+                WHERE n.nspname IN ('strata_core', 'strata_vectors', 'strata_learning')
+                  AND c.relkind IN ('r', 'p', 'v', 'm', 'f')
+                """
+            )
+        }
+        learning_usage = await conn.fetchval(
+            "SELECT has_schema_privilege('strata_readonly', 'strata_learning', 'USAGE')"
+        )
+        default_acls = await conn.fetchval(
+            """
+            SELECT count(*) FROM pg_default_acl d
+            CROSS JOIN LATERAL aclexplode(d.defaclacl) a
+            WHERE a.grantee = 'strata_readonly'::regrole
+            """
+        )
+    finally:
+        await conn.close()
+    return {"tables": tables, "learning_usage": learning_usage, "default_acls": default_acls}
+
+
+def _assert_closed(privileges: dict) -> None:
+    tables = privileges["tables"]
+    assert {t for t, readable in tables.items() if readable} == set(_READABLE)
+    for t in ("strata_core.audit_log", "strata_core.users", "strata_core.schema_migrations"):
+        assert tables[t] is False
+    learning = [t for t in tables if t.startswith("strata_learning.")]
+    assert learning
+    assert not any(tables[t] for t in learning)
+    assert privileges["learning_usage"] is False
+    assert privileges["default_acls"] == 0
+
+
+async def test_readonly_grants_migrate_old_install(db_url, readonly_role):
+    await _owner_execute(db_url, _OLD_GRANTS)
+    conn = await asyncpg.connect(db_url)
+    try:
+        assert await conn.fetchval(_presence_query(6)) is False
+    finally:
+        await conn.close()
+
+    await migrations.ensure_schema(db_url)
+
+    _assert_closed(await _readonly_privileges(db_url))
+    assert 6 in await _recorded(db_url)
+
+
+async def test_readonly_role_select(db_url, readonly_role):
+    await migrations.ensure_schema(db_url)
+    conn = await asyncpg.connect(db_url)
+    try:
+        if not await conn.fetchval(
+            "SELECT rolsuper OR pg_has_role(current_user, 'strata_readonly', 'MEMBER') "
+            "FROM pg_roles WHERE rolname = current_user"
+        ):
+            pytest.skip("the owner may not SET ROLE strata_readonly")
+        for table in ("strata_core.audit_log", "strata_core.users"):
+            with pytest.raises(asyncpg.InsufficientPrivilegeError):
+                async with conn.transaction():
+                    await conn.execute("SET LOCAL ROLE strata_readonly")
+                    await conn.fetch(f"SELECT 1 FROM {table} LIMIT 1")
+        for table in ("strata_vectors.chunks", "strata_core.knowledge_layers"):
+            async with conn.transaction():
+                await conn.execute("SET LOCAL ROLE strata_readonly")
+                await conn.fetch(f"SELECT 1 FROM {table} LIMIT 1")
+    finally:
+        await conn.close()
+
+
+async def test_readonly_new_table_not_readable(db_url, readonly_role):
+    await _owner_execute(db_url, _OLD_GRANTS)
+    try:
+        await migrations.ensure_schema(db_url)
+        await _owner_execute(db_url, "CREATE TABLE strata_core.grant_probe (id INT)")
+        conn = await asyncpg.connect(db_url)
+        try:
+            assert not await conn.fetchval(
+                "SELECT has_table_privilege('strata_readonly', 'strata_core.grant_probe', 'SELECT')"
+            )
+        finally:
+            await conn.close()
+    finally:
+        await _owner_execute(db_url, "DROP TABLE IF EXISTS strata_core.grant_probe")
+
+
+async def test_readonly_presence_without_ingested_files(db_url, readonly_role):
+    conn = await asyncpg.connect(db_url)
+    try:
+        tx = conn.transaction()
+        await tx.start()
+        try:
+            await conn.execute(
+                "ALTER TABLE strata_core.ingested_files RENAME TO ingested_files_probe"
+            )
+            assert await conn.fetchval(_presence_query(6)) is False
+        finally:
+            await tx.rollback()
+    finally:
+        await conn.close()
