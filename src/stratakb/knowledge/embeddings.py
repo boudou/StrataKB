@@ -41,15 +41,46 @@ _MISSING_KEY_ERROR = (
 )
 
 
+def _hub_repo(model_name: str) -> str:
+    """The Hugging Face repository of a sentence-transformers model name."""
+    return model_name if "/" in model_name else f"sentence-transformers/{model_name}"
+
+
 def _missing_model_error(model_name: str) -> str:
     """Explain a model that STRATA_LOCAL_ONLY cannot download."""
-    repo = model_name if "/" in model_name else f"sentence-transformers/{model_name}"
+    repo = _hub_repo(model_name)
     return (
         f"STRATA_LOCAL_ONLY is on and the embedding model {model_name} is not "
         f"installed on this machine, so it cannot be downloaded. On a machine that "
         f"may download, run `uv run hf download {repo}`, or set EMBEDDING_MODEL to "
         f"a folder that holds the model."
     )
+
+
+def is_model_cached(model_name: str) -> bool:
+    """True when the model can load without a download. Never downloads.
+
+    A folder that holds the model counts as cached. Otherwise the Hugging
+    Face cache must hold both config.json and the weights: a download that
+    stopped half-way leaves config.json next to an incomplete weights file.
+    """
+    try:
+        if os.path.isdir(model_name):
+            return True
+        from huggingface_hub import try_to_load_from_cache
+
+        repo = _hub_repo(model_name)
+        cache_dir = os.environ.get("SENTENCE_TRANSFORMERS_HOME") or None
+
+        def cached(filename: str) -> bool:
+            found = try_to_load_from_cache(repo, filename, cache_dir=cache_dir)
+            return isinstance(found, str)
+
+        return cached("config.json") and (
+            cached("model.safetensors") or cached("pytorch_model.bin")
+        )
+    except Exception:
+        return False
 
 
 # Singleton for local model (loaded once, reused)

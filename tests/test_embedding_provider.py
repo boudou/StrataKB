@@ -6,10 +6,12 @@ Tests cover:
 - Default model resolution for each backend
 - Vectors of the wrong length are refused on both backends
 - strata_search and strata_ingest_documents need no OpenAI key with a base URL
+- is_model_cached needs config.json and the weights, and never downloads
 """
 
 from __future__ import annotations
 
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -232,3 +234,79 @@ class TestToolKeyChecks:
             result = await fn(layer_name="docs", source_path="/tmp/docs")
         assert result["status"] == "error"
         assert "API key" in result["error"]
+
+
+# ── is_model_cached ──────────────────────────────────────
+
+
+def _fake_hub_cache(cache: Path, repo: str, files: list[str]) -> None:
+    """Lay out a Hugging Face cache entry holding these files."""
+    entry = cache / f"models--{repo.replace('/', '--')}"
+    snapshot = entry / "snapshots" / "abc123"
+    snapshot.mkdir(parents=True)
+    (entry / "refs").mkdir()
+    (entry / "refs" / "main").write_text("abc123")
+    for name in files:
+        (snapshot / name).write_text("x")
+
+
+@pytest.mark.parametrize(
+    ("files", "expected"),
+    [
+        (["config.json", "model.safetensors"], True),
+        (["config.json", "pytorch_model.bin"], True),
+        (["config.json"], False),  # a download that stopped before the weights
+        (["model.safetensors"], False),
+        ([], False),
+    ],
+)
+def test_is_model_cached_needs_config_and_weights(tmp_path, monkeypatch, files, expected):
+    from stratakb.knowledge.embeddings import is_model_cached
+
+    _fake_hub_cache(tmp_path, "sentence-transformers/tiny-model", files)
+    monkeypatch.setenv("SENTENCE_TRANSFORMERS_HOME", str(tmp_path))
+    assert is_model_cached("tiny-model") is expected
+
+
+def test_is_model_cached_keeps_an_owner_prefix(tmp_path, monkeypatch):
+    from stratakb.knowledge.embeddings import is_model_cached
+
+    _fake_hub_cache(tmp_path, "acme/embedder", ["config.json", "model.safetensors"])
+    monkeypatch.setenv("SENTENCE_TRANSFORMERS_HOME", str(tmp_path))
+    assert is_model_cached("acme/embedder") is True
+    assert is_model_cached("embedder") is False
+
+
+def test_is_model_cached_accepts_a_local_folder(tmp_path):
+    from stratakb.knowledge.embeddings import is_model_cached
+
+    assert is_model_cached(str(tmp_path)) is True
+
+
+def test_is_model_cached_uses_the_default_cache_without_the_variable(monkeypatch):
+    from stratakb.knowledge.embeddings import is_model_cached
+
+    monkeypatch.delenv("SENTENCE_TRANSFORMERS_HOME", raising=False)
+    lookup = MagicMock(return_value="/cache/file")
+    with patch("huggingface_hub.try_to_load_from_cache", lookup):
+        assert is_model_cached("all-mpnet-base-v2") is True
+    repo, filename = lookup.call_args_list[0].args
+    assert repo == "sentence-transformers/all-mpnet-base-v2"
+    assert filename == "config.json"
+    assert lookup.call_args_list[0].kwargs == {"cache_dir": None}
+
+
+def test_is_model_cached_is_false_on_any_error():
+    from stratakb.knowledge.embeddings import is_model_cached
+
+    with patch("huggingface_hub.try_to_load_from_cache", side_effect=OSError("disk")):
+        assert is_model_cached("all-mpnet-base-v2") is False
+
+
+def test_is_model_cached_never_downloads(tmp_path, monkeypatch):
+    from stratakb.knowledge.embeddings import is_model_cached
+
+    monkeypatch.setenv("SENTENCE_TRANSFORMERS_HOME", str(tmp_path))
+    monkeypatch.delenv("HF_HUB_OFFLINE", raising=False)
+    assert is_model_cached("not-there") is False
+    assert list(tmp_path.iterdir()) == []

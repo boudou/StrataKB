@@ -156,6 +156,14 @@ def enforce_local_only(settings: Settings) -> None:
     if providers := outbound_providers(settings):
         logger.error("local_only_refused", settings=[p.setting_name for p in providers])
         raise SystemExit("\n".join(refusal_line(p) for p in providers))
+    keep_hugging_face_offline()
+
+
+def keep_hugging_face_offline() -> None:
+    """Make the Hugging Face libraries use local files only.
+
+    Call before anything imports huggingface_hub, which reads these once.
+    """
     # Assign, not setdefault: a user's HF_HUB_OFFLINE=0 must not win
     os.environ["HF_HUB_OFFLINE"] = "1"
     os.environ["TRANSFORMERS_OFFLINE"] = "1"

@@ -1,5 +1,5 @@
-"""Allow running with: python -m stratakb"""
+"""Allow running with: python -m stratakb (the stratakb command)"""
 
-from stratakb.mcp_server import main
+from stratakb.cli import main
 
-main()
+raise SystemExit(main())

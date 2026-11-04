@@ -32,6 +32,7 @@ dependencies = [
     "openai>=1.50.0",
     # Local embeddings and reranking
     "sentence-transformers>=5.6.0",
+    "huggingface-hub>=2.4.0",
     # Logging
     "structlog>=24.0.0",
     # Utils
@@ -48,7 +49,7 @@ Issues = "https://github.com/boudou/StrataKB/issues"
 Changelog = "https://github.com/boudou/StrataKB/blob/main/CHANGELOG.md"
 
 [project.scripts]
-stratakb = "stratakb.mcp_server:main"
+stratakb = "stratakb.cli:main"
 
 [project.optional-dependencies]
 dev = [

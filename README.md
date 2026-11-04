@@ -55,8 +55,11 @@ flowchart LR
 
 ```mermaid
 flowchart LR
-    f["Files"] --> n{"Secret-looking<br/>name?"}
-    n -->|"yes"| k["Skip, never opened"]
+    add["stratakb add"] --> sel["Select files<br/>(.gitignore, .strataignore)"] --> pol{"Secret, code,<br/>build file or<br/>too large?"}
+    pol -->|"yes"| k["Skip, never opened"]
+    pol -->|"no"| h
+    f["strata_ingest_documents"] --> n{"Secret-looking<br/>name?"}
+    n -->|"yes"| k
     n -->|"no"| h{"Content<br/>changed?"}
     h -->|"no"| s["Skip"]
     h -->|"new or changed"| p["Parse<br/>per format"]
@@ -119,7 +122,31 @@ Add the server to your client's MCP configuration (for example a project `.mcp.j
 
 ### Build your first layer
 
-The repository ships two example presets, SEPA payments and ISO 20022 messaging. The SEPA preset includes a small sample of reason codes, so it works before you download anything:
+Point `stratakb add` at a folder of documents. It creates one layer for the folder, named after it, and ingests what it finds:
+
+```bash
+uv run stratakb add path/to/docs                      # create the layer, or sync it
+uv run stratakb add path/to/docs --name team_docs     # pick the layer name
+uv run stratakb add path/to/docs --json               # the report as JSON, for scripts
+```
+
+Run the same command again after editing the documents: it re-embeds only what changed and removes files that were deleted. It follows `.gitignore` (and a `.strataignore` in the folder, same syntax), skips hidden files and folders and dependency or build folders such as `node_modules` and `dist`, and never opens files that look like secrets, code, build output, or files over `--max-file-size` megabytes (default 50); the report lists every skipped file with its reason. The description comes from the folder's README unless you pass `--description`.
+
+```mermaid
+flowchart LR
+    cmd["stratakb add &lt;folder&gt;"] --> plan["Plan: which layer,<br/>which files, what changed"]
+    plan -->|"broad path or<br/>large run"| ask{"Confirmed?<br/>prompt, --allow-broad, --yes"}
+    ask -->|"no"| stop["Refuse, nothing written<br/>(exit 2)"]
+    ask -->|"yes"| apply
+    plan -->|"otherwise"| apply["Create or sync the layer,<br/>ingest, audit"]
+    apply --> report["Report and exit code"]
+```
+
+A drive root, your home folder (or a folder above it) and system folders need `--allow-broad`; a run that adds or updates more than 2,000 files or 500 MB, or removes at least 10 files that are more than half of the layer's files, needs `--yes`. At a terminal the command asks instead; in a script it refuses and names the flag. Exit codes: `0` done, `1` some files failed (the rest are stored), `2` refused or a usage error (nothing written), `3` the database is unreachable or its schema can't be updated, `130` interrupted (stored files stay; the next run carries on). The first run with the `local` backend downloads the embedding model and says so.
+
+`stratakb` with no command, or `stratakb serve`, starts the MCP server, as `python -m stratakb` does.
+
+The repository also ships two example presets, SEPA payments and ISO 20022 messaging. The SEPA preset includes a small sample of reason codes, so it works before you download anything:
 
 ```bash
 uv run python scripts/apply_preset.py examples/sepa/preset.yaml --dry-run   # parse only, no database
@@ -128,7 +155,7 @@ uv run python scripts/apply_preset.py examples/sepa/preset.yaml             # cr
 
 Then ask from your client, for example *"What does reject reason AC04 mean?"*. [examples/README.md](examples/README.md) lists where to download the full rulebooks and ISO 20022 schemas.
 
-For your own documents, either write a preset (below) or call `strata_create_knowledge_layer` followed by `strata_ingest_documents` with a folder path. Run `strata_ingest_documents` again after editing the documents: it re-embeds only what changed. Pass `replace_all=True` to rebuild the whole layer, for example after changing its `chunk_config` or the embedding model.
+From an MCP client without a shell, either write a preset (below) or call `strata_create_knowledge_layer` followed by `strata_ingest_documents` with a folder path. Run `strata_ingest_documents` again after editing the documents: it re-embeds only what changed. Pass `replace_all=True` to rebuild the whole layer, for example after changing its `chunk_config` or the embedding model.
 
 Upgrading: the server adds the file-tracking table to an existing database on startup. A layer ingested by an older version is rebuilt on its next ingestion, and that run keeps only the folder it ingests, so ingest each folder of such a layer once (applying a preset does this).
 
@@ -185,6 +212,8 @@ The layer's **description** also tells the query rewriter which terminology the 
 The two SQL tools never run as the owner role. They are only registered when `READONLY_DATABASE_URL` is set, and at startup the server removes them again when that role is a superuser, a member of a superuser role, a member of `pg_read_server_files`, `pg_write_server_files`, `pg_execute_server_program` or `pg_signal_backend`, or cannot be checked (for example, the database is unreachable; restart the server once it is up). `strata_admin_health` says which applies under `sql_tools`. The `strata_readonly` role can read four tables only: `strata_core.knowledge_layers`, `strata_core.ingestion_runs`, `strata_core.ingested_files` and `strata_vectors.chunks`. It cannot read the audit log, the users table or anything in `strata_learning`, and a table added later needs a `GRANT` by name. Existing databases get these grants when the server starts.
 
 On the stdio transport, `STRATA_USER` and `STRATA_ROLE` set who you are. Whoever starts the server picks the role, so on stdio roles separate duties rather than enforce security; see [SECURITY.md](SECURITY.md).
+
+The `stratakb add` command has no role check: whoever can reach the database with `DATABASE_URL` can add a folder. Each run writes one audit entry with the tool name `cli:add`, the folder, the run id and the counts per outcome (no file names). Its user is `STRATA_USER` when you set it, otherwise `os:` plus your login name, a name nobody verified.
 
 ## Configuration
 
@@ -269,7 +298,7 @@ Dotted paths are off by default and blocked by `STRATA_LOCAL_ONLY=true`.
 | OpenAI embeddings | Documents and questions | `EMBEDDING_BACKEND=openai` without `EMBEDDING_BASE_URL` | Yes |
 | Embedding server on another host | Documents and questions | `EMBEDDING_BASE_URL` pointing off this machine | Yes |
 | Embedding server on this machine | Documents and questions, to `127.0.0.1`, `::1` or `localhost` | `EMBEDDING_BASE_URL` | No |
-| Hugging Face downloads | Nothing about your documents; model files come in | The first start and the first `strata_ask` | Yes |
+| Hugging Face downloads | Nothing about your documents; model files come in | The first start, the first `stratakb add` and the first `strata_ask` | Yes |
 
 With `STRATA_LOCAL_ONLY=true` the server refuses to start while any blocked path is configured, and the error names each setting that caused it. The embedding calls and query rewriting check the switch again on every call, so a key added later is refused too. The Hugging Face libraries run offline and load the embedding and reranking models from local files only; a model that is not installed fails with a message that says how to install it (`uv run hf download <model>` on a machine that may download, or `EMBEDDING_MODEL` / `RERANKING_MODEL` set to a folder that holds it). The switch does not cover the database: `DATABASE_URL` may point at a team server on purpose.
 
@@ -284,9 +313,11 @@ db/                   Schema: 01_init.sql (core, vectors), 02_learning.sql (lear
 examples/             Example layer presets (SEPA, ISO 20022)
 scripts/              apply_preset.py, backup_restore.py
 src/stratakb/
-  mcp_server.py       Entry point: server, admin and user tools
+  cli.py              The stratakb command: add a folder, or start the server
+  mcp_server.py       MCP server: admin and user tools
   core/               Database pool, roles, audit log, logging
   knowledge/          Layers, presets, ingestion pipeline, parsers, embeddings, vector store
+    add_folder.py     Turns one folder into one layer and keeps it in sync
   rag/                Retriever (hybrid + RRF), reranker, cache, routing, query rewriter, tools
   learning/           Interaction tracking, signals, synonyms, promotion, feedback tools
   database_access/    Read-only SQL and introspection tools
@@ -300,7 +331,9 @@ docs/IMPROVEMENTS.md  Product goal and order of work (issues hold the items)
 uv sync --extra dev
 uv run pytest                  # full suite; integration tests need the database running
 uv run ruff check src tests    # lint
-uv run python -m stratakb      # run the server on stdio
+uv run python -m stratakb      # run the server on stdio (same as: uv run stratakb)
+uv run stratakb add docs --name strata_docs --json   # add a folder as a layer
+uv run stratakb --help         # the commands and their flags
 ```
 
 Without a running database, the integration tests fail with a connection error and the rest pass.
