@@ -42,7 +42,7 @@ uv sync
 uv run stratakb add path/to/docs
 ```
 
-It creates a layer named after the folder and reads the documents in it: PDF, Word, Markdown, HTML, plain text and more. It skips files that look like secrets, code or build output, and lists every file it skipped. Run it again after you edit the documents: it reads only what changed.
+It creates a layer named after the folder and reads the documents in it: PDF, Word, Markdown, HTML, plain text and more. It skips files that look like secrets, code or build output, and tells you what it skipped and why (`--json` lists every file). Run it again after you edit the documents: it reads only what changed.
 
 The first run downloads a model of about 420 MB into your Hugging Face cache, and the first question downloads one of about 90 MB. To keep everything on this machine, see [Where your data goes](#where-your-data-goes).
 
@@ -57,7 +57,7 @@ Add the server to your client's MCP configuration (for example a project `.mcp.j
       "command": "uv",
       "args": ["run", "--directory", "/path/to/StrataKB", "python", "-m", "stratakb"],
       "env": {
-        "DATABASE_URL": "postgresql://strata:strata_dev_password@localhost:5433/strata",
+        "DATABASE_URL": "postgresql://strata:strata_dev_password@127.0.0.1:5433/strata",
         "STRATA_USER": "developer",
         "STRATA_ROLE": "admin"
       }
@@ -103,7 +103,9 @@ flowchart LR
 
 ```mermaid
 flowchart LR
-    start["python -m stratakb"] --> db["Connect to PostgreSQL,<br/>update the schema"] --> ro{"READONLY_DATABASE_URL<br/>set, and a safe role?"}
+    start["python -m stratakb"] --> lo{"STRATA_LOCAL_ONLY on and a<br/>setting sends data off?"}
+    lo -->|"yes"| refuse["Refuse to start,<br/>name each setting"]
+    lo -->|"no"| db["Connect to PostgreSQL,<br/>update the schema"] --> ro{"READONLY_DATABASE_URL<br/>set, and a safe role?"}
     ro -->|"yes"| ready["Answer the client"]
     ro -->|"no"| off["Drop strata_db_query<br/>and strata_db_explain"] --> ready
     db -.->|"background"| m["Load the local embedding model<br/>(local backend only)"] -.-> s["First search<br/>(waits if still loading)"]
@@ -113,16 +115,19 @@ flowchart LR
 
 ```mermaid
 flowchart LR
-    add["stratakb add"] --> sel["Select files<br/>(.gitignore, .strataignore)"] --> pol{"Secret, code,<br/>build file or<br/>too large?"}
+    add["stratakb add"] --> sel["Select files<br/>(.gitignore, .strataignore)"] --> pol{"Secret, code, build file,<br/>unsupported format,<br/>path too long or too large?"}
     pol -->|"yes"| k["Skip, never opened"]
     pol -->|"no"| h
     f["strata_ingest_documents"] --> n{"Secret-looking<br/>name?"}
-    n -->|"yes"| k
+    n -->|"yes"| k2["Skip, never opened;<br/>remove if ingested before"]
     n -->|"no"| h{"Content<br/>changed?"}
     h -->|"no"| s["Skip"]
-    h -->|"new or changed"| p["Parse<br/>per format"]
-    p -->|"empty"| t["No text:<br/>skip or remove"]
-    p --> c["Chunk"] --> x["Prefix<br/>[layer > file > section]"] --> e["Embed"] --> v[("pgvector<br/>replace that file's chunks")]
+    h -->|"new or changed"| z{"Empty or<br/>whitespace only?"}
+    z -->|"yes"| t["No text:<br/>skip or remove"]
+    z -->|"no"| p["Parse<br/>per format"]
+    p -->|"no text"| t
+    p --> c["Chunk"] --> x["Prefix<br/>[layer > file > Page N]"] --> e["Embed"] --> v[("pgvector<br/>replace that file's chunks")]
+    p -.->|"scanned-looking PDF"| fl["Stored, reported<br/>as flagged"]
 ```
 
 Ingesting a folder again is a sync: unchanged files are skipped, changed files are replaced, new files are added, and files deleted from that folder are removed. Other folders in the same layer are left alone. Files whose names look like secrets (`.env`, `client_secret.json`, `id_rsa`, `*.pem`) are skipped without being opened, and one ingested earlier is removed. Empty files are reported as no text rather than as failures. A PDF that looks scanned (fewer than half its pages have text, or under 200 characters per page on average) is stored for the text it has and reported as flagged. A file that fails to parse is reported and the rest of the run carries on.
@@ -155,7 +160,7 @@ uv run stratakb add path/to/docs --name team_docs     # pick the layer name
 uv run stratakb add path/to/docs --json               # the report as JSON, for scripts
 ```
 
-Run the same command again after editing the documents: it re-embeds only what changed and removes files that were deleted. It follows `.gitignore` (and a `.strataignore` in the folder, same syntax), skips hidden files and folders and dependency or build folders such as `node_modules` and `dist`, and never opens files that look like secrets, code, build output, or files over `--max-file-size` megabytes (default 50); the report lists every skipped file with its reason. The description comes from the folder's README unless you pass `--description`.
+Run the same command again after editing the documents: it re-embeds only what changed and removes files that were deleted. It follows `.gitignore` (inside a git work tree as git does; elsewhere only the folder's top-level `.gitignore`, and the report notes any nested ones it did not apply) and a `.strataignore` in the folder (same syntax), skips hidden files and folders and dependency or build folders such as `node_modules` and `dist`, and never opens files that look like secrets, code or build output, files in formats it can't parse, paths over 500 characters, or files over `--max-file-size` megabytes (default 50); the report lists every skipped file with its reason. The description comes from the folder's README unless you pass `--description`.
 
 ```mermaid
 flowchart LR
@@ -163,11 +168,12 @@ flowchart LR
     plan -->|"broad path or<br/>large run"| ask{"Confirmed?<br/>prompt, --allow-broad, --yes"}
     ask -->|"no"| stop["Refuse, nothing written<br/>(exit 2)"]
     ask -->|"yes"| apply
+    plan -->|"name taken, folder overlaps<br/>another layer, nothing to add"| stop
     plan -->|"otherwise"| apply["Create or sync the layer,<br/>ingest, audit"]
     apply --> report["Report and exit code"]
 ```
 
-A drive root, your home folder (or a folder above it) and system folders need `--allow-broad`; a run that adds or updates more than 2,000 files or 500 MB, or removes at least 10 files that are more than half of the layer's files, needs `--yes`. At a terminal the command asks instead; in a script it refuses and names the flag. Exit codes: `0` done, `1` some files failed (the rest are stored), `2` refused or a usage error (nothing written), `3` the database is unreachable or its schema can't be updated, `130` interrupted (stored files stay; the next run carries on). The first run with the `local` backend downloads the embedding model and says so.
+A drive root, your home folder (or a folder above it) and system folders need `--allow-broad`; a run that adds, updates or removes more than 2,000 files, adds or updates more than 500 MB, or removes at least 10 files that are more than half of the layer's files, needs `--yes`. At a terminal the command asks instead; in a script it refuses and names the flag. Exit codes: `0` done, `1` some files failed (the rest are stored), `2` refused or a usage error (nothing written), `3` the database is unreachable or its schema can't be updated, `130` interrupted (stored files stay; the next run carries on). The first run with the `local` backend downloads the embedding model and says so.
 
 `stratakb` with no command, or `stratakb serve`, starts the MCP server, as `python -m stratakb` does.
 
@@ -278,13 +284,19 @@ flowchart LR
 | `HNSW_EF_SEARCH` | `40` | Recall versus latency for the vector index |
 | `RERANKING_ENABLED` | `true` | Cross-encoder reranking in `strata_ask` |
 | `RERANKING_MODEL` | `cross-encoder/ms-marco-MiniLM-L-6-v2` | Reranker |
+| `RERANKING_CANDIDATE_MULTIPLIER` | `3` | `strata_ask` reranks `top_k` times this many candidates |
 | `CACHE_ENABLED`, `CACHE_TTL_SECONDS` | `true`, `600` | Query result cache, cleared per layer on ingestion |
+| `CACHE_MAXSIZE` | `500` | Query results kept in the cache |
 | `LEARNING_ENABLED` | `true` | Record interactions and learn from them |
 | `LEARNING_STORE_RAW_QUERIES` | `false` | Store queries without scrubbing personal data |
+| `LEARNING_SESSION_TIMEOUT_MINUTES` | `30` | Idle minutes that end a session for rephrase detection |
+| `LEARNING_PROMOTE_EVERY_N_QUERIES` | `50` | Interactions between promotion runs |
+| `LEARNING_MIN_SUCCESS_RATE` | `0.6` | Lowest success rate for a learned rewrite to be used |
+| `LEARNING_REWRITE_BYPASS_THRESHOLD`, `LEARNING_REWRITE_BYPASS_MIN_SAMPLES` | `0.85`, `5` | A learned rewrite at or above this success rate and sample count skips the rewrite model |
 | `STRATA_LOCAL_ONLY` | `false` | Refuse to start while any provider would send content off this machine, and load models from local files only; see [Where your data goes](#where-your-data-goes) |
 | `LOG_LEVEL` | `INFO` | Structured JSON logs on stderr |
 
-To change the embedding model, update the three `EMBEDDING_*` settings and re-embed each layer with `vector_store.re_embed_layer()`, which re-embeds the stored chunk text in place without re-parsing files.
+To change the embedding model, update `EMBEDDING_BACKEND`, `EMBEDDING_MODEL` and `EMBEDDING_DIMENSIONS` (and `EMBEDDING_BASE_URL` for a model server), then re-embed each layer with `vector_store.re_embed_layer()`, which resizes the vector column when the dimensions change and re-embeds the stored chunk text in place without re-parsing files.
 
 ### Database and models
 
@@ -359,7 +371,7 @@ Dotted paths are off by default and blocked by `STRATA_LOCAL_ONLY=true`.
 | Embedding server on this machine | Documents and questions, to `127.0.0.1`, `::1` or `localhost` | `EMBEDDING_BASE_URL` | No |
 | Hugging Face downloads | Nothing about your documents; model files come in | The first start, the first `stratakb add` and the first `strata_ask` | Yes |
 
-With `STRATA_LOCAL_ONLY=true` the server refuses to start while any blocked path is configured, and the error names each setting that caused it. The embedding calls and query rewriting check the switch again on every call, so a key added later is refused too. The Hugging Face libraries run offline and load the embedding and reranking models from local files only; a model that is not installed fails with a message that says how to install it (`uv run hf download <model>` on a machine that may download, or `EMBEDDING_MODEL` / `RERANKING_MODEL` set to a folder that holds it). The switch does not cover the database: `DATABASE_URL` may point at a team server on purpose.
+With `STRATA_LOCAL_ONLY=true` the server refuses to start while any blocked path is configured, and the error names each setting that caused it. The embedding calls and query rewriting check the switch again on every call, so a key added later is refused too. The Hugging Face libraries run offline and load the embedding and reranking models from local files only; a model that is not installed fails with a message that says how to install it (`uv run hf download <model>` on a machine that may download, or `EMBEDDING_MODEL` / `RERANKING_MODEL` set to a folder that holds it). The switch does not cover the database: `DATABASE_URL` may point at a team server on purpose. `stratakb add` does not refuse up front: with a blocked embedding path configured, each file fails to embed and the run exits with `1`. The OpenAI and Anthropic SDKs also read `OPENAI_BASE_URL` and `ANTHROPIC_BASE_URL`; StrataKB treats them as the destination of those paths, and `STRATA_LOCAL_ONLY` checks them too.
 
 `strata_admin_health` always lists the switch (`local_only`) and the active outbound providers (`outbound`: provider, purpose, what it sends, destination host and the setting that turns it on), whether the switch is on or not. It never shows keys, credentials, paths or ports.
 
@@ -370,11 +382,11 @@ StrataKB cannot control what your MCP client's language model does with the retr
 ## Glossary
 
 - **Chunk**: a passage of a document, cut along its headings or structure. Search returns chunks, each with its file and section.
-- **Confidence**: `high`, `medium` or `low`, from the search scores, returned with every `strata_ask` result; a low one comes with a warning.
+- **Confidence**: `high`, `medium` or `low`, from the reranker's scores (or the similarity scores when reranking is off), returned with every `strata_ask` result; a low one comes with a warning.
 - **Embedding**: a list of numbers that stands for a chunk's meaning, so similar meanings get similar numbers. The embedding model (`all-mpnet-base-v2` by default) makes them; the vector column stores them (`EMBEDDING_DIMENSIONS`, 768 by default).
 - **HNSW**: the pgvector index that finds similar embeddings quickly; `HNSW_EF_SEARCH` trades recall for speed.
 - **Hybrid search**: a search by meaning (embeddings) and a search by words (PostgreSQL full-text search), merged into one list with RRF.
-- **interaction_id**: the id on each search and ask result; pass it to `strata_feedback` to rate the result.
+- **interaction_id**: the id on each search and ask result while learning is on; pass it to `strata_feedback` to rate the result.
 - **Layer**: a named collection of documents, usually one folder or one domain, with its own chunking and routing rules.
 - **Query rewriting**: optional; a language model turns a question into several searches in the layer's own terms. Learned rewrites are reused without the model.
 - **Reranking**: in `strata_ask`, a second model (a cross-encoder, `RERANKING_MODEL`) reads the question with each candidate chunk and puts the best first.
@@ -415,7 +427,7 @@ uv run stratakb --help         # the commands and their flags
 
 Without a running database, the integration tests fail with a connection error and the rest pass.
 
-`scripts/backup_restore.py` backs up the whole database or exports and imports a single layer.
+`scripts/backup_restore.py` backs up the whole database or exports and imports a single layer, through `docker exec` in the `strata-postgres` container. A layer export holds its configuration and chunks but not its file tracking, so the first ingestion after an import rebuilds the layer.
 
 ## Roadmap
 
