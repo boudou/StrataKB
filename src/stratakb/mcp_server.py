@@ -28,7 +28,11 @@ from stratakb.core.auth import get_current_user, require_role
 from stratakb.core.database import check_connection, close_pool, get_pool
 from stratakb.core.migrations import ensure_schema
 from stratakb.core.users import ensure_user, list_users, update_user_role
-from stratakb.database_access.tools import register_database_tools
+from stratakb.database_access.tools import (
+    register_database_tools,
+    secure_sql_tools,
+    sql_tools_status,
+)
 from stratakb.knowledge.tools import register_knowledge_tools
 from stratakb.learning.tools import register_learning_tools
 from stratakb.rag.tools import register_rag_tools
@@ -60,6 +64,10 @@ async def _lifespan(server: FastMCP):
             await ensure_schema(_settings.database_url)
         except Exception as e:
             logger.warning("db_migration_failed", error=str(e))
+
+    # Drop the SQL tools unless the read-only role is safe (fast, at most 5s).
+    # Runs before the first message, so tools/list never shows them otherwise.
+    await secure_sql_tools(server, _settings.readonly_database_url)
 
     # Load the embedding model in the background (17s+ for the PyTorch import
     # on a cold start). A search that arrives first waits for it in its worker
@@ -110,9 +118,7 @@ settings = _settings
 # Register module tools
 register_knowledge_tools(mcp, settings.database_url, settings.openai_api_key)
 register_rag_tools(mcp, settings.database_url, settings.openai_api_key)
-register_database_tools(
-    mcp, settings.database_url, settings.readonly_database_url or settings.database_url
-)
+register_database_tools(mcp, settings.database_url, settings.readonly_database_url)
 register_learning_tools(mcp, settings.database_url)
 
 
@@ -130,7 +136,9 @@ async def strata_admin_health() -> dict:
     Returns status of all components: PostgreSQL, pgvector extension,
     database schemas, which optional API keys are configured, whether
     STRATA_LOCAL_ONLY is on, and the providers that receive content from
-    this machine (name, purpose, what it sends, destination host, setting).
+    this machine (name, purpose, what it sends, destination host, setting),
+    and whether the SQL tools (strata_db_query, strata_db_explain) are
+    enabled or, when disabled, why.
     """
     result: dict[str, object] = {}
     current = get_settings()
@@ -154,6 +162,9 @@ async def strata_admin_health() -> dict:
     # Where data goes (host names and setting names only, never values)
     result["local_only"] = current.strata_local_only
     result["outbound"] = [asdict(p) for p in outbound_providers(current)]
+
+    # SQL tools: on only with a safe READONLY_DATABASE_URL role
+    result["sql_tools"] = sql_tools_status()
 
     # Current user context
     result["user"] = {

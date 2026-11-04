@@ -5,6 +5,7 @@ Tests cover:
 - A failed model preload is logged, not raised
 - No preload for a remote embedding backend
 - The startup migration runs only after a successful database warm-up
+- The SQL tools role check runs before the lifespan yields
 
 No database and no model are needed: the pool, the migration and the model
 load are patched.
@@ -35,6 +36,13 @@ def _fake_pool() -> MagicMock:
     pool = MagicMock()
     pool.acquire = acquire
     return pool
+
+
+@pytest.fixture(autouse=True)
+def secure_sql_tools():
+    """Keep the role check off the network and the global server's tools intact."""
+    with patch("stratakb.mcp_server.secure_sql_tools", AsyncMock()) as secure:
+        yield secure
 
 
 @pytest.fixture
@@ -128,3 +136,11 @@ async def test_migration_runs_after_warmup(db_ok, monkeypatch):
     async with mcp_server._lifespan(mcp_server.mcp):
         pass
     migrate.assert_awaited_once_with(mcp_server._settings.database_url)
+
+
+async def test_lifespan_secures_sql_tools(db_ok, secure_sql_tools, monkeypatch):
+    monkeypatch.setattr(mcp_server._settings, "embedding_backend", "openai")
+    async with mcp_server._lifespan(mcp_server.mcp):
+        secure_sql_tools.assert_awaited_once_with(
+            mcp_server.mcp, mcp_server._settings.readonly_database_url
+        )

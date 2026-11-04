@@ -22,5 +22,9 @@ Reports about these areas are especially welcome:
   `DATABASE_URL` and API keys out of version control.
 - The SQL tools run each statement in a read-only transaction that is rolled back.
   A read-only transaction still allows reading functions such as `pg_read_file()` when
-  the connection is a superuser, so set `READONLY_DATABASE_URL` to the `strata_readonly`
-  role from `db/03_readonly_role.sql`, which can only `SELECT` from the StrataKB schemas.
+  the connection is a superuser, so the SQL tools are only registered when
+  `READONLY_DATABASE_URL` is set; point it at the `strata_readonly` role from
+  `db/03_readonly_role.sql`, which can only `SELECT` from the StrataKB schemas. At startup
+  the server removes the SQL tools when that role is a superuser, a member of a
+  superuser role, or a member of `pg_read_server_files`, `pg_write_server_files`, `pg_execute_server_program` or
+  `pg_signal_backend`, or when the check cannot run.

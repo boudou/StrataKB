@@ -10,7 +10,8 @@ class Settings(BaseSettings):
 
     # Database
     database_url: str = "postgresql://strata:strata_dev_password@localhost:5433/strata"
-    # Connection for strata_db_query and strata_db_explain; empty = database_url.
+    # Connection for strata_db_query and strata_db_explain; empty = the SQL tools
+    # are not registered. A superuser role is refused at startup.
     # Point it at the strata_readonly role from db/03_readonly_role.sql.
     readonly_database_url: str = ""
 

@@ -45,7 +45,9 @@ flowchart LR
 
 ```mermaid
 flowchart LR
-    start["python -m stratakb"] --> db["Connect to PostgreSQL,<br/>update the schema"] --> ready["Answer the client"]
+    start["python -m stratakb"] --> db["Connect to PostgreSQL,<br/>update the schema"] --> ro{"READONLY_DATABASE_URL<br/>set, and a safe role?"}
+    ro -->|"yes"| ready["Answer the client"]
+    ro -->|"no"| off["Drop strata_db_query<br/>and strata_db_explain"] --> ready
     db -.->|"background"| m["Load the local embedding model<br/>(local backend only)"] -.-> s["First search<br/>(waits if still loading)"]
 ```
 
@@ -166,12 +168,12 @@ The layer's **description** also tells the query rewriter which terminology the 
 | `strata_feedback` | viewer | Rates a result as helpful or not, per answer or per chunk |
 | `strata_learning_stats` | viewer | What the learning system has recorded and learned |
 | `strata_whoami` | viewer | Your identity and role |
-| `strata_admin_health` | viewer | Database, pgvector and schema status, the local-only switch and the providers that receive data |
+| `strata_admin_health` | viewer | Database, pgvector and schema status, the local-only switch, the providers that receive data, and whether the SQL tools are on |
 | `strata_db_schema` | viewer | Lists tables, or a table's columns and keys |
 | `strata_db_vector_stats` | viewer | Chunk counts per layer, vector dimensions and index sizes |
 | `strata_db_sample_chunks` | viewer | Sample chunks from a layer |
-| `strata_db_query` | operator | Read-only SQL |
-| `strata_db_explain` | operator | Query plan for a SQL statement |
+| `strata_db_query` | operator | Read-only SQL (only with `READONLY_DATABASE_URL`) |
+| `strata_db_explain` | operator | Query plan for a SQL statement (only with `READONLY_DATABASE_URL`) |
 | `strata_create_knowledge_layer` | admin | Creates a layer |
 | `strata_ingest_documents` | admin | Syncs a file or folder into a layer: adds, replaces and removes files; reports added, updated, unchanged, removed and skipped |
 | `strata_apply_preset` | admin | Creates a layer from a preset and ingests its sources |
@@ -180,6 +182,8 @@ The layer's **description** also tells the query rewriter which terminology the 
 | `strata_admin_audit_log` | admin | Queries the audit log |
 | `strata_admin_list_users` | admin | Lists users and roles |
 | `strata_admin_update_role` | admin | Changes a user's role |
+
+The two SQL tools never run as the owner role. They are only registered when `READONLY_DATABASE_URL` is set, and at startup the server removes them again when that role is a superuser, a member of a superuser role, a member of `pg_read_server_files`, `pg_write_server_files`, `pg_execute_server_program` or `pg_signal_backend`, or cannot be checked (for example, the database is unreachable; restart the server once it is up). `strata_admin_health` says which applies under `sql_tools`.
 
 On the stdio transport, `STRATA_USER` and `STRATA_ROLE` set who you are. Whoever starts the server picks the role, so on stdio roles separate duties rather than enforce security; see [SECURITY.md](SECURITY.md).
 
@@ -190,7 +194,7 @@ Settings come from environment variables or `.env`.
 | Variable | Default | Description |
 | --- | --- | --- |
 | `DATABASE_URL` | `postgresql://strata:…@localhost:5433/strata` | PostgreSQL connection |
-| `READONLY_DATABASE_URL` | `DATABASE_URL` | Connection for `strata_db_query` and `strata_db_explain`; point it at the `strata_readonly` role from `db/03_readonly_role.sql` |
+| `READONLY_DATABASE_URL` | | Connection for `strata_db_query` and `strata_db_explain`; point it at the `strata_readonly` role from `db/03_readonly_role.sql`. Empty means the two tools are off; a superuser, or a member of a superuser or server-access role (such as the Docker `strata` user) is refused |
 | `STRATA_USER`, `STRATA_ROLE` | `developer`, `viewer` | Identity and role on stdio |
 | `EMBEDDING_BACKEND` | `local` | `local` (sentence-transformers) or `openai` (OpenAI, or the OpenAI-compatible server in `EMBEDDING_BASE_URL`) |
 | `EMBEDDING_MODEL` | `all-mpnet-base-v2` | Embedding model; the `openai` backend uses `text-embedding-3-large` unless set |
