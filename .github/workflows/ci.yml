@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Checks out and runs the tests; the token needs nothing more than read access
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_DB: strata
+          POSTGRES_USER: strata
+          POSTGRES_PASSWORD: strata_ci_password
+        ports:
+          - 5433:5432
+        options: >-
+          --health-cmd "pg_isready -U strata"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgresql://strata:strata_ci_password@localhost:5433/strata
+      READONLY_DATABASE_URL: postgresql://strata_readonly:strata_readonly_ci_password@localhost:5433/strata
+      READONLY_DB_PASSWORD: strata_readonly_ci_password
+      PGPASSWORD: strata_ci_password
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10
+        with:
+          enable-cache: true
+      - name: Create schemas
+        run: |
+          for f in db/01_init.sql db/02_learning.sql db/03_readonly_role.sql src/stratakb/core/sql/04_ingested_files.sql; do
+            psql -h localhost -p 5433 -U strata -d strata -v ON_ERROR_STOP=1 -f "$f"
+          done
+      - run: uv sync --extra dev --locked
+      - run: uv run pytest

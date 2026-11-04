@@ -1,0 +1,28 @@
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: strata-postgres
+    restart: unless-stopped
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      # Run in name order on first start of an empty data volume
+      - ./db/01_init.sql:/docker-entrypoint-initdb.d/01_init.sql
+      - ./db/02_learning.sql:/docker-entrypoint-initdb.d/02_learning.sql
+      - ./db/03_readonly_role.sql:/docker-entrypoint-initdb.d/03_readonly_role.sql
+      # Shipped in the package: the server also applies it to existing databases
+      - ./src/stratakb/core/sql/04_ingested_files.sql:/docker-entrypoint-initdb.d/04_ingested_files.sql
+    environment:
+      POSTGRES_DB: strata
+      POSTGRES_USER: strata
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-strata_dev_password}
+      READONLY_DB_PASSWORD: ${READONLY_DB_PASSWORD:-strata_readonly_dev_password}
+    ports:
+      - "${DB_PORT:-5433}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U strata"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  postgres-data:

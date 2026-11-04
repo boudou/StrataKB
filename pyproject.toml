@@ -1,0 +1,97 @@
+[project]
+name = "stratakb"
+version = "0.1.0"
+description = "Layered, self-learning knowledge base served over the Model Context Protocol"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "boudou" }]
+requires-python = ">=3.12"
+keywords = ["mcp", "rag", "knowledge-base", "pgvector", "hybrid-search", "model-context-protocol"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Database",
+    "Topic :: Text Processing :: Indexing",
+]
+dependencies = [
+    # MCP framework. 2.x removed mcp.server.fastmcp; see docs/IMPROVEMENTS.md before lifting the cap.
+    "mcp[cli]>=1.30,<2",
+    # Database
+    "asyncpg>=0.30.0",
+    # Document processing
+    "langchain-text-splitters>=0.3.0",
+    "pypdf>=5.0.0",
+    "pyyaml>=6.0",
+    "lxml>=5.0.0",
+    "beautifulsoup4>=4.12.0",
+    "python-docx>=1.2.0",
+    # Optional LLM query rewriting and OpenAI embeddings
+    "anthropic>=0.40.0",
+    "openai>=1.50.0",
+    # Local embeddings and reranking
+    "sentence-transformers>=3.0.0",
+    # Logging
+    "structlog>=24.0.0",
+    # Utils
+    "pydantic>=2.0.0",
+    "pydantic-settings>=2.0.0",
+    "cachetools>=7.0.5",
+]
+
+[project.urls]
+Homepage = "https://github.com/boudou/StrataKB"
+Issues = "https://github.com/boudou/StrataKB/issues"
+Changelog = "https://github.com/boudou/StrataKB/blob/main/CHANGELOG.md"
+
+[project.scripts]
+stratakb = "stratakb.mcp_server:main"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.24.0",
+    "ruff>=0.8.0",
+    "mypy>=1.13.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/stratakb"]
+# Ship code only; package notes stay in the source tree
+exclude = ["**/*.md"]
+
+# Whitelist, so local files that are not committed never reach the archive
+[tool.hatch.build.targets.sdist]
+only-include = [
+    "src",
+    "tests",
+    "db",
+    "examples",
+    "scripts",
+    "docker-compose.yml",
+    ".env.example",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE",
+]
+exclude = ["src/**/*.md", "db/*.md", "scripts/*.md", "**/__pycache__"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "N", "UP", "B", "A", "SIM"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true

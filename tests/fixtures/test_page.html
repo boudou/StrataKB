@@ -1,0 +1,34 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>SEPA Credit Transfer Guide</title>
+    <style>body { font-family: sans-serif; }</style>
+</head>
+<body>
+    <nav>Navigation menu to skip</nav>
+    <h1>SEPA Credit Transfer</h1>
+    <p>This guide covers SEPA Credit Transfer (SCT) processing.</p>
+    <p>SEPA enables euro-denominated payments across the Single Euro Payments Area.</p>
+
+    <h2>Message Format</h2>
+    <p>SCT uses the ISO 20022 pain.001 message format.</p>
+    <p>The message contains a group header and one or more payment instructions.</p>
+
+    <h3>Group Header</h3>
+    <p>The group header contains message identification, creation date, and control sum.</p>
+    <p>Field MsgId uniquely identifies the message.</p>
+
+    <h3>Payment Information</h3>
+    <p>Each payment instruction contains debtor information and credit transfer details.</p>
+
+    <h2>Processing Rules</h2>
+    <p>Banks must process SCT transactions within one business day.</p>
+    <p>The maximum amount per transaction is governed by the scheme rules.</p>
+
+    <h3>Validation</h3>
+    <p>IBAN validation is required for all account identifiers.</p>
+
+    <footer>Copyright 2025</footer>
+    <script>console.log('skip this');</script>
+</body>
+</html>

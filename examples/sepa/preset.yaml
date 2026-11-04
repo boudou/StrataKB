@@ -1,0 +1,45 @@
+# StrataKB layer preset: SEPA payment schemes
+#
+# Apply with:  uv run python scripts/apply_preset.py examples/sepa/preset.yaml
+# or from an MCP client: strata_apply_preset(preset_path="examples/sepa/preset.yaml")
+#
+# Source folders are relative to this file. Download the documents listed
+# under each source into its folder first; see examples/README.md.
+
+name: sepa
+display_name: SEPA Payments
+description: >-
+  Single Euro Payments Area scheme documents from the European Payments Council:
+  SEPA Credit Transfer (SCT), SCT Inst and SEPA Direct Debit (SDD Core and B2B)
+  rulebooks and implementation guidelines, plus reject, return and refund reason codes.
+
+metadata_schema:
+  scheme: string            # SCT, SCT Inst, SDD Core, SDD B2B
+  rulebook_version: string  # e.g. "2025 v1.1"
+
+chunk_config:
+  chunk_size: 1500
+  chunk_overlap: 200
+
+# A query matching any of these is routed to this layer when no layers are given
+routing_patterns:
+  - '\bsepa\b'
+  - '\bsct\b'
+  - '\bsct\s*inst\b'
+  - '\bsdd\b'
+  - '\bepc\b'
+  - '\brulebooks?\b'
+  - '\b(reject|return|refund|recall)\s+(reason\s+)?codes?\b'
+
+sources:
+  - name: rulebooks
+    path: rulebooks
+    description: SCT, SCT Inst and SDD rulebooks (PDF)
+    download: https://www.europeanpaymentscouncil.eu/
+  - name: implementation_guidelines
+    path: guidelines
+    description: Customer-to-PSP and inter-PSP implementation guidelines (PDF)
+    download: https://www.europeanpaymentscouncil.eu/
+  - name: reason_codes
+    path: reason_codes
+    description: Reject, return and refund reason codes (CSV); a small sample ships with this preset

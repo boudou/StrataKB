@@ -1,0 +1,78 @@
+openapi: 3.0.1
+info:
+  title: Customer Order
+  description: "This service orchestrates customer orders from checkout to delivery."
+  contact:
+    name: Example API Team
+    url: https://example.com
+  version: 14.0.0
+paths:
+  /CustomerOrder/Initiate:
+    post:
+      tags:
+        - CR - CustomerOrderFacility
+      summary: InCR Initiate A new Customer Order
+      description: InCR Initiate A new Customer Order
+      operationId: Initiate
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                accountType:
+                  type: string
+                  description: Type of customer order
+                currency:
+                  type: string
+                  description: Account currency
+      responses:
+        '200':
+          description: Successful initiation
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  accountId:
+                    type: string
+                  status:
+                    type: string
+  '/CustomerOrder/{customerorderid}/Retrieve':
+    get:
+      tags:
+        - CR - CustomerOrderFacility
+      summary: ReCR Retrieve information about a customer order
+      description: ReCR Retrieve information about a customer order
+      operationId: Retrieve
+      parameters:
+        - name: customerorderid
+          in: path
+          required: true
+          description: The customer order identifier
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Successful retrieval
+  '/CustomerOrder/{customerorderid}/Interest/{interestid}/Retrieve':
+    get:
+      tags:
+        - BQ - Interest
+      summary: ReBQ Retrieve details about interest applied
+      description: ReBQ Retrieve details about interest applied to the account
+      operationId: RetrieveInterest
+      parameters:
+        - name: customerorderid
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: interestid
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Interest details retrieved

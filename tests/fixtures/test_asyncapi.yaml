@@ -1,0 +1,40 @@
+asyncapi: 3.0.0
+info:
+  title: Customer Order
+  version: 14.0.0
+  description: >-
+    This service orchestrates customer orders
+    from checkout to delivery.
+channels:
+  CustomerOrderFacility/Created:
+    address: CustomerOrderFacility/Created
+    messages:
+      CustomerOrderFacility-created.message:
+        $ref: '#/components/messages/CustomerOrderFacility'
+    description: 'Notification when a new account is created'
+  CustomerOrderFacility/Updated:
+    address: CustomerOrderFacility/Updated
+    messages:
+      CustomerOrderFacility-updated.message:
+        $ref: '#/components/messages/CustomerOrderFacility'
+    description: 'Notification when an account is updated'
+  Interest/Created:
+    address: Interest/Created
+    messages:
+      publish.message:
+        $ref: '#/components/messages/Interest'
+    description: ''
+operations:
+  CustomerOrderFacility-created:
+    action: receive
+    channel:
+      $ref: '#/channels/CustomerOrderFacility~1Created'
+    summary: Account created event
+components:
+  messages:
+    CustomerOrderFacility:
+      payload:
+        type: object
+    Interest:
+      payload:
+        type: object

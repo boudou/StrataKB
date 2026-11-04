@@ -1,0 +1,13 @@
+Code,Name,Description
+AC01,IncorrectAccountNumber,Account number is invalid or missing
+AC04,ClosedAccountNumber,Account number specified has been closed on the books of the account servicer
+AC06,BlockedAccount,"Account specified is blocked, prohibiting posting of transactions against it"
+AG01,TransactionForbidden,Transaction forbidden on this type of account
+AM04,InsufficientFunds,Amount of funds available to cover the specified message amount is insufficient
+AM05,Duplication,Duplication
+BE05,UnrecognisedInitiatingParty,Party who initiated the message is not recognised by the end customer
+MD01,NoMandate,No mandate
+MD07,EndCustomerDeceased,End customer is deceased
+MS02,NotSpecifiedReasonCustomerGenerated,Reason has not been specified by the end customer
+MS03,NotSpecifiedReasonAgentGenerated,Reason has not been specified by the agent
+RC01,BankIdentifierIncorrect,Bank identifier code specified in the message has an incorrect format

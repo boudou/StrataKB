@@ -1,0 +1,43 @@
+# StrataKB layer preset: ISO 20022 financial messaging
+#
+# Apply with:  uv run python scripts/apply_preset.py examples/iso20022/preset.yaml
+# or from an MCP client: strata_apply_preset(preset_path="examples/iso20022/preset.yaml")
+#
+# Source folders are relative to this file. Download the documents listed
+# under each source into its folder first; see examples/README.md.
+
+name: iso20022
+display_name: ISO 20022 Messages
+description: >-
+  ISO 20022 financial messaging standard: message definition reports and XSD
+  schemas for payments initiation (pain), payments clearing and settlement (pacs)
+  and cash management (camt) messages, and the external code sets.
+
+metadata_schema:
+  message_type: string  # e.g. pacs.008
+  version: string       # e.g. pacs.008.001.08
+
+chunk_config:
+  chunk_size: 1500
+  chunk_overlap: 200
+
+routing_patterns:
+  - '\biso\s*20022\b'
+  - '\b(pain|pacs|camt)\.\d{3}\b'
+  - '\bexternal\s+code\s+sets?\b'
+  - '\bmessage\s+definition\s+reports?\b'
+  - '\bxsd\b'
+
+sources:
+  - name: message_definitions
+    path: message_definitions
+    description: Message Definition Reports for the pain, pacs and camt message sets (PDF)
+    download: https://www.iso20022.org/iso-20022-message-definitions
+  - name: schemas
+    path: schemas
+    description: XSD schemas for the same message sets
+    download: https://www.iso20022.org/iso-20022-message-definitions
+  - name: external_code_sets
+    path: external_code_sets
+    description: External code sets (use the XSD or JSON download; XLSX is not parsed)
+    download: https://www.iso20022.org/catalogue-messages/additional-content-messages/external-code-sets

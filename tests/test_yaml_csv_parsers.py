@@ -1,0 +1,325 @@
+"""Tests for YAML/OpenAPI and CSV parsers.
+
+Tests cover:
+- OpenAPI 3.x detection and operation extraction
+- AsyncAPI 3.x detection and channel extraction
+- Plain YAML fallback
+- CSV parsing of a reason code list
+- Error handling for bad files
+- Metadata fields (service_domain, operation_type, api_version)
+- Integration with ingestion pipeline (SUPPORTED_PARSERS)
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import pytest
+
+FIXTURES_DIR = Path(__file__).parent / "fixtures"
+TEST_OPENAPI = FIXTURES_DIR / "test_openapi.yaml"
+TEST_ASYNCAPI = FIXTURES_DIR / "test_asyncapi.yaml"
+TEST_CSV = FIXTURES_DIR / "reason_codes.csv"
+
+
+# ==========================================
+# OpenAPI parser tests
+# ==========================================
+
+
+class TestOpenAPIParser:
+    def test_detects_openapi_format(self):
+        from stratakb.knowledge.parsers.yaml_parser import parse_yaml
+
+        result = parse_yaml(TEST_OPENAPI)
+        assert result.error is None
+        assert result.total_pages > 0
+
+    def test_extracts_operations_as_pages(self):
+        from stratakb.knowledge.parsers.yaml_parser import parse_yaml
+
+        result = parse_yaml(TEST_OPENAPI)
+        # 3 operations + 1 summary = 4 pages
+        assert result.total_pages == 4
+
+    def test_summary_page_present(self):
+        from stratakb.knowledge.parsers.yaml_parser import parse_yaml
+
+        result = parse_yaml(TEST_OPENAPI)
+        summary = result.pages[0]
+        assert summary.page_number == 0
+        assert "Customer Order" in summary.text
+        assert "API Overview" in summary.text
+        assert "14.0.0" in summary.text
+
+    def test_operation_page_has_method_and_path(self):
+        from stratakb.knowledge.parsers.yaml_parser import parse_yaml
+
+        result = parse_yaml(TEST_OPENAPI)
+        # First operation page (after summary)
+        initiate_page = result.pages[1]
+        assert "POST" in initiate_page.text
+        assert "/CustomerOrder/Initiate" in initiate_page.text
+        assert "Initiate" in initiate_page.text
+
+    def test_operation_has_summary_and_description(self):
+        from stratakb.knowledge.parsers.yaml_parser import parse_yaml
+
+        result = parse_yaml(TEST_OPENAPI)
+        initiate_page = result.pages[1]
+        assert "InCR Initiate A new Customer Order" in initiate_page.text
+
+    def test_operation_has_parameters(self):
+        from stratakb.knowledge.parsers.yaml_parser import parse_yaml
+
+        result = parse_yaml(TEST_OPENAPI)
+        # Retrieve operation has a path parameter
+        retrieve_page = result.pages[2]
+        assert "customerorderid" in retrieve_page.text
+        assert "path" in retrieve_page.text
+
+    def test_operation_has_request_body(self):
+        from stratakb.knowledge.parsers.yaml_parser import parse_yaml
+
+        result = parse_yaml(TEST_OPENAPI)
+        initiate_page = result.pages[1]
+        assert "Request Body" in initiate_page.text
+        assert "accountType" in initiate_page.text
+
+    def test_operation_has_tags(self):
+        from stratakb.knowledge.parsers.yaml_parser import parse_yaml
+
+        result = parse_yaml(TEST_OPENAPI)
+        initiate_page = result.pages[1]
+        assert "CR - CustomerOrderFacility" in initiate_page.text
+
+    def test_summary_lists_operation_count(self):
+        from stratakb.knowledge.parsers.yaml_parser import parse_yaml
+
+        result = parse_yaml(TEST_OPENAPI)
+        summary = result.pages[0]
+        assert "Operations (3)" in summary.text
+
+    def test_service_domain_name_in_text(self):
+        from stratakb.knowledge.parsers.yaml_parser import parse_yaml
+
+        result = parse_yaml(TEST_OPENAPI)
+        for page in result.pages:
+            assert "Customer Order" in page.text
+
+
+# ==========================================
+# AsyncAPI parser tests
+# ==========================================
+
+
+class TestAsyncAPIParser:
+    def test_detects_asyncapi_format(self):
+        from stratakb.knowledge.parsers.yaml_parser import parse_yaml
+
+        result = parse_yaml(TEST_ASYNCAPI)
+        assert result.error is None
+        assert result.total_pages > 0
+
+    def test_extracts_channels(self):
+        from stratakb.knowledge.parsers.yaml_parser import parse_yaml
+
+        result = parse_yaml(TEST_ASYNCAPI)
+        # 3 channels + 1 operation + 1 summary = 5 pages
+        assert result.total_pages == 5
+
+    def test_summary_page_has_asyncapi_info(self):
+        from stratakb.knowledge.parsers.yaml_parser import parse_yaml
+
+        result = parse_yaml(TEST_ASYNCAPI)
+        summary = result.pages[0]
+        assert "AsyncAPI Overview" in summary.text
+        assert "Customer Order" in summary.text
+        assert "14.0.0" in summary.text
+
+    def test_channel_page_has_address(self):
+        from stratakb.knowledge.parsers.yaml_parser import parse_yaml
+
+        result = parse_yaml(TEST_ASYNCAPI)
+        # First channel page
+        ch_page = result.pages[1]
+        assert "Channel:" in ch_page.text
+        assert "CustomerOrderFacility/Created" in ch_page.text
+
+    def test_channel_has_messages(self):
+        from stratakb.knowledge.parsers.yaml_parser import parse_yaml
+
+        result = parse_yaml(TEST_ASYNCAPI)
+        ch_page = result.pages[1]
+        assert "Messages:" in ch_page.text
+
+    def test_operations_extracted(self):
+        from stratakb.knowledge.parsers.yaml_parser import parse_yaml
+
+        result = parse_yaml(TEST_ASYNCAPI)
+        # The operation page should be after the 3 channel pages
+        op_page = result.pages[4]
+        assert "Operation:" in op_page.text
+        assert "receive" in op_page.text
+
+
+# ==========================================
+# YAML error handling tests
+# ==========================================
+
+
+class TestYAMLErrors:
+    def test_nonexistent_file(self):
+        from stratakb.knowledge.parsers.yaml_parser import parse_yaml
+
+        result = parse_yaml("/nonexistent/file.yaml")
+        assert result.error is not None
+        assert "not found" in result.error.lower()
+
+    def test_non_yaml_file(self):
+        from stratakb.knowledge.parsers.yaml_parser import parse_yaml
+
+        result = parse_yaml(__file__)  # .py file
+        assert result.error is not None
+        assert "Not a YAML" in result.error
+
+    def test_plain_yaml_fallback(self):
+        """A YAML file without openapi/asyncapi key should still parse."""
+        import tempfile
+
+        with tempfile.NamedTemporaryFile(suffix=".yaml", mode="w", delete=False) as f:
+            f.write("key: value\nlist:\n  - item1\n  - item2\n")
+            f.flush()
+
+            from stratakb.knowledge.parsers.yaml_parser import parse_yaml
+
+            result = parse_yaml(f.name)
+            assert result.error is None
+            assert result.total_pages == 1
+            assert "key: value" in result.pages[0].text
+
+        Path(f.name).unlink()
+
+
+# ==========================================
+# CSV parser tests
+# ==========================================
+
+
+class TestCSVParser:
+    def test_parse_code_list(self):
+        from stratakb.knowledge.parsers.csv_parser import parse_csv
+
+        result = parse_csv(TEST_CSV)
+        assert result.error is None
+        assert result.total_pages == 3  # 3 data rows
+
+    def test_rows_have_structured_text(self):
+        from stratakb.knowledge.parsers.csv_parser import parse_csv
+
+        result = parse_csv(TEST_CSV)
+        first_page = result.pages[0]
+        assert "AC01" in first_page.text
+        assert "IncorrectAccountNumber" in first_page.text
+        assert "invalid or missing" in first_page.text
+
+    def test_column_headers_as_labels(self):
+        from stratakb.knowledge.parsers.csv_parser import parse_csv
+
+        result = parse_csv(TEST_CSV)
+        first_page = result.pages[0]
+        assert "**Code:**" in first_page.text
+        assert "**Description:**" in first_page.text
+
+    def test_title_extracted(self):
+        from stratakb.knowledge.parsers.csv_parser import parse_csv
+
+        result = parse_csv(TEST_CSV)
+        # Title should be from the "Name" column
+        first_page = result.pages[0]
+        assert first_page.text.startswith("# IncorrectAccountNumber")
+
+    def test_nonexistent_csv(self):
+        from stratakb.knowledge.parsers.csv_parser import parse_csv
+
+        result = parse_csv("/nonexistent/file.csv")
+        assert result.error is not None
+
+    def test_non_csv_file(self):
+        from stratakb.knowledge.parsers.csv_parser import parse_csv
+
+        result = parse_csv(__file__)
+        assert result.error is not None
+        assert "Not a CSV" in result.error
+
+    def test_empty_csv(self):
+        import tempfile
+
+        from stratakb.knowledge.parsers.csv_parser import parse_csv
+
+        with tempfile.NamedTemporaryFile(suffix=".csv", mode="w", delete=False) as f:
+            f.write("col1,col2\n")  # Header only, no data
+            f.flush()
+
+            result = parse_csv(f.name)
+            assert result.error is not None
+            assert "empty" in result.error.lower()
+
+        Path(f.name).unlink()
+
+
+# ==========================================
+# Ingestion pipeline integration
+# ==========================================
+
+
+class TestPipelineIntegration:
+    def test_yaml_registered_in_supported_parsers(self):
+        from stratakb.knowledge.ingestion import SUPPORTED_PARSERS
+
+        assert ".yaml" in SUPPORTED_PARSERS
+        assert ".yml" in SUPPORTED_PARSERS
+
+    def test_csv_registered_in_supported_parsers(self):
+        from stratakb.knowledge.ingestion import SUPPORTED_PARSERS
+
+        assert ".csv" in SUPPORTED_PARSERS
+
+    def test_discover_yaml_files(self):
+        from stratakb.knowledge.ingestion import _discover_files
+
+        files = _discover_files(FIXTURES_DIR)
+        yaml_files = [f for f in files if f.suffix in (".yaml", ".yml")]
+        assert len(yaml_files) >= 2  # openapi + asyncapi
+
+    def test_discover_csv_files(self):
+        from stratakb.knowledge.ingestion import _discover_files
+
+        files = _discover_files(FIXTURES_DIR)
+        csv_files = [f for f in files if f.suffix == ".csv"]
+        assert len(csv_files) >= 1
+
+    def test_parse_file_dispatches_yaml(self):
+        from stratakb.knowledge.ingestion import _parse_file
+
+        result = _parse_file(TEST_OPENAPI)
+        assert result.error is None
+        assert result.total_pages > 0
+
+    def test_chunk_document_sets_yaml_doc_type(self):
+        from stratakb.knowledge.ingestion import _chunk_document
+        from stratakb.knowledge.parsers.yaml_parser import parse_yaml
+
+        doc = parse_yaml(TEST_OPENAPI)
+        chunks = _chunk_document(doc, layer_name="test", chunk_size=2000, chunk_overlap=100)
+        assert len(chunks) > 0
+        assert chunks[0].doc_type == "yaml"
+
+    def test_chunk_document_sets_csv_doc_type(self):
+        from stratakb.knowledge.ingestion import _chunk_document
+        from stratakb.knowledge.parsers.csv_parser import parse_csv
+
+        doc = parse_csv(TEST_CSV)
+        chunks = _chunk_document(doc, layer_name="test", chunk_size=2000, chunk_overlap=100)
+        assert len(chunks) > 0
+        assert chunks[0].doc_type == "csv"

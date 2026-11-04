@@ -1,0 +1,4 @@
+Code,Name,Category,Description
+AC01,IncorrectAccountNumber,Account,Account number is invalid or missing
+AM04,InsufficientFunds,Amount,Amount of funds available to cover specified message amount is insufficient
+MD01,NoMandate,Mandate,No mandate

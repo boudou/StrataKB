@@ -1,0 +1,49 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+
+# Build output
+dist/
+build/
+
+# Env and secrets
+.env
+.env.*
+!.env.example
+
+# Test and tool caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+htmlcov/
+.coverage
+
+# Logs
+*.log
+
+# Data: database dumps and downloaded reference documents
+# (rulebooks and standards are licensed by their publishers; keep them out of git)
+backups/
+documents/
+examples/**/*.pdf
+examples/**/*.docx
+examples/**/*.xsd
+examples/**/*.zip
+
+# Editor / OS
+.vscode/*
+!.vscode/extensions.json
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Local MCP client configuration (may hold database credentials)
+.mcp.json

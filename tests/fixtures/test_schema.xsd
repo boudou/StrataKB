@@ -1,0 +1,79 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+           targetNamespace="urn:iso:std:iso:20022:tech:xsd:pain.001.001.03"
+           elementFormDefault="qualified">
+
+  <xs:element name="Document" type="Document"/>
+
+  <xs:complexType name="Document">
+    <xs:annotation>
+      <xs:documentation>SEPA Credit Transfer Initiation message</xs:documentation>
+    </xs:annotation>
+    <xs:sequence>
+      <xs:element name="CstmrCdtTrfInitn" type="CustomerCreditTransferInitiationV03"/>
+    </xs:sequence>
+  </xs:complexType>
+
+  <xs:complexType name="CustomerCreditTransferInitiationV03">
+    <xs:annotation>
+      <xs:documentation>Customer Credit Transfer Initiation V03</xs:documentation>
+    </xs:annotation>
+    <xs:sequence>
+      <xs:element name="GrpHdr" type="GroupHeader32">
+        <xs:annotation>
+          <xs:documentation>Set of characteristics shared by all individual transactions</xs:documentation>
+        </xs:annotation>
+      </xs:element>
+      <xs:element name="PmtInf" type="PaymentInstructionInformation3" maxOccurs="unbounded">
+        <xs:annotation>
+          <xs:documentation>Payment instruction information</xs:documentation>
+        </xs:annotation>
+      </xs:element>
+    </xs:sequence>
+  </xs:complexType>
+
+  <xs:complexType name="GroupHeader32">
+    <xs:sequence>
+      <xs:element name="MsgId" type="xs:string" minOccurs="1" maxOccurs="1"/>
+      <xs:element name="CreDtTm" type="xs:dateTime"/>
+      <xs:element name="NbOfTxs" type="xs:string"/>
+      <xs:element name="CtrlSum" type="xs:decimal" minOccurs="0"/>
+    </xs:sequence>
+  </xs:complexType>
+
+  <xs:complexType name="PaymentInstructionInformation3">
+    <xs:sequence>
+      <xs:element name="PmtInfId" type="xs:string"/>
+      <xs:element name="PmtMtd" type="PaymentMethod3Code"/>
+      <xs:element name="NbOfTxs" type="xs:string" minOccurs="0"/>
+    </xs:sequence>
+  </xs:complexType>
+
+  <xs:simpleType name="PaymentMethod3Code">
+    <xs:annotation>
+      <xs:documentation>Payment method code for credit transfers</xs:documentation>
+    </xs:annotation>
+    <xs:restriction base="xs:string">
+      <xs:enumeration value="CHK"/>
+      <xs:enumeration value="TRF"/>
+      <xs:enumeration value="TRA"/>
+    </xs:restriction>
+  </xs:simpleType>
+
+  <xs:simpleType name="IBANIdentifier">
+    <xs:restriction base="xs:string">
+      <xs:pattern value="[A-Z]{2,2}[0-9]{2,2}[a-zA-Z0-9]{1,30}"/>
+    </xs:restriction>
+  </xs:simpleType>
+
+  <xs:group name="PaymentIdentificationGroup">
+    <xs:annotation>
+      <xs:documentation>Group of payment identification elements</xs:documentation>
+    </xs:annotation>
+    <xs:sequence>
+      <xs:element name="InstrId" type="xs:string" minOccurs="0"/>
+      <xs:element name="EndToEndId" type="xs:string"/>
+    </xs:sequence>
+  </xs:group>
+
+</xs:schema>
