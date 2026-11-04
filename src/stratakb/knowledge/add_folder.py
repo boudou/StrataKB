@@ -1,0 +1,724 @@
+"""Add a folder: turn one folder into one layer and keep it in sync.
+
+plan() decides everything and writes nothing: the root, which layer (create,
+adopt, sync, or a refusal with a reason code), which files go in and why the
+others don't, and what needs confirming. apply() then creates or adopts the
+layer, ingests the file list and writes one audit entry, and returns a
+Report holding every key the command prints.
+
+The service never prints, never reads stdin and logs nothing itself, so any
+front end (the `stratakb add` command, a later push) can drive it. plan()
+never loads the embedding model.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import dataclasses
+import getpass
+import hashlib
+import os
+import re
+import sys
+from collections import Counter
+from collections.abc import Callable, Collection
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Literal
+from urllib.parse import urlsplit
+from uuid import uuid4
+
+from stratakb.core.audit import write_audit_log
+from stratakb.core.database import get_pool
+from stratakb.knowledge.ingestion import ingest_documents
+from stratakb.knowledge.layers import (
+    MAX_OWNER_LENGTH,
+    NAME_PATTERN,
+    LayerError,
+    LayerNotFoundError,
+    LayerValidationError,
+    create_layer,
+    layer_holds_folder,
+    list_layers,
+    set_description,
+    set_root_path,
+)
+from stratakb.knowledge.policy import Verdict, evaluate
+from stratakb.knowledge.selection import (
+    FileEntry,
+    SelectionResult,
+    _fold_enabled,
+    select_files,
+)
+
+# A run above these asks for confirmation (large_run)
+LARGE_RUN_FILES = 2000
+LARGE_RUN_BYTES = 500_000_000
+# ... and so does removing at least this many files, when that is more than half
+LARGE_REMOVAL_MIN = 10
+
+OUTCOME_KEYS = ("added", "updated", "unchanged", "removed", "skipped", "flagged", "failed")
+
+# The keys of the JSON report, in order: a stable interface
+REPORT_KEYS = (
+    "run_id",
+    "layer",
+    "created",
+    "root",
+    "mode",
+    "counts",
+    "skipped_by_reason",
+    "excluded_by_reason",
+    "files",
+    "excluded",
+    "notes",
+    "reason",
+    "exit_code",
+)
+
+_README_NAMES = ("readme.md", "readme.rst", "readme.txt", "readme")
+_README_MAX_BYTES = 64 * 1024
+_DESCRIPTION_MAX = 300
+_DISPLAY_NAME_MAX = 200
+_NAME_MAX = 100
+_HASH_CHUNK = 1024 * 1024
+_MAX_ERROR_NOTES = 3
+
+_WINDOWS_SYSTEM_VARS = (
+    "SystemRoot",
+    "ProgramFiles",
+    "ProgramFiles(x86)",
+    "ProgramData",
+    "APPDATA",
+    "LOCALAPPDATA",
+)
+_POSIX_SYSTEM_DIRS = (
+    "/bin", "/boot", "/dev", "/etc", "/lib", "/opt", "/proc", "/sbin", "/sys",
+    "/usr", "/var", "/System", "/Library", "/Applications",
+)
+
+_LINK = re.compile(r"\[([^\]]*)\]\([^)]*\)")
+_RULE_LINE = re.compile(r"^[=\-~^*+#_`]+$")
+
+
+@dataclass
+class Options:
+    """What the caller asked for: the command's flags."""
+
+    name: str | None = None
+    description: str | None = None
+    max_file_size_mb: float = 50.0
+    allow_broad: bool = False
+    yes: bool = False
+
+
+@dataclass
+class Plan:
+    """What apply() would do, or why it can't.
+
+    action is None when refusal (reason, hint) is set. description is the
+    description to write: a new layer's (given or derived), or on adopt and
+    sync the --description value, None to keep the current one.
+    """
+
+    root: str
+    layer: str | None = None
+    action: Literal["create", "adopt", "sync"] | None = None
+    display_name: str = ""
+    description: str | None = None
+    selection: SelectionResult | None = None
+    verdicts: dict[str, Verdict] = field(default_factory=dict)
+    entries: list[FileEntry] = field(default_factory=list)
+    planned: dict[str, int] = field(default_factory=dict)
+    work_files: int = 0
+    work_bytes: int = 0
+    removals: dict[str, str] = field(default_factory=dict)
+    tracked: int = 0
+    needs: set[str] = field(default_factory=set)
+    refusal: tuple[str, str] | None = None
+    broad_why: str | None = None
+    layer_id: Any = None
+
+
+@dataclass
+class Report:
+    """The outcome of one run. REPORT_KEYS are printed; hint and db_target are not."""
+
+    run_id: str
+    layer: str | None
+    created: bool
+    root: str
+    mode: str | None
+    counts: dict[str, int]
+    skipped_by_reason: dict[str, int]
+    excluded_by_reason: dict[str, int]
+    files: list[dict]
+    excluded: list[dict]
+    notes: list[str]
+    reason: str | None
+    exit_code: int
+    hint: str | None = None
+    db_target: str = ""
+
+    def as_dict(self) -> dict:
+        """The printed keys, in REPORT_KEYS order."""
+        return {key: getattr(self, key) for key in REPORT_KEYS}
+
+
+def _zero_counts() -> dict[str, int]:
+    return dict.fromkeys(OUTCOME_KEYS, 0)
+
+
+def refused(
+    reason: str,
+    hint: str,
+    *,
+    root: str,
+    layer: str | None = None,
+    mode: str | None = None,
+    db_target: str = "",
+    exit_code: int = 2,
+) -> Report:
+    """The report of a refused run: nothing written, zero counts."""
+    return Report(
+        run_id=uuid4().hex,
+        layer=layer,
+        created=False,
+        root=root,
+        mode=mode,
+        counts=_zero_counts(),
+        skipped_by_reason={},
+        excluded_by_reason={},
+        files=[],
+        excluded=[],
+        notes=[],
+        reason=reason,
+        exit_code=exit_code,
+        hint=hint,
+        db_target=db_target,
+    )
+
+
+def db_target(database_url: str) -> str:
+    """host:port of a database URL, never its user, password or database name."""
+    try:
+        parts = urlsplit(database_url)
+        host = parts.hostname or "localhost"
+        port = parts.port or 5432
+    except ValueError:
+        return "localhost:5432"
+    return f"{host}:{port}"
+
+
+def resolve_owner(settings: Any) -> str:
+    """STRATA_USER when it was set; otherwise the login name, marked unverified."""
+    if "strata_user" in settings.model_fields_set:
+        return settings.strata_user
+    try:
+        return "os:" + getpass.getuser()
+    except Exception:
+        # getuser() raises without a login name, as in some containers
+        return "os:unknown"
+
+
+def _key(path: str, fold: bool) -> str:
+    """A comparison key: one trailing slash, casefolded where the filesystem folds case."""
+    key = path.replace("\\", "/").rstrip("/") + "/"
+    return key.casefold() if fold else key
+
+
+def _inside(key: str, folder_key: str) -> bool:
+    return key == folder_key or key.startswith(folder_key)
+
+
+def _system_folders() -> list[str]:
+    if sys.platform == "win32":
+        folders = []
+        for var in _WINDOWS_SYSTEM_VARS:
+            value = os.environ.get(var)
+            if value:
+                folders.append(value.replace("\\", "/").rstrip("/"))
+        return folders
+    return list(_POSIX_SYSTEM_DIRS)
+
+
+def broad_reason(root: str) -> str | None:
+    """Why root is too broad to add without --allow-broad, or None."""
+    fold = _fold_enabled()
+    stripped = root.replace("\\", "/").rstrip("/")
+    if stripped == "" or re.fullmatch(r"[A-Za-z]:", stripped):
+        return "a drive root"
+    root_key = _key(root, fold)
+    home_key = _key(Path.home().resolve().as_posix(), fold)
+    if root_key == home_key:
+        return "your home folder"
+    if home_key.startswith(root_key):
+        return "a folder above your home folder"
+    for folder in _system_folders():
+        if _inside(root_key, _key(folder, fold)):
+            return f"inside {folder}"
+    return None
+
+
+def is_broad(root: str) -> bool:
+    """True for a drive root, the home folder, an ancestor of it, or a system folder."""
+    return broad_reason(root) is not None
+
+
+def slugify(folder_name: str, root: str | None = None) -> str:
+    """A layer name from a folder name; a hash of root when nothing usable is left."""
+    slug = re.sub(r"[^a-z0-9]+", "_", folder_name.lower()).strip("_")
+    if slug[:1].isdigit():
+        slug = "d_" + slug
+    if len(slug) < 3:
+        slug = slug.ljust(3, "0")
+    if len(slug) > _NAME_MAX:
+        slug = slug[:_NAME_MAX].rstrip("_")
+    if not NAME_PATTERN.match(slug):
+        digest = hashlib.sha256((root or folder_name).encode("utf-8")).hexdigest()
+        slug = "layer_" + digest[:8]
+    return slug
+
+
+def _is_decoration(line: str) -> bool:
+    """A badge, image or HTML line."""
+    return line.startswith(("[![", "![", "<"))
+
+
+def _read_readme(root: str, allowed: Collection[str] | None) -> str | None:
+    try:
+        names = sorted(os.listdir(root))
+    except OSError:
+        return None
+    by_fold: dict[str, str] = {}
+    for name in names:
+        by_fold.setdefault(name.casefold(), name)
+    for candidate in _README_NAMES:
+        real = by_fold.get(candidate)
+        if real is None or (allowed is not None and real not in allowed):
+            continue
+        path = Path(root) / real
+        try:
+            if path.is_symlink() or not path.is_file():
+                continue
+            with path.open("rb") as f:
+                data = f.read(_README_MAX_BYTES)
+        except OSError:
+            continue
+        return data.decode("utf-8", errors="replace")
+    return None
+
+
+def _shorten(text: str, limit: int) -> str:
+    if len(text) <= limit:
+        return text
+    cut = text.rfind(" ", 0, limit)
+    if cut <= 0:
+        cut = limit - 1
+    return text[:cut].rstrip() + "…"
+
+
+def derive_description(root: str, allowed: Collection[str] | None = None) -> str:
+    """A layer description from the folder's README, or "Documents from <folder>".
+
+    allowed, when given, holds the relative paths that may be read: a README
+    the user excluded never feeds the description.
+    """
+    fallback = f"Documents from {Path(root).name or root}"
+    text = _read_readme(root, allowed)
+    if text is None:
+        return fallback
+    lines = text.splitlines()
+
+    title = None
+    start = len(lines)
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if not stripped or _is_decoration(stripped):
+            continue
+        candidate = stripped.lstrip("#= ").strip()
+        if candidate and not _RULE_LINE.match(stripped):
+            title = candidate
+            start = i + 1
+            break
+    if title is None:
+        return fallback
+
+    # Paragraphs after the title: runs of consecutive non-empty lines
+    paragraphs: list[list[str]] = []
+    current: list[str] = []
+    for line in lines[start:]:
+        stripped = line.strip()
+        if stripped:
+            current.append(stripped)
+        elif current:
+            paragraphs.append(current)
+            current = []
+    if current:
+        paragraphs.append(current)
+
+    body = ""
+    for paragraph in paragraphs:
+        first = paragraph[0]
+        if _is_decoration(first) or first.startswith("#") or _RULE_LINE.match(first):
+            continue
+        body = " ".join(_LINK.sub(r"\1", " ".join(paragraph)).split())
+        if body:
+            break
+
+    result = f"{title}: {body}" if body else title
+    return _shorten(result, _DESCRIPTION_MAX)
+
+
+def _sha256_file(path: Path) -> str | None:
+    """SHA-256 of the whole file, as ingestion computes it; None when it can't be read."""
+    digest = hashlib.sha256()
+    try:
+        with path.open("rb") as f:
+            while chunk := f.read(_HASH_CHUNK):
+                digest.update(chunk)
+    except OSError:
+        return None
+    return digest.hexdigest()
+
+
+def _hash_entries(entries: list[FileEntry]) -> tuple[list[FileEntry], list[str]]:
+    """Hash each entry; return the hashed entries and the paths that became links."""
+    hashed: list[FileEntry] = []
+    links: list[str] = []
+    for entry in entries:
+        # Never follow a file turned into a link after selection
+        try:
+            is_link = entry.path.is_symlink()
+        except OSError:
+            is_link = False
+        if is_link:
+            links.append(entry.relative_path)
+            continue
+        hashed.append(dataclasses.replace(entry, sha256=_sha256_file(entry.path)))
+    return hashed, links
+
+
+def _refuse(plan: Plan, reason: str, hint: str) -> Plan:
+    plan.refusal = (reason, hint)
+    plan.action = None
+    return plan
+
+
+def _removal_reason(path: str, plan: Plan, root: Path) -> str:
+    verdict = plan.verdicts.get(path)
+    if verdict is not None and not verdict.ingest and verdict.reason:
+        return verdict.reason
+    selection = plan.selection
+    if selection is not None:
+        for excluded, reason in selection.excluded:
+            if excluded == path or (excluded.endswith("/") and path.startswith(excluded)):
+                return reason
+        if selection.mode == "git" and (root / path).exists():
+            return "ignored_by_gitignore"
+    return "deleted"
+
+
+async def plan(database_url: str, path: str | os.PathLike, options: Options) -> Plan:
+    """Decide what adding the folder at path would do. Writes nothing."""
+    # 1. The root
+    p = Path(path).expanduser()
+    if not p.exists():
+        return _refuse(
+            Plan(root=p.absolute().as_posix()), "path_not_found", f"{p} does not exist."
+        )
+    if not p.is_dir():
+        return _refuse(
+            Plan(root=p.absolute().as_posix()),
+            "not_a_folder",
+            f"{p} is a file; give the folder that holds it.",
+        )
+    root = p.resolve().as_posix()
+    result = Plan(root=root)
+
+    if options.name is not None and not NAME_PATTERN.match(options.name):
+        return _refuse(
+            result,
+            "usage_error",
+            f"Invalid layer name '{options.name}'. Must be 3-100 chars, "
+            "lowercase alphanumeric with underscores, starting with a letter.",
+        )
+    if not options.max_file_size_mb > 0:
+        return _refuse(result, "usage_error", "--max-file-size must be a positive number.")
+    max_bytes = int(options.max_file_size_mb * 1_000_000)
+
+    # 2. Broad paths
+    result.broad_why = broad_reason(root)
+    if result.broad_why is not None:
+        result.needs.add("broad_path")
+
+    # 3. Selection and policy
+    try:
+        selection = await asyncio.to_thread(select_files, Path(root))
+    except NotADirectoryError:
+        return _refuse(result, "not_a_folder", f"{root} is not a folder.")
+    except PermissionError:
+        return _refuse(result, "path_unreadable", f"{root} can't be listed (permission denied).")
+    result.selection = selection
+    result.verdicts = {e.relative_path: evaluate(e, max_bytes) for e in selection.entries}
+    candidates = [e for e in selection.entries if result.verdicts[e.relative_path].ingest]
+
+    # 4. Layer resolution: the first matching row wins
+    fold = _fold_enabled()
+    root_key = _key(root, fold)
+    folder_name = Path(root).name
+    name = options.name or slugify(folder_name, root)
+    result.layer = name
+    layers = await list_layers(database_url)
+
+    same = next((layer for layer in layers if layer["root_path"] == root), None)
+    if same is not None:
+        if options.name is None or options.name == same["name"]:
+            result.layer = same["name"]
+            result.layer_id = same["id"]
+            result.action = "sync"
+        else:
+            return _refuse(
+                result,
+                "root_taken",
+                f"The layer '{same['name']}' already holds {root}. "
+                f"Run without --name, or with --name {same['name']}.",
+            )
+    else:
+        for layer in layers:
+            stored = layer["root_path"]
+            if stored is None:
+                continue
+            stored_key = _key(stored, fold)
+            if root_key.startswith(stored_key) or stored_key.startswith(root_key):
+                return _refuse(
+                    result,
+                    "overlapping_root",
+                    f"The layer '{layer['name']}' holds {stored}, which overlaps {root}.",
+                )
+        by_name = {layer["name"]: layer for layer in layers}
+        existing = by_name.get(name)
+        if existing is not None:
+            if (existing.get("origin") or "").startswith("preset:"):
+                return _refuse(
+                    result,
+                    "preset_layer",
+                    f"The layer '{name}' comes from a preset; "
+                    "pass --name to add the folder as another layer.",
+                )
+            if existing["root_path"] is None and await layer_holds_folder(
+                database_url, name, root
+            ):
+                result.layer_id = existing["id"]
+                result.action = "adopt"
+            else:
+                return _refuse(
+                    result,
+                    "name_taken",
+                    f"A layer named '{name}' already exists with other content. "
+                    "Pass --name with another name, or delete that layer.",
+                )
+        else:
+            result.action = "create"
+
+    # 5. The tracked files of this layer and root
+    tracked: dict[str, tuple[str, int]] = {}
+    if result.layer_id is not None:
+        pool = await get_pool(database_url)
+        rows = await pool.fetch(
+            """
+            SELECT relative_path, content_hash, size_bytes FROM strata_core.ingested_files
+            WHERE layer_id = $1 AND source_root = $2
+            """,
+            result.layer_id,
+            root,
+        )
+        tracked = {r["relative_path"]: (r["content_hash"], r["size_bytes"]) for r in rows}
+    result.tracked = len(tracked)
+
+    # 6. Hash the ingest set (only files that passed policy are ever opened)
+    entries, links = await asyncio.to_thread(_hash_entries, candidates)
+    selection.excluded.extend((rel, "symlink") for rel in links)
+    result.entries = entries
+
+    # 7. Count the work
+    added = updated = unchanged = 0
+    work_bytes = 0
+    for entry in entries:
+        previous = tracked.get(entry.relative_path)
+        if previous is None:
+            added += 1
+        elif entry.sha256 is None or entry.sha256 != previous[0]:
+            updated += 1
+        else:
+            unchanged += 1
+            continue
+        work_bytes += entry.size
+    ingest_set = {e.relative_path for e in entries}
+    root_path = Path(root)
+    result.removals = {
+        rel: _removal_reason(rel, result, root_path)
+        for rel in sorted(tracked) if rel not in ingest_set
+    }
+    removed = len(result.removals)
+    result.planned = {
+        "added": added, "updated": updated, "unchanged": unchanged, "removed": removed,
+    }
+    result.work_files = added + updated + removed
+    result.work_bytes = work_bytes
+    if (
+        result.work_files > LARGE_RUN_FILES
+        or work_bytes > LARGE_RUN_BYTES
+        or (removed >= LARGE_REMOVAL_MIN and removed * 2 > result.tracked)
+    ):
+        result.needs.add("large_run")
+
+    # 8. A new layer needs at least one file
+    if result.action == "create" and not entries:
+        return _refuse(
+            result,
+            "nothing_to_add",
+            f"No file in {root} can be added: every file is excluded or skipped.",
+        )
+
+    if result.action == "create":
+        result.display_name = folder_name[:_DISPLAY_NAME_MAX] or slugify("", root)
+        result.description = (
+            options.description
+            if options.description is not None
+            else derive_description(root, ingest_set)
+        )
+    else:
+        result.description = options.description
+    return result
+
+
+async def apply(
+    database_url: str,
+    settings: Any,
+    plan: Plan,
+    *,
+    confirmed: set[str],
+    progress: Callable[[int, int], None] | None = None,
+) -> Report:
+    """Carry out a plan: create or adopt the layer, ingest, audit, report.
+
+    Raises ValueError for a refused plan or an unconfirmed need, and
+    LayerValidationError for an owner longer than its column, before any write.
+    LayerExistsError and RootTakenError propagate when another process won
+    the name or the folder after plan().
+    """
+    if plan.refusal is not None or plan.action is None or plan.layer is None:
+        raise ValueError(f"The plan was refused: {plan.refusal}")
+    missing = plan.needs - set(confirmed)
+    if missing:
+        raise ValueError(f"Not confirmed: {', '.join(sorted(missing))}")
+    owner = resolve_owner(settings)
+    if len(owner) > MAX_OWNER_LENGTH:
+        raise LayerValidationError(f"owner must be at most {MAX_OWNER_LENGTH} characters.")
+    layer = plan.layer
+
+    if plan.action == "create":
+        await create_layer(
+            database_url,
+            name=layer,
+            display_name=plan.display_name,
+            description=plan.description or "",
+            origin="folder",
+            owner=owner,
+            root_path=plan.root,
+        )
+    else:
+        if plan.action == "adopt":
+            await set_root_path(database_url, layer, plan.root)
+        if plan.description is not None:
+            await set_description(database_url, layer, plan.description)
+
+    result = await ingest_documents(
+        database_url,
+        settings.openai_api_key,
+        layer_name=layer,
+        source_path=plan.root,
+        files=plan.entries,
+        progress=progress,
+    )
+    if result.status == "failed" and not result.files and result.errors:
+        error = result.errors[0].get("error", "ingestion failed")
+        if error.startswith("Layer "):
+            raise LayerNotFoundError(error)
+        raise LayerError(error)
+
+    # One row per path: ingestion outcomes, then untracked policy skips
+    rows: dict[str, tuple[str, str | None]] = {}
+    for outcome in result.files:
+        reason = outcome.reason
+        if outcome.outcome == "removed" and reason == "not_selected":
+            reason = plan.removals.get(outcome.relative_path, reason)
+        rows[outcome.relative_path] = (outcome.outcome, reason)
+    for rel, verdict in plan.verdicts.items():
+        if not verdict.ingest and rel not in rows:
+            rows[rel] = ("skipped", verdict.reason)
+    files = [
+        {"path": rel, "outcome": outcome, "reason": reason}
+        for rel, (outcome, reason) in sorted(rows.items())
+    ]
+    selection = plan.selection
+    excluded_pairs = list(selection.excluded) if selection is not None else []
+    excluded = [{"path": rel, "reason": reason} for rel, reason in excluded_pairs]
+
+    counts = _zero_counts()
+    for row in files:
+        counts[row["outcome"]] = counts.get(row["outcome"], 0) + 1
+    skipped_by_reason = dict(
+        Counter(row["reason"] for row in files if row["outcome"] == "skipped")
+    )
+    excluded_by_reason = dict(Counter(reason for _, reason in excluded_pairs))
+
+    notes = list(selection.notes) if selection is not None else []
+    reason_by_path = {row["path"]: row["reason"] for row in files if row["outcome"] == "failed"}
+    seen_errors: set[str] = set()
+    for error in result.errors:
+        path = error.get("file")
+        text = error.get("error", "")
+        if path not in reason_by_path or text in seen_errors:
+            continue
+        seen_errors.add(text)
+        notes.append(f"{reason_by_path[path]}: {text}")
+        if len(seen_errors) >= _MAX_ERROR_NOTES:
+            break
+
+    run_id = uuid4().hex
+    created = plan.action == "create"
+    changes = ", ".join(f"{n} {k}" for k, n in counts.items() if n)
+    await write_audit_log(
+        database_url,
+        user_id=owner,
+        action="ingest",
+        tool_name="cli:add",
+        parameters={
+            "source": "cli",
+            "resource_type": "knowledge_layer",
+            "run_id": run_id,
+            "root": plan.root,
+            "created": created,
+            "counts": dict(counts),
+        },
+        result_summary=f"{layer}: {changes}" if changes else f"{layer}: no changes",
+    )
+
+    return Report(
+        run_id=run_id,
+        layer=layer,
+        created=created,
+        root=plan.root,
+        mode=selection.mode if selection is not None else None,
+        counts=counts,
+        skipped_by_reason=skipped_by_reason,
+        excluded_by_reason=excluded_by_reason,
+        files=files,
+        excluded=excluded,
+        notes=notes,
+        reason=None,
+        exit_code=1 if counts["failed"] > 0 else 0,
+        db_target=db_target(database_url),
+    )
