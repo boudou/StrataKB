@@ -8,7 +8,7 @@ from __future__ import annotations
 from mcp.server.fastmcp import FastMCP
 
 from stratakb.core.audit import write_audit_log
-from stratakb.core.auth import get_current_user, require_role
+from stratakb.core.auth import check_role, get_current_user, require_role
 from stratakb.core.logging import log_tool_call
 from stratakb.knowledge.layers import (
     LayerError,
@@ -39,6 +39,18 @@ def _serialize(obj: object) -> object:
     return obj
 
 
+# Who made a layer and the server folder it holds are shown to admins only
+_ADMIN_ONLY_LAYER_FIELDS = ("owner", "root_path")
+
+
+def _for_caller(layer: dict) -> dict:
+    """Drop the admin-only layer fields when the caller is below admin."""
+    _, role = get_current_user()
+    if check_role(role, "admin"):
+        return layer
+    return {k: v for k, v in layer.items() if k not in _ADMIN_ONLY_LAYER_FIELDS}
+
+
 def register_knowledge_tools(
     mcp: FastMCP, database_url: str, openai_api_key: str = ""
 ) -> None:
@@ -56,7 +68,7 @@ def register_knowledge_tools(
         """
         layers = await list_layers(database_url)
         return {
-            "layers": [_serialize(layer) for layer in layers],
+            "layers": [_serialize(_for_caller(layer)) for layer in layers],
             "total": len(layers),
         }
 
@@ -101,6 +113,8 @@ def register_knowledge_tools(
                 metadata_schema=metadata_schema,
                 chunk_config=chunk_config,
                 routing_patterns=routing_patterns,
+                origin="manual",
+                owner=user_id,
             )
             await write_audit_log(
                 database_url,
@@ -130,7 +144,7 @@ def register_knowledge_tools(
         """
         try:
             status = await get_layer_status(database_url, name=name)
-            return {"status": "ok", "layer": _serialize(status)}
+            return {"status": "ok", "layer": _serialize(_for_caller(status))}
         except LayerNotFoundError as e:
             return {"status": "error", "error": str(e)}
 

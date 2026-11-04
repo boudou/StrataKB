@@ -15,6 +15,7 @@ import structlog
 from cachetools import TTLCache
 
 from stratakb.core.database import get_pool
+from stratakb.core.migrations import ensure_schema
 
 logger = structlog.get_logger()
 
@@ -22,6 +23,18 @@ logger = structlog.get_logger()
 NAME_PATTERN = re.compile(r"^[a-z][a-z0-9_]{1,98}[a-z0-9]$")
 REQUIRED_CHUNK_KEYS = {"chunk_size", "chunk_overlap"}
 VALID_STATUSES = {"active", "inactive", "archived"}
+# Column sizes in core/sql/05_add_folder.sql
+MAX_ORIGIN_LENGTH = 100
+MAX_OWNER_LENGTH = 200
+
+# Partial unique index on root_path (core/sql/05_add_folder.sql)
+_ROOT_PATH_INDEX = "knowledge_layers_root_path_key"
+
+_LAYER_COLUMNS = (
+    "id, name, display_name, description, metadata_schema, chunk_config, "
+    "routing_patterns, status, doc_count, chunk_count, last_ingested, "
+    "created_at, updated_at, origin, owner, root_path"
+)
 
 # Routing patterns and descriptions change only when layers are created or
 # deleted, so search tools read them through a short-lived cache.
@@ -42,6 +55,10 @@ class LayerExistsError(LayerError):
 
 class LayerValidationError(LayerError):
     """Invalid layer configuration."""
+
+
+class RootTakenError(LayerError):
+    """Another layer already holds this folder."""
 
 
 def _validate_name(name: str) -> None:
@@ -84,14 +101,19 @@ def _validate_chunk_config(chunk_config: dict) -> dict:
     return config
 
 
+def _validate_length(field: str, value: str | None, limit: int) -> None:
+    """Reject a value longer than its column allows."""
+    if value is not None and len(value) > limit:
+        raise LayerValidationError(f"{field} must be at most {limit} characters.")
+
+
 async def list_layers(database_url: str) -> list[dict]:
     """Return all configured knowledge layers."""
+    await ensure_schema(database_url)
     pool = await get_pool(database_url)
     rows = await pool.fetch(
-        """
-        SELECT id, name, display_name, description, metadata_schema,
-               chunk_config, routing_patterns, status, doc_count, chunk_count,
-               last_ingested, created_at, updated_at
+        f"""
+        SELECT {_LAYER_COLUMNS}
         FROM strata_core.knowledge_layers
         ORDER BY name
         """
@@ -108,11 +130,17 @@ async def create_layer(
     metadata_schema: dict | None = None,
     chunk_config: dict | None = None,
     routing_patterns: list[str] | None = None,
+    origin: str | None = None,
+    owner: str | None = None,
+    root_path: str | None = None,
 ) -> dict:
     """Create a new knowledge layer.
 
+    root_path is stored as given: callers pass Path(p).resolve().as_posix().
+
     Returns the created layer record.
     Raises LayerExistsError if name already taken.
+    Raises RootTakenError if another layer already holds root_path.
     Raises LayerValidationError if inputs are invalid.
     """
     _validate_name(name)
@@ -126,18 +154,19 @@ async def create_layer(
 
     chunk_cfg = _validate_chunk_config(chunk_config or {})
     routing = _validate_routing_patterns(routing_patterns or [])
+    _validate_length("origin", origin, MAX_ORIGIN_LENGTH)
+    _validate_length("owner", owner, MAX_OWNER_LENGTH)
 
+    await ensure_schema(database_url)
     pool = await get_pool(database_url)
     try:
         row = await pool.fetchrow(
-            """
+            f"""
             INSERT INTO strata_core.knowledge_layers
                 (name, display_name, description, metadata_schema, chunk_config,
-                 routing_patterns)
-            VALUES ($1, $2, $3, $4::jsonb, $5::jsonb, $6::jsonb)
-            RETURNING id, name, display_name, description, metadata_schema,
-                      chunk_config, routing_patterns, status, doc_count, chunk_count,
-                      last_ingested, created_at, updated_at
+                 routing_patterns, origin, owner, root_path)
+            VALUES ($1, $2, $3, $4::jsonb, $5::jsonb, $6::jsonb, $7, $8, $9)
+            RETURNING {_LAYER_COLUMNS}
             """,
             name,
             display_name.strip(),
@@ -145,8 +174,15 @@ async def create_layer(
             _json_str(meta),
             _json_str(chunk_cfg),
             json.dumps(routing),
+            origin,
+            owner,
+            root_path,
         )
-    except asyncpg.UniqueViolationError:
+    except asyncpg.UniqueViolationError as e:
+        if e.constraint_name == _ROOT_PATH_INDEX:
+            raise RootTakenError(
+                f"Another layer already holds the folder '{root_path}'."
+            ) from e
         raise LayerExistsError(f"Knowledge layer '{name}' already exists.")
 
     _routing_cache.clear()
@@ -159,13 +195,14 @@ async def get_layer_status(database_url: str, *, name: str) -> dict:
 
     Raises LayerNotFoundError if layer doesn't exist.
     """
+    await ensure_schema(database_url)
     pool = await get_pool(database_url)
     row = await pool.fetchrow(
         """
         SELECT kl.id, kl.name, kl.display_name, kl.description,
                kl.status, kl.doc_count, kl.chunk_count, kl.last_ingested,
                kl.chunk_config, kl.metadata_schema, kl.routing_patterns,
-               kl.created_at, kl.updated_at,
+               kl.created_at, kl.updated_at, kl.origin, kl.owner, kl.root_path,
                (SELECT count(*) FROM strata_core.ingestion_runs ir
                 WHERE ir.layer_id = kl.id) AS ingestion_run_count,
                (SELECT max(ir.completed_at) FROM strata_core.ingestion_runs ir
@@ -179,6 +216,136 @@ async def get_layer_status(database_url: str, *, name: str) -> dict:
     if row is None:
         raise LayerNotFoundError(f"Knowledge layer '{name}' not found.")
     return dict(row)
+
+
+async def find_layer_by_root(database_url: str, root_path: str) -> dict | None:
+    """Return the layer that holds root_path, or None."""
+    await ensure_schema(database_url)
+    pool = await get_pool(database_url)
+    row = await pool.fetchrow(
+        f"""
+        SELECT {_LAYER_COLUMNS}
+        FROM strata_core.knowledge_layers
+        WHERE root_path = $1
+        """,
+        root_path,
+    )
+    return dict(row) if row is not None else None
+
+
+async def find_overlapping_roots(database_url: str, root_path: str) -> list[dict]:
+    """Return the layers whose root is an ancestor or a descendant of root_path.
+
+    Paths are compared on whole components: /a/b overlaps /a/b/c and /a, but
+    not /a/bc. A layer holding root_path itself is not included.
+    """
+    await ensure_schema(database_url)
+    pool = await get_pool(database_url)
+    # starts_with, not LIKE: _ and % are ordinary characters in folder names.
+    # rtrim keeps a filesystem root ("/" or "C:/") a prefix of its children.
+    rows = await pool.fetch(
+        f"""
+        SELECT {_LAYER_COLUMNS}
+        FROM strata_core.knowledge_layers
+        WHERE root_path IS NOT NULL AND root_path <> $1
+          AND (starts_with($1, rtrim(root_path, '/') || '/')
+               OR starts_with(root_path, rtrim($1, '/') || '/'))
+        ORDER BY name
+        """,
+        root_path,
+    )
+    return [dict(r) for r in rows]
+
+
+async def layer_holds_folder(database_url: str, layer_name: str, root_path: str) -> bool:
+    """Return True when the layer holds nothing but files from root_path.
+
+    True for a layer with no chunks and no ingested files, or for one whose
+    ingested files all come from exactly root_path and that has no chunks
+    without a file (an older ingestion). False otherwise.
+
+    Raises LayerNotFoundError if the layer doesn't exist.
+    """
+    await ensure_schema(database_url)
+    pool = await get_pool(database_url)
+    row = await pool.fetchrow(
+        """
+        SELECT EXISTS (
+                   SELECT 1 FROM strata_core.ingested_files f
+                   WHERE f.layer_id = kl.id AND f.source_root <> $2
+               ) AS other_root,
+               EXISTS (
+                   SELECT 1 FROM strata_vectors.chunks c
+                   WHERE c.layer_name = kl.name AND c.file_id IS NULL
+               ) AS legacy
+        FROM strata_core.knowledge_layers kl
+        WHERE kl.name = $1
+        """,
+        layer_name,
+        root_path,
+    )
+    if row is None:
+        raise LayerNotFoundError(f"Knowledge layer '{layer_name}' not found.")
+    return not row["other_root"] and not row["legacy"]
+
+
+async def _set_column(
+    database_url: str, layer_name: str, column: str, value: str | None
+) -> None:
+    """Set one column of a layer and bump updated_at.
+
+    column is always a literal from the setters below, never caller input.
+    """
+    await ensure_schema(database_url)
+    pool = await get_pool(database_url)
+    row = await pool.fetchrow(
+        f"""
+        UPDATE strata_core.knowledge_layers
+        SET {column} = $2, updated_at = NOW()
+        WHERE name = $1
+        RETURNING id
+        """,
+        layer_name,
+        value,
+    )
+    if row is None:
+        raise LayerNotFoundError(f"Knowledge layer '{layer_name}' not found.")
+    _routing_cache.clear()
+    logger.info("layer_updated", layer=layer_name, field=column)
+
+
+async def set_root_path(database_url: str, layer_name: str, root_path: str | None) -> None:
+    """Set the folder a layer holds (Path(p).resolve().as_posix(), or None).
+
+    Raises LayerNotFoundError if the layer doesn't exist.
+    Raises RootTakenError if another layer already holds root_path.
+    """
+    try:
+        await _set_column(database_url, layer_name, "root_path", root_path)
+    except asyncpg.UniqueViolationError as e:
+        if e.constraint_name == _ROOT_PATH_INDEX:
+            raise RootTakenError(
+                f"Another layer already holds the folder '{root_path}'."
+            ) from e
+        raise
+
+
+async def set_description(database_url: str, layer_name: str, description: str) -> None:
+    """Set a layer's description.
+
+    Raises LayerNotFoundError if the layer doesn't exist.
+    """
+    await _set_column(database_url, layer_name, "description", description)
+
+
+async def set_origin(database_url: str, layer_name: str, origin: str | None) -> None:
+    """Record where a layer came from ("manual", "preset:<name>").
+
+    Raises LayerNotFoundError if the layer doesn't exist.
+    Raises LayerValidationError if origin is longer than its column.
+    """
+    _validate_length("origin", origin, MAX_ORIGIN_LENGTH)
+    await _set_column(database_url, layer_name, "origin", origin)
 
 
 async def delete_layer(database_url: str, *, name: str) -> dict:

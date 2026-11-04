@@ -167,19 +167,46 @@ class TestCreatePresetLayer:
         assert kwargs["name"] == "iso20022"
         assert kwargs["routing_patterns"] == preset.routing_patterns
         assert kwargs["chunk_config"]["chunk_size"] == 1500
+        assert kwargs["origin"] == "preset:iso20022"
 
-    async def test_existing_layer_reported(self):
+    async def _create_existing(self, existing_origin):
         from stratakb.knowledge.layers import LayerExistsError
 
         preset = load_preset(SEPA_PRESET)
-        with patch(
-            "stratakb.knowledge.presets.create_layer",
-            new_callable=AsyncMock,
-            side_effect=LayerExistsError("exists"),
+        with (
+            patch(
+                "stratakb.knowledge.presets.create_layer",
+                new_callable=AsyncMock,
+                side_effect=LayerExistsError("exists"),
+            ),
+            patch(
+                "stratakb.knowledge.presets.get_layer_status",
+                new_callable=AsyncMock,
+                return_value={"name": "sepa", "origin": existing_origin},
+            ),
+            patch(
+                "stratakb.knowledge.presets.set_origin", new_callable=AsyncMock
+            ) as mock_set_origin,
         ):
             result = await create_preset_layer("postgresql://test", preset)
+        return result, mock_set_origin
+
+    async def test_existing_layer_reported(self):
+        result, _ = await self._create_existing("preset:sepa")
 
         assert result["status"] == "exists"
+
+    async def test_existing_layer_backfills_origin(self):
+        result, mock_set_origin = await self._create_existing(None)
+
+        assert result["status"] == "exists"
+        mock_set_origin.assert_awaited_once_with("postgresql://test", "sepa", "preset:sepa")
+
+    async def test_existing_layer_keeps_other_origin(self):
+        result, mock_set_origin = await self._create_existing("manual")
+
+        assert result["status"] == "exists"
+        mock_set_origin.assert_not_awaited()
 
 
 class TestPresetToolRegistration:
