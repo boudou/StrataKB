@@ -22,22 +22,25 @@ dependencies = [
     "asyncpg>=0.30.0",
     # Document processing
     "langchain-text-splitters>=0.3.0",
-    "pypdf>=5.0.0",
+    "pypdf>=6.21.4",
     "pyyaml>=6.0",
     "lxml>=5.0.0",
     "beautifulsoup4>=4.12.0",
     "python-docx>=1.2.0",
     # Optional LLM query rewriting and OpenAI embeddings
-    "anthropic>=0.40.0",
+    "anthropic>=0.87.0",
     "openai>=1.50.0",
     # Local embeddings and reranking
-    "sentence-transformers>=3.0.0",
+    "sentence-transformers>=5.6.0",
+    "huggingface-hub>=2.4.0",
     # Logging
     "structlog>=24.0.0",
     # Utils
     "pydantic>=2.0.0",
     "pydantic-settings>=2.0.0",
     "cachetools>=7.0.5",
+    # Folder selection: .gitignore-style rules
+    "pathspec>=0.12",
 ]
 
 [project.urls]
@@ -46,7 +49,7 @@ Issues = "https://github.com/boudou/StrataKB/issues"
 Changelog = "https://github.com/boudou/StrataKB/blob/main/CHANGELOG.md"
 
 [project.scripts]
-stratakb = "stratakb.mcp_server:main"
+stratakb = "stratakb.cli:main"
 
 [project.optional-dependencies]
 dev = [

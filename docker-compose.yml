@@ -6,10 +6,10 @@ services:
     volumes:
       - postgres-data:/var/lib/postgresql/data
       # Run in name order on first start of an empty data volume
-      - ./db/01_init.sql:/docker-entrypoint-initdb.d/01_init.sql
-      - ./db/02_learning.sql:/docker-entrypoint-initdb.d/02_learning.sql
+      # 01, 02 and 04 ship in the package: the server also applies them itself
+      - ./src/stratakb/core/sql/01_init.sql:/docker-entrypoint-initdb.d/01_init.sql
+      - ./src/stratakb/core/sql/02_learning.sql:/docker-entrypoint-initdb.d/02_learning.sql
       - ./db/03_readonly_role.sql:/docker-entrypoint-initdb.d/03_readonly_role.sql
-      # Shipped in the package: the server also applies it to existing databases
       - ./src/stratakb/core/sql/04_ingested_files.sql:/docker-entrypoint-initdb.d/04_ingested_files.sql
     environment:
       POSTGRES_DB: strata

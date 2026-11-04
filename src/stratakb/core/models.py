@@ -32,3 +32,6 @@ class KnowledgeLayer:
     last_ingested: datetime | None
     created_at: datetime
     updated_at: datetime
+    origin: str | None = None
+    owner: str | None = None
+    root_path: str | None = None

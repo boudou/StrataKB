@@ -262,8 +262,25 @@ class TestCSVParser:
             f.flush()
 
             result = parse_csv(f.name)
-            assert result.error is not None
-            assert "empty" in result.error.lower()
+            assert result.error is None
+            assert result.pages == []
+            assert result.total_pages == 0
+
+        Path(f.name).unlink()
+
+    def test_csv_without_header(self):
+        import tempfile
+
+        from stratakb.knowledge.parsers.csv_parser import parse_csv
+
+        with tempfile.NamedTemporaryFile(suffix=".csv", mode="w", delete=False) as f:
+            f.write("")  # 0 bytes: no header row at all
+            f.flush()
+
+            result = parse_csv(f.name)
+            assert result.error is None
+            assert result.pages == []
+            assert result.total_pages == 0
 
         Path(f.name).unlink()
 

@@ -17,6 +17,7 @@ from stratakb.knowledge.presets import (
 EXAMPLES_DIR = Path(__file__).parent.parent / "examples"
 SEPA_PRESET = EXAMPLES_DIR / "sepa" / "preset.yaml"
 ISO_PRESET = EXAMPLES_DIR / "iso20022" / "preset.yaml"
+PEPS_PRESET = EXAMPLES_DIR / "peps" / "preset.yaml"
 
 
 def _write_preset(tmp_path: Path, body: str) -> Path:
@@ -26,15 +27,21 @@ def _write_preset(tmp_path: Path, body: str) -> Path:
 
 
 class TestLoadPreset:
-    @pytest.mark.parametrize("path", [SEPA_PRESET, ISO_PRESET])
+    @pytest.mark.parametrize("path", [SEPA_PRESET, ISO_PRESET, PEPS_PRESET])
     def test_example_presets_load(self, path):
         preset = load_preset(path)
-        assert preset.name in ("sepa", "iso20022")
+        assert preset.name in ("sepa", "iso20022", "python_peps")
         assert preset.display_name
         assert preset.description
         assert preset.routing_patterns
         assert preset.sources
         assert preset.root == path.parent
+
+    def test_peps_preset_source(self):
+        preset = load_preset(PEPS_PRESET)
+        assert [s.path for s in preset.sources] == ["source/peps"]
+        assert preset.chunk_config["chunk_size"] == 1500
+        assert preset.chunk_config["chunk_overlap"] == 200
 
     def test_chunk_config_defaults_applied(self, tmp_path):
         path = _write_preset(tmp_path, (
@@ -99,6 +106,45 @@ class TestLoadPreset:
             load_preset(tmp_path / "nope.yaml")
 
 
+class TestPepsRouting:
+    """The PEPs preset's routing patterns, compiled as the server compiles them."""
+
+    @staticmethod
+    def _patterns(*paths: Path) -> dict:
+        from stratakb.rag.layer_detect import compile_patterns
+
+        presets = [load_preset(p) for p in paths]
+        return compile_patterns({p.name: p.routing_patterns for p in presets})
+
+    @pytest.mark.parametrize("query", [
+        "PEP 8",
+        "pep-484",
+        "PEP8",
+        "What does PEP 572 say?",
+        "Python Enhancement Proposal",
+        "python enhancement proposals on typing",
+    ])
+    def test_routed(self, query):
+        from stratakb.rag.layer_detect import detect_layers
+
+        assert detect_layers(query, self._patterns(PEPS_PRESET)) == ["python_peps"]
+
+    @pytest.mark.parametrize(
+        "query", ["pepper", "step 8", "pep 12345", "general payments question"]
+    )
+    def test_not_routed(self, query):
+        from stratakb.rag.layer_detect import detect_layers
+
+        assert detect_layers(query, self._patterns(PEPS_PRESET)) == []
+
+    def test_alongside_the_other_examples(self):
+        from stratakb.rag.layer_detect import detect_layers
+
+        patterns = self._patterns(SEPA_PRESET, ISO_PRESET, PEPS_PRESET)
+        assert detect_layers("PEP 8 line length", patterns) == ["python_peps"]
+        assert "python_peps" not in detect_layers("pacs.008 settlement amount", patterns)
+
+
 class TestDryRun:
     def test_sample_reason_codes_parse(self):
         result = dry_run_parse(load_preset(SEPA_PRESET))
@@ -129,6 +175,29 @@ class TestDryRun:
         assert result.total_chunks >= 1
         assert result.errors == []
 
+    def test_secret_names_not_parsed(self, tmp_path):
+        from stratakb.knowledge import presets
+
+        docs = tmp_path / "docs"
+        docs.mkdir()
+        (docs / "failover.md").write_text("# Failover\n\nSwitch traffic to the standby region.\n")
+        (docs / "client_secret.json").write_text('{"client_secret": "x"}')
+        preset_path = _write_preset(tmp_path, (
+            "name: runbooks\n"
+            "display_name: Ops Runbooks\n"
+            "sources:\n"
+            "  - {name: docs, path: docs}\n"
+        ))
+        with patch(
+            "stratakb.knowledge.presets._parse_file", side_effect=presets._parse_file
+        ) as spy:
+            result = dry_run_parse(load_preset(preset_path))
+
+        assert [c.args[0].name for c in spy.call_args_list] == ["failover.md"]
+        assert result.group_stats["docs"]["files"] == 1
+        assert result.parsed_files == 1
+        assert result.errors == []
+
 
 class TestCreatePresetLayer:
     async def test_passes_preset_settings_to_create_layer(self):
@@ -144,19 +213,46 @@ class TestCreatePresetLayer:
         assert kwargs["name"] == "iso20022"
         assert kwargs["routing_patterns"] == preset.routing_patterns
         assert kwargs["chunk_config"]["chunk_size"] == 1500
+        assert kwargs["origin"] == "preset:iso20022"
 
-    async def test_existing_layer_reported(self):
+    async def _create_existing(self, existing_origin):
         from stratakb.knowledge.layers import LayerExistsError
 
         preset = load_preset(SEPA_PRESET)
-        with patch(
-            "stratakb.knowledge.presets.create_layer",
-            new_callable=AsyncMock,
-            side_effect=LayerExistsError("exists"),
+        with (
+            patch(
+                "stratakb.knowledge.presets.create_layer",
+                new_callable=AsyncMock,
+                side_effect=LayerExistsError("exists"),
+            ),
+            patch(
+                "stratakb.knowledge.presets.get_layer_status",
+                new_callable=AsyncMock,
+                return_value={"name": "sepa", "origin": existing_origin},
+            ),
+            patch(
+                "stratakb.knowledge.presets.set_origin", new_callable=AsyncMock
+            ) as mock_set_origin,
         ):
             result = await create_preset_layer("postgresql://test", preset)
+        return result, mock_set_origin
+
+    async def test_existing_layer_reported(self):
+        result, _ = await self._create_existing("preset:sepa")
 
         assert result["status"] == "exists"
+
+    async def test_existing_layer_backfills_origin(self):
+        result, mock_set_origin = await self._create_existing(None)
+
+        assert result["status"] == "exists"
+        mock_set_origin.assert_awaited_once_with("postgresql://test", "sepa", "preset:sepa")
+
+    async def test_existing_layer_keeps_other_origin(self):
+        result, mock_set_origin = await self._create_existing("manual")
+
+        assert result["status"] == "exists"
+        mock_set_origin.assert_not_awaited()
 
 
 class TestPresetToolRegistration:

@@ -24,7 +24,7 @@ def parse_html(file_path: str | Path) -> ParsedDocument:
         file_path: Path to the HTML file.
 
     Returns:
-        ParsedDocument with one page per heading section.
+        ParsedDocument with one page per heading section, or no pages when there is no text.
     """
     file_path = Path(file_path)
     source = file_path.name
@@ -42,7 +42,7 @@ def parse_html(file_path: str | Path) -> ParsedDocument:
         return ParsedDocument(source_file=source, error=f"Read error: {e}")
 
     if not raw.strip():
-        return ParsedDocument(source_file=source, error="HTML file is empty")
+        return ParsedDocument(source_file=source, pages=[], total_pages=0)
 
     # Extract title from <title> tag
     title = _extract_title(raw)
@@ -56,7 +56,7 @@ def parse_html(file_path: str | Path) -> ParsedDocument:
         # No headings — return as single page with stripped text
         text = _strip_tags(raw).strip()
         if not text:
-            return ParsedDocument(source_file=source, error="HTML file has no text content")
+            return ParsedDocument(source_file=source, pages=[], total_pages=0)
         if title:
             text = f"# {title}\n\n{text}"
         page = ParsedPage(text=text, page_number=1, source_file=source)

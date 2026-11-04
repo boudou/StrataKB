@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from stratakb.config import Settings
 from stratakb.rag.retriever import SearchResult, _hybrid_search
 from stratakb.rag.tools import register_rag_tools
 
@@ -25,10 +26,11 @@ class _ToolCollector:
 
 @pytest.fixture
 def tools(monkeypatch):
-    settings = SimpleNamespace(
+    settings = Settings(
+        _env_file=None,
         learning_enabled=False,
         embedding_backend="local",
-        anthropic_api_key="",
+        anthropic_api_key="test-key",
         reranking_enabled=False,
         reranking_candidate_multiplier=3,
         reranking_model="test-model",

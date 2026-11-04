@@ -29,7 +29,7 @@ def parse_markdown(file_path: str | Path) -> ParsedDocument:
         file_path: Path to the Markdown file.
 
     Returns:
-        ParsedDocument with one page per heading section.
+        ParsedDocument with one page per heading section, or no pages for whitespace-only text.
     """
     file_path = Path(file_path)
     source = file_path.name
@@ -47,7 +47,7 @@ def parse_markdown(file_path: str | Path) -> ParsedDocument:
         return ParsedDocument(source_file=source, error=f"Read error: {e}")
 
     if not text.strip():
-        return ParsedDocument(source_file=source, error="Markdown file is empty")
+        return ParsedDocument(source_file=source, pages=[], total_pages=0)
 
     sections = _split_by_headings(text)
 

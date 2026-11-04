@@ -78,15 +78,13 @@ def register_rag_tools(
     ) -> dict:
         """Run strata_search; the tool below documents the arguments."""
         from stratakb.config import get_settings
+        from stratakb.knowledge.embeddings import embedding_key_error
         from stratakb.rag.confidence import score_confidence
         from stratakb.rag.retriever import search_chunks
 
         _settings = get_settings()
-        if _settings.embedding_backend == "openai" and not openai_api_key:
-            return {
-                "status": "error",
-                "error": "OpenAI API key not configured. Set OPENAI_API_KEY in .env",
-            }
+        if err := embedding_key_error(_settings, openai_api_key):
+            return {"status": "error", "error": err}
 
         if not query or not query.strip():
             return {
@@ -212,7 +210,11 @@ def register_rag_tools(
         """Run strata_ask; the tool below documents the arguments."""
         from stratakb.config import get_settings
         from stratakb.rag.confidence import score_confidence
-        from stratakb.rag.query_rewriter import build_domain_context, rewrite_query
+        from stratakb.rag.query_rewriter import (
+            build_domain_context,
+            rewrite_configured,
+            rewrite_query,
+        )
         from stratakb.rag.retriever import SearchResult, search_chunks
 
         _settings = get_settings()
@@ -241,7 +243,7 @@ def register_rag_tools(
 
             # Rewrite query into domain-specific variants
             domain_context = ""
-            if _settings.anthropic_api_key:
+            if rewrite_configured(_settings):
                 try:
                     from stratakb.knowledge.layers import get_layer_routing
                     routing = await get_layer_routing(database_url)

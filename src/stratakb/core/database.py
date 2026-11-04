@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from datetime import datetime
+
 import asyncpg
 import structlog
 
@@ -25,6 +27,19 @@ async def get_pool(database_url: str) -> asyncpg.Pool:
         _pools[database_url] = pool
         logger.info("db_pool_created")
     return pool
+
+
+async def fetch_layers_stamp(database_url: str) -> tuple[int, datetime | None]:
+    """Return (layer count, newest updated_at) of strata_core.knowledge_layers.
+
+    Caches compare this stamp to notice layer changes made by any process.
+    """
+    pool = await get_pool(database_url)
+    row = await pool.fetchrow(
+        "SELECT count(*) AS layers, max(updated_at) AS latest "
+        "FROM strata_core.knowledge_layers"
+    )
+    return (row["layers"], row["latest"])
 
 
 async def close_pool() -> None:

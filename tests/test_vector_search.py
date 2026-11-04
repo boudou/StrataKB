@@ -114,6 +114,16 @@ def _mock_pool_and_conn(fetch_return=None):
 
 
 class TestSearchChunksUnit:
+    @pytest.fixture(autouse=True)
+    def _no_stamp_read(self):
+        """The fake URL has no database: never read the layers stamp."""
+        with patch(
+            "stratakb.rag.retriever.fetch_layers_stamp",
+            new_callable=AsyncMock,
+            return_value=(0, None),
+        ):
+            yield
+
     @pytest.mark.asyncio
     async def test_empty_query_returns_empty(self):
         from stratakb.rag.retriever import search_chunks
@@ -345,6 +355,7 @@ class TestSearchTool:
 
         with patch("stratakb.config.get_settings") as mock_settings:
             mock_settings.return_value.embedding_backend = "openai"
+            mock_settings.return_value.embedding_base_url = ""
             mock_settings.return_value.strata_user = "test"
             mock_settings.return_value.strata_role = "admin"
             result = await fn(query="test query")

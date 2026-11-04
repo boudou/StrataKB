@@ -8,6 +8,8 @@ Tests cover:
 
 from __future__ import annotations
 
+import contextlib
+
 import pytest
 
 from stratakb.knowledge.layers import (
@@ -257,3 +259,345 @@ class TestLayerCRUDIntegration:
 
         with pytest.raises(LayerValidationError, match="display_name"):
             await create_layer(db_url, name="valid_name", display_name="")
+
+
+# ==========================================
+# Layer origin, owner and root folder (require database)
+# ==========================================
+
+# Roots live under a prefix no other test uses, since overlap checks scan every layer
+ROOT = "/strata_test_50"
+
+
+async def _drop_layers(db_url, *names):
+    from stratakb.knowledge.layers import delete_layer
+
+    for name in names:
+        with contextlib.suppress(LayerNotFoundError):
+            await delete_layer(db_url, name=name)
+
+
+async def _add_file_row(db_url, layer_name, source_root, relative_path="a.md"):
+    from stratakb.core.database import get_pool
+
+    pool = await get_pool(db_url)
+    await pool.execute(
+        """
+        INSERT INTO strata_core.ingested_files
+            (layer_id, source_root, relative_path, content_hash)
+        SELECT id, $2, $3, $4 FROM strata_core.knowledge_layers WHERE name = $1
+        """,
+        layer_name,
+        source_root,
+        relative_path,
+        "0" * 64,
+    )
+
+
+async def _add_legacy_chunk(db_url, layer_name):
+    from stratakb.core.database import get_pool
+
+    pool = await get_pool(db_url)
+    await pool.execute(
+        "INSERT INTO strata_vectors.chunks (layer_name, content) VALUES ($1, $2)",
+        layer_name,
+        "legacy chunk",
+    )
+
+
+async def _updated_at(db_url, layer_name):
+    from stratakb.knowledge.layers import get_layer_status
+
+    return (await get_layer_status(db_url, name=layer_name))["updated_at"]
+
+
+class TestFolderFieldsIntegration:
+    """origin, owner and root_path on layers, and the folder helpers."""
+
+    async def test_fields_round_trip(self, db_url):
+        from stratakb.knowledge.layers import create_layer, get_layer_status, list_layers
+
+        name = "test_folder_fields"
+        root = f"{ROOT}/r"
+        await _drop_layers(db_url, name)
+        try:
+            created = await create_layer(
+                db_url, name=name, display_name="Folder", origin="manual",
+                owner="u1", root_path=root,
+            )
+            expected = {"origin": "manual", "owner": "u1", "root_path": root}
+            assert {k: created[k] for k in expected} == expected
+
+            listed = next(
+                layer for layer in await list_layers(db_url) if layer["name"] == name
+            )
+            assert {k: listed[k] for k in expected} == expected
+
+            status = await get_layer_status(db_url, name=name)
+            assert {k: status[k] for k in expected} == expected
+        finally:
+            await _drop_layers(db_url, name)
+
+    async def test_fields_default_to_none(self, db_url):
+        from stratakb.knowledge.layers import create_layer
+
+        name = "test_folder_none"
+        await _drop_layers(db_url, name)
+        try:
+            created = await create_layer(db_url, name=name, display_name="None")
+            assert created["origin"] is None
+            assert created["owner"] is None
+            assert created["root_path"] is None
+        finally:
+            await _drop_layers(db_url, name)
+
+    async def test_same_root_raises_root_taken(self, db_url):
+        from stratakb.knowledge.layers import RootTakenError, create_layer
+
+        root = f"{ROOT}/taken"
+        await _drop_layers(db_url, "test_root_first", "test_root_second")
+        try:
+            await create_layer(db_url, name="test_root_first", display_name="A", root_path=root)
+            with pytest.raises(RootTakenError):
+                await create_layer(
+                    db_url, name="test_root_second", display_name="B", root_path=root
+                )
+            with pytest.raises(LayerExistsError):
+                await create_layer(db_url, name="test_root_first", display_name="C")
+        finally:
+            await _drop_layers(db_url, "test_root_first", "test_root_second")
+
+    async def test_find_layer_by_root(self, db_url):
+        from stratakb.knowledge.layers import create_layer, find_layer_by_root
+
+        name = "test_find_root"
+        root = f"{ROOT}/find"
+        await _drop_layers(db_url, name)
+        try:
+            await create_layer(db_url, name=name, display_name="Find", root_path=root)
+            found = await find_layer_by_root(db_url, root)
+            assert found is not None and found["name"] == name
+            assert await find_layer_by_root(db_url, f"{ROOT}/other") is None
+        finally:
+            await _drop_layers(db_url, name)
+
+    async def test_find_overlapping_roots(self, db_url):
+        from stratakb.knowledge.layers import create_layer, find_overlapping_roots
+
+        layers = {
+            "test_overlap_a": f"{ROOT}/p/a",
+            "test_overlap_abc": f"{ROOT}/p/a/b/c",
+            "test_overlap_bc": f"{ROOT}/p/a/bc",
+            "test_overlap_ab": f"{ROOT}/p/a/b",
+        }
+        await _drop_layers(db_url, *layers)
+        try:
+            for name, root in layers.items():
+                await create_layer(db_url, name=name, display_name=name, root_path=root)
+            overlapping = await find_overlapping_roots(db_url, f"{ROOT}/p/a/b")
+            assert sorted(layer["root_path"] for layer in overlapping) == [
+                f"{ROOT}/p/a",
+                f"{ROOT}/p/a/b/c",
+            ]
+        finally:
+            await _drop_layers(db_url, *layers)
+
+    async def test_find_overlapping_roots_treats_underscore_literally(self, db_url):
+        from stratakb.knowledge.layers import create_layer, find_overlapping_roots
+
+        name = "test_overlap_literal"
+        await _drop_layers(db_url, name)
+        try:
+            await create_layer(
+                db_url, name=name, display_name="Literal", root_path=f"{ROOT}/x_y"
+            )
+            # LIKE would read "_" as any character and match /x_y against /xzy/...
+            assert await find_overlapping_roots(db_url, f"{ROOT}/xzy/sub") == []
+        finally:
+            await _drop_layers(db_url, name)
+
+    @pytest.mark.parametrize(
+        ("setup", "expected"),
+        [
+            ("empty", True),
+            ("other_root", False),
+            ("legacy", False),
+            ("this_root", True),
+            ("subfolder", False),
+        ],
+    )
+    async def test_layer_holds_folder(self, db_url, setup, expected):
+        from stratakb.knowledge.layers import create_layer, layer_holds_folder
+
+        name = "test_holds_folder"
+        root = f"{ROOT}/docs"
+        await _drop_layers(db_url, name)
+        try:
+            await create_layer(db_url, name=name, display_name="Holds", origin="manual")
+            if setup == "other_root":
+                await _add_file_row(db_url, name, f"{ROOT}/elsewhere")
+            elif setup == "legacy":
+                await _add_legacy_chunk(db_url, name)
+            elif setup == "this_root":
+                await _add_file_row(db_url, name, root, "a.md")
+                await _add_file_row(db_url, name, root, "sub/b.md")
+            elif setup == "subfolder":
+                await _add_file_row(db_url, name, f"{root}/a")
+            assert await layer_holds_folder(db_url, name, root) is expected
+        finally:
+            await _drop_layers(db_url, name)
+
+    async def test_layer_holds_folder_unknown_layer(self, db_url):
+        from stratakb.knowledge.layers import layer_holds_folder
+
+        with pytest.raises(LayerNotFoundError):
+            await layer_holds_folder(db_url, "nonexistent_layer_xyz", f"{ROOT}/docs")
+
+    @pytest.mark.parametrize(
+        ("setter", "column", "value"),
+        [
+            ("set_root_path", "root_path", f"{ROOT}/set"),
+            ("set_description", "description", "New description"),
+            ("set_origin", "origin", "preset:test"),
+        ],
+    )
+    async def test_setters(self, db_url, setter, column, value):
+        from stratakb.knowledge import layers
+
+        name = "test_setter"
+        await _drop_layers(db_url, name)
+        try:
+            await layers.create_layer(db_url, name=name, display_name="Setter")
+            before = await _updated_at(db_url, name)
+            await getattr(layers, setter)(db_url, name, value)
+            status = await layers.get_layer_status(db_url, name=name)
+            assert status[column] == value
+            assert status["updated_at"] > before
+
+            with pytest.raises(LayerNotFoundError):
+                await getattr(layers, setter)(db_url, "nonexistent_layer_xyz", value)
+        finally:
+            await _drop_layers(db_url, name)
+
+    async def test_set_root_path_onto_taken_root_raises(self, db_url):
+        from stratakb.knowledge.layers import RootTakenError, create_layer, set_root_path
+
+        root = f"{ROOT}/owned"
+        await _drop_layers(db_url, "test_root_owner", "test_root_mover")
+        try:
+            await create_layer(db_url, name="test_root_owner", display_name="A", root_path=root)
+            await create_layer(db_url, name="test_root_mover", display_name="B")
+            with pytest.raises(RootTakenError):
+                await set_root_path(db_url, "test_root_mover", root)
+        finally:
+            await _drop_layers(db_url, "test_root_owner", "test_root_mover")
+
+    async def test_origin_too_long_rejected(self, db_url):
+        from stratakb.knowledge.layers import create_layer, set_origin
+
+        with pytest.raises(LayerValidationError, match="origin"):
+            await create_layer(
+                db_url, name="test_long_origin", display_name="Long", origin="x" * 101
+            )
+        with pytest.raises(LayerValidationError, match="origin"):
+            await set_origin(db_url, "test_long_origin", "x" * 101)
+
+    async def test_create_layer_checks_schema_once(self, db_url):
+        from unittest.mock import AsyncMock, patch
+
+        import asyncpg
+
+        from stratakb.core import migrations
+        from stratakb.knowledge.layers import create_layer
+
+        names = ("test_schema_one", "test_schema_two")
+        await _drop_layers(db_url, *names)
+        migrations._checked.discard(db_url)
+        try:
+            with patch(
+                "stratakb.core.migrations.asyncpg.connect",
+                new_callable=AsyncMock,
+                side_effect=asyncpg.connect,
+            ) as mock_connect:
+                for name in names:
+                    await create_layer(db_url, name=name, display_name=name)
+            mock_connect.assert_awaited_once()
+            assert db_url in migrations._checked
+        finally:
+            await _drop_layers(db_url, *names)
+
+    async def test_create_tool_records_manual_origin_and_owner(self, db_url):
+        from unittest.mock import AsyncMock, patch
+
+        from stratakb.knowledge.layers import get_layer_status
+        from stratakb.mcp_server import mcp
+
+        name = "test_tool_origin"
+        await _drop_layers(db_url, name)
+        try:
+            with (
+                patch("stratakb.core.auth.get_current_user", return_value=("tester", "admin")),
+                patch(
+                    "stratakb.knowledge.tools.get_current_user",
+                    return_value=("tester", "admin"),
+                ),
+                patch("stratakb.knowledge.tools.write_audit_log", new_callable=AsyncMock),
+            ):
+                await mcp.call_tool(
+                    "strata_create_knowledge_layer", {"name": name, "display_name": "Tool"}
+                )
+            status = await get_layer_status(db_url, name=name)
+            assert status["origin"] == "manual"
+            assert status["owner"] == "tester"
+        finally:
+            await _drop_layers(db_url, name)
+
+
+class TestLayerFieldsForCaller:
+    """Viewers and operators do not see who made a layer or its server folder."""
+
+    LAYER = {"name": "x", "origin": "manual", "owner": "u1", "root_path": "/srv/docs"}
+
+    @pytest.mark.parametrize("role", ["viewer", "operator"])
+    async def test_below_admin_drops_owner_and_root(self, role):
+        from unittest.mock import AsyncMock, patch
+
+        from stratakb.mcp_server import mcp
+
+        with (
+            patch("stratakb.core.auth.get_current_user", return_value=("u", role)),
+            patch("stratakb.knowledge.tools.get_current_user", return_value=("u", role)),
+            patch(
+                "stratakb.knowledge.tools.list_layers",
+                new_callable=AsyncMock,
+                return_value=[dict(self.LAYER)],
+            ),
+            patch(
+                "stratakb.knowledge.tools.get_layer_status",
+                new_callable=AsyncMock,
+                return_value=dict(self.LAYER),
+            ),
+        ):
+            listed = await mcp._tool_manager.get_tool("strata_list_knowledge_layers").fn()
+            status = await mcp._tool_manager.get_tool("strata_get_layer_status").fn(name="x")
+
+        for layer in (listed["layers"][0], status["layer"]):
+            assert layer == {"name": "x", "origin": "manual"}
+
+    async def test_admin_sees_owner_and_root(self):
+        from unittest.mock import AsyncMock, patch
+
+        from stratakb.mcp_server import mcp
+
+        with (
+            patch("stratakb.core.auth.get_current_user", return_value=("u", "admin")),
+            patch("stratakb.knowledge.tools.get_current_user", return_value=("u", "admin")),
+            patch(
+                "stratakb.knowledge.tools.get_layer_status",
+                new_callable=AsyncMock,
+                return_value=dict(self.LAYER),
+            ),
+        ):
+            status = await mcp._tool_manager.get_tool("strata_get_layer_status").fn(name="x")
+
+        assert status["layer"] == self.LAYER

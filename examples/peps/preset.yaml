@@ -1,0 +1,28 @@
+# StrataKB layer preset: Python Enhancement Proposals (PEPs)
+#
+# Fetch the PEPs into source/ first (git commands in examples/README.md), then
+# apply with:  uv run python scripts/apply_preset.py examples/peps/preset.yaml
+# or from an MCP client: strata_apply_preset(preset_path="examples/peps/preset.yaml")
+
+name: python_peps
+display_name: Python PEPs
+description: >-
+  Python Enhancement Proposals (PEPs): the design documents of the Python language,
+  its standard library and packaging, for example the style guide (PEP 8), docstring
+  conventions (PEP 257), type hints (PEP 484, PEP 695), assignment expressions
+  (PEP 572), structural pattern matching (PEP 634) and inline script metadata (PEP 723).
+
+chunk_config:
+  chunk_size: 1500
+  chunk_overlap: 200
+
+# A query matching any of these is routed to this layer when no layers are given
+routing_patterns:
+  - '\bpeps?\s*-?\s*\d{1,4}\b'
+  - '\bpython\s+enhancement\s+proposals?\b'
+
+sources:
+  - name: peps
+    path: source/peps
+    description: PEP files (reStructuredText) from the python/peps repository
+    download: "https://github.com/python/peps, with the git commands in examples/README.md"

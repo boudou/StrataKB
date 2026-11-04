@@ -2,15 +2,27 @@
 
 from __future__ import annotations
 
+import os
+import sys
+from pathlib import Path
+
 from pydantic_settings import BaseSettings
+
+DOTENV_WARNING = "./.env is not read; set STRATAKB_CONFIG=.env to use it."
 
 
 class Settings(BaseSettings):
-    """Application settings loaded from environment variables."""
+    """Application settings.
+
+    Read, each source overriding the one before: the defaults below, the
+    user-level config.env, the file named by STRATAKB_CONFIG, then
+    environment variables. ./.env is not read unless STRATAKB_CONFIG names it.
+    """
 
     # Database
     database_url: str = "postgresql://strata:strata_dev_password@localhost:5433/strata"
-    # Connection for strata_db_query and strata_db_explain; empty = database_url.
+    # Connection for strata_db_query and strata_db_explain; empty = the SQL tools
+    # are not registered. A superuser role is refused at startup.
     # Point it at the strata_readonly role from db/03_readonly_role.sql.
     readonly_database_url: str = ""
 
@@ -18,13 +30,25 @@ class Settings(BaseSettings):
     anthropic_api_key: str = ""
     openai_api_key: str = ""
 
-    # Query Rewriting (used only when ANTHROPIC_API_KEY is set)
+    # Query Rewriting
+    # "anthropic" (needs ANTHROPIC_API_KEY), or "openai_compatible" (needs
+    # QUERY_REWRITE_BASE_URL, e.g. http://127.0.0.1:11434/v1, and a QUERY_REWRITE_MODEL)
+    query_rewrite_provider: str = "anthropic"
     query_rewrite_model: str = "claude-haiku-5-5"
+    query_rewrite_base_url: str = ""
+    # key for QUERY_REWRITE_BASE_URL; OPENAI_API_KEY is never sent there
+    query_rewrite_api_key: str = ""
 
     # Embeddings
-    embedding_backend: str = "local"  # "local" or "openai"
-    embedding_model: str = "all-mpnet-base-v2"  # local: sentence-transformers model
+    # "local", or "openai" (OpenAI or an OpenAI-compatible server)
+    embedding_backend: str = "local"
+    # local: sentence-transformers model; openai: text-embedding-3-large unless set
+    embedding_model: str = "all-mpnet-base-v2"
     embedding_dimensions: int = 768  # must match model output
+    # openai backend: an OpenAI-compatible server, e.g. http://127.0.0.1:11434/v1;
+    # empty = OpenAI
+    embedding_base_url: str = ""
+    embedding_api_key: str = ""  # key for EMBEDDING_BASE_URL; OPENAI_API_KEY is never sent there
 
     # HNSW Search Tuning
     hnsw_ef_search: int = 40  # recall vs latency tradeoff (higher = more recall, slower)
@@ -54,6 +78,11 @@ class Settings(BaseSettings):
     learning_rewrite_bypass_threshold: float = 0.85
     learning_rewrite_bypass_min_samples: int = 5
 
+    # Data egress
+    # True: refuse to start with any provider that sends content off this
+    # machine, and load Hugging Face models from local files only
+    strata_local_only: bool = False
+
     # MCP Server
     strata_user: str = "developer"
     strata_role: str = "viewer"
@@ -61,9 +90,67 @@ class Settings(BaseSettings):
     # Logging
     log_level: str = "INFO"
 
-    model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}
+    # utf-8-sig: a file saved with a BOM keeps its first key. Unknown keys,
+    # such as the compose-only ones in .env.example, are ignored.
+    model_config = {"env_file_encoding": "utf-8-sig", "extra": "ignore"}
+
+
+def user_config_file() -> Path:
+    """The user-level config.env, whether or not it exists."""
+    if sys.platform == "win32":
+        appdata = os.environ.get("APPDATA")
+        base = Path(appdata) if appdata else Path.home() / "AppData" / "Roaming"
+    else:
+        xdg = os.environ.get("XDG_CONFIG_HOME")
+        base = Path(xdg) if xdg else Path.home() / ".config"
+    return base / "stratakb" / "config.env"
+
+
+def _named_config_file() -> Path | None:
+    """The path in STRATAKB_CONFIG, or None when it is unset or empty."""
+    value = os.environ.get("STRATAKB_CONFIG")
+    return Path(value).expanduser() if value else None
+
+
+def config_files() -> list[Path]:
+    """The config files that exist, lowest priority first.
+
+    The user-level config.env, then the file named by STRATAKB_CONFIG.
+    A file listed twice is read once.
+    """
+    candidates = [user_config_file()]
+    named = _named_config_file()
+    if named is not None:
+        candidates.append(named)
+
+    files: list[Path] = []
+    seen: set[Path] = set()
+    for path in candidates:
+        if not path.is_file():
+            continue
+        resolved = path.resolve()
+        if resolved not in seen:
+            seen.add(resolved)
+            files.append(path)
+    return files
+
+
+def config_file_missing() -> bool:
+    """True when STRATAKB_CONFIG names a path that is not a file."""
+    named = _named_config_file()
+    return named is not None and not named.is_file()
+
+
+def dotenv_warning() -> str | None:
+    """A hint when ./.env exists but is not among the files read, else None."""
+    dotenv = Path.cwd() / ".env"
+    if not dotenv.is_file():
+        return None
+    if dotenv.resolve() in {path.resolve() for path in config_files()}:
+        return None
+    return DOTENV_WARNING
 
 
 def get_settings() -> Settings:
-    """Get application settings singleton."""
-    return Settings()
+    """Settings from the defaults, the config files and the environment."""
+    return Settings(_env_file=config_files())

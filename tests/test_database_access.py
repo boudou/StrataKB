@@ -288,13 +288,261 @@ class TestDBQuery:
 # ==========================================
 
 
+_FIXED_TOOLS = {"strata_db_schema", "strata_db_vector_stats", "strata_db_sample_chunks"}
+_SQL_TOOL_NAMES = {"strata_db_query", "strata_db_explain"}
+_FAKE_URL = "postgresql://ro:secret-pw@db.example:5432/strata"
+
+
+def _server(query_database_url: str = _FAKE_URL):
+    from mcp.server.fastmcp import FastMCP
+
+    from stratakb.database_access.tools import register_database_tools
+
+    server = FastMCP("test")
+    register_database_tools(server, "postgresql://owner@db.example/strata", query_database_url)
+    return server
+
+
+def _tool_names(server) -> set[str]:
+    return {t.name for t in server._tool_manager.list_tools()}
+
+
+def _fake_connect(fetchval_results=None, error=None):
+    """Patch asyncpg.connect in the tools module; return (patcher, conn)."""
+    from unittest.mock import patch
+
+    conn = MagicMock()
+    conn.fetchval = AsyncMock(side_effect=fetchval_results or [False, None])
+    conn.close = AsyncMock()
+    connect = AsyncMock(side_effect=error) if error else AsyncMock(return_value=conn)
+    return patch("stratakb.database_access.tools.asyncpg.connect", connect), conn
+
+
+@pytest.fixture(autouse=True)
+def _keep_sql_tools_status():
+    """Restore the module's SQL tools status after each test."""
+    from stratakb.database_access import tools
+
+    saved = dict(tools._sql_tools)
+    yield
+    tools._sql_tools.clear()
+    tools._sql_tools.update(saved)
+
+
 class TestDBToolRegistration:
     def test_db_tools_registered(self):
-        from stratakb.mcp_server import mcp
+        assert _tool_names(_server()) == _FIXED_TOOLS | _SQL_TOOL_NAMES
 
-        tool_names = [t.name for t in mcp._tool_manager.list_tools()]
-        assert "strata_db_query" in tool_names
-        assert "strata_db_schema" in tool_names
-        assert "strata_db_vector_stats" in tool_names
-        assert "strata_db_sample_chunks" in tool_names
-        assert "strata_db_explain" in tool_names
+
+class TestSqlToolsGate:
+    def test_sql_tools_not_registered_without_url(self):
+        from structlog.testing import capture_logs
+
+        from stratakb.database_access.tools import sql_tools_status
+
+        with capture_logs() as logs:
+            server = _server("")
+
+        assert _tool_names(server) == _FIXED_TOOLS
+        disabled = [e for e in logs if e["event"] == "sql_tools_disabled"]
+        assert disabled and disabled[0]["reason"] == "READONLY_DATABASE_URL is not set"
+        assert sql_tools_status() == {
+            "status": "disabled",
+            "reason": "READONLY_DATABASE_URL is not set",
+        }
+
+    def test_sql_tools_registered_with_url(self):
+        from stratakb.database_access.tools import sql_tools_status
+
+        assert _tool_names(_server()) >= _SQL_TOOL_NAMES
+        assert sql_tools_status() == {"status": "enabled"}
+
+    async def _secure(self, server, fetchval_results=None, error=None):
+        from structlog.testing import capture_logs
+
+        from stratakb.database_access.tools import secure_sql_tools
+
+        patcher, conn = _fake_connect(fetchval_results, error)
+        with patcher, capture_logs() as logs:
+            await secure_sql_tools(server, _FAKE_URL)
+        return logs, conn
+
+    def _assert_disabled(self, server, logs, reason_part):
+        from stratakb.database_access.tools import sql_tools_status
+
+        assert _tool_names(server) == _FIXED_TOOLS
+        disabled = [e for e in logs if e["event"] == "sql_tools_disabled"]
+        assert len(disabled) == 1
+        assert reason_part in disabled[0]["reason"]
+        status = sql_tools_status()
+        assert status["status"] == "disabled"
+        assert reason_part in status["reason"]
+        # The reason never carries the URL or its password
+        assert "secret-pw" not in status["reason"]
+        assert "db.example" not in status["reason"]
+
+    @pytest.mark.asyncio
+    async def test_superuser_role_removes_sql_tools(self):
+        server = _server()
+        logs, conn = await self._secure(server, [True, None])
+        self._assert_disabled(server, logs, "is a superuser or a member of a superuser role")
+        conn.close.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_superuser_check_covers_role_membership(self):
+        """rolsuper is not inherited: the check must look at every role reachable."""
+        server = _server()
+        _, conn = await self._secure(server, [False, None])
+        superuser_sql = conn.fetchval.await_args_list[0].args[0]
+        assert "pg_has_role(session_user, oid, 'MEMBER')" in superuser_sql
+        assert "pg_has_role(current_user, oid, 'MEMBER')" in superuser_sql
+
+    @pytest.mark.asyncio
+    async def test_server_access_member_removes_sql_tools(self):
+        server = _server()
+        logs, conn = await self._secure(server, [False, ["pg_read_server_files"]])
+        self._assert_disabled(server, logs, "is a member of pg_read_server_files")
+        conn.close.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_unreachable_role_removes_sql_tools(self):
+        server = _server()
+        logs, _ = await self._secure(server, error=OSError("connection refused"))
+        self._assert_disabled(
+            server, logs, "could not check the READONLY_DATABASE_URL role: OSError"
+        )
+
+    @pytest.mark.asyncio
+    async def test_failed_check_query_closes_connection(self):
+        server = _server()
+        logs, conn = await self._secure(server, [RuntimeError("boom")])
+        self._assert_disabled(server, logs, "could not check")
+        conn.close.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_safe_role_keeps_sql_tools(self):
+        from stratakb.database_access.tools import sql_tools_status
+
+        server = _server()
+        logs, conn = await self._secure(server, [False, None])
+        assert _tool_names(server) == _FIXED_TOOLS | _SQL_TOOL_NAMES
+        assert any(e["event"] == "sql_tools_enabled" for e in logs)
+        assert not any(e["event"] == "sql_tools_disabled" for e in logs)
+        assert sql_tools_status() == {"status": "enabled"}
+        conn.close.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_secure_twice_is_safe(self):
+        server = _server()
+        await self._secure(server, [True, None])
+        logs, _ = await self._secure(server, [True, None])
+        self._assert_disabled(server, logs, "is a superuser")
+
+    @pytest.mark.asyncio
+    async def test_secure_without_url_does_nothing(self):
+        from unittest.mock import patch
+
+        from stratakb.database_access.tools import secure_sql_tools
+
+        server = _server("")
+        connect = AsyncMock()
+        with patch("stratakb.database_access.tools.asyncpg.connect", connect):
+            await secure_sql_tools(server, "")
+        connect.assert_not_called()
+        assert _tool_names(server) == _FIXED_TOOLS
+
+    @pytest.mark.asyncio
+    async def test_health_reports_sql_tools(self):
+        from unittest.mock import patch
+
+        from stratakb import mcp_server
+        from stratakb.database_access import tools
+
+        tools._sql_tools.clear()
+        tools._sql_tools.update(status="disabled", reason="READONLY_DATABASE_URL is not set")
+        with patch(
+            "stratakb.mcp_server.check_connection",
+            AsyncMock(return_value={"status": "ok"}),
+        ):
+            result = await mcp_server.strata_admin_health()
+
+        assert result["sql_tools"] == {
+            "status": "disabled",
+            "reason": "READONLY_DATABASE_URL is not set",
+        }
+
+
+class TestSqlToolsGateDatabase:
+    """The role check against the real database."""
+
+    @pytest.mark.asyncio
+    async def test_real_superuser_url_refused(self, db_url):
+        import asyncpg
+
+        from stratakb.database_access.tools import secure_sql_tools
+
+        try:
+            conn = await asyncpg.connect(db_url, timeout=5)
+        except Exception:
+            pytest.skip("database not reachable")
+        try:
+            superuser = await conn.fetchval(
+                "SELECT rolsuper FROM pg_roles WHERE rolname = current_user"
+            )
+        finally:
+            await conn.close()
+        if not superuser:
+            pytest.skip("DATABASE_URL role is not a superuser")
+
+        server = _server(db_url)
+        await secure_sql_tools(server, db_url)
+        assert _tool_names(server) == _FIXED_TOOLS
+
+    @pytest.mark.asyncio
+    async def test_member_of_superuser_role_detected(self, db_url):
+        """A role granted a superuser role can reach it with set_config('role', ...)."""
+        import asyncpg
+
+        from stratakb.database_access.tools import _SUPERUSER_QUERY
+
+        try:
+            conn = await asyncpg.connect(db_url, timeout=5)
+        except Exception:
+            pytest.skip("database not reachable")
+        try:
+            superuser = await conn.fetchval(
+                "SELECT rolsuper FROM pg_roles WHERE rolname = current_user"
+            )
+            if not superuser:
+                pytest.skip("DATABASE_URL role is not a superuser")
+            owner = await conn.fetchval("SELECT current_user")
+            tr = conn.transaction()
+            await tr.start()
+            try:
+                # Roles and grants vanish with the rollback
+                await conn.execute("CREATE ROLE strata_probe_member NOLOGIN NOSUPERUSER")
+                await conn.execute("CREATE ROLE strata_probe_plain NOLOGIN NOSUPERUSER")
+                await conn.execute(f'GRANT "{owner}" TO strata_probe_member')
+
+                await conn.execute("SET LOCAL SESSION AUTHORIZATION strata_probe_member")
+                assert await conn.fetchval(_SUPERUSER_QUERY) is True
+
+                await conn.execute("SET LOCAL SESSION AUTHORIZATION strata_probe_plain")
+                assert await conn.fetchval(_SUPERUSER_QUERY) is False
+            finally:
+                await tr.rollback()
+        finally:
+            await conn.close()
+
+    @pytest.mark.asyncio
+    async def test_real_readonly_role_accepted(self):
+        from stratakb.config import get_settings
+        from stratakb.database_access.tools import secure_sql_tools, sql_tools_status
+
+        url = get_settings().readonly_database_url
+        if not url:
+            pytest.skip("READONLY_DATABASE_URL is not set")
+        server = _server(url)
+        await secure_sql_tools(server, url)
+        assert _tool_names(server) == _FIXED_TOOLS | _SQL_TOOL_NAMES
+        assert sql_tools_status() == {"status": "enabled"}

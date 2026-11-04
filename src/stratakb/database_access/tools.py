@@ -5,11 +5,13 @@ Provides read-only SQL execution, schema introspection, and vector stats.
 
 from __future__ import annotations
 
+import contextlib
 import re
 
 import asyncpg
 import structlog
 from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp.exceptions import ToolError
 
 from stratakb.core.audit import write_audit_log
 from stratakb.core.auth import get_current_user, require_role
@@ -17,9 +19,34 @@ from stratakb.core.logging import log_tool_call
 
 logger = structlog.get_logger()
 
+# Built-in roles that reach the server's files, programs or other backends.
+# A read-only role that is a member of any of them is refused.
+_SERVER_ACCESS_ROLES = (
+    "pg_execute_server_program",
+    "pg_read_server_files",
+    "pg_signal_backend",
+    "pg_write_server_files",
+)
+
+# Whether session_user or current_user is, or is a member of, a superuser
+# role. 'MEMBER' covers direct and indirect membership, including INHERIT
+# FALSE; a superuser is a member of every role, so it also returns true.
+_SUPERUSER_QUERY = (
+    "SELECT bool_or(rolsuper) FROM pg_roles "
+    "WHERE pg_has_role(session_user, oid, 'MEMBER') "
+    "OR pg_has_role(current_user, oid, 'MEMBER')"
+)
+
+# Seconds to wait for the read-only database at startup
+_CHECK_TIMEOUT = 5
+
+# Whether the SQL tools are on, and why not (read by strata_admin_health)
+_sql_tools: dict[str, str] = {"status": "disabled", "reason": "not registered"}
+
 # SQL statements that modify data or schema. This only gives an early, friendly
 # error; the guard is the read-only transaction in _fetch_read_only and the
-# grants of the role behind readonly_database_url.
+# grants of the role behind readonly_database_url, which secure_sql_tools
+# checks at startup.
 _FORBIDDEN_PATTERNS = re.compile(
     r"\b(DROP|DELETE|TRUNCATE|ALTER|CREATE|INSERT|UPDATE|GRANT|REVOKE|"
     r"COPY|VACUUM|REINDEX|CLUSTER|COMMENT|LOCK|DISCARD|REASSIGN|"
@@ -76,82 +103,78 @@ def _query_error(e: Exception) -> str:
     return str(e)
 
 
+def sql_tools_status() -> dict[str, str]:
+    """Return whether the SQL tools are on and, when off, why."""
+    return dict(_sql_tools)
+
+
+def _disable_sql_tools(mcp: FastMCP, reason: str) -> None:
+    """Remove the SQL tools that are still registered and record why."""
+    for name in _SQL_TOOLS:
+        # Not registered: no URL, or removed by an earlier check
+        with contextlib.suppress(ToolError):
+            mcp.remove_tool(name)
+    _sql_tools.clear()
+    _sql_tools.update(status="disabled", reason=reason)
+    logger.warning("sql_tools_disabled", reason=reason)
+
+
+async def _unsafe_role_reason(query_database_url: str) -> str | None:
+    """Say why the role behind `query_database_url` is unsafe, or None.
+
+    Both session_user and current_user are checked, together with every role
+    they are members of: a statement can switch to the login role or to any
+    role it belongs to with set_config('role', ...), even in a read-only
+    transaction, and rolsuper is not inherited.
+    """
+    conn = await asyncpg.connect(query_database_url, timeout=_CHECK_TIMEOUT)
+    try:
+        superuser = await conn.fetchval(_SUPERUSER_QUERY)
+        if superuser:
+            return "the READONLY_DATABASE_URL role is a superuser or a member of a superuser role"
+        members = await conn.fetchval(
+            "SELECT array_agg(rolname ORDER BY rolname) FROM pg_roles "
+            "WHERE rolname = ANY($1::text[]) "
+            "AND (pg_has_role(session_user, oid, 'MEMBER') "
+            "OR pg_has_role(current_user, oid, 'MEMBER'))",
+            list(_SERVER_ACCESS_ROLES),
+        )
+        if members:
+            return "the READONLY_DATABASE_URL role is a member of " + ", ".join(members)
+        return None
+    finally:
+        await conn.close()
+
+
+async def secure_sql_tools(mcp: FastMCP, query_database_url: str) -> None:
+    """Remove the SQL tools unless the read-only role is safe to run SQL as.
+
+    Refuses a superuser, a member of a server-access role, and a role that
+    cannot be checked (fail closed). Never raises; the URL is never logged.
+    """
+    if not query_database_url:
+        return
+    try:
+        reason = await _unsafe_role_reason(query_database_url)
+    except Exception as e:
+        reason = f"could not check the READONLY_DATABASE_URL role: {type(e).__name__}"
+    if reason:
+        _disable_sql_tools(mcp, reason)
+        return
+    _sql_tools.clear()
+    _sql_tools.update(status="enabled")
+    logger.info("sql_tools_enabled")
+
+
 def register_database_tools(mcp: FastMCP, database_url: str, query_database_url: str) -> None:
     """Register database access tools on the MCP server.
 
     `query_database_url` serves the free-form SQL tools (strata_db_query,
     strata_db_explain); the fixed introspection queries and the audit log use
-    `database_url`.
+    `database_url`. When `query_database_url` is empty the SQL tools are not
+    registered at all, so they never run as the owner role. secure_sql_tools
+    checks the role behind it at startup.
     """
-
-    @mcp.tool()
-    @require_role("operator")
-    @log_tool_call
-    async def strata_db_query(
-        sql: str,
-        params: list[str] | None = None,
-    ) -> dict:
-        """Execute a read-only SQL query against the StrataKB database.
-
-        Runs SELECT queries against the strata_core, strata_vectors and
-        strata_learning schemas, in a read-only transaction that is rolled back
-        afterwards. Write operations (INSERT, UPDATE, DELETE, DROP, etc.) are
-        blocked. Returns at most 1000 rows. Use fully qualified table names
-        (e.g., strata_core.knowledge_layers).
-
-        Args:
-            sql: SQL query to execute. Must be read-only (SELECT, EXPLAIN, SHOW, WITH).
-                 Use $1, $2, etc. for parameterized values.
-                 Examples:
-                   "SELECT * FROM strata_core.knowledge_layers"
-                   "SELECT count(*) FROM strata_vectors.chunks WHERE layer_name = $1"
-            params: Optional list of parameter values for $1, $2, etc. placeholders.
-        """
-        # Validate read-only
-        error = _validate_read_only(sql)
-        if error:
-            return {"status": "error", "error": error}
-
-        try:
-            from stratakb.core.database import get_pool
-
-            pool = await get_pool(query_database_url)
-
-            # One row past the cap tells whether the result was truncated
-            rows = await _fetch_read_only(pool, sql, params or [], _MAX_ROWS + 1)
-            results = [dict(row) for row in rows[:_MAX_ROWS]]
-
-            # Serialize non-JSON-safe types
-            for row_dict in results:
-                for key, value in row_dict.items():
-                    if hasattr(value, "isoformat"):
-                        row_dict[key] = value.isoformat()
-                    elif isinstance(value, (bytes, bytearray)):
-                        row_dict[key] = f"<binary {len(value)} bytes>"
-                    elif not isinstance(value, (str, int, float, bool, list, dict, type(None))):
-                        row_dict[key] = str(value)
-
-            truncated = len(rows) > _MAX_ROWS
-
-            # Audit log
-            user_id, _ = get_current_user()
-            await write_audit_log(
-                database_url,
-                user_id=user_id,
-                action="query",
-                tool_name="strata_db_query",
-                parameters={"sql": sql[:500]},
-                result_summary=f"{len(results)} rows returned" + (" (truncated)" if truncated else ""),
-            )
-
-            return {
-                "status": "ok",
-                "rows": results,
-                "row_count": len(results),
-                "truncated": truncated,
-            }
-        except Exception as e:
-            return {"status": "error", "error": _query_error(e)}
 
     @mcp.tool()
     @require_role("viewer")
@@ -391,6 +414,99 @@ def register_database_tools(mcp: FastMCP, database_url: str, query_database_url:
             }
         except Exception as e:
             return {"status": "error", "error": str(e)}
+
+    if query_database_url:
+        _register_sql_tools(mcp, database_url, query_database_url)
+    else:
+        reason = "READONLY_DATABASE_URL is not set"
+        _sql_tools.clear()
+        _sql_tools.update(status="disabled", reason=reason)
+        logger.info("sql_tools_disabled", reason=reason)
+
+
+# The free-form SQL tools. They run only as the role behind
+# readonly_database_url, never as the owner role behind database_url.
+_SQL_TOOLS = ("strata_db_query", "strata_db_explain")
+
+
+def _register_sql_tools(mcp: FastMCP, database_url: str, query_database_url: str) -> None:
+    """Register the free-form SQL tools, which run as the role behind `query_database_url`.
+
+    `database_url` serves only the audit log.
+    """
+    _sql_tools.clear()
+    _sql_tools.update(status="enabled")
+
+    @mcp.tool()
+    @require_role("operator")
+    @log_tool_call
+    async def strata_db_query(
+        sql: str,
+        params: list[str] | None = None,
+    ) -> dict:
+        """Execute a read-only SQL query against the StrataKB database.
+
+        Runs SELECT queries against strata_core.knowledge_layers,
+        strata_core.ingestion_runs, strata_core.ingested_files and
+        strata_vectors.chunks (the audit log, users and learning tables are not
+        readable), in a read-only transaction that is rolled back afterwards.
+        Write operations (INSERT, UPDATE, DELETE, DROP, etc.) are blocked.
+        Returns at most 1000 rows. Use fully qualified table names
+        (e.g., strata_core.knowledge_layers).
+
+        Args:
+            sql: SQL query to execute. Must be read-only (SELECT, EXPLAIN, SHOW, WITH).
+                 Use $1, $2, etc. for parameterized values.
+                 Examples:
+                   "SELECT * FROM strata_core.knowledge_layers"
+                   "SELECT count(*) FROM strata_vectors.chunks WHERE layer_name = $1"
+            params: Optional list of parameter values for $1, $2, etc. placeholders.
+        """
+        # Validate read-only
+        error = _validate_read_only(sql)
+        if error:
+            return {"status": "error", "error": error}
+
+        try:
+            from stratakb.core.database import get_pool
+
+            pool = await get_pool(query_database_url)
+
+            # One row past the cap tells whether the result was truncated
+            rows = await _fetch_read_only(pool, sql, params or [], _MAX_ROWS + 1)
+            results = [dict(row) for row in rows[:_MAX_ROWS]]
+
+            # Serialize non-JSON-safe types
+            for row_dict in results:
+                for key, value in row_dict.items():
+                    if hasattr(value, "isoformat"):
+                        row_dict[key] = value.isoformat()
+                    elif isinstance(value, (bytes, bytearray)):
+                        row_dict[key] = f"<binary {len(value)} bytes>"
+                    elif not isinstance(value, (str, int, float, bool, list, dict, type(None))):
+                        row_dict[key] = str(value)
+
+            truncated = len(rows) > _MAX_ROWS
+
+            # Audit log
+            user_id, _ = get_current_user()
+            await write_audit_log(
+                database_url,
+                user_id=user_id,
+                action="query",
+                tool_name="strata_db_query",
+                parameters={"sql": sql[:500]},
+                result_summary=f"{len(results)} rows returned" + (" (truncated)" if truncated else ""),
+            )
+
+            return {
+                "status": "ok",
+                "rows": results,
+                "row_count": len(results),
+                "truncated": truncated,
+            }
+        except Exception as e:
+            return {"status": "error", "error": _query_error(e)}
 
     @mcp.tool()
     @require_role("operator")
