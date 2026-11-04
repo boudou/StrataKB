@@ -1,7 +1,8 @@
 """Document ingestion pipeline orchestrator.
 
-Pipeline: discover files → skip unchanged → parse → chunk → embed → store per
-file → remove gone files → record run → recount layer stats.
+Pipeline: discover files → skip secret-looking names → skip unchanged → skip
+empty → parse → chunk → embed → store per file → remove gone files → record
+run → recount layer stats.
 """
 
 from __future__ import annotations
@@ -26,6 +27,7 @@ from stratakb.knowledge.parsers.markdown_parser import parse_markdown
 from stratakb.knowledge.parsers.pdf_parser import ParsedDocument, parse_pdf
 from stratakb.knowledge.parsers.xml_parser import parse_xml
 from stratakb.knowledge.parsers.yaml_parser import parse_yaml
+from stratakb.knowledge.policy import is_secret_name
 from stratakb.knowledge.vector_store import ChunkRecord, insert_chunks
 
 logger = structlog.get_logger()
@@ -48,6 +50,24 @@ SUPPORTED_PARSERS = {
 
 EMBED_BATCH_SIZE = 100
 
+# Formats read as bytes by their parser: never decoded to check for empty text
+_BINARY_FORMATS = {".pdf", ".docx"}
+
+
+@dataclass(frozen=True)
+class FileOutcome:
+    """What one ingest run did with one discovered or tracked file.
+
+    outcome: "added", "updated", "unchanged", "removed", "skipped" or "failed".
+    reason: why a file was removed ("deleted", "secret", "no_text"), skipped
+    ("secret", "no_text") or failed ("parse_error", "embed_error"); None
+    otherwise.
+    """
+
+    relative_path: str
+    outcome: str
+    reason: str | None = None
+
 
 @dataclass
 class IngestionResult:
@@ -62,9 +82,11 @@ class IngestionResult:
     files_updated: int = 0
     files_unchanged: int = 0
     files_removed: int = 0
+    files_skipped: int = 0  # secret-looking names and files without text, not tracked
     # True when chunks from before per-file tracking were dropped and the layer rebuilt
     rebuilt_legacy: bool = False
     errors: list[dict] = field(default_factory=list)
+    files: list[FileOutcome] = field(default_factory=list)
     duration_seconds: float = 0.0
 
 
@@ -169,11 +191,18 @@ async def ingest_documents(
     fails to parse keeps its previous chunks. Each file's chunks are replaced
     in one transaction.
 
+    A file whose name looks like a secret (see policy.is_secret_name) is
+    never read: it is skipped, or removed when it was tracked. A file without
+    text (0 bytes, whitespace only, or a parse that yields nothing) is not a
+    failure: it is skipped, or removed when it was tracked. Every file gets a
+    FileOutcome in result.files.
+
     Steps:
     1. Validate layer exists (and apply the schema migration if needed)
     2. Discover files at source_path
     3. Clear the layer (replace_all) or its pre-tracking chunks (legacy)
-    4. For each changed or new file: parse, chunk, embed, store
+    4. For each file: check its name; for a changed or new file, check for
+       text, then parse, chunk, embed, store
     5. Remove files that are gone from the root
     6. Record ingestion run
     7. Recount layer stats
@@ -258,29 +287,63 @@ async def ingest_documents(
 
     logger.info("ingestion_started", layer=layer_name, files=len(files))
 
+    async def drop(relative_path: str, previous, reason: str) -> None:
+        """Skip a file, or remove it (row and chunks) when it was tracked."""
+        if previous is None:
+            result.files.append(FileOutcome(relative_path, "skipped", reason))
+            result.files_skipped += 1
+            return
+        await pool.execute("DELETE FROM strata_core.ingested_files WHERE id = $1", previous["id"])
+        result.files.append(FileOutcome(relative_path, "removed", reason))
+        result.files_removed += 1
+
+    def fail(relative_path: str, error: str, reason: str) -> None:
+        result.files.append(FileOutcome(relative_path, "failed", reason))
+        result.docs_failed += 1
+        result.errors.append({"file": relative_path, "error": error})
+
     # Step 4: Parse, chunk, embed and store each new or changed file
     seen: set[str] = set()
     for file_path in files:
         relative_path = file_path.relative_to(root).as_posix()
         seen.add(relative_path)
+        previous = tracked.get(relative_path)
+
+        # Checked on the name alone: a secret-looking file is never opened
+        if is_secret_name(relative_path):
+            await drop(relative_path, previous, "secret")
+            continue
 
         try:
             data = file_path.read_bytes()
         except OSError as e:
-            result.docs_failed += 1
-            result.errors.append({"file": relative_path, "error": str(e)})
+            fail(relative_path, str(e), "parse_error")
             continue
         content_hash = hashlib.sha256(data).hexdigest()
 
-        previous = tracked.get(relative_path)
         if previous is not None and previous["content_hash"] == content_hash:
             result.files_unchanged += 1
+            result.files.append(FileOutcome(relative_path, "unchanged"))
             continue
 
-        parsed = _parse_file(file_path)
+        if not data or (
+            file_path.suffix.lower() not in _BINARY_FORMATS
+            and not data.decode("utf-8-sig", errors="replace").strip()
+        ):
+            await drop(relative_path, previous, "no_text")
+            continue
+
+        try:
+            parsed = _parse_file(file_path)
+        except Exception as e:
+            logger.warning(
+                "file_parse_raised", layer=layer_name, file=relative_path,
+                error_type=type(e).__name__,
+            )
+            fail(relative_path, str(e), "parse_error")
+            continue
         if parsed.error:
-            result.docs_failed += 1
-            result.errors.append({"file": relative_path, "error": parsed.error})
+            fail(relative_path, parsed.error, "parse_error")
             continue
         parsed.source_file = relative_path
 
@@ -291,8 +354,7 @@ async def ingest_documents(
             chunk_overlap=chunk_overlap,
         )
         if not doc_chunks:
-            result.docs_failed += 1
-            result.errors.append({"file": relative_path, "error": "No text extracted"})
+            await drop(relative_path, previous, "no_text")
             continue
 
         try:
@@ -315,28 +377,31 @@ async def ingest_documents(
             logger.warning(
                 "file_ingestion_failed", layer=layer_name, file=relative_path, error=str(e)
             )
-            result.docs_failed += 1
-            result.errors.append({"file": relative_path, "error": str(e)})
+            fail(relative_path, str(e), "embed_error")
             continue
 
         if previous is None:
             result.files_added += 1
+            result.files.append(FileOutcome(relative_path, "added"))
         else:
             result.files_updated += 1
+            result.files.append(FileOutcome(relative_path, "updated"))
         result.docs_processed += 1
         result.chunks_created += len(doc_chunks)
 
     # Step 5: Remove files ingested from this root that no longer exist
     if not single_file:
         gone = [
-            r["id"] for path, r in tracked.items()
+            (path, r["id"]) for path, r in tracked.items()
             if path not in seen and not (root / path).exists()
         ]
         if gone:
             await pool.execute(
-                "DELETE FROM strata_core.ingested_files WHERE id = ANY($1::uuid[])", gone
+                "DELETE FROM strata_core.ingested_files WHERE id = ANY($1::uuid[])",
+                [file_id for _, file_id in gone],
             )
-            result.files_removed = len(gone)
+            result.files.extend(FileOutcome(path, "removed", "deleted") for path, _ in gone)
+            result.files_removed += len(gone)
 
     # Step 6: Record ingestion run
     if result.docs_failed == 0:
@@ -372,6 +437,7 @@ async def ingest_documents(
         files_updated=result.files_updated,
         files_unchanged=result.files_unchanged,
         files_removed=result.files_removed,
+        files_skipped=result.files_skipped,
         duration=round(result.duration_seconds, 1),
     )
 

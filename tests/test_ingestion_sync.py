@@ -253,6 +253,161 @@ class TestSync:
         assert second.files_unchanged == 1
 
 
+def _outcomes(result) -> dict[str, tuple[str, str | None]]:
+    return {f.relative_path: (f.outcome, f.reason) for f in result.files}
+
+
+class TestPolicyAndEmpty:
+    async def test_secret_names_never_opened(self, db_url, layer, tmp_path):
+        from stratakb.knowledge import ingestion
+
+        _write(tmp_path / ".env.local", "API_KEY=do-not-read\n")
+        _write(tmp_path / "client_secret.json", '{"client_secret": "do-not-read"}')
+        _write(tmp_path / ".env.json", '{"token": "do-not-read"}')
+        _write(tmp_path / "notes.md", "# Notes\n\nPlain runbook notes.\n")
+
+        read: list[str] = []
+        parsed: list[str] = []
+        original_read = Path.read_bytes
+        original_parse = ingestion._parse_file
+
+        def spy_read(self):
+            read.append(self.name)
+            return original_read(self)
+
+        def spy_parse(file_path):
+            parsed.append(file_path.name)
+            return original_parse(file_path)
+
+        with (
+            patch.object(Path, "read_bytes", spy_read),
+            patch("stratakb.knowledge.ingestion._parse_file", side_effect=spy_parse),
+        ):
+            result, embedded = await _ingest(db_url, layer, tmp_path)
+
+        assert read == ["notes.md"]
+        assert parsed == ["notes.md"]
+        assert not any("do-not-read" in t for t in embedded)
+        outcomes = _outcomes(result)
+        assert outcomes["client_secret.json"] == ("skipped", "secret")
+        assert outcomes[".env.json"] == ("skipped", "secret")
+        assert outcomes["notes.md"] == ("added", None)
+        assert ".env.local" not in outcomes  # not a supported format, never discovered
+        assert result.files_skipped == 2
+        assert result.status == "completed"
+        assert [f["relative_path"] for f in await _files(db_url, layer)] == ["notes.md"]
+
+    async def test_tracked_secret_removed(self, db_url, layer, tmp_path):
+        _write(tmp_path / "secrets.yaml", "token: abc\nowner: ops\n")
+        _write(tmp_path / "a.md", "# Alpha\n\nAlpha content.\n")
+        with patch("stratakb.knowledge.ingestion.is_secret_name", return_value=False):
+            first, _ = await _ingest(db_url, layer, tmp_path)
+        assert first.files_added == 2
+        assert "secrets.yaml" in _ids_by_file(await _chunks(db_url, layer))
+
+        result, _ = await _ingest(db_url, layer, tmp_path)
+
+        assert _outcomes(result)["secrets.yaml"] == ("removed", "secret")
+        assert result.files_removed == 1
+        assert result.files_skipped == 0
+        assert {r["source_file"] for r in await _chunks(db_url, layer)} == {"a.md"}
+        assert [f["relative_path"] for f in await _files(db_url, layer)] == ["a.md"]
+
+    async def test_empty_files_are_no_text(self, db_url, layer, tmp_path):
+        _write(tmp_path / "empty.md", "")
+        (tmp_path / "zero.csv").write_bytes(b"")
+        _write(tmp_path / "blank.json", "  \n\t\n")
+        _write(tmp_path / "a.md", "# Alpha\n\nAlpha content.\n")
+
+        result, _ = await _ingest(db_url, layer, tmp_path)
+
+        outcomes = _outcomes(result)
+        for name in ("empty.md", "zero.csv", "blank.json"):
+            assert outcomes[name] == ("skipped", "no_text")
+        assert outcomes["a.md"] == ("added", None)
+        assert result.files_skipped == 3
+        assert result.docs_failed == 0
+        assert result.errors == []
+        assert result.status == "completed"
+
+    async def test_tracked_file_becoming_empty_removed(self, db_url, layer, tmp_path):
+        a = _write(tmp_path / "a.md", "# Alpha\n\nAlpha content.\n")
+        _write(tmp_path / "b.md", "# Beta\n\nBeta content.\n")
+        await _ingest(db_url, layer, tmp_path)
+
+        _write(a, "")
+        result, _ = await _ingest(db_url, layer, tmp_path)
+
+        assert _outcomes(result)["a.md"] == ("removed", "no_text")
+        assert result.files_removed == 1
+        assert result.errors == []
+        assert {r["source_file"] for r in await _chunks(db_url, layer)} == {"b.md"}
+        assert [f["relative_path"] for f in await _files(db_url, layer)] == ["b.md"]
+
+    async def test_parser_exception_fails_one_file(self, db_url, layer, tmp_path):
+        from stratakb.knowledge import ingestion
+
+        bad = _write(tmp_path / "bad.md", "# Bad\n\nFirst version.\n")
+        await _ingest(db_url, layer, tmp_path)
+        before = _ids_by_file(await _chunks(db_url, layer))["bad.md"]
+
+        _write(bad, "# Bad\n\nSecond version.\n")
+        _write(tmp_path / "good.md", "# Good\n\nGood content.\n")
+        original_parse = ingestion._parse_file
+
+        def raising_parse(file_path):
+            if file_path.name == "bad.md":
+                raise RuntimeError("parser exploded")
+            return original_parse(file_path)
+
+        with patch("stratakb.knowledge.ingestion._parse_file", side_effect=raising_parse):
+            result, _ = await _ingest(db_url, layer, tmp_path)
+
+        outcomes = _outcomes(result)
+        assert outcomes["bad.md"] == ("failed", "parse_error")
+        assert outcomes["good.md"] == ("added", None)
+        assert result.errors == [{"file": "bad.md", "error": "parser exploded"}]
+        assert result.docs_failed == 1
+        assert result.status == "partial"
+        assert _ids_by_file(await _chunks(db_url, layer))["bad.md"] == before
+
+    async def test_deleted_file_outcome(self, db_url, layer, tmp_path):
+        from stratakb.knowledge.ingestion import FileOutcome
+
+        _write(tmp_path / "a.md", "# Alpha\n\nAlpha content.\n")
+        b = _write(tmp_path / "sub" / "b.md", "# Beta\n\nBeta content.\n")
+        await _ingest(db_url, layer, tmp_path)
+
+        b.unlink()
+        result, _ = await _ingest(db_url, layer, tmp_path)
+
+        assert FileOutcome("sub/b.md", "removed", "deleted") in result.files
+        assert FileOutcome("a.md", "unchanged") in result.files
+        assert result.files_removed == 1
+
+
+async def test_tool_returns_files_skipped():
+    from stratakb.knowledge.ingestion import IngestionResult
+    from stratakb.mcp_server import mcp
+
+    fake = IngestionResult(layer_name="x", status="completed", files_skipped=2)
+    with (
+        patch("stratakb.core.auth.get_current_user", return_value=("tester", "admin")),
+        patch("stratakb.knowledge.tools.get_current_user", return_value=("tester", "admin")),
+        patch(
+            "stratakb.knowledge.ingestion.ingest_documents",
+            new_callable=AsyncMock,
+            return_value=fake,
+        ),
+        patch("stratakb.knowledge.tools.write_audit_log", new_callable=AsyncMock),
+    ):
+        tool = mcp._tool_manager.get_tool("strata_ingest_documents")
+        result = await tool.fn(layer_name="x", source_path="y")
+
+    assert result["status"] == "completed"
+    assert result["files_skipped"] == 2
+
+
 class TestMigration:
     async def test_sql_file_applies_twice(self, db_url):
         from stratakb.core.database import get_pool

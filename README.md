@@ -29,7 +29,7 @@ The server retrieves; it does not write answers. Your MCP client reads the retur
 - **Many formats**: PDF, DOCX, Markdown, HTML, CSV, JSON, XML/XSD and OpenAPI/AsyncAPI YAML, each split along its natural structure
 - **Local embeddings by default**: `all-mpnet-base-v2` runs on CPU with no API key; OpenAI embeddings are optional
 - **Roles and audit**: viewer, operator and admin roles on every tool, and an append-only audit log of searches and changes
-- **Privacy guards**: IBANs and card numbers are masked in logs, and IBANs, BICs and account numbers are scrubbed from stored queries; secrets are redacted from audit entries
+- **Privacy guards**: IBANs and card numbers are masked in logs, and IBANs, BICs and account numbers are scrubbed from stored queries; secrets are redacted from audit entries; files whose names look like secrets (`.env`, keys, certificates, credentials) are never read or ingested
 - **Read-only SQL**: inspect the store with schema browsing, sample chunks, vector statistics and `EXPLAIN`
 
 ## How it works
@@ -52,12 +52,16 @@ flowchart LR
 
 ```mermaid
 flowchart LR
-    f["Files"] --> h{"Content<br/>changed?"}
+    f["Files"] --> n{"Secret-looking<br/>name?"}
+    n -->|"yes"| k["Skip, never opened"]
+    n -->|"no"| h{"Content<br/>changed?"}
     h -->|"no"| s["Skip"]
-    h -->|"new or changed"| p["Parse<br/>per format"] --> c["Chunk"] --> x["Prefix<br/>[layer > file > section]"] --> e["Embed"] --> v[("pgvector<br/>replace that file's chunks")]
+    h -->|"new or changed"| p["Parse<br/>per format"]
+    p -->|"empty"| t["No text:<br/>skip or remove"]
+    p --> c["Chunk"] --> x["Prefix<br/>[layer > file > section]"] --> e["Embed"] --> v[("pgvector<br/>replace that file's chunks")]
 ```
 
-Ingesting a folder again is a sync: unchanged files are skipped, changed files are replaced, new files are added, and files deleted from that folder are removed. Other folders in the same layer are left alone.
+Ingesting a folder again is a sync: unchanged files are skipped, changed files are replaced, new files are added, and files deleted from that folder are removed. Other folders in the same layer are left alone. Files whose names look like secrets (`.env`, `client_secret.json`, `id_rsa`, `*.pem`) are skipped without being opened, and one ingested earlier is removed. Empty files are reported as no text rather than as failures. A file that fails to parse is reported and the rest of the run carries on.
 
 **Ask**
 
@@ -168,7 +172,7 @@ The layer's **description** also tells the query rewriter which terminology the 
 | `strata_db_query` | operator | Read-only SQL |
 | `strata_db_explain` | operator | Query plan for a SQL statement |
 | `strata_create_knowledge_layer` | admin | Creates a layer |
-| `strata_ingest_documents` | admin | Syncs a file or folder into a layer: adds, replaces and removes files; reports the four counts |
+| `strata_ingest_documents` | admin | Syncs a file or folder into a layer: adds, replaces and removes files; reports added, updated, unchanged, removed and skipped |
 | `strata_apply_preset` | admin | Creates a layer from a preset and ingests its sources |
 | `strata_delete_knowledge_layer` | admin | Deletes a layer and its chunks |
 | `strata_reset_learning` | admin | Clears learned patterns |

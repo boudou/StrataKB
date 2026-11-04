@@ -179,6 +179,12 @@ def register_knowledge_tools(
         single-file source_path never removes anything. A file that fails to
         parse keeps its previous chunks and is listed in errors.
 
+        Files whose names look like secrets (.env, keys, certificates,
+        credentials, e.g. client_secret.json) are always skipped and never
+        opened; one ingested earlier is removed. Empty files are reported as
+        no text, not as failures: skipped, or removed if ingested earlier.
+        files_skipped counts the skipped files.
+
         Unchanged means the same file content (SHA-256). A change to the
         layer's chunk_config or to the embedding model is not detected: use
         replace_all=True after such a change.
@@ -237,6 +243,7 @@ def register_knowledge_tools(
                 "files_updated": result.files_updated,
                 "files_unchanged": result.files_unchanged,
                 "files_removed": result.files_removed,
+                "files_skipped": result.files_skipped,
                 "rebuilt_legacy": result.rebuilt_legacy,
                 "duration_seconds": round(result.duration_seconds, 1),
                 "errors": result.errors if result.errors else None,

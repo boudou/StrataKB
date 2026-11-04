@@ -36,6 +36,7 @@ from stratakb.knowledge.layers import (
     _validate_routing_patterns,
     create_layer,
 )
+from stratakb.knowledge.policy import is_secret_name
 
 logger = structlog.get_logger()
 
@@ -180,7 +181,8 @@ def _parse_source_group(preset: LayerPreset, root: Path, group: SourceGroup) -> 
         stats["errors"].append({"group": group.name, "error": error})
         return stats
 
-    files = _discover_files(source_path)
+    # Secret-looking names are never opened, as in a real ingest
+    files = [f for f in _discover_files(source_path) if not is_secret_name(f.name)]
     stats["files"] = len(files)
 
     for file_path in files:

@@ -129,6 +129,29 @@ class TestDryRun:
         assert result.total_chunks >= 1
         assert result.errors == []
 
+    def test_secret_names_not_parsed(self, tmp_path):
+        from stratakb.knowledge import presets
+
+        docs = tmp_path / "docs"
+        docs.mkdir()
+        (docs / "failover.md").write_text("# Failover\n\nSwitch traffic to the standby region.\n")
+        (docs / "client_secret.json").write_text('{"client_secret": "x"}')
+        preset_path = _write_preset(tmp_path, (
+            "name: runbooks\n"
+            "display_name: Ops Runbooks\n"
+            "sources:\n"
+            "  - {name: docs, path: docs}\n"
+        ))
+        with patch(
+            "stratakb.knowledge.presets._parse_file", side_effect=presets._parse_file
+        ) as spy:
+            result = dry_run_parse(load_preset(preset_path))
+
+        assert [c.args[0].name for c in spy.call_args_list] == ["failover.md"]
+        assert result.group_stats["docs"]["files"] == 1
+        assert result.parsed_files == 1
+        assert result.errors == []
+
 
 class TestCreatePresetLayer:
     async def test_passes_preset_settings_to_create_layer(self):
