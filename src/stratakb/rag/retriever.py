@@ -77,6 +77,7 @@ class SearchResult:
     source_section: str
     doc_type: str
     metadata: dict = field(default_factory=dict)
+    similarity_score: float | None = None
 
 
 async def search_chunks(
@@ -192,6 +193,7 @@ async def search_chunks(
                 source_section=row["source_section"] or "",
                 doc_type=row["doc_type"] or "",
                 metadata=meta if isinstance(meta, dict) else {},
+                similarity_score=round(float(row["score"]), 4),
             )
         )
 
@@ -349,12 +351,13 @@ async def _hybrid_search(
     import uuid as _uuid
     uuid_ids = [_uuid.UUID(tid) for tid in top_ids]
     chunk_sql = """
-        SELECT id, content, layer_name, source_file, source_section, doc_type, metadata
+        SELECT id, content, layer_name, source_file, source_section, doc_type, metadata,
+               1 - (embedding <=> $2::vector) AS similarity_score
         FROM strata_vectors.chunks
         WHERE id = ANY($1::uuid[])
     """
     async with pool.acquire() as conn:
-        chunk_rows = await conn.fetch(chunk_sql, uuid_ids)
+        chunk_rows = await conn.fetch(chunk_sql, uuid_ids, query_vector)
 
     import json
     results = []
@@ -372,6 +375,10 @@ async def _hybrid_search(
             source_section=row["source_section"] or "",
             doc_type=row["doc_type"] or "",
             metadata=meta if isinstance(meta, dict) else {},
+            similarity_score=(
+                round(float(row["similarity_score"]), 4)
+                if row["similarity_score"] is not None else None
+            ),
         ))
 
     results.sort(key=lambda r: r.score, reverse=True)
