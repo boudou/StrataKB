@@ -17,6 +17,7 @@ from stratakb.knowledge.presets import (
 EXAMPLES_DIR = Path(__file__).parent.parent / "examples"
 SEPA_PRESET = EXAMPLES_DIR / "sepa" / "preset.yaml"
 ISO_PRESET = EXAMPLES_DIR / "iso20022" / "preset.yaml"
+PEPS_PRESET = EXAMPLES_DIR / "peps" / "preset.yaml"
 
 
 def _write_preset(tmp_path: Path, body: str) -> Path:
@@ -26,15 +27,21 @@ def _write_preset(tmp_path: Path, body: str) -> Path:
 
 
 class TestLoadPreset:
-    @pytest.mark.parametrize("path", [SEPA_PRESET, ISO_PRESET])
+    @pytest.mark.parametrize("path", [SEPA_PRESET, ISO_PRESET, PEPS_PRESET])
     def test_example_presets_load(self, path):
         preset = load_preset(path)
-        assert preset.name in ("sepa", "iso20022")
+        assert preset.name in ("sepa", "iso20022", "python_peps")
         assert preset.display_name
         assert preset.description
         assert preset.routing_patterns
         assert preset.sources
         assert preset.root == path.parent
+
+    def test_peps_preset_source(self):
+        preset = load_preset(PEPS_PRESET)
+        assert [s.path for s in preset.sources] == ["source/peps"]
+        assert preset.chunk_config["chunk_size"] == 1500
+        assert preset.chunk_config["chunk_overlap"] == 200
 
     def test_chunk_config_defaults_applied(self, tmp_path):
         path = _write_preset(tmp_path, (
@@ -97,6 +104,45 @@ class TestLoadPreset:
     def test_missing_file(self, tmp_path):
         with pytest.raises(FileNotFoundError):
             load_preset(tmp_path / "nope.yaml")
+
+
+class TestPepsRouting:
+    """The PEPs preset's routing patterns, compiled as the server compiles them."""
+
+    @staticmethod
+    def _patterns(*paths: Path) -> dict:
+        from stratakb.rag.layer_detect import compile_patterns
+
+        presets = [load_preset(p) for p in paths]
+        return compile_patterns({p.name: p.routing_patterns for p in presets})
+
+    @pytest.mark.parametrize("query", [
+        "PEP 8",
+        "pep-484",
+        "PEP8",
+        "What does PEP 572 say?",
+        "Python Enhancement Proposal",
+        "python enhancement proposals on typing",
+    ])
+    def test_routed(self, query):
+        from stratakb.rag.layer_detect import detect_layers
+
+        assert detect_layers(query, self._patterns(PEPS_PRESET)) == ["python_peps"]
+
+    @pytest.mark.parametrize(
+        "query", ["pepper", "step 8", "pep 12345", "general payments question"]
+    )
+    def test_not_routed(self, query):
+        from stratakb.rag.layer_detect import detect_layers
+
+        assert detect_layers(query, self._patterns(PEPS_PRESET)) == []
+
+    def test_alongside_the_other_examples(self):
+        from stratakb.rag.layer_detect import detect_layers
+
+        patterns = self._patterns(SEPA_PRESET, ISO_PRESET, PEPS_PRESET)
+        assert detect_layers("PEP 8 line length", patterns) == ["python_peps"]
+        assert "python_peps" not in detect_layers("pacs.008 settlement amount", patterns)
 
 
 class TestDryRun:

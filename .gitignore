@@ -35,6 +35,7 @@ examples/**/*.pdf
 examples/**/*.docx
 examples/**/*.xsd
 examples/**/*.zip
+examples/peps/source/
 
 # Editor / OS
 .vscode/*

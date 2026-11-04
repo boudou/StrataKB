@@ -146,14 +146,16 @@ A drive root, your home folder (or a folder above it) and system folders need `-
 
 `stratakb` with no command, or `stratakb serve`, starts the MCP server, as `python -m stratakb` does.
 
-The repository also ships two example presets, SEPA payments and ISO 20022 messaging. The SEPA preset includes a small sample of reason codes, so it works before you download anything:
+The repository also ships three example presets. The quickest to try is Python PEPs: git fetches eight PEPs in a few seconds, with no account:
 
 ```bash
-uv run python scripts/apply_preset.py examples/sepa/preset.yaml --dry-run   # parse only, no database
-uv run python scripts/apply_preset.py examples/sepa/preset.yaml             # create the layer and ingest
+git clone --depth 1 --filter=blob:none --sparse https://github.com/python/peps.git examples/peps/source
+git -C examples/peps/source sparse-checkout set --no-cone /peps/pep-0008.rst /peps/pep-0020.rst /peps/pep-0257.rst /peps/pep-0484.rst /peps/pep-0572.rst /peps/pep-0634.rst /peps/pep-0695.rst /peps/pep-0723.rst
+uv run python scripts/apply_preset.py examples/peps/preset.yaml --dry-run   # parse only, no database
+uv run python scripts/apply_preset.py examples/peps/preset.yaml             # create the layer and ingest
 ```
 
-Then ask from your client, for example *"What does reject reason AC04 mean?"*. [examples/README.md](examples/README.md) lists where to download the full rulebooks and ISO 20022 schemas.
+Then ask from your client, for example *"How long should a line of Python be?"*. The SEPA preset includes a small sample of reason codes, so it works before you download anything (ask *"What does reject reason AC04 mean?"*); the ISO 20022 preset needs the downloaded schemas. [examples/README.md](examples/README.md) has the PEPs options (all PEPs, updates, Git Bash on Windows) and lists where to download the SEPA rulebooks and ISO 20022 documents.
 
 From an MCP client without a shell, either write a preset (below) or call `strata_create_knowledge_layer` followed by `strata_ingest_documents` with a folder path. Run `strata_ingest_documents` again after editing the documents: it re-embeds only what changed. Pass `replace_all=True` to rebuild the whole layer, for example after changing its `chunk_config` or the embedding model.
 
@@ -179,7 +181,7 @@ sources:
     download: https://wiki.example.com/postmortems   # shown when the folder is missing
 ```
 
-Apply it with `scripts/apply_preset.py` or the `strata_apply_preset` tool. Applying a preset again rebuilds the layer from scratch.
+Apply it with `scripts/apply_preset.py` or the `strata_apply_preset` tool. Applying a preset again rebuilds the layer from scratch. Ready-made presets are in [examples/](examples/README.md): Python PEPs (the quickest to try), SEPA payments and ISO 20022 messaging.
 
 The layer's **description** also tells the query rewriter which terminology the layer uses, so a clear description improves `strata_ask`.
 
@@ -332,7 +334,7 @@ StrataKB cannot control what your MCP client's language model does with the retr
 
 ```
 db/                   Schema: 01_init.sql (core, vectors), 02_learning.sql (learning), 03_readonly_role.sql (SQL tools role)
-examples/             Example layer presets (SEPA, ISO 20022)
+examples/             Example layer presets (Python PEPs, SEPA, ISO 20022)
 scripts/              apply_preset.py, backup_restore.py
 src/stratakb/
   cli.py              The stratakb command: add a folder, or start the server
