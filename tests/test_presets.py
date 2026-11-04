@@ -105,6 +105,26 @@ class TestLoadPreset:
         with pytest.raises(FileNotFoundError):
             load_preset(tmp_path / "nope.yaml")
 
+    def test_answer_mode_defaults_to_grounded(self, tmp_path):
+        path = _write_preset(tmp_path, (
+            "name: runbooks\n"
+            "display_name: Ops Runbooks\n"
+            "sources:\n"
+            "  - {name: docs, path: docs}\n"
+        ))
+        assert load_preset(path).answer_mode == "grounded"
+
+    def test_answer_mode_invalid_refused(self, tmp_path):
+        path = _write_preset(tmp_path, (
+            "name: runbooks\n"
+            "display_name: Ops Runbooks\n"
+            "answer_mode: verbatim\n"
+            "sources:\n"
+            "  - {name: docs, path: docs}\n"
+        ))
+        with pytest.raises(LayerValidationError, match="answer_mode"):
+            load_preset(path)
+
 
 class TestPepsRouting:
     """The PEPs preset's routing patterns, compiled as the server compiles them."""
@@ -214,11 +234,12 @@ class TestCreatePresetLayer:
         assert kwargs["routing_patterns"] == preset.routing_patterns
         assert kwargs["chunk_config"]["chunk_size"] == 1500
         assert kwargs["origin"] == "preset:iso20022"
+        assert kwargs["answer_mode"] == "grounded"
 
-    async def _create_existing(self, existing_origin):
+    async def _create_existing(self, existing_origin, existing_mode="grounded", preset=None):
         from stratakb.knowledge.layers import LayerExistsError
 
-        preset = load_preset(SEPA_PRESET)
+        preset = preset or load_preset(SEPA_PRESET)
         with (
             patch(
                 "stratakb.knowledge.presets.create_layer",
@@ -228,13 +249,19 @@ class TestCreatePresetLayer:
             patch(
                 "stratakb.knowledge.presets.get_layer_status",
                 new_callable=AsyncMock,
-                return_value={"name": "sepa", "origin": existing_origin},
+                return_value={
+                    "name": "sepa", "origin": existing_origin, "answer_mode": existing_mode,
+                },
             ),
             patch(
                 "stratakb.knowledge.presets.set_origin", new_callable=AsyncMock
             ) as mock_set_origin,
+            patch(
+                "stratakb.knowledge.presets.set_layer_answer_mode", new_callable=AsyncMock
+            ) as mock_set_mode,
         ):
             result = await create_preset_layer("postgresql://test", preset)
+        self.mock_set_mode = mock_set_mode
         return result, mock_set_origin
 
     async def test_existing_layer_reported(self):
@@ -253,6 +280,46 @@ class TestCreatePresetLayer:
 
         assert result["status"] == "exists"
         mock_set_origin.assert_not_awaited()
+
+    async def test_existing_layer_keeps_same_answer_mode(self):
+        await self._create_existing("preset:sepa")
+
+        self.mock_set_mode.assert_not_awaited()
+
+    async def test_existing_layer_takes_preset_answer_mode(self):
+        preset = load_preset(SEPA_PRESET)
+        preset.answer_mode = "extractive"
+        await self._create_existing("preset:sepa", preset=preset)
+
+        self.mock_set_mode.assert_awaited_once_with("postgresql://test", "sepa", "extractive")
+
+    async def test_answer_mode_extractive_stored(self, tmp_path):
+        import contextlib
+
+        from stratakb.config import get_settings
+        from stratakb.knowledge.layers import LayerNotFoundError, delete_layer, list_layers
+
+        db_url = get_settings().database_url
+        name = "test_preset_extractive"
+        path = _write_preset(tmp_path, (
+            f"name: {name}\n"
+            "display_name: Extractive\n"
+            "answer_mode: extractive\n"
+            "sources:\n"
+            "  - {name: docs, path: docs}\n"
+        ))
+        preset = load_preset(path)
+        assert preset.answer_mode == "extractive"
+        with contextlib.suppress(LayerNotFoundError):
+            await delete_layer(db_url, name=name)
+        try:
+            result = await create_preset_layer(db_url, preset)
+            assert result["layer"]["answer_mode"] == "extractive"
+            listed = next(layer for layer in await list_layers(db_url) if layer["name"] == name)
+            assert listed["answer_mode"] == "extractive"
+        finally:
+            with contextlib.suppress(LayerNotFoundError):
+                await delete_layer(db_url, name=name)
 
 
 class TestPresetToolRegistration:

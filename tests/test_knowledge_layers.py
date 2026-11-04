@@ -459,6 +459,7 @@ class TestFolderFieldsIntegration:
             ("set_root_path", "root_path", f"{ROOT}/set"),
             ("set_description", "description", "New description"),
             ("set_origin", "origin", "preset:test"),
+            ("set_layer_answer_mode", "answer_mode", "extractive"),
         ],
     )
     async def test_setters(self, db_url, setter, column, value):
@@ -501,6 +502,62 @@ class TestFolderFieldsIntegration:
             )
         with pytest.raises(LayerValidationError, match="origin"):
             await set_origin(db_url, "test_long_origin", "x" * 101)
+
+    async def test_listing_shows_answer_mode_default_grounded(self, db_url):
+        from unittest.mock import AsyncMock, patch
+
+        from stratakb.knowledge.layers import create_layer, list_layers
+        from stratakb.mcp_server import mcp
+
+        name = "test_answer_mode_default"
+        await _drop_layers(db_url, name)
+        try:
+            created = await create_layer(db_url, name=name, display_name="Default")
+            assert created["answer_mode"] == "grounded"
+            rows = await list_layers(db_url)
+            assert next(r for r in rows if r["name"] == name)["answer_mode"] == "grounded"
+
+            # The tool passes the stored rows through, so a viewer sees the mode.
+            # The tool's own URL is fixed at import, so it lists the rows read above.
+            with (
+                patch("stratakb.core.auth.get_current_user", return_value=("u", "viewer")),
+                patch("stratakb.knowledge.tools.get_current_user", return_value=("u", "viewer")),
+                patch(
+                    "stratakb.knowledge.tools.list_layers",
+                    new_callable=AsyncMock,
+                    return_value=rows,
+                ),
+            ):
+                listed = await mcp._tool_manager.get_tool("strata_list_knowledge_layers").fn()
+            layer = next(layer for layer in listed["layers"] if layer["name"] == name)
+            assert layer["answer_mode"] == "grounded"
+        finally:
+            await _drop_layers(db_url, name)
+
+    async def test_invalid_answer_mode_refused(self, db_url):
+        import asyncpg
+
+        from stratakb.core.database import get_pool
+        from stratakb.knowledge.layers import create_layer, set_layer_answer_mode
+
+        name = "test_answer_mode_bad"
+        await _drop_layers(db_url, name)
+        try:
+            with pytest.raises(LayerValidationError, match="answer_mode"):
+                await create_layer(db_url, name=name, display_name="Bad", answer_mode="free")
+            await create_layer(db_url, name=name, display_name="Bad")
+            with pytest.raises(LayerValidationError, match="answer_mode"):
+                await set_layer_answer_mode(db_url, name, "free")
+            # The column refuses it too, for writes that bypass the setters
+            pool = await get_pool(db_url)
+            with pytest.raises(asyncpg.CheckViolationError):
+                await pool.execute(
+                    "UPDATE strata_core.knowledge_layers SET answer_mode = 'free' "
+                    "WHERE name = $1",
+                    name,
+                )
+        finally:
+            await _drop_layers(db_url, name)
 
     async def test_create_layer_checks_schema_once(self, db_url):
         from unittest.mock import AsyncMock, patch

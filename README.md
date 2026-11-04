@@ -195,6 +195,7 @@ chunk_config: {chunk_size: 1200, chunk_overlap: 150}
 routing_patterns:            # questions matching any of these search this layer first
   - '\brunbooks?\b'
   - '\b(failover|incident|on-?call)\b'
+answer_mode: grounded        # or extractive; grounded when left out
 sources:
   - name: runbooks
     path: runbooks
@@ -206,6 +207,8 @@ sources:
 Apply it with `scripts/apply_preset.py` or the `strata_apply_preset` tool. Applying a preset again rebuilds the layer from scratch. Ready-made presets are in [examples/](examples/README.md): Python PEPs (the quickest to try), SEPA payments and ISO 20022 messaging.
 
 The layer's **description** also tells the query rewriter which terminology the layer uses, so a clear description improves `strata_ask`.
+
+The layer's **answer_mode** says how its questions are to be answered: `grounded` (the default) means your client writes the answer from the cited passages; `extractive` is for layers where paraphrase is not acceptable, answered with the document's own sentences. Any other value is refused. `strata_list_knowledge_layers` shows each layer's mode, applying a preset again sets the mode of an existing layer, and layers created before this setting read as `grounded`. The server records the mode but does not act on it yet: extractive answers are on the [roadmap](#roadmap).
 
 ### Try an example preset
 

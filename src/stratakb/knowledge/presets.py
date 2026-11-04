@@ -12,6 +12,7 @@ Example (see examples/ for complete presets):
     description: SEPA rulebooks, implementation guidelines and reason codes.
     chunk_config: {chunk_size: 1500, chunk_overlap: 200}
     routing_patterns: ['\\bsepa\\b', '\\bsct\\s*inst\\b']
+    answer_mode: grounded    # or extractive; grounded when left out
     sources:
       - name: rulebooks
         path: rulebooks
@@ -29,13 +30,16 @@ import yaml
 
 from stratakb.knowledge.ingestion import _chunk_document, _discover_files, _parse_file
 from stratakb.knowledge.layers import (
+    DEFAULT_ANSWER_MODE,
     LayerExistsError,
     LayerValidationError,
+    _validate_answer_mode,
     _validate_chunk_config,
     _validate_name,
     _validate_routing_patterns,
     create_layer,
     get_layer_status,
+    set_layer_answer_mode,
     set_origin,
 )
 from stratakb.knowledge.policy import is_secret_name
@@ -63,6 +67,7 @@ class LayerPreset:
     metadata_schema: dict = field(default_factory=dict)
     chunk_config: dict = field(default_factory=dict)
     routing_patterns: list[str] = field(default_factory=list)
+    answer_mode: str = DEFAULT_ANSWER_MODE
     sources: list[SourceGroup] = field(default_factory=list)
     # Directory the source paths are relative to, unless the caller overrides it
     root: Path | None = None
@@ -87,6 +92,7 @@ def load_preset(preset_path: str | Path) -> LayerPreset:
     _validate_name(data["name"])
     chunk_config = _validate_chunk_config(data.get("chunk_config") or {})
     routing_patterns = _validate_routing_patterns(data.get("routing_patterns") or [])
+    answer_mode = _validate_answer_mode(data.get("answer_mode", DEFAULT_ANSWER_MODE))
 
     sources = []
     for raw in data["sources"]:
@@ -110,6 +116,7 @@ def load_preset(preset_path: str | Path) -> LayerPreset:
         metadata_schema=data.get("metadata_schema") or {},
         chunk_config=chunk_config,
         routing_patterns=routing_patterns,
+        answer_mode=answer_mode,
         sources=sources,
         root=root,
     )
@@ -217,7 +224,8 @@ async def create_preset_layer(database_url: str, preset: LayerPreset) -> dict:
     """Create the preset's knowledge layer, or report that it already exists.
 
     An existing layer with no recorded origin (made before origins were
-    recorded) is marked as coming from this preset.
+    recorded) is marked as coming from this preset. An existing layer takes
+    the preset's answer mode.
     """
     origin = f"preset:{preset.name}"
     try:
@@ -229,6 +237,7 @@ async def create_preset_layer(database_url: str, preset: LayerPreset) -> dict:
             metadata_schema=preset.metadata_schema,
             chunk_config=preset.chunk_config,
             routing_patterns=preset.routing_patterns,
+            answer_mode=preset.answer_mode,
             origin=origin,
         )
         return {"status": "created", "layer": layer}
@@ -236,6 +245,8 @@ async def create_preset_layer(database_url: str, preset: LayerPreset) -> dict:
         existing = await get_layer_status(database_url, name=preset.name)
         if existing.get("origin") is None:
             await set_origin(database_url, preset.name, origin)
+        if existing.get("answer_mode") != preset.answer_mode:
+            await set_layer_answer_mode(database_url, preset.name, preset.answer_mode)
         return {"status": "exists", "message": f"Layer '{preset.name}' already exists"}
 
 

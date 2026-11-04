@@ -25,6 +25,9 @@ logger = structlog.get_logger()
 NAME_PATTERN = re.compile(r"^[a-z][a-z0-9_]{1,98}[a-z0-9]$")
 REQUIRED_CHUNK_KEYS = {"chunk_size", "chunk_overlap"}
 VALID_STATUSES = {"active", "inactive", "archived"}
+# How strata_ask answers for a layer (core/sql/12_answer_mode.sql)
+ANSWER_MODES = ("grounded", "extractive")
+DEFAULT_ANSWER_MODE = "grounded"
 # Column sizes in core/sql/05_add_folder.sql
 MAX_ORIGIN_LENGTH = 100
 MAX_OWNER_LENGTH = 200
@@ -35,7 +38,7 @@ _ROOT_PATH_INDEX = "knowledge_layers_root_path_key"
 _LAYER_COLUMNS = (
     "id, name, display_name, description, metadata_schema, chunk_config, "
     "routing_patterns, status, doc_count, chunk_count, last_ingested, "
-    "created_at, updated_at, origin, owner, root_path"
+    "created_at, updated_at, origin, owner, root_path, answer_mode"
 )
 
 # Search tools read routing patterns and descriptions through a short-lived
@@ -109,6 +112,15 @@ def _validate_chunk_config(chunk_config: dict) -> dict:
     return config
 
 
+def _validate_answer_mode(answer_mode: str) -> str:
+    """Validate an answer mode: one of ANSWER_MODES."""
+    if answer_mode not in ANSWER_MODES:
+        raise LayerValidationError(
+            f"Invalid answer_mode '{answer_mode}'. Must be one of: {', '.join(ANSWER_MODES)}."
+        )
+    return answer_mode
+
+
 def _validate_length(field: str, value: str | None, limit: int) -> None:
     """Reject a value longer than its column allows."""
     if value is not None and len(value) > limit:
@@ -141,6 +153,7 @@ async def create_layer(
     origin: str | None = None,
     owner: str | None = None,
     root_path: str | None = None,
+    answer_mode: str = DEFAULT_ANSWER_MODE,
 ) -> dict:
     """Create a new knowledge layer.
 
@@ -162,6 +175,7 @@ async def create_layer(
 
     chunk_cfg = _validate_chunk_config(chunk_config or {})
     routing = _validate_routing_patterns(routing_patterns or [])
+    mode = _validate_answer_mode(answer_mode)
     _validate_length("origin", origin, MAX_ORIGIN_LENGTH)
     _validate_length("owner", owner, MAX_OWNER_LENGTH)
 
@@ -172,8 +186,8 @@ async def create_layer(
             f"""
             INSERT INTO strata_core.knowledge_layers
                 (name, display_name, description, metadata_schema, chunk_config,
-                 routing_patterns, origin, owner, root_path)
-            VALUES ($1, $2, $3, $4::jsonb, $5::jsonb, $6::jsonb, $7, $8, $9)
+                 routing_patterns, origin, owner, root_path, answer_mode)
+            VALUES ($1, $2, $3, $4::jsonb, $5::jsonb, $6::jsonb, $7, $8, $9, $10)
             RETURNING {_LAYER_COLUMNS}
             """,
             name,
@@ -185,6 +199,7 @@ async def create_layer(
             origin,
             owner,
             root_path,
+            mode,
         )
     except asyncpg.UniqueViolationError as e:
         if e.constraint_name == _ROOT_PATH_INDEX:
@@ -211,6 +226,7 @@ async def get_layer_status(database_url: str, *, name: str) -> dict:
                kl.status, kl.doc_count, kl.chunk_count, kl.last_ingested,
                kl.chunk_config, kl.metadata_schema, kl.routing_patterns,
                kl.created_at, kl.updated_at, kl.origin, kl.owner, kl.root_path,
+               kl.answer_mode,
                (SELECT count(*) FROM strata_core.ingestion_runs ir
                 WHERE ir.layer_id = kl.id) AS ingestion_run_count,
                (SELECT max(ir.completed_at) FROM strata_core.ingestion_runs ir
@@ -354,6 +370,16 @@ async def set_origin(database_url: str, layer_name: str, origin: str | None) -> 
     """
     _validate_length("origin", origin, MAX_ORIGIN_LENGTH)
     await _set_column(database_url, layer_name, "origin", origin)
+
+
+async def set_layer_answer_mode(database_url: str, layer_name: str, answer_mode: str) -> None:
+    """Set how strata_ask answers for a layer ("grounded" or "extractive").
+
+    Raises LayerNotFoundError if the layer doesn't exist.
+    Raises LayerValidationError if answer_mode is not one of ANSWER_MODES.
+    """
+    _validate_answer_mode(answer_mode)
+    await _set_column(database_url, layer_name, "answer_mode", answer_mode)
 
 
 async def delete_layer(database_url: str, *, name: str) -> dict:

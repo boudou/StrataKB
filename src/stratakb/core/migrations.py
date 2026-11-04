@@ -133,6 +133,18 @@ MIGRATIONS: list[tuple[int, str, str]] = [
         END
         """,
     ),
+    (
+        12,
+        "12_answer_mode.sql",
+        """
+        SELECT EXISTS (
+            SELECT 1 FROM information_schema.columns
+            WHERE table_schema = 'strata_core'
+              AND table_name = 'knowledge_layers'
+              AND column_name = 'answer_mode'
+        )
+        """,
+    ),
 ]
 
 # Same definition as in 05_add_folder.sql

@@ -82,6 +82,7 @@ async def test_sql_files_apply_twice(db_url):
         "04_ingested_files.sql",
         "05_add_folder.sql",
         "06_readonly_grants.sql",
+        "12_answer_mode.sql",
     ):
         sql = migrations._load_sql(name)
         await _owner_execute(db_url, sql)
@@ -108,7 +109,7 @@ async def fresh_url(db_url):
 async def test_builds_an_empty_database(fresh_url):
     await migrations.ensure_schema(fresh_url)
 
-    assert await _recorded(fresh_url) == {1, 2, 4, 5, 6}
+    assert await _recorded(fresh_url) == {1, 2, 4, 5, 6, 12}
     conn = await asyncpg.connect(fresh_url)
     try:
         for table in (
@@ -181,7 +182,7 @@ async def test_records_existing_objects_without_running(db_url):
     await _owner_execute(db_url, "DROP TABLE strata_core.schema_migrations")
     with patch.object(migrations, "_load_sql", side_effect=AssertionError("file was run")):
         await migrations.ensure_schema(db_url)
-    assert await _recorded(db_url) == {1, 2, 4, 5, 6}
+    assert await _recorded(db_url) == {1, 2, 4, 5, 6, 12}
     assert db_url in migrations._checked
 
 
@@ -222,13 +223,44 @@ async def test_applies_missing_05(db_url):
         await conn.close()
     assert {"origin", "owner", "root_path"} <= columns
     assert index == "strata_core.knowledge_layers_root_path_key"
-    assert await _recorded(db_url) == {1, 2, 4, 5, 6}
+    assert await _recorded(db_url) == {1, 2, 4, 5, 6, 12}
+
+
+async def test_applies_missing_12_existing_layers_read_grounded(db_url):
+    await _owner_execute(
+        db_url,
+        """
+        DELETE FROM strata_core.knowledge_layers WHERE name = 'test_mig_answer_mode';
+        ALTER TABLE strata_core.knowledge_layers DROP COLUMN answer_mode;
+        DELETE FROM strata_core.schema_migrations WHERE version = 12;
+        INSERT INTO strata_core.knowledge_layers (name, display_name)
+        VALUES ('test_mig_answer_mode', 'Older layer');
+        """,
+    )
+    try:
+        await migrations.ensure_schema(db_url)
+
+        conn = await asyncpg.connect(db_url)
+        try:
+            mode = await conn.fetchval(
+                "SELECT answer_mode FROM strata_core.knowledge_layers "
+                "WHERE name = 'test_mig_answer_mode'"
+            )
+        finally:
+            await conn.close()
+        assert mode == "grounded"
+        assert await _recorded(db_url) == {1, 2, 4, 5, 6, 12}
+    finally:
+        await _owner_execute(
+            db_url,
+            "DELETE FROM strata_core.knowledge_layers WHERE name = 'test_mig_answer_mode'",
+        )
 
 
 async def test_concurrent_calls(db_url):
     await _owner_execute(db_url, "DROP TABLE strata_core.schema_migrations")
     await asyncio.gather(migrations.ensure_schema(db_url), migrations.ensure_schema(db_url))
-    assert await _recorded(db_url) == {1, 2, 4, 5, 6}
+    assert await _recorded(db_url) == {1, 2, 4, 5, 6, 12}
 
 
 async def test_broken_file_raises_naming_it(db_url):
@@ -261,11 +293,11 @@ async def test_non_owner_schema_present(db_url, readonly_url):
             await migrations.ensure_schema(readonly_url)
         events = [entry for entry in logs if entry["event"] == "migration_not_recorded"]
         assert len(events) == 1
-        assert events[0]["versions"] == [1, 2, 4, 5, 6]
+        assert events[0]["versions"] == [1, 2, 4, 5, 6, 12]
         assert readonly_url in migrations._checked
     finally:
         await migrations.ensure_schema(db_url)
-    assert await _recorded(db_url) == {1, 2, 4, 5, 6}
+    assert await _recorded(db_url) == {1, 2, 4, 5, 6, 12}
 
 
 async def test_non_owner_schema_missing(db_url, readonly_url):
