@@ -22,14 +22,8 @@ from stratakb.core.database import get_pool
 from stratakb.core.migrations import ensure_schema
 from stratakb.knowledge.embeddings import embed_texts
 from stratakb.knowledge.layers import LayerNotFoundError, get_layer_status
-from stratakb.knowledge.parsers.csv_parser import parse_csv
-from stratakb.knowledge.parsers.docx_parser import parse_docx
-from stratakb.knowledge.parsers.html_parser import parse_html
-from stratakb.knowledge.parsers.json_parser import parse_json
-from stratakb.knowledge.parsers.markdown_parser import parse_markdown
-from stratakb.knowledge.parsers.pdf_parser import ParsedDocument, parse_pdf
-from stratakb.knowledge.parsers.xml_parser import parse_xml
-from stratakb.knowledge.parsers.yaml_parser import parse_yaml
+from stratakb.knowledge.parsers.pdf_parser import ParsedDocument
+from stratakb.knowledge.parsers.registry import SUPPORTED_PARSERS
 from stratakb.knowledge.policy import is_secret_name
 from stratakb.knowledge.vector_store import ChunkRecord, insert_chunks
 
@@ -37,22 +31,6 @@ if TYPE_CHECKING:
     from stratakb.knowledge.selection import FileEntry
 
 logger = structlog.get_logger()
-
-# Supported file extensions and their parsers
-SUPPORTED_PARSERS = {
-    ".pdf": parse_pdf,
-    ".docx": parse_docx,
-    ".yaml": parse_yaml,
-    ".yml": parse_yaml,
-    ".csv": parse_csv,
-    ".xml": parse_xml,
-    ".xsd": parse_xml,
-    ".json": parse_json,
-    ".md": parse_markdown,
-    ".markdown": parse_markdown,
-    ".html": parse_html,
-    ".htm": parse_html,
-}
 
 EMBED_BATCH_SIZE = 100
 
@@ -593,7 +571,7 @@ def _chunk_document(
 
     # Derive doc_type from file extension
     ext = Path(doc.source_file).suffix.lower()
-    doc_type_map = {".pdf": "pdf", ".docx": "docx", ".yaml": "yaml", ".yml": "yaml", ".csv": "csv", ".xml": "xml", ".xsd": "xsd", ".json": "json", ".md": "markdown", ".markdown": "markdown", ".html": "html", ".htm": "html"}
+    doc_type_map = {".pdf": "pdf", ".docx": "docx", ".yaml": "yaml", ".yml": "yaml", ".csv": "csv", ".xml": "xml", ".xsd": "xsd", ".json": "json", ".md": "markdown", ".markdown": "markdown", ".html": "html", ".htm": "html", ".txt": "text", ".rst": "rst", ".adoc": "adoc"}
     doc_type = doc_type_map.get(ext, ext.lstrip(".") or "unknown")
 
     chunks: list[ChunkRecord] = []

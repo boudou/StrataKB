@@ -13,6 +13,8 @@ from fnmatch import fnmatchcase
 from pathlib import PurePosixPath
 from typing import TYPE_CHECKING
 
+from stratakb.knowledge.parsers.registry import SUPPORTED_PARSERS
+
 if TYPE_CHECKING:
     from stratakb.knowledge.selection import FileEntry
 
@@ -101,9 +103,6 @@ def evaluate(entry: FileEntry, max_file_size_bytes: int) -> Verdict:
 
     Order: secret, path_too_long, build_file, code, unsupported, too_large.
     """
-    # Imported here: ingestion imports this module at its top
-    from stratakb.knowledge.ingestion import SUPPORTED_PARSERS
-
     path = entry.relative_path
     name = path.rsplit("/", 1)[-1].casefold()
     if is_secret_name(path):

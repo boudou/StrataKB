@@ -26,7 +26,7 @@ The server retrieves; it does not write answers. Your MCP client reads the retur
 - **Query routing**: when no layers are given, questions are routed to the right layers by each layer's patterns
 - **Query rewriting** (optional): with an Anthropic API key, `strata_ask` expands a question into several searches in the knowledge base's own terminology
 - **Learns from use**: records searches, detects rephrased questions and layer switches, and takes explicit feedback on each result's `interaction_id`. It then learns synonyms, query rewrites that worked (a proven rewrite skips the LLM call) and which layers a question belongs to
-- **Many formats**: PDF, DOCX, Markdown, HTML, CSV, JSON, XML/XSD and OpenAPI/AsyncAPI YAML, each split along its natural structure
+- **Many formats**: PDF, DOCX, Markdown, HTML, plain text, reStructuredText, AsciiDoc, CSV, JSON, XML/XSD and OpenAPI/AsyncAPI YAML, each split along its natural structure
 - **Local embeddings by default**: `all-mpnet-base-v2` runs on CPU with no API key; OpenAI or any OpenAI-compatible server (Ollama, LM Studio, vLLM) is optional
 - **Roles and audit**: viewer, operator and admin roles on every tool, and an append-only audit log of searches and changes
 - **Local-only switch**: `STRATA_LOCAL_ONLY=true` refuses to start while any setting would send content off this machine, and keeps model downloads off; see [Where your data goes](#where-your-data-goes)

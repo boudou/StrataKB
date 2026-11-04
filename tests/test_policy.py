@@ -114,9 +114,19 @@ def test_evaluate_workflow_rule_is_a_path_rule():
     assert evaluate(_entry(".GitHub/Workflows/CI.YAML"), 50 * MB).reason == "build_file"
 
 
-@pytest.mark.parametrize("path", [".env.example", "credentials.md", "my-secret-notes.txt"])
+@pytest.mark.parametrize("path", ["credentials.md", "my-secret-notes.txt"])
 def test_evaluate_allowed_not_secret(path):
-    assert evaluate(_entry(path), 50 * MB).reason != "secret"
+    assert evaluate(_entry(path), 50 * MB) == Verdict(True, None)
+
+
+def test_evaluate_env_example_is_unsupported_not_secret():
+    # Its suffix is ".example", not a supported format
+    assert evaluate(_entry(".env.example"), 50 * MB) == Verdict(False, "unsupported")
+
+
+@pytest.mark.parametrize("path", ["notes.txt", "docs/guide.rst", "manual.ADOC"])
+def test_evaluate_ingests_plain_text_formats(path):
+    assert evaluate(_entry(path), 50 * MB) == Verdict(True, None)
 
 
 @pytest.mark.parametrize("path", ["client_secret.json", "prod-credentials.yaml"])

@@ -203,7 +203,8 @@ def register_knowledge_tools(
         layer's chunk_config or to the embedding model is not detected: use
         replace_all=True after such a change.
 
-        Supported formats: PDF, DOCX, YAML/OpenAPI, CSV, JSON, XML/XSD, Markdown, HTML.
+        Supported formats: PDF, DOCX, YAML/OpenAPI, CSV, JSON, XML/XSD, Markdown, HTML,
+        plain text (.txt), reStructuredText (.rst), AsciiDoc (.adoc).
 
         Args:
             layer_name: Target knowledge layer (must exist). Example: "runbooks"
