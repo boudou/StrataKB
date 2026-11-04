@@ -52,7 +52,7 @@ def is_secret_name(relative_path: str) -> bool:
     return not (matched <= {"*secret*", "*credential*"} and is_document)
 
 
-# The VARCHAR(500) of strata_vectors.chunks.source_file (db/01_init.sql)
+# The VARCHAR(500) of strata_vectors.chunks.source_file (core/sql/01_init.sql)
 MAX_RELATIVE_PATH = 500
 
 # Lock files and tool configs: matched on the basename, case-insensitively

@@ -38,7 +38,7 @@ jobs:
           enable-cache: true
       - name: Create schemas
         run: |
-          for f in db/01_init.sql db/02_learning.sql db/03_readonly_role.sql src/stratakb/core/sql/04_ingested_files.sql; do
+          for f in src/stratakb/core/sql/01_init.sql src/stratakb/core/sql/02_learning.sql db/03_readonly_role.sql src/stratakb/core/sql/04_ingested_files.sql; do
             psql -h localhost -p 5433 -U strata -d strata -v ON_ERROR_STOP=1 -f "$f"
           done
       - run: uv sync --extra dev --locked

@@ -1,5 +1,7 @@
 -- StrataKB database initialization
 -- Creates the core and vector schemas. The learning schema is in 02_learning.sql.
+-- Idempotent: applied by the server (stratakb.core.migrations) to an empty
+-- database and by docker-compose on a fresh volume.
 
 -- Enable extensions
 CREATE EXTENSION IF NOT EXISTS vector;

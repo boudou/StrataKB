@@ -98,6 +98,8 @@ docker compose up -d        # PostgreSQL 16 + pgvector on port 5433, schemas cre
 uv sync
 ```
 
+Any empty PostgreSQL 16 database with pgvector works as well: `stratakb add` and the server create the schema on first use, as long as the user in `DATABASE_URL` may create the `vector` and `pg_trgm` extensions.
+
 The server answers its client at once and, with the default `local` backend, loads the embedding model in the background; a search sent before the model is ready waits for it. The first start downloads the embedding model (about 420 MB) and the first `strata_ask` downloads the reranker (about 90 MB), both into your Hugging Face cache. With `STRATA_LOCAL_ONLY=true` nothing is downloaded; see [Where your data goes](#where-your-data-goes).
 
 ### Connect an MCP client
@@ -337,13 +339,14 @@ StrataKB cannot control what your MCP client's language model does with the retr
 ## Project structure
 
 ```
-db/                   Schema: 01_init.sql (core, vectors), 02_learning.sql (learning), 03_readonly_role.sql (SQL tools role)
+db/                   03_readonly_role.sql (SQL tools role, applied with psql)
 examples/             Example layer presets (Python PEPs, SEPA, ISO 20022)
 scripts/              apply_preset.py, backup_restore.py
 src/stratakb/
   cli.py              The stratakb command: add a folder, or start the server
   mcp_server.py       MCP server: admin and user tools
-  core/               Database pool, roles, audit log, logging
+  core/               Database pool, roles, audit log, logging, schema migrations
+    sql/              Schema, applied in version order by the server: 01_init, 02_learning, then 04–06 upgrades
   knowledge/          Layers, presets, ingestion pipeline, parsers, embeddings, vector store
     add_folder.py     Turns one folder into one layer and keeps it in sync
   rag/                Retriever (hybrid + RRF), reranker, cache, routing, query rewriter, tools

@@ -76,18 +76,112 @@ def _with_extra(version: int, name: str, sql: str):
 
 
 async def test_sql_files_apply_twice(db_url):
-    for name in ("04_ingested_files.sql", "05_add_folder.sql", "06_readonly_grants.sql"):
+    for name in (
+        "01_init.sql",
+        "02_learning.sql",
+        "04_ingested_files.sql",
+        "05_add_folder.sql",
+        "06_readonly_grants.sql",
+    ):
         sql = migrations._load_sql(name)
         await _owner_execute(db_url, sql)
         await _owner_execute(db_url, sql)
     assert {4, 5, 6} <= await _recorded(db_url)
 
 
+@pytest.fixture
+async def fresh_url(db_url):
+    """URL of a new, empty database next to db_url, dropped afterwards."""
+    parts = urlsplit(db_url)
+    name = f"{parts.path.lstrip('/')}_fresh"
+    try:
+        await _owner_execute(db_url, f'DROP DATABASE IF EXISTS "{name}" WITH (FORCE)')
+        await _owner_execute(db_url, f'CREATE DATABASE "{name}"')
+    except asyncpg.InsufficientPrivilegeError:
+        pytest.skip("the owner may not create databases")
+    try:
+        yield urlunsplit(parts._replace(path=f"/{name}"))
+    finally:
+        await _owner_execute(db_url, f'DROP DATABASE IF EXISTS "{name}" WITH (FORCE)')
+
+
+async def test_builds_an_empty_database(fresh_url):
+    await migrations.ensure_schema(fresh_url)
+
+    assert await _recorded(fresh_url) == {1, 2, 4, 5, 6}
+    conn = await asyncpg.connect(fresh_url)
+    try:
+        for table in (
+            "strata_core.knowledge_layers",
+            "strata_core.ingested_files",
+            "strata_vectors.chunks",
+            "strata_learning.query_sessions",
+        ):
+            assert await conn.fetchval("SELECT to_regclass($1) IS NOT NULL", table), table
+        columns = {
+            (row["table_name"], row["column_name"])
+            for row in await conn.fetch(
+                """
+                SELECT table_name, column_name FROM information_schema.columns
+                WHERE (table_schema, table_name, column_name) IN (
+                    ('strata_core', 'knowledge_layers', 'root_path'),
+                    ('strata_vectors', 'chunks', 'file_id')
+                )
+                """
+            )
+        }
+        assert columns == {("knowledge_layers", "root_path"), ("chunks", "file_id")}
+
+        if await conn.fetchval("SELECT 1 FROM pg_roles WHERE rolname = 'strata_readonly'"):
+            readable = {
+                row["t"]
+                for row in await conn.fetch(
+                    """
+                    SELECT format('%I.%I', n.nspname, c.relname) AS t
+                    FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+                    WHERE n.nspname IN ('strata_core', 'strata_vectors', 'strata_learning')
+                      AND c.relkind IN ('r', 'p', 'v', 'm', 'f')
+                      AND has_table_privilege('strata_readonly', c.oid, 'SELECT')
+                    """
+                )
+            }
+            assert readable == set(_READABLE)
+            assert not await conn.fetchval(
+                "SELECT has_schema_privilege('strata_readonly', 'strata_learning', 'USAGE')"
+            )
+    finally:
+        await conn.close()
+
+    migrations._checked.clear()
+    with capture_logs() as logs:
+        await migrations.ensure_schema(fresh_url)
+    assert not [entry for entry in logs if entry["event"] == "applying_migration"]
+
+
+async def test_records_01_and_02_on_an_existing_database(db_url):
+    await migrations.ensure_schema(db_url)
+    migrations._checked.clear()
+    await _owner_execute(
+        db_url, "DELETE FROM strata_core.schema_migrations WHERE version IN (1, 2)"
+    )
+    with patch.object(migrations, "_load_sql", side_effect=AssertionError("file was run")):
+        await migrations.ensure_schema(db_url)
+    assert {1, 2} <= await _recorded(db_url)
+
+
+async def test_non_owner_empty_database_names_01(fresh_url, readonly_url):
+    url = urlunsplit(urlsplit(readonly_url)._replace(path=urlsplit(fresh_url).path))
+    with pytest.raises(migrations.MigrationError) as exc:
+        await migrations.ensure_schema(url)
+    assert "01_init.sql" in str(exc.value)
+    assert url not in migrations._checked
+
+
 async def test_records_existing_objects_without_running(db_url):
     await _owner_execute(db_url, "DROP TABLE strata_core.schema_migrations")
     with patch.object(migrations, "_load_sql", side_effect=AssertionError("file was run")):
         await migrations.ensure_schema(db_url)
-    assert await _recorded(db_url) == {4, 5, 6}
+    assert await _recorded(db_url) == {1, 2, 4, 5, 6}
     assert db_url in migrations._checked
 
 
@@ -128,13 +222,13 @@ async def test_applies_missing_05(db_url):
         await conn.close()
     assert {"origin", "owner", "root_path"} <= columns
     assert index == "strata_core.knowledge_layers_root_path_key"
-    assert await _recorded(db_url) == {4, 5, 6}
+    assert await _recorded(db_url) == {1, 2, 4, 5, 6}
 
 
 async def test_concurrent_calls(db_url):
     await _owner_execute(db_url, "DROP TABLE strata_core.schema_migrations")
     await asyncio.gather(migrations.ensure_schema(db_url), migrations.ensure_schema(db_url))
-    assert await _recorded(db_url) == {4, 5, 6}
+    assert await _recorded(db_url) == {1, 2, 4, 5, 6}
 
 
 async def test_broken_file_raises_naming_it(db_url):
@@ -167,11 +261,11 @@ async def test_non_owner_schema_present(db_url, readonly_url):
             await migrations.ensure_schema(readonly_url)
         events = [entry for entry in logs if entry["event"] == "migration_not_recorded"]
         assert len(events) == 1
-        assert events[0]["versions"] == [4, 5, 6]
+        assert events[0]["versions"] == [1, 2, 4, 5, 6]
         assert readonly_url in migrations._checked
     finally:
         await migrations.ensure_schema(db_url)
-    assert await _recorded(db_url) == {4, 5, 6}
+    assert await _recorded(db_url) == {1, 2, 4, 5, 6}
 
 
 async def test_non_owner_schema_missing(db_url, readonly_url):
