@@ -5,6 +5,7 @@ All tests need the database; embeddings are mocked.
 
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 from uuid import uuid4
@@ -406,4 +407,216 @@ async def test_tool_returns_files_skipped():
 
     assert result["status"] == "completed"
     assert result["files_skipped"] == 2
+
+
+def _entries(root: Path, *relative_paths: str, carry_hash: bool = False) -> list:
+    """FileEntry objects for files under root, optionally with their real SHA-256."""
+    from stratakb.knowledge.selection import FileEntry
+
+    entries = []
+    for rel in relative_paths:
+        path = root / rel
+        data = path.read_bytes()
+        entries.append(FileEntry(
+            relative_path=rel,
+            size=len(data),
+            path=path,
+            sha256=hashlib.sha256(data).hexdigest() if carry_hash else None,
+        ))
+    return entries
+
+
+class TestFileList:
+    async def test_excluded_existing_file_removed(self, db_url, layer, tmp_path):
+        from stratakb.knowledge.ingestion import FileOutcome
+
+        _write(tmp_path / "a.md", "# Alpha\n\nAlpha content.\n")
+        _write(tmp_path / "sub" / "b.md", "# Beta\n\nBeta content.\n")
+        await _ingest(db_url, layer, tmp_path)
+
+        result, _ = await _ingest(db_url, layer, tmp_path, files=_entries(tmp_path, "a.md"))
+
+        assert result.status == "completed"
+        assert FileOutcome("sub/b.md", "removed", "not_selected") in result.files
+        assert FileOutcome("a.md", "unchanged") in result.files
+        assert result.files_removed == 1
+        assert (tmp_path / "sub" / "b.md").exists()
+        assert [f["relative_path"] for f in await _files(db_url, layer)] == ["a.md"]
+        assert set(_ids_by_file(await _chunks(db_url, layer))) == {"a.md"}
+
+    async def test_unlisted_missing_file_is_deleted(self, db_url, layer, tmp_path):
+        from stratakb.knowledge.ingestion import FileOutcome
+
+        _write(tmp_path / "a.md", "# Alpha\n\nAlpha content.\n")
+        b = _write(tmp_path / "b.md", "# Beta\n\nBeta content.\n")
+        await _ingest(db_url, layer, tmp_path)
+        b.unlink()
+
+        result, _ = await _ingest(db_url, layer, tmp_path, files=_entries(tmp_path, "a.md"))
+
+        assert FileOutcome("b.md", "removed", "deleted") in result.files
+
+    async def test_empty_list_removes_all(self, db_url, layer, tmp_path):
+        _write(tmp_path / "a.md", "# Alpha\n\nAlpha content.\n")
+        _write(tmp_path / "b.md", "# Beta\n\nBeta content.\n")
+        await _ingest(db_url, layer, tmp_path)
+
+        result, _ = await _ingest(db_url, layer, tmp_path, files=[])
+
+        assert result.status == "completed"
+        assert result.files_removed == 2
+        assert set(_outcomes(result).values()) == {("removed", "not_selected")}
+        assert await _files(db_url, layer) == []
+        assert await _chunks(db_url, layer) == []
+
+    async def test_empty_list_nothing_tracked_completes(self, db_url, layer, tmp_path):
+        result, _ = await _ingest(db_url, layer, tmp_path, files=[])
+
+        assert result.status == "completed"
+        assert result.errors == []
+        assert result.files == []
+
+    async def test_list_ingests_only_given_files(self, db_url, layer, tmp_path):
+        _write(tmp_path / "a.md", "# Alpha\n\nAlpha content.\n")
+        _write(tmp_path / "other.md", "# Other\n\nNot listed.\n")
+
+        result, _ = await _ingest(db_url, layer, tmp_path, files=_entries(tmp_path, "a.md"))
+
+        assert _outcomes(result) == {"a.md": ("added", None)}
+        assert [f["relative_path"] for f in await _files(db_url, layer)] == ["a.md"]
+
+    async def test_carried_hash_skips_hashing(self, db_url, layer, tmp_path):
+        _write(tmp_path / "a.md", "# Alpha\n\nAlpha content.\n")
+        _write(tmp_path / "sub" / "b.md", "# Beta\n\nBeta content.\n")
+        entries = _entries(tmp_path, "a.md", "sub/b.md", carry_hash=True)
+
+        # Only the module's name: asyncpg's login uses hashlib.sha256 too
+        with patch("stratakb.knowledge.ingestion.hashlib") as mock_hashlib:
+            first, _ = await _ingest(db_url, layer, tmp_path, files=entries)
+            second, _ = await _ingest(db_url, layer, tmp_path, files=entries)
+
+        mock_hashlib.sha256.assert_not_called()
+        assert first.files_added == 2
+        assert second.files_unchanged == 2
+        stored = {f["relative_path"]: f["content_hash"] for f in await _files(db_url, layer)}
+        assert stored == {e.relative_path: e.sha256 for e in entries}
+
+    async def test_carried_unchanged_hash_never_opens(self, db_url, layer, tmp_path):
+        _write(tmp_path / "a.md", "# Alpha\n\nAlpha content.\n")
+        entries = _entries(tmp_path, "a.md", carry_hash=True)
+        await _ingest(db_url, layer, tmp_path, files=entries)
+
+        with patch.object(Path, "read_bytes", side_effect=AssertionError("opened")):
+            result, _ = await _ingest(db_url, layer, tmp_path, files=entries)
+
+        assert _outcomes(result) == {"a.md": ("unchanged", None)}
+
+    async def test_files_with_replace_all_raises(self, db_url, layer, tmp_path):
+        _write(tmp_path / "a.md", "# Alpha\n\nAlpha content.\n")
+
+        with pytest.raises(ValueError, match="replace_all"):
+            await _ingest(
+                db_url, layer, tmp_path, files=_entries(tmp_path, "a.md"), replace_all=True
+            )
+
+    @pytest.mark.parametrize("bad", ["../x.md", "sub/../../x.md", "/etc/x.md"])
+    async def test_dotdot_path_raises(self, db_url, layer, tmp_path, bad):
+        from stratakb.knowledge.selection import FileEntry
+
+        entry = FileEntry(relative_path=bad, size=1, path=tmp_path / "x.md")
+        with pytest.raises(ValueError, match="relative"):
+            await _ingest(db_url, layer, tmp_path, files=[entry])
+
+    async def test_file_source_path_raises(self, db_url, layer, tmp_path):
+        a = _write(tmp_path / "a.md", "# Alpha\n\nAlpha content.\n")
+
+        with pytest.raises(ValueError, match="folder"):
+            await _ingest(db_url, layer, a, files=_entries(tmp_path, "a.md"))
+
+    async def test_progress_calls(self, db_url, layer, tmp_path):
+        _write(tmp_path / "a.md", "# Alpha\n\nAlpha content.\n")
+        b = _write(tmp_path / "b.md", "# Beta\n\nBeta content.\n")
+        calls: list[tuple[int, int]] = []
+
+        await _ingest(
+            db_url, layer, tmp_path,
+            files=_entries(tmp_path, "a.md", "b.md", carry_hash=True),
+            progress=lambda done, total: calls.append((done, total)),
+        )
+        assert calls == [(1, 2), (2, 2)]
+
+        calls.clear()
+        _write(b, "# Beta\n\nBeta content, edited.\n")
+        await _ingest(
+            db_url, layer, tmp_path,
+            files=_entries(tmp_path, "a.md", "b.md", carry_hash=True),
+            progress=lambda done, total: calls.append((done, total)),
+        )
+        assert calls == [(1, 1)]
+
+    async def test_progress_in_discovery_mode(self, db_url, layer, tmp_path):
+        _write(tmp_path / "a.md", "# Alpha\n\nAlpha content.\n")
+        calls: list[tuple[int, int]] = []
+
+        await _ingest(db_url, layer, tmp_path, progress=lambda d, t: calls.append((d, t)))
+
+        assert calls == [(1, 1)]
+
+    async def test_connection_error_raises(self, db_url, layer, tmp_path):
+        import asyncpg
+
+        _write(tmp_path / "a.md", "# Alpha\n\nAlpha content.\n")
+
+        with (
+            patch(
+                "stratakb.knowledge.ingestion._store_file",
+                new_callable=AsyncMock,
+                side_effect=asyncpg.InterfaceError("connection lost"),
+            ),
+            pytest.raises(asyncpg.InterfaceError),
+        ):
+            await _ingest(db_url, layer, tmp_path, files=_entries(tmp_path, "a.md"))
+
+    async def test_store_runtime_error_is_embed_error(self, db_url, layer, tmp_path):
+        _write(tmp_path / "a.md", "# Alpha\n\nAlpha content.\n")
+
+        with patch(
+            "stratakb.knowledge.ingestion._store_file",
+            new_callable=AsyncMock,
+            side_effect=RuntimeError("constraint"),
+        ):
+            result, _ = await _ingest(db_url, layer, tmp_path, files=_entries(tmp_path, "a.md"))
+
+        assert _outcomes(result)["a.md"] == ("failed", "embed_error")
+        assert result.status == "failed"
+
+    async def test_root_form_matches_mcp_route(self, db_url, layer, tmp_path, monkeypatch):
+        from stratakb.knowledge.selection import select_files
+        from stratakb.mcp_server import mcp
+
+        monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path.parent))
+        _write(tmp_path / "a.md", "# Alpha\n\nAlpha content.\n")
+        _write(tmp_path / "sub" / "b.md", "# Beta\n\nBeta content.\n")
+
+        with (
+            patch("stratakb.core.auth.get_current_user", return_value=("tester", "admin")),
+            patch("stratakb.knowledge.tools.get_current_user", return_value=("tester", "admin")),
+            patch("stratakb.knowledge.tools.write_audit_log", new_callable=AsyncMock),
+            patch(
+                "stratakb.knowledge.ingestion.embed_texts",
+                new_callable=AsyncMock,
+                side_effect=lambda texts, **_: [FAKE_EMBEDDING for _ in texts],
+            ),
+        ):
+            tool = mcp._tool_manager.get_tool("strata_ingest_documents")
+            first = await tool.fn(layer_name=layer, source_path=str(tmp_path))
+        assert first["files_added"] == 2
+
+        result, embedded = await _ingest(
+            db_url, layer, str(tmp_path) + "/", files=select_files(tmp_path).entries
+        )
+
+        assert embedded == []
+        assert set(_outcomes(result).values()) == {("unchanged", None)}
+        assert (result.files_added, result.files_removed, result.files_unchanged) == (0, 0, 2)
 
