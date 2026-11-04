@@ -63,6 +63,7 @@ class Settings(BaseSettings):
     hybrid_semantic_weight: float = 0.7  # RRF weight for vector results
     hybrid_keyword_weight: float = 0.3   # RRF weight for full-text results
     hybrid_rrf_k: int = 60              # RRF constant (standard = 60)
+    hybrid_keyword_slots: int = 1       # results kept for the best full-text hits
 
     # Reranking
     reranking_enabled: bool = True

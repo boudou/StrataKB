@@ -19,6 +19,9 @@ from stratakb.rag.cache import QueryCache
 
 logger = structlog.get_logger()
 
+# Server-side cap (seconds) on each search query, below the pool's 30 s command_timeout
+_SEARCH_TIMEOUT = 10
+
 _cache: QueryCache | None = None
 
 
@@ -173,6 +176,7 @@ async def search_chunks(
     async with pool.acquire() as conn:
         async with conn.transaction():
             await conn.execute(f"SET LOCAL hnsw.ef_search = {settings.hnsw_ef_search}")
+            await conn.execute(f"SET LOCAL statement_timeout = '{_SEARCH_TIMEOUT}s'")
             rows = await conn.fetch(sql, *params)
 
     results = []
@@ -256,6 +260,41 @@ def _fuse_rrf(
     return sorted(scores.items(), key=lambda x: x[1], reverse=True)
 
 
+def _reserve_keyword_slots(
+    fused: list[tuple[str, float]],
+    keyword: list[tuple[str, int]],
+    top_k: int,
+    slots: int,
+) -> list[tuple[str, float]]:
+    """Keep the best full-text hits in the top_k fused results.
+
+    A chunk only the full-text leg found scores below almost every vector
+    rank, so an exact term the embedding misses would never be returned.
+    The keyword ranks 1..n (n = slots, at most top_k - 1, so the fused #1
+    always stays) each replace the lowest-scored unprotected entry when they
+    are missing, and keep their own fused score.
+
+    Returns:
+        At most top_k (chunk_id, fused_score), highest first.
+    """
+    n = max(0, min(slots, top_k - 1))
+    chosen = list(fused[:top_k])
+    protected = [cid for cid, _ in sorted(keyword, key=lambda x: x[1])[:n]]
+    present = {cid for cid, _ in chosen}
+    missing = [cid for cid in protected if cid not in present]
+    if not missing:
+        return chosen
+
+    scores = dict(fused)
+    keep = set(protected)
+    for cid in missing:
+        # chosen is sorted highest first: drop the last entry that is not protected
+        drop = max(i for i, (c, _) in enumerate(chosen) if c not in keep)
+        chosen.pop(drop)
+        chosen.append((cid, scores[cid]))
+    return sorted(chosen, key=lambda x: x[1], reverse=True)
+
+
 def _build_hybrid_sql(
     query_vector: str,
     query_text: str,
@@ -330,6 +369,7 @@ async def _hybrid_search(
     async with pool.acquire() as conn:
         async with conn.transaction():
             await conn.execute(f"SET LOCAL hnsw.ef_search = {settings.hnsw_ef_search}")
+            await conn.execute(f"SET LOCAL statement_timeout = '{_SEARCH_TIMEOUT}s'")
             rows = await conn.fetch(sql, *params)
 
     semantic_ranks = [(str(r["id"]), r["rank"]) for r in rows if r["source"] == "semantic"]
@@ -342,7 +382,8 @@ async def _hybrid_search(
         kw_weight=settings.hybrid_keyword_weight,
     )
 
-    top_ids = [f[0] for f in fused[:top_k]]
+    kept = _reserve_keyword_slots(fused, keyword_ranks, top_k, settings.hybrid_keyword_slots)
+    top_ids = [f[0] for f in kept]
     fused_scores = {f[0]: f[1] for f in fused}
 
     if not top_ids:
@@ -396,6 +437,7 @@ async def _hybrid_search(
         layers=layers,
         semantic_results=len(semantic_ranks),
         keyword_results=len(keyword_ranks),
+        keyword_only_results=len(set(top_ids) - {cid for cid, _ in semantic_ranks}),
         fused_results=len(results),
     )
     return results

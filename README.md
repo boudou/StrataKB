@@ -281,6 +281,7 @@ flowchart LR
 | `HYBRID_SEARCH_ENABLED` | `true` | Vector plus full-text search |
 | `HYBRID_SEMANTIC_WEIGHT`, `HYBRID_KEYWORD_WEIGHT` | `0.7`, `0.3` | RRF weights |
 | `HYBRID_RRF_K` | `60` | RRF constant |
+| `HYBRID_KEYWORD_SLOTS` | `1` | Results kept for the best full-text matches, so an exact term the embedding misses still comes back (at most `top_k` − 1; `0` turns it off) |
 | `HNSW_EF_SEARCH` | `40` | Recall versus latency for the vector index |
 | `RERANKING_ENABLED` | `true` | Cross-encoder reranking in `strata_ask` |
 | `RERANKING_MODEL` | `cross-encoder/ms-marco-MiniLM-L-6-v2` | Reranker |
@@ -391,7 +392,7 @@ StrataKB cannot control what your MCP client's language model does with the retr
 - **Query rewriting**: optional; a language model turns a question into several searches in the layer's own terms. Learned rewrites are reused without the model.
 - **Reranking**: in `strata_ask`, a second model (a cross-encoder, `RERANKING_MODEL`) reads the question with each candidate chunk and puts the best first.
 - **Routing patterns**: a layer's regular expressions. When a question names no layers, those whose patterns match are searched first.
-- **RRF** (Reciprocal Rank Fusion): how hybrid search merges its two lists by rank, weighted by `HYBRID_SEMANTIC_WEIGHT` and `HYBRID_KEYWORD_WEIGHT`, with the constant `HYBRID_RRF_K`.
+- **RRF** (Reciprocal Rank Fusion): how hybrid search merges its two lists by rank, weighted by `HYBRID_SEMANTIC_WEIGHT` and `HYBRID_KEYWORD_WEIGHT`, with the constant `HYBRID_RRF_K`. The best full-text matches keep `HYBRID_KEYWORD_SLOTS` places in the results, because a chunk found only by words would otherwise rank below every chunk found by meaning.
 - **top_k**: how many chunks a tool returns: 5 by default for `strata_search`, 10 for `strata_ask`.
 
 ## Project structure
