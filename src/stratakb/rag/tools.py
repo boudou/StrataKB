@@ -6,6 +6,7 @@ Registers knowledge search tools with the MCP server.
 from __future__ import annotations
 
 import asyncio
+from typing import Any
 
 from mcp.server.fastmcp import FastMCP
 
@@ -41,6 +42,17 @@ async def _detect_layers(database_url: str, query: str, learning_enabled: bool) 
     )
 
 
+def _routing_fallback_reason(
+    result_count: int, top_k: int, confidence: dict[str, Any]
+) -> str | None:
+    """Decide whether an automatically routed search needs to broaden its scope."""
+    if result_count < max(1, min(top_k, 50)):
+        return "insufficient_results"
+    if confidence["level"] == "low":
+        return "low_confidence"
+    return None
+
+
 def register_rag_tools(
     mcp: FastMCP, database_url: str, openai_api_key: str = ""
 ) -> None:
@@ -66,7 +78,7 @@ def register_rag_tools(
     ) -> dict:
         """Run strata_search; the tool below documents the arguments."""
         from stratakb.config import get_settings
-        from stratakb.rag.layer_detect import extract_metadata_hints
+        from stratakb.rag.confidence import score_confidence
         from stratakb.rag.retriever import search_chunks
 
         _settings = get_settings()
@@ -93,12 +105,6 @@ def register_rag_tools(
                 if detected_layers:
                     layers = detected_layers
 
-            # Extract metadata hints from query if no explicit filter
-            if not metadata_filter:
-                hints = extract_metadata_hints(query)
-                if hints:
-                    metadata_filter = hints
-
             results = await search_chunks(
                 database_url,
                 openai_api_key,
@@ -107,6 +113,19 @@ def register_rag_tools(
                 top_k=top_k,
                 metadata_filter=metadata_filter,
             )
+
+            fallback_reason = None
+            if detected_layers:
+                confidence = score_confidence([
+                    r.similarity_score for r in results if r.similarity_score is not None
+                ])
+                fallback_reason = _routing_fallback_reason(len(results), top_k, confidence)
+                if fallback_reason:
+                    results = await search_chunks(
+                        database_url, openai_api_key, query,
+                        layers=None, top_k=top_k, metadata_filter=metadata_filter,
+                    )
+                    layers = None
 
             user_id, _ = get_current_user()
             await write_audit_log(
@@ -118,6 +137,7 @@ def register_rag_tools(
                     "query": query[:200],
                     "layers": layers,
                     "top_k": top_k,
+                    "routing_fallback": bool(fallback_reason),
                 },
                 result_summary=f"Found {len(results)} results",
             )
@@ -142,6 +162,10 @@ def register_rag_tools(
             }
             if detected_layers:
                 response["auto_detected_layers"] = detected_layers
+            if fallback_reason:
+                response["routing_fallback"] = {
+                    "reason": fallback_reason, "searched_layers": "all",
+                }
 
             return response
         except Exception as e:
@@ -231,50 +255,71 @@ def register_rag_tools(
                 domain_context=domain_context,
             )
 
-            # Multi-query search: run all rewritten queries in PARALLEL
-            async def _run_search(q: str) -> list:
-                return await search_chunks(
-                    database_url, openai_api_key, q,
-                    layers=layers, top_k=top_k,
+            async def _collect(
+                search_layers: list[str] | None,
+            ) -> tuple[list[SearchResult], list[dict[str, Any]] | None, dict[str, Any]]:
+                async def _run_search(q: str) -> list[SearchResult]:
+                    return await search_chunks(
+                        database_url, openai_api_key, q,
+                        layers=search_layers, top_k=top_k,
+                    )
+
+                batch_results = await asyncio.gather(*(_run_search(q) for q in queries))
+                all_results: dict[str, SearchResult] = {}
+                for results in batch_results:
+                    for r in results:
+                        key = str(hash(r.content[:200]))
+                        existing = all_results.get(key)
+                        if not existing or r.score > existing.score:
+                            all_results[key] = r
+
+                rerank_limit = (
+                    top_k * _settings.reranking_candidate_multiplier
+                    if _settings.reranking_enabled else top_k
                 )
+                ranked = sorted(
+                    all_results.values(), key=lambda r: r.score, reverse=True
+                )[:rerank_limit]
+                reranked_chunks = None
+                if _settings.reranking_enabled and ranked:
+                    from stratakb.rag.reranker import rerank_results
 
-            search_tasks = [_run_search(q) for q in queries]
-            batch_results = await asyncio.gather(*search_tasks)
+                    chunks_for_rerank = [
+                        {"chunk_id": r.chunk_id, "content": r.content, "score": r.score,
+                         "layer": r.layer_name, "source_file": r.source_file,
+                         "section": r.source_section, "doc_type": r.doc_type,
+                         "metadata": r.metadata}
+                        for r in ranked
+                    ]
+                    reranked_chunks = await asyncio.to_thread(
+                        rerank_results, question, chunks_for_rerank, top_k,
+                        _settings.reranking_model,
+                    )
+                    scores = [c.get("rerank_score", c.get("score", 0)) for c in reranked_chunks]
+                else:
+                    scores = [
+                        r.similarity_score for r in ranked if r.similarity_score is not None
+                    ]
+                return ranked, reranked_chunks, score_confidence(scores)
 
-            all_results: dict[str, SearchResult] = {}
-            for results in batch_results:
-                for r in results:
-                    # Dedup by content (keep highest score)
-                    key = hash(r.content[:200])
-                    existing = all_results.get(str(key))
-                    if not existing or r.score > existing.score:
-                        all_results[str(key)] = r
+            ranked, reranked_chunks, confidence = await _collect(layers)
+            fallback_reason = None
+            if detected:
+                result_count = len(reranked_chunks) if reranked_chunks is not None else len(ranked)
+                fallback_reason = _routing_fallback_reason(result_count, top_k, confidence)
+                if fallback_reason:
+                    ranked, reranked_chunks, confidence = await _collect(None)
+                    layers = None
 
-            # Sort by score descending; over-retrieve if reranking is enabled
-            rerank_limit = top_k * _settings.reranking_candidate_multiplier if _settings.reranking_enabled else top_k
-            ranked = sorted(all_results.values(), key=lambda r: r.score, reverse=True)[:rerank_limit]
-
-            # Reranking pass
-            if _settings.reranking_enabled and ranked:
-                from stratakb.rag.reranker import rerank_results
-
-                chunks_for_rerank = [
-                    {"chunk_id": r.chunk_id, "content": r.content, "score": r.score,
-                     "layer": r.layer_name, "source_file": r.source_file,
-                     "section": r.source_section, "doc_type": r.doc_type,
-                     "metadata": r.metadata}
-                    for r in ranked
-                ]
-                reranked_chunks = await asyncio.to_thread(
-                    rerank_results, question, chunks_for_rerank, top_k,
-                    _settings.reranking_model,
-                )
+            if reranked_chunks is not None:
                 chunks = reranked_chunks
                 sources = []
                 seen_sources = set()
                 for c in reranked_chunks:
                     if include_sources:
-                        source_key = f"{c['layer']}:{c.get('source_file', '')}:{c.get('section', '')}"
+                        source_key = (
+                            f"{c['layer']}:{c.get('source_file', '')}:{c.get('section', '')}"
+                        )
                         if source_key not in seen_sources:
                             seen_sources.add(source_key)
                             sources.append({
@@ -285,15 +330,7 @@ def register_rag_tools(
                                 "relevance_score": c.get("rerank_score", c.get("score", 0)),
                             })
 
-                # Confidence scoring using reranked scores
-                scores = [c.get("rerank_score", c.get("score", 0)) for c in chunks]
-                confidence = score_confidence(scores)
             else:
-                # Original path (no reranking)
-                # Confidence scoring
-                scores = [r.score for r in ranked]
-                confidence = score_confidence(scores)
-
                 # Build response
                 chunks = []
                 sources = []
@@ -332,6 +369,7 @@ def register_rag_tools(
                     "question": question[:200],
                     "layers": layers,
                     "queries_used": len(queries),
+                    "routing_fallback": bool(fallback_reason),
                 },
                 result_summary=f"{len(ranked)} chunks, confidence={confidence['level']}",
             )
@@ -349,6 +387,10 @@ def register_rag_tools(
                 response["sources"] = sources
             if detected:
                 response["auto_detected_layers"] = detected
+            if fallback_reason:
+                response["routing_fallback"] = {
+                    "reason": fallback_reason, "searched_layers": "all",
+                }
 
             return response
 
