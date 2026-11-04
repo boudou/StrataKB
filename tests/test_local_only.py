@@ -6,6 +6,7 @@ Tests cover:
 - main() forces the Hugging Face libraries offline when the switch is on
 - strata_admin_health lists the switch and the outbound providers
 - Embedding, model loading and query rewriting refuse or skip at call time
+- A rewrite endpoint (QUERY_REWRITE_BASE_URL) is outbound unless loopback
 
 No database and no model are needed: the pool, the server run and the
 model classes are patched.
@@ -104,6 +105,49 @@ def test_openai_base_url_env_is_followed(monkeypatch):
     assert outbound_providers(_settings(embedding_backend="openai")) == []
 
 
+def _rewrite_endpoint(url: str, **overrides) -> Settings:
+    return _settings(
+        query_rewrite_provider="openai_compatible",
+        query_rewrite_base_url=url,
+        query_rewrite_model="llama3.2",
+        **overrides,
+    )
+
+
+def test_remote_rewrite_endpoint_is_outbound():
+    providers = outbound_providers(_rewrite_endpoint("http://gpu-box:11434/v1"))
+    assert len(providers) == 1
+    p = providers[0]
+    assert p.provider == "openai_compatible"
+    assert p.purpose == "query rewriting"
+    assert p.destination == "gpu-box"
+    assert p.setting == "QUERY_REWRITE_BASE_URL"
+
+
+@pytest.mark.parametrize(
+    "url",
+    ["http://127.0.0.1:11434/v1", "http://localhost:11434/v1", "http://[::1]:11434/v1"],
+)
+def test_loopback_rewrite_endpoint_is_local(url):
+    assert outbound_providers(_rewrite_endpoint(url)) == []
+
+
+def test_rewrite_endpoint_hides_credentials():
+    providers = outbound_providers(_rewrite_endpoint("http://user:pw@10.0.0.5/v1"))
+    p = providers[0]
+    assert p.destination == "10.0.0.5"
+    assert not any("pw" in str(v) for v in vars(p).values())
+
+
+def test_anthropic_key_unused_with_openai_compatible():
+    settings = _rewrite_endpoint("http://127.0.0.1:11434/v1", anthropic_api_key="sk-ant-test")
+    assert outbound_providers(settings) == []
+    settings = _settings(
+        query_rewrite_provider="openai_compatible", anthropic_api_key="sk-ant-test"
+    )
+    assert outbound_providers(settings) == []
+
+
 # ==========================================
 # main()
 # ==========================================
@@ -121,6 +165,8 @@ def server(monkeypatch):
         "anthropic_api_key": "",
         "embedding_backend": "local",
         "embedding_base_url": "",
+        "query_rewrite_provider": "anthropic",
+        "query_rewrite_base_url": "",
     }.items():
         monkeypatch.setattr(mcp_server.settings, name, value)
     run = MagicMock()
@@ -152,6 +198,30 @@ def test_main_refusal_hides_key_value(server, monkeypatch):
     with pytest.raises(SystemExit) as exc:
         mcp_server.main()
     assert "sk-ant-test-123" not in str(exc.value)
+
+
+def test_main_refuses_remote_rewrite_endpoint(server, monkeypatch):
+    mcp_server, run = server
+    monkeypatch.setattr(mcp_server.settings, "query_rewrite_provider", "openai_compatible")
+    monkeypatch.setattr(
+        mcp_server.settings, "query_rewrite_base_url", "http://user:pw@gpu-box:11434/v1"
+    )
+    with pytest.raises(SystemExit) as exc:
+        mcp_server.main()
+    text = str(exc.value)
+    assert "QUERY_REWRITE_BASE_URL" in text
+    assert "gpu-box" in text
+    assert "pw" not in text
+    run.assert_not_called()
+
+
+def test_main_starts_with_loopback_rewrite_endpoint(server, monkeypatch):
+    mcp_server, run = server
+    monkeypatch.setattr(mcp_server.settings, "query_rewrite_provider", "openai_compatible")
+    monkeypatch.setattr(mcp_server.settings, "query_rewrite_base_url", "http://127.0.0.1:11434/v1")
+    monkeypatch.setattr(mcp_server.settings, "anthropic_api_key", "sk-ant-test-123")
+    mcp_server.main()
+    run.assert_called_once()
 
 
 def test_main_forces_hf_offline(server, monkeypatch):
@@ -206,6 +276,38 @@ async def test_health_lists_outbound():
         }
     ]
     assert "sk-ant-test" not in str(result)
+
+
+@pytest.mark.asyncio
+async def test_health_lists_rewrite_endpoint():
+    from stratakb import mcp_server
+
+    settings = _rewrite_endpoint(
+        "http://user:pw@gpu-box:11434/v1", query_rewrite_api_key="endpoint-key"
+    )
+    with (
+        patch("stratakb.config.get_settings", return_value=settings),
+        patch("stratakb.mcp_server.get_settings", return_value=settings),
+        patch(
+            "stratakb.mcp_server.check_connection",
+            AsyncMock(return_value={"status": "ok"}),
+        ),
+    ):
+        result = await mcp_server.strata_admin_health()
+
+    assert result["outbound"] == [
+        {
+            "provider": "openai_compatible",
+            "purpose": "query rewriting",
+            "sends": "questions and layer descriptions",
+            "destination": "gpu-box",
+            "setting": "QUERY_REWRITE_BASE_URL",
+        }
+    ]
+    text = str(result)
+    assert "pw" not in text
+    assert "endpoint-key" not in text
+    assert "11434" not in text
 
 
 # ==========================================
@@ -338,3 +440,32 @@ async def test_rewrite_skipped_under_local_only():
         result = await rewrite_query("q", anthropic_api_key="sk-ant-test")
     assert result == ["q"]
     client_cls.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_openai_compatible_rewrite_skipped_under_local_only():
+    from stratakb.rag.query_rewriter import rewrite_query
+
+    settings = _rewrite_endpoint("http://gpu-box:11434/v1", strata_local_only=True)
+    with (
+        patch("stratakb.config.get_settings", return_value=settings),
+        patch("openai.AsyncOpenAI") as client_cls,
+    ):
+        result = await rewrite_query("q")
+    assert result == ["q"]
+    client_cls.assert_not_called()
+
+    client = MagicMock()
+    client.chat.completions.create = AsyncMock(
+        return_value=SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content='["a", "b"]'))]
+        )
+    )
+    settings = _rewrite_endpoint("http://127.0.0.1:11434/v1", strata_local_only=True)
+    with (
+        patch("stratakb.config.get_settings", return_value=settings),
+        patch("openai.AsyncOpenAI", return_value=client) as client_cls,
+    ):
+        result = await rewrite_query("q")
+    assert result == ["a", "b"]
+    client_cls.assert_called_once()

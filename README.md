@@ -24,7 +24,7 @@ The server retrieves; it does not write answers. Your MCP client reads the retur
 - **Layer presets**: describe a layer and its source folders in one YAML file, then build or rebuild it in one call
 - **Hybrid retrieval**: pgvector HNSW similarity plus PostgreSQL full-text search, fused with Reciprocal Rank Fusion, then reranked by a cross-encoder
 - **Query routing**: when no layers are given, questions are routed to the right layers by each layer's patterns
-- **Query rewriting** (optional): with an Anthropic API key, `strata_ask` expands a question into several searches in the knowledge base's own terminology
+- **Query rewriting** (optional): with an Anthropic API key or any OpenAI-compatible endpoint (including a local Ollama), `strata_ask` expands a question into several searches in the knowledge base's own terminology
 - **Learns from use**: records searches, detects rephrased questions and layer switches, and takes explicit feedback on each result's `interaction_id`. It then learns synonyms, query rewrites that worked (a proven rewrite skips the LLM call) and which layers a question belongs to
 - **Many formats**: PDF, DOCX, Markdown, HTML, plain text, reStructuredText, AsciiDoc, CSV, JSON, XML/XSD and OpenAPI/AsyncAPI YAML, each split along its natural structure
 - **Local embeddings by default**: `all-mpnet-base-v2` runs on CPU with no API key; OpenAI or any OpenAI-compatible server (Ollama, LM Studio, vLLM) is optional
@@ -238,8 +238,11 @@ flowchart LR
 | `EMBEDDING_BASE_URL` | | `openai` backend: an OpenAI-compatible server, ending in `/v1` (for example `http://127.0.0.1:11434/v1`); empty means OpenAI |
 | `EMBEDDING_API_KEY` | | Key for `EMBEDDING_BASE_URL`, only if the server asks for one |
 | `OPENAI_API_KEY` | | Needed for the `openai` backend without `EMBEDDING_BASE_URL`; never sent to that server |
-| `ANTHROPIC_API_KEY` | | Turns on query rewriting in `strata_ask` |
-| `QUERY_REWRITE_MODEL` | `claude-haiku-5-5` | Model used for query rewriting |
+| `QUERY_REWRITE_PROVIDER` | `anthropic` | Who rewrites questions in `strata_ask`: `anthropic`, or `openai_compatible` (the endpoint in `QUERY_REWRITE_BASE_URL`) |
+| `ANTHROPIC_API_KEY` | | Turns on query rewriting with the `anthropic` provider |
+| `QUERY_REWRITE_BASE_URL` | | `openai_compatible` provider: an OpenAI-compatible chat endpoint, ending in `/v1` (for example `http://127.0.0.1:11434/v1`) |
+| `QUERY_REWRITE_API_KEY` | | Key for `QUERY_REWRITE_BASE_URL`, only if the endpoint asks for one; `OPENAI_API_KEY` is never sent there |
+| `QUERY_REWRITE_MODEL` | `claude-haiku-5-5` | Model used for query rewriting; must be set for `openai_compatible` |
 | `HYBRID_SEARCH_ENABLED` | `true` | Vector plus full-text search |
 | `HYBRID_SEMANTIC_WEIGHT`, `HYBRID_KEYWORD_WEIGHT` | `0.7`, `0.3` | RRF weights |
 | `HYBRID_RRF_K` | `60` | RRF constant |
@@ -271,6 +274,23 @@ EMBEDDING_MODEL=nomic-embed-text
 
 The URL ends in `/v1`. A model with other dimensions, for example `mxbai-embed-large` (1024), needs `EMBEDDING_DIMENSIONS` and the `vector(…)` column changed to match. Switching models means re-embedding every layer with `vector_store.re_embed_layer()`, even when the dimensions match: vectors from two models cannot be compared.
 
+### Query rewriting through a model server
+
+`strata_ask` can also rewrite questions through any endpoint that speaks the OpenAI chat API, such as Ollama, LM Studio, vLLM, Azure OpenAI or Groq, instead of Anthropic. Your questions and the layer descriptions then go to that endpoint; no Anthropic key is needed. With `STRATA_LOCAL_ONLY=true` only an endpoint on this machine (`127.0.0.1`, `::1`, `localhost`) is allowed. For a local Ollama:
+
+```bash
+ollama pull llama3.2
+```
+
+```bash
+QUERY_REWRITE_PROVIDER=openai_compatible
+QUERY_REWRITE_BASE_URL=http://127.0.0.1:11434/v1
+QUERY_REWRITE_MODEL=llama3.2
+# QUERY_REWRITE_API_KEY=       # only if the endpoint asks for a key
+```
+
+The URL ends in `/v1`, and `QUERY_REWRITE_MODEL` must name a model the endpoint serves. Small models often wrap their answer in prose or a code fence; StrataKB takes the first JSON list of strings from the reply. When a reply has none, the question is searched as written and the server logs `query_rewrite_json_error` with a running count.
+
 ## Where your data goes
 
 By default nothing leaves this machine except what you choose to send: your documents stay in PostgreSQL, and the embedding and reranking models run in-process. Each other path is off until a setting turns it on.
@@ -283,7 +303,7 @@ flowchart LR
     end
     server -->|"documents, chunks, learning, audit<br/>DATABASE_URL"| pg[("PostgreSQL")]
     server -->|"retrieved text"| client["Your MCP client<br/>and its language model"]
-    server -.->|"questions and layer descriptions<br/>ANTHROPIC_API_KEY"| anthropic["Anthropic<br/>(query rewriting)"]
+    server -.->|"questions and layer descriptions<br/>ANTHROPIC_API_KEY / QUERY_REWRITE_BASE_URL"| anthropic["Anthropic or a remote<br/>rewrite endpoint<br/>(query rewriting)"]
     server -.->|"documents and questions<br/>EMBEDDING_BACKEND / EMBEDDING_BASE_URL"| emb["OpenAI or a remote<br/>embedding server"]
     hf["Hugging Face"] -.->|"model files on first use,<br/>nothing about your documents"| models
 ```
@@ -295,6 +315,8 @@ Dotted paths are off by default and blocked by `STRATA_LOCAL_ONLY=true`.
 | PostgreSQL | Documents, chunks, stored queries, audit entries | `DATABASE_URL` (always) | No |
 | Your MCP client and its language model | Retrieved text, sources | Every search and ask | No |
 | Anthropic query rewriting | Questions and layer descriptions | `ANTHROPIC_API_KEY` | Yes |
+| Rewrite endpoint on another host | Questions and layer descriptions | `QUERY_REWRITE_PROVIDER=openai_compatible` with `QUERY_REWRITE_BASE_URL` pointing off this machine | Yes |
+| Rewrite endpoint on this machine | Questions and layer descriptions, to `127.0.0.1`, `::1` or `localhost` | `QUERY_REWRITE_PROVIDER=openai_compatible` with `QUERY_REWRITE_BASE_URL` | No |
 | OpenAI embeddings | Documents and questions | `EMBEDDING_BACKEND=openai` without `EMBEDDING_BASE_URL` | Yes |
 | Embedding server on another host | Documents and questions | `EMBEDDING_BASE_URL` pointing off this machine | Yes |
 | Embedding server on this machine | Documents and questions, to `127.0.0.1`, `::1` or `localhost` | `EMBEDDING_BASE_URL` | No |
@@ -304,7 +326,7 @@ With `STRATA_LOCAL_ONLY=true` the server refuses to start while any blocked path
 
 `strata_admin_health` always lists the switch (`local_only`) and the active outbound providers (`outbound`: provider, purpose, what it sends, destination host and the setting that turns it on), whether the switch is on or not. It never shows keys, credentials, paths or ports.
 
-StrataKB cannot control what your MCP client's language model does with the retrieved text. If the client uses a cloud model, the retrieved text goes to that provider. Teams that need the whole path to stay on the machine should embed through an OpenAI-compatible server on this machine (see [Embeddings from a model server](#embeddings-from-a-model-server)) and use a client with a local model.
+StrataKB cannot control what your MCP client's language model does with the retrieved text. If the client uses a cloud model, the retrieved text goes to that provider. Teams that need the whole path to stay on the machine should embed through an OpenAI-compatible server on this machine (see [Embeddings from a model server](#embeddings-from-a-model-server)), rewrite questions through one too if they want rewriting (see [Query rewriting through a model server](#query-rewriting-through-a-model-server)), and use a client with a local model.
 
 ## Project structure
 

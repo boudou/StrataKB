@@ -30,8 +30,14 @@ class Settings(BaseSettings):
     anthropic_api_key: str = ""
     openai_api_key: str = ""
 
-    # Query Rewriting (used only when ANTHROPIC_API_KEY is set)
+    # Query Rewriting
+    # "anthropic" (needs ANTHROPIC_API_KEY), or "openai_compatible" (needs
+    # QUERY_REWRITE_BASE_URL, e.g. http://127.0.0.1:11434/v1, and a QUERY_REWRITE_MODEL)
+    query_rewrite_provider: str = "anthropic"
     query_rewrite_model: str = "claude-haiku-5-5"
+    query_rewrite_base_url: str = ""
+    # key for QUERY_REWRITE_BASE_URL; OPENAI_API_KEY is never sent there
+    query_rewrite_api_key: str = ""
 
     # Embeddings
     # "local", or "openai" (OpenAI or an OpenAI-compatible server)

@@ -186,7 +186,11 @@ def register_rag_tools(
         """Run strata_ask; the tool below documents the arguments."""
         from stratakb.config import get_settings
         from stratakb.rag.confidence import score_confidence
-        from stratakb.rag.query_rewriter import build_domain_context, rewrite_query
+        from stratakb.rag.query_rewriter import (
+            build_domain_context,
+            rewrite_configured,
+            rewrite_query,
+        )
         from stratakb.rag.retriever import SearchResult, search_chunks
 
         _settings = get_settings()
@@ -215,7 +219,7 @@ def register_rag_tools(
 
             # Rewrite query into domain-specific variants
             domain_context = ""
-            if _settings.anthropic_api_key:
+            if rewrite_configured(_settings):
                 try:
                     from stratakb.knowledge.layers import get_layer_routing
                     routing = await get_layer_routing(database_url)

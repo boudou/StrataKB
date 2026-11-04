@@ -29,7 +29,7 @@ _ANTHROPIC_DEFAULT_URL = "https://api.anthropic.com"
 class OutboundProvider:
     """A provider that receives content from this machine."""
 
-    provider: str  # "anthropic" or "embeddings"
+    provider: str  # "anthropic", "openai_compatible" or "embeddings"
     purpose: str
     sends: str
     destination: str  # host name only
@@ -98,6 +98,36 @@ def anthropic_provider(
     )
 
 
+def rewrite_provider(
+    settings: Settings, api_key: str | None = None
+) -> OutboundProvider | None:
+    """Return query rewriting as a provider when it would leave this machine, else None.
+
+    Follows QUERY_REWRITE_PROVIDER: "anthropic" sends to the Anthropic API,
+    "openai_compatible" to QUERY_REWRITE_BASE_URL. Any other value rewrites
+    nothing, so it is not outbound.
+
+    Args:
+        settings: The settings to check.
+        api_key: The Anthropic key the rewrite would use; defaults to ANTHROPIC_API_KEY.
+    """
+    provider = settings.query_rewrite_provider
+    if provider == "anthropic":
+        return anthropic_provider(settings, api_key)
+    if provider != "openai_compatible":
+        return None
+    url = settings.query_rewrite_base_url
+    if not url or is_loopback(url):
+        return None
+    return OutboundProvider(
+        provider="openai_compatible",
+        purpose="query rewriting",
+        sends="questions and layer descriptions",
+        destination=_host(url) or "unknown host",
+        setting="QUERY_REWRITE_BASE_URL",
+    )
+
+
 def embedding_provider(settings: Settings, backend: str = "") -> OutboundProvider | None:
     """Return embedding as a provider when it would leave this machine, else None.
 
@@ -131,7 +161,7 @@ def outbound_providers(settings: Settings, backend: str = "") -> list[OutboundPr
     """List the providers that would receive content with these settings."""
     return [
         p
-        for p in (anthropic_provider(settings), embedding_provider(settings, backend))
+        for p in (rewrite_provider(settings), embedding_provider(settings, backend))
         if p
     ]
 
