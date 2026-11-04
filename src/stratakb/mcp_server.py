@@ -9,11 +9,13 @@ from __future__ import annotations
 
 import threading
 from contextlib import asynccontextmanager
+from dataclasses import asdict
 
 import structlog
 from mcp.server.fastmcp import FastMCP
 
 from stratakb.config import get_settings
+from stratakb.core.egress import enforce_local_only, outbound_providers
 from stratakb.core.logging import configure_logging, log_tool_call
 
 _settings = get_settings()
@@ -126,9 +128,12 @@ async def strata_admin_health() -> dict:
     """Check StrataKB system health.
 
     Returns status of all components: PostgreSQL, pgvector extension,
-    database schemas, and which optional API keys are configured.
+    database schemas, which optional API keys are configured, whether
+    STRATA_LOCAL_ONLY is on, and the providers that receive content from
+    this machine (name, purpose, what it sends, destination host, setting).
     """
     result: dict[str, object] = {}
+    current = get_settings()
 
     # Check database
     db_status = await check_connection(settings.database_url)
@@ -145,6 +150,10 @@ async def strata_admin_health() -> dict:
     # Overall status
     all_ok = db_status.get("status") == "ok"
     result["overall"] = "ok" if all_ok else "degraded"
+
+    # Where data goes (host names and setting names only, never values)
+    result["local_only"] = current.strata_local_only
+    result["outbound"] = [asdict(p) for p in outbound_providers(current)]
 
     # Current user context
     result["user"] = {
@@ -285,6 +294,9 @@ async def strata_admin_update_role(
 
 def main() -> None:
     """Run the StrataKB MCP server."""
+    # Before anything imports huggingface_hub, which reads its offline flags once
+    enforce_local_only(settings)
+
     logger.info(
         "starting_stratakb",
         user=settings.strata_user,

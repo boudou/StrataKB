@@ -102,10 +102,16 @@ async def rewrite_query(
         logger.debug("query_rewrite_skipped", reason="no_api_key")
         return [enriched_query]
 
-    if not model:
-        from stratakb.config import get_settings
-        settings = get_settings()
-        model = settings.query_rewrite_model
+    from stratakb.config import get_settings
+    from stratakb.core.egress import anthropic_provider
+
+    settings = get_settings()
+    # Learned rewrites and synonyms above are local and stay on
+    if settings.strata_local_only and anthropic_provider(settings, anthropic_api_key):
+        logger.info("query_rewrite_skipped", reason="local_only")
+        return [enriched_query]
+
+    model = model or settings.query_rewrite_model
 
     try:
         import anthropic

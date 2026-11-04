@@ -40,6 +40,18 @@ _MISSING_KEY_ERROR = (
     "or EMBEDDING_BASE_URL for an OpenAI-compatible server."
 )
 
+
+def _missing_model_error(model_name: str) -> str:
+    """Explain a model that STRATA_LOCAL_ONLY cannot download."""
+    repo = model_name if "/" in model_name else f"sentence-transformers/{model_name}"
+    return (
+        f"STRATA_LOCAL_ONLY is on and the embedding model {model_name} is not "
+        f"installed on this machine, so it cannot be downloaded. On a machine that "
+        f"may download, run `uv run hf download {repo}`, or set EMBEDDING_MODEL to "
+        f"a folder that holds the model."
+    )
+
+
 # Singleton for local model (loaded once, reused)
 _local_model = None
 _local_model_lock = threading.Lock()
@@ -56,7 +68,19 @@ def _get_local_model(model_name: str = "all-MiniLM-L6-v2"):
             return _local_model
         from sentence_transformers import SentenceTransformer
 
+        from stratakb.config import get_settings
+
         logger.info("loading_local_embedding_model", model=model_name)
+        if get_settings().strata_local_only:
+            # Local files only, and no online retry
+            try:
+                model = SentenceTransformer(model_name, local_files_only=True)
+            except Exception as e:
+                raise RuntimeError(_missing_model_error(model_name)) from e
+            model._model_name = model_name  # tag for cache check
+            _local_model = model
+            logger.info("local_embedding_model_loaded", model=model_name)
+            return _local_model
         try:
             _local_model = SentenceTransformer(model_name)
         except Exception:
@@ -121,15 +145,20 @@ async def embed_texts(
 def embedding_key_error(
     settings: Settings, openai_api_key: str, backend: str = ""
 ) -> str | None:
-    """Return why embedding cannot run for lack of a key, or None if it can.
+    """Return why embedding cannot run (a missing key or the local-only switch), or None.
 
     The openai backend needs OPENAI_API_KEY unless EMBEDDING_BASE_URL points
     it at an OpenAI-compatible server, whose key is optional. The local
-    backend needs no key.
+    backend needs no key. With STRATA_LOCAL_ONLY on, only a server on this
+    machine may receive the texts.
     """
     backend = backend or settings.embedding_backend
     if backend == "openai" and not openai_api_key and not settings.embedding_base_url:
         return _MISSING_KEY_ERROR
+    from stratakb.core.egress import embedding_provider, refusal_line
+
+    if settings.strata_local_only and (provider := embedding_provider(settings, backend)):
+        return refusal_line(provider)
     return None
 
 

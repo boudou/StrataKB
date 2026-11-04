@@ -60,6 +60,11 @@ class Settings(BaseSettings):
     learning_rewrite_bypass_threshold: float = 0.85
     learning_rewrite_bypass_min_samples: int = 5
 
+    # Data egress
+    # True: refuse to start with any provider that sends content off this
+    # machine, and load Hugging Face models from local files only
+    strata_local_only: bool = False
+
     # MCP Server
     strata_user: str = "developer"
     strata_role: str = "viewer"

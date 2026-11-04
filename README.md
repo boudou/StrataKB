@@ -29,6 +29,7 @@ The server retrieves; it does not write answers. Your MCP client reads the retur
 - **Many formats**: PDF, DOCX, Markdown, HTML, CSV, JSON, XML/XSD and OpenAPI/AsyncAPI YAML, each split along its natural structure
 - **Local embeddings by default**: `all-mpnet-base-v2` runs on CPU with no API key; OpenAI or any OpenAI-compatible server (Ollama, LM Studio, vLLM) is optional
 - **Roles and audit**: viewer, operator and admin roles on every tool, and an append-only audit log of searches and changes
+- **Local-only switch**: `STRATA_LOCAL_ONLY=true` refuses to start while any setting would send content off this machine, and keeps model downloads off; see [Where your data goes](#where-your-data-goes)
 - **Privacy guards**: IBANs and card numbers are masked in logs, and IBANs, BICs and account numbers are scrubbed from stored queries; secrets are redacted from audit entries; files whose names look like secrets (`.env`, keys, certificates, credentials) are never read or ingested
 - **Read-only SQL**: inspect the store with schema browsing, sample chunks, vector statistics and `EXPLAIN`
 
@@ -93,7 +94,7 @@ docker compose up -d        # PostgreSQL 16 + pgvector on port 5433, schemas cre
 uv sync
 ```
 
-The server answers its client at once and, with the default `local` backend, loads the embedding model in the background; a search sent before the model is ready waits for it. The first start downloads the embedding model (about 420 MB) and the first `strata_ask` downloads the reranker (about 90 MB), both into your Hugging Face cache.
+The server answers its client at once and, with the default `local` backend, loads the embedding model in the background; a search sent before the model is ready waits for it. The first start downloads the embedding model (about 420 MB) and the first `strata_ask` downloads the reranker (about 90 MB), both into your Hugging Face cache. With `STRATA_LOCAL_ONLY=true` nothing is downloaded; see [Where your data goes](#where-your-data-goes).
 
 ### Connect an MCP client
 
@@ -165,7 +166,7 @@ The layer's **description** also tells the query rewriter which terminology the 
 | `strata_feedback` | viewer | Rates a result as helpful or not, per answer or per chunk |
 | `strata_learning_stats` | viewer | What the learning system has recorded and learned |
 | `strata_whoami` | viewer | Your identity and role |
-| `strata_admin_health` | viewer | Database, pgvector and schema status |
+| `strata_admin_health` | viewer | Database, pgvector and schema status, the local-only switch and the providers that receive data |
 | `strata_db_schema` | viewer | Lists tables, or a table's columns and keys |
 | `strata_db_vector_stats` | viewer | Chunk counts per layer, vector dimensions and index sizes |
 | `strata_db_sample_chunks` | viewer | Sample chunks from a layer |
@@ -208,13 +209,14 @@ Settings come from environment variables or `.env`.
 | `CACHE_ENABLED`, `CACHE_TTL_SECONDS` | `true`, `600` | Query result cache, cleared per layer on ingestion |
 | `LEARNING_ENABLED` | `true` | Record interactions and learn from them |
 | `LEARNING_STORE_RAW_QUERIES` | `false` | Store queries without scrubbing personal data |
+| `STRATA_LOCAL_ONLY` | `false` | Refuse to start while any provider would send content off this machine, and load models from local files only; see [Where your data goes](#where-your-data-goes) |
 | `LOG_LEVEL` | `INFO` | Structured JSON logs on stderr |
 
 To change the embedding model, update the three `EMBEDDING_*` settings and re-embed each layer with `vector_store.re_embed_layer()`, which re-embeds the stored chunk text in place without re-parsing files.
 
 ### Embeddings from a model server
 
-Instead of the in-process model, StrataKB can embed through any server that speaks the OpenAI embeddings API, such as Ollama, LM Studio or vLLM. Your documents and questions then go to that server and nowhere else; no OpenAI key is needed. For a local Ollama:
+Instead of the in-process model, StrataKB can embed through any server that speaks the OpenAI embeddings API, such as Ollama, LM Studio or vLLM. Your documents and questions then go to that server and nowhere else; no OpenAI key is needed. With `STRATA_LOCAL_ONLY=true` only a server on this machine (`127.0.0.1`, `::1`, `localhost`) is allowed. For a local Ollama:
 
 ```bash
 ollama pull nomic-embed-text   # 768 dimensions, matches the default column
@@ -228,6 +230,41 @@ EMBEDDING_MODEL=nomic-embed-text
 ```
 
 The URL ends in `/v1`. A model with other dimensions, for example `mxbai-embed-large` (1024), needs `EMBEDDING_DIMENSIONS` and the `vector(…)` column changed to match. Switching models means re-embedding every layer with `vector_store.re_embed_layer()`, even when the dimensions match: vectors from two models cannot be compared.
+
+## Where your data goes
+
+By default nothing leaves this machine except what you choose to send: your documents stay in PostgreSQL, and the embedding and reranking models run in-process. Each other path is off until a setting turns it on.
+
+```mermaid
+flowchart LR
+    subgraph local["This machine"]
+        files["Your files"] --> server["StrataKB server"]
+        models["Local embedding<br/>and reranking models"] --- server
+    end
+    server -->|"documents, chunks, learning, audit<br/>DATABASE_URL"| pg[("PostgreSQL")]
+    server -->|"retrieved text"| client["Your MCP client<br/>and its language model"]
+    server -.->|"questions and layer descriptions<br/>ANTHROPIC_API_KEY"| anthropic["Anthropic<br/>(query rewriting)"]
+    server -.->|"documents and questions<br/>EMBEDDING_BACKEND / EMBEDDING_BASE_URL"| emb["OpenAI or a remote<br/>embedding server"]
+    hf["Hugging Face"] -.->|"model files on first use,<br/>nothing about your documents"| models
+```
+
+Dotted paths are off by default and blocked by `STRATA_LOCAL_ONLY=true`.
+
+| Path | What leaves | Turned on by | Blocked by `STRATA_LOCAL_ONLY` |
+| --- | --- | --- | --- |
+| PostgreSQL | Documents, chunks, stored queries, audit entries | `DATABASE_URL` (always) | No |
+| Your MCP client and its language model | Retrieved text, sources | Every search and ask | No |
+| Anthropic query rewriting | Questions and layer descriptions | `ANTHROPIC_API_KEY` | Yes |
+| OpenAI embeddings | Documents and questions | `EMBEDDING_BACKEND=openai` without `EMBEDDING_BASE_URL` | Yes |
+| Embedding server on another host | Documents and questions | `EMBEDDING_BASE_URL` pointing off this machine | Yes |
+| Embedding server on this machine | Documents and questions, to `127.0.0.1`, `::1` or `localhost` | `EMBEDDING_BASE_URL` | No |
+| Hugging Face downloads | Nothing about your documents; model files come in | The first start and the first `strata_ask` | Yes |
+
+With `STRATA_LOCAL_ONLY=true` the server refuses to start while any blocked path is configured, and the error names each setting that caused it. The embedding calls and query rewriting check the switch again on every call, so a key added later is refused too. The Hugging Face libraries run offline and load the embedding and reranking models from local files only; a model that is not installed fails with a message that says how to install it (`uv run hf download <model>` on a machine that may download, or `EMBEDDING_MODEL` / `RERANKING_MODEL` set to a folder that holds it). The switch does not cover the database: `DATABASE_URL` may point at a team server on purpose.
+
+`strata_admin_health` always lists the switch (`local_only`) and the active outbound providers (`outbound`: provider, purpose, what it sends, destination host and the setting that turns it on), whether the switch is on or not. It never shows keys, credentials, paths or ports.
+
+StrataKB cannot control what your MCP client's language model does with the retrieved text. If the client uses a cloud model, the retrieved text goes to that provider. Teams that need the whole path to stay on the machine should embed through an OpenAI-compatible server on this machine (see [Embeddings from a model server](#embeddings-from-a-model-server)) and use a client with a local model.
 
 ## Project structure
 
