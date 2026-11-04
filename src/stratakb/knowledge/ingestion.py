@@ -37,15 +37,20 @@ EMBED_BATCH_SIZE = 100
 # Formats read as bytes by their parser: never decoded to check for empty text
 _BINARY_FORMATS = {".pdf", ".docx"}
 
+# A PDF averaging fewer characters per page than this probably holds scanned images
+_SCANNED_MIN_CHARS_PER_PAGE = 200
+
 
 @dataclass(frozen=True)
 class FileOutcome:
     """What one ingest run did with one discovered or tracked file.
 
-    outcome: "added", "updated", "unchanged", "removed", "skipped" or "failed".
+    outcome: "added", "updated", "unchanged", "removed", "skipped", "flagged"
+    or "failed".
     reason: why a file was removed ("deleted", "not_selected" when a file list
     left out a file that still exists, "secret", "no_text"), skipped
-    ("secret", "no_text") or failed ("parse_error", "embed_error"); None
+    ("secret", "no_text"), flagged ("probably_scanned": stored, and counted
+    as added or updated) or failed ("parse_error", "embed_error"); None
     otherwise.
     """
 
@@ -68,6 +73,7 @@ class IngestionResult:
     files_unchanged: int = 0
     files_removed: int = 0
     files_skipped: int = 0  # secret-looking names and files without text, not tracked
+    files_flagged: int = 0  # PDFs that look scanned; also counted as added or updated
     # True when chunks from before per-file tracking were dropped and the layer rebuilt
     rebuilt_legacy: bool = False
     errors: list[dict] = field(default_factory=list)
@@ -183,8 +189,9 @@ async def ingest_documents(
     A file whose name looks like a secret (see policy.is_secret_name) is
     never read: it is skipped, or removed when it was tracked. A file without
     text (0 bytes, whitespace only, or a parse that yields nothing) is not a
-    failure: it is skipped, or removed when it was tracked. Every file gets a
-    FileOutcome in result.files.
+    failure: it is skipped, or removed when it was tracked. A PDF that looks
+    scanned (see _probably_scanned) is stored for the text it has and flagged.
+    Every file gets a FileOutcome in result.files.
 
     With files, source_path is the root folder and the list is the full
     ingest set: nothing is discovered, and every tracked file of that root
@@ -445,10 +452,14 @@ async def ingest_documents(
 
             if previous is None:
                 result.files_added += 1
-                result.files.append(FileOutcome(relative_path, "added"))
+                outcome = FileOutcome(relative_path, "added")
             else:
                 result.files_updated += 1
-                result.files.append(FileOutcome(relative_path, "updated"))
+                outcome = FileOutcome(relative_path, "updated")
+            if file_path.suffix.lower() == ".pdf" and _probably_scanned(parsed):
+                result.files_flagged += 1
+                outcome = FileOutcome(relative_path, "flagged", "probably_scanned")
+            result.files.append(outcome)
             result.docs_processed += 1
             result.chunks_created += len(doc_chunks)
             done += 1
@@ -500,6 +511,7 @@ async def ingest_documents(
         files_unchanged=result.files_unchanged,
         files_removed=result.files_removed,
         files_skipped=result.files_skipped,
+        files_flagged=result.files_flagged,
         duration=round(result.duration_seconds, 1),
     )
 
@@ -528,6 +540,18 @@ def _parse_file(file_path: Path) -> ParsedDocument:
     if parser is None:
         return ParsedDocument(source_file=file_path.name, error=f"Unsupported format: {ext}")
     return parser(file_path)
+
+
+def _probably_scanned(doc: ParsedDocument) -> bool:
+    """Whether a parsed PDF looks scanned: under half its pages have text, or
+    too few characters per page on average. The PDF parser keeps only pages
+    with text, so len(doc.pages) counts those."""
+    if doc.total_pages <= 0 or not doc.pages:
+        return False
+    return (
+        2 * len(doc.pages) < doc.total_pages
+        or sum(len(p.text) for p in doc.pages) / doc.total_pages < _SCANNED_MIN_CHARS_PER_PAGE
+    )
 
 
 def _build_context_prefix(

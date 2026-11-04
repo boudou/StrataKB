@@ -418,6 +418,111 @@ class TestPolicyAndEmpty:
         assert result.files_removed == 1
 
 
+def _pdf_doc(page_lengths: list[int], total_pages: int):
+    """A parsed PDF with one text page per length; the parser drops pages without text."""
+    from stratakb.knowledge.parsers.pdf_parser import ParsedDocument, ParsedPage
+
+    return ParsedDocument(
+        source_file="scan.pdf",
+        pages=[
+            ParsedPage(text="x" * n, page_number=i + 1, source_file="scan.pdf")
+            for i, n in enumerate(page_lengths)
+        ],
+        total_pages=total_pages,
+    )
+
+
+class TestScannedPdf:
+    async def _ingest_pdf(
+        self, db_url, layer, root: Path, page_lengths: list[int], total_pages: int
+    ):
+        """Ingest root with scan.pdf parsed as the given pages; other files parse as usual."""
+        from stratakb.knowledge import ingestion
+
+        original_parse = ingestion._parse_file
+
+        def fake_parse(file_path):
+            if file_path.name == "scan.pdf":
+                return _pdf_doc(page_lengths, total_pages)
+            return original_parse(file_path)
+
+        with patch("stratakb.knowledge.ingestion._parse_file", side_effect=fake_parse):
+            result, _ = await _ingest(db_url, layer, root)
+        return result
+
+    async def test_one_of_four_pages_flagged(self, db_url, layer, tmp_path):
+        (tmp_path / "scan.pdf").write_bytes(b"%PDF-1.4 test")
+        _write(tmp_path / "a.md", "# Alpha\n\nAlpha content.\n")
+
+        result = await self._ingest_pdf(db_url, layer, tmp_path, [1000], 4)
+
+        outcomes = _outcomes(result)
+        assert outcomes["scan.pdf"] == ("flagged", "probably_scanned")
+        assert outcomes["a.md"] == ("added", None)
+        assert result.files_flagged == 1
+        assert result.files_added == 2
+        assert result.docs_processed == 2
+        assert result.status == "completed"
+        files = {f["relative_path"]: f for f in await _files(db_url, layer)}
+        assert files["scan.pdf"]["chunk_count"] > 0
+        assert "scan.pdf" in _ids_by_file(await _chunks(db_url, layer))
+
+    async def test_two_of_four_pages_not_flagged(self, db_url, layer, tmp_path):
+        (tmp_path / "scan.pdf").write_bytes(b"%PDF-1.4 test")
+
+        result = await self._ingest_pdf(db_url, layer, tmp_path, [400, 400], 4)
+
+        assert _outcomes(result)["scan.pdf"] == ("added", None)
+        assert result.files_flagged == 0
+        assert result.files_added == 1
+
+    async def test_just_under_200_chars_flagged(self, db_url, layer, tmp_path):
+        (tmp_path / "scan.pdf").write_bytes(b"%PDF-1.4 test")
+
+        result = await self._ingest_pdf(db_url, layer, tmp_path, [199, 200, 200, 200], 4)
+
+        assert _outcomes(result)["scan.pdf"] == ("flagged", "probably_scanned")
+        assert result.files_flagged == 1
+
+    async def test_200_chars_not_flagged(self, db_url, layer, tmp_path):
+        (tmp_path / "scan.pdf").write_bytes(b"%PDF-1.4 test")
+
+        result = await self._ingest_pdf(db_url, layer, tmp_path, [200, 200, 200, 200], 4)
+
+        assert _outcomes(result)["scan.pdf"] == ("added", None)
+        assert result.files_flagged == 0
+
+    async def test_pdf_without_text_pages_is_no_text(self, db_url, layer, tmp_path):
+        (tmp_path / "scan.pdf").write_bytes(b"%PDF-1.4 test")
+        _write(tmp_path / "a.md", "# Alpha\n\nAlpha content.\n")
+
+        result = await self._ingest_pdf(db_url, layer, tmp_path, [], 3)
+
+        assert _outcomes(result)["scan.pdf"] == ("skipped", "no_text")
+        assert result.files_flagged == 0
+        assert result.files_skipped == 1
+        assert [f["relative_path"] for f in await _files(db_url, layer)] == ["a.md"]
+
+    async def test_flagged_update_counts_as_updated(self, db_url, layer, tmp_path):
+        scan = tmp_path / "scan.pdf"
+        scan.write_bytes(b"%PDF-1.4 first")
+        first = await self._ingest_pdf(db_url, layer, tmp_path, [1000], 4)
+        assert _outcomes(first)["scan.pdf"] == ("flagged", "probably_scanned")
+        assert first.files_added == 1
+
+        scan.write_bytes(b"%PDF-1.4 second")
+        second = await self._ingest_pdf(db_url, layer, tmp_path, [1000], 4)
+        assert _outcomes(second)["scan.pdf"] == ("flagged", "probably_scanned")
+        assert second.files_updated == 1
+        assert second.files_flagged == 1
+        assert second.docs_processed == 1
+
+        third = await self._ingest_pdf(db_url, layer, tmp_path, [1000], 4)
+        assert _outcomes(third)["scan.pdf"] == ("unchanged", None)
+        assert third.files_flagged == 0
+        assert third.files_unchanged == 1
+
+
 async def test_tool_returns_files_skipped():
     from stratakb.knowledge.ingestion import IngestionResult
     from stratakb.mcp_server import mcp
@@ -438,6 +543,29 @@ async def test_tool_returns_files_skipped():
 
     assert result["status"] == "completed"
     assert result["files_skipped"] == 2
+
+
+async def test_tool_returns_files_flagged():
+    from stratakb.knowledge.ingestion import IngestionResult
+    from stratakb.mcp_server import mcp
+
+    fake = IngestionResult(layer_name="x", status="completed", files_added=1, files_flagged=1)
+    with (
+        patch("stratakb.core.auth.get_current_user", return_value=("tester", "admin")),
+        patch("stratakb.knowledge.tools.get_current_user", return_value=("tester", "admin")),
+        patch(
+            "stratakb.knowledge.ingestion.ingest_documents",
+            new_callable=AsyncMock,
+            return_value=fake,
+        ),
+        patch("stratakb.knowledge.tools.write_audit_log", new_callable=AsyncMock),
+    ):
+        tool = mcp._tool_manager.get_tool("strata_ingest_documents")
+        result = await tool.fn(layer_name="x", source_path="y")
+
+    assert result["status"] == "completed"
+    assert result["files_flagged"] == 1
+    assert result["files_added"] == 1
 
 
 def _entries(root: Path, *relative_paths: str, carry_hash: bool = False) -> list:

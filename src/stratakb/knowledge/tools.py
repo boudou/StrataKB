@@ -197,7 +197,10 @@ def register_knowledge_tools(
         credentials, e.g. client_secret.json) are always skipped and never
         opened; one ingested earlier is removed. Empty files are reported as
         no text, not as failures: skipped, or removed if ingested earlier.
-        files_skipped counts the skipped files.
+        files_skipped counts the skipped files. A PDF that looks scanned
+        (under half its pages have text, or under 200 characters per page on
+        average) is stored for the text it has and counted in files_flagged;
+        it also counts as added or updated.
 
         Unchanged means the same file content (SHA-256). A change to the
         layer's chunk_config or to the embedding model is not detected: use
@@ -257,6 +260,7 @@ def register_knowledge_tools(
                 "files_unchanged": result.files_unchanged,
                 "files_removed": result.files_removed,
                 "files_skipped": result.files_skipped,
+                "files_flagged": result.files_flagged,
                 "rebuilt_legacy": result.rebuilt_legacy,
                 "duration_seconds": round(result.duration_seconds, 1),
                 "errors": result.errors if result.errors else None,

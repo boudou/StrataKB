@@ -67,7 +67,7 @@ flowchart LR
     p --> c["Chunk"] --> x["Prefix<br/>[layer > file > section]"] --> e["Embed"] --> v[("pgvector<br/>replace that file's chunks")]
 ```
 
-Ingesting a folder again is a sync: unchanged files are skipped, changed files are replaced, new files are added, and files deleted from that folder are removed. Other folders in the same layer are left alone. Files whose names look like secrets (`.env`, `client_secret.json`, `id_rsa`, `*.pem`) are skipped without being opened, and one ingested earlier is removed. Empty files are reported as no text rather than as failures. A file that fails to parse is reported and the rest of the run carries on.
+Ingesting a folder again is a sync: unchanged files are skipped, changed files are replaced, new files are added, and files deleted from that folder are removed. Other folders in the same layer are left alone. Files whose names look like secrets (`.env`, `client_secret.json`, `id_rsa`, `*.pem`) are skipped without being opened, and one ingested earlier is removed. Empty files are reported as no text rather than as failures. A PDF that looks scanned (fewer than half its pages have text, or under 200 characters per page on average) is stored for the text it has and reported as flagged. A file that fails to parse is reported and the rest of the run carries on.
 
 **Ask**
 
@@ -203,7 +203,7 @@ The layer's **description** also tells the query rewriter which terminology the 
 | `strata_db_query` | operator | Read-only SQL (only with `READONLY_DATABASE_URL`) |
 | `strata_db_explain` | operator | Query plan for a SQL statement (only with `READONLY_DATABASE_URL`) |
 | `strata_create_knowledge_layer` | admin | Creates a layer |
-| `strata_ingest_documents` | admin | Syncs a file or folder into a layer: adds, replaces and removes files; reports added, updated, unchanged, removed and skipped |
+| `strata_ingest_documents` | admin | Syncs a file or folder into a layer: adds, replaces and removes files; reports added, updated, unchanged, removed, skipped and flagged |
 | `strata_apply_preset` | admin | Creates a layer from a preset and ingests its sources |
 | `strata_delete_knowledge_layer` | admin | Deletes a layer and its chunks |
 | `strata_reset_learning` | admin | Clears learned patterns |
