@@ -42,7 +42,7 @@ def db_ok():
     """Patch the database steps of the lifespan with a reachable fake pool."""
     with (
         patch("stratakb.mcp_server.get_pool", AsyncMock(return_value=_fake_pool())) as get_pool,
-        patch("stratakb.mcp_server.ensure_ingestion_schema", AsyncMock()) as migrate,
+        patch("stratakb.mcp_server.ensure_schema", AsyncMock()) as migrate,
         patch("stratakb.mcp_server.close_pool", AsyncMock()),
     ):
         yield get_pool, migrate
@@ -111,7 +111,7 @@ async def test_migration_skipped_when_database_unreachable(monkeypatch):
     monkeypatch.setattr(mcp_server._settings, "embedding_backend", "openai")
     with (
         patch("stratakb.mcp_server.get_pool", AsyncMock(side_effect=OSError("refused"))),
-        patch("stratakb.mcp_server.ensure_ingestion_schema", AsyncMock()) as migrate,
+        patch("stratakb.mcp_server.ensure_schema", AsyncMock()) as migrate,
         patch("stratakb.mcp_server.close_pool", AsyncMock()),
         capture_logs() as logs,
     ):

@@ -16,7 +16,7 @@ from pathlib import Path
 import structlog
 
 from stratakb.core.database import get_pool
-from stratakb.core.migrations import ensure_ingestion_schema
+from stratakb.core.migrations import ensure_schema
 from stratakb.knowledge.embeddings import embed_texts
 from stratakb.knowledge.layers import LayerNotFoundError, get_layer_status
 from stratakb.knowledge.parsers.csv_parser import parse_csv
@@ -150,7 +150,7 @@ async def _store_file(
 
 async def clear_layer(database_url: str, layer_name: str) -> None:
     """Delete every chunk and ingested_files row of a layer."""
-    await ensure_ingestion_schema(database_url)
+    await ensure_schema(database_url)
     pool = await get_pool(database_url)
     async with pool.acquire() as conn:
         async with conn.transaction():
@@ -225,7 +225,7 @@ async def ingest_documents(
     start = time.monotonic()
     result = IngestionResult(layer_name=layer_name, status="failed")
 
-    await ensure_ingestion_schema(database_url)
+    await ensure_schema(database_url)
 
     # Step 1: Validate layer
     try:

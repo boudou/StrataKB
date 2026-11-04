@@ -24,7 +24,7 @@ configure_logging(_settings.log_level)
 from stratakb.core.audit import write_audit_log, query_audit_log
 from stratakb.core.auth import get_current_user, require_role
 from stratakb.core.database import check_connection, close_pool, get_pool
-from stratakb.core.migrations import ensure_ingestion_schema
+from stratakb.core.migrations import ensure_schema
 from stratakb.core.users import ensure_user, list_users, update_user_role
 from stratakb.database_access.tools import register_database_tools
 from stratakb.knowledge.tools import register_knowledge_tools
@@ -55,7 +55,7 @@ async def _lifespan(server: FastMCP):
         # current). Skipped when the database is unreachable: ingestion runs
         # it on first use anyway.
         try:
-            await ensure_ingestion_schema(_settings.database_url)
+            await ensure_schema(_settings.database_url)
         except Exception as e:
             logger.warning("db_migration_failed", error=str(e))
 
