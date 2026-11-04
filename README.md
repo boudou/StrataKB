@@ -10,7 +10,7 @@ Point it at your documentation, organise it in layers, and query it from any MCP
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![PRs welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](CONTRIBUTING.md)
 
-[Quick start](#quick-start) · [Layers and presets](#layers-and-presets) · [Tools](#tools) · [Configuration](#configuration) · [Roadmap](docs/IMPROVEMENTS.md)
+[Quick start](#quick-start) · [Layers and presets](#layers-and-presets) · [Tools](#tools) · [Configuration](#configuration) · [Roadmap](#roadmap)
 
 </div>
 
@@ -227,6 +227,32 @@ uv run python -m stratakb      # run the server on stdio
 Without a running database, the integration tests fail with a connection error and the rest pass.
 
 `scripts/backup_restore.py` backs up the whole database or exports and imports a single layer.
+
+## Roadmap
+
+The target: ask your own documents (contracts, rulebooks, specs, runbooks) and get answers you can **prove**, without learning how retrieval works and without sending private data anywhere you did not choose. Work is grouped into [milestones](https://github.com/boudou/StrataKB/milestones):
+
+1. **Five-minute start**: add a folder in one step, a one-command local mode, any OpenAI-compatible model provider, and a clear statement of where data goes.
+2. **Answers you can prove** (planned): every claim can be checked against its source, so you can be sure the model did not make it up.
+   - Each passage comes with its exact location: file, page, line range and clause (`7 Termination > 7.2`), and documents are chunked along their clauses and sections.
+   - **Grounded mode:** your client writes the answer, and `strata_verify` checks that every quote, number, date, amount, code and clause reference in it appears in the cited passages.
+   - **Extractive mode:** for layers where paraphrase is not acceptable, the server answers with the document's own sentences, chosen without a language model.
+   - **Receipts:** every verified or extractive answer gets a receipt you can open outside the chat, showing the quotes in context and whether the document changed since.
+   - An honest "not found" instead of a confident guess, and smaller responses that cost fewer tokens.
+3. **Team server**: Streamable HTTP, real identities, per-layer access.
+4. **Daily use and sync**: a command line for daily use, connectors (git first), scanned PDFs.
+5. **Depth**: exact-lookup catalogs, cross-document references, source code.
+
+```mermaid
+flowchart LR
+    Q[Question] --> A[strata_ask]
+    A --> P["Passages with<br/>exact locations"]
+    P --> G{Layer mode}
+    G -->|grounded| W[Client writes answer] --> V[strata_verify] --> R[Receipt]
+    G -->|extractive| X["Server returns the<br/>document's own sentences"] --> R
+```
+
+The product goal, the goals every change is checked against and the order of work are in [docs/IMPROVEMENTS.md](docs/IMPROVEMENTS.md).
 
 ## Contributing
 
