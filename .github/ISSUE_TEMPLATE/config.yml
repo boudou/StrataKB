@@ -4,8 +4,8 @@ contact_links:
     url: https://github.com/boudou/StrataKB/wiki
     about: Installation, layers and presets, searching, roles and troubleshooting. Check here first.
   - name: Roadmap and known issues
-    url: https://github.com/boudou/StrataKB/blob/main/docs/IMPROVEMENTS.md
-    about: Check whether it is already planned or known.
+    url: https://github.com/boudou/StrataKB/issues
+    about: Search the open issues and milestones first; it may already be planned or known.
   - name: Report a security vulnerability
     url: https://github.com/boudou/StrataKB/security/advisories/new
     about: Please report vulnerabilities privately, not in a public issue.

@@ -9,7 +9,7 @@ updates:
       minor-and-patch:
         update-types: [minor, patch]
     ignore:
-      # 2.x removed mcp.server.fastmcp; the migration is planned in docs/IMPROVEMENTS.md
+      # 2.x removed mcp.server.fastmcp; the migration is planned in issue #16
       - dependency-name: mcp
         versions: [">=2"]
   - package-ecosystem: github-actions

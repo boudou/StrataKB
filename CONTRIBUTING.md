@@ -1,6 +1,6 @@
 # Contributing to StrataKB
 
-Thanks for your interest! Bug reports, ideas and pull requests are welcome. Good first stops are the open [enhancement issues](https://github.com/boudou/StrataKB/issues?q=is%3Aissue+is%3Aopen+label%3Aenhancement) and the roadmap in [docs/IMPROVEMENTS.md](docs/IMPROVEMENTS.md).
+Thanks for your interest! Bug reports, ideas and pull requests are welcome. Good first stops are the open [enhancement issues](https://github.com/boudou/StrataKB/issues?q=is%3Aissue+is%3Aopen+label%3Aenhancement), the [milestones](https://github.com/boudou/StrataKB/milestones), and the product goal in [docs/IMPROVEMENTS.md](docs/IMPROVEMENTS.md).
 
 ## Setup
 

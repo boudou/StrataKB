@@ -16,7 +16,7 @@ classifiers = [
     "Topic :: Text Processing :: Indexing",
 ]
 dependencies = [
-    # MCP framework. 2.x removed mcp.server.fastmcp; see docs/IMPROVEMENTS.md before lifting the cap.
+    # MCP framework. 2.x removed mcp.server.fastmcp; see issue #16 before lifting the cap.
     "mcp[cli]>=1.30,<2",
     # Database
     "asyncpg>=0.30.0",

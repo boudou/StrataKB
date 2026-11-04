@@ -212,7 +212,7 @@ src/stratakb/
   learning/           Interaction tracking, signals, synonyms, promotion, feedback tools
   database_access/    Read-only SQL and introspection tools
 tests/                pytest suite
-docs/IMPROVEMENTS.md  Known issues and the improvement roadmap
+docs/IMPROVEMENTS.md  Product goal and order of work (issues hold the items)
 ```
 
 ## Development
@@ -230,7 +230,7 @@ Without a running database, the integration tests fail with a connection error a
 
 ## Contributing
 
-Bug reports, ideas and pull requests are welcome. Start with [CONTRIBUTING.md](CONTRIBUTING.md), and please follow the [code of conduct](CODE_OF_CONDUCT.md). Known issues and planned work are in [docs/IMPROVEMENTS.md](docs/IMPROVEMENTS.md).
+Bug reports, ideas and pull requests are welcome. Start with [CONTRIBUTING.md](CONTRIBUTING.md), and please follow the [code of conduct](CODE_OF_CONDUCT.md). Known issues and planned work are in [GitHub issues](https://github.com/boudou/StrataKB/issues), grouped by [milestone](https://github.com/boudou/StrataKB/milestones).
 
 - **Found a bug?** [Open a bug report](https://github.com/boudou/StrataKB/issues/new?template=bug_report.md).
 - **Have an idea?** [Suggest a feature](https://github.com/boudou/StrataKB/issues/new?template=feature_request.md).
