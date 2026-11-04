@@ -167,9 +167,30 @@ class TestConfidenceScoring:
     def test_low_confidence(self):
         from stratakb.rag.confidence import score_confidence
 
-        result = score_confidence([0.45, 0.35])
+        result = score_confidence([0.40, 0.30])
         assert result["level"] == "low"
+        assert result["basis"] == "similarity"
         assert "warning" in result
+
+    def test_rerank_basis_uses_rerank_thresholds(self):
+        from stratakb.rag.confidence import score_confidence
+
+        scores = [0.7, 0.65, 0.6]
+        assert score_confidence(scores, basis="rerank")["level"] == "medium"
+        assert score_confidence(scores, basis="rerank")["basis"] == "rerank"
+        assert score_confidence(scores)["level"] == "high"
+
+    def test_unknown_basis_raises(self):
+        from stratakb.rag.confidence import score_confidence
+
+        with pytest.raises(ValueError):
+            score_confidence([0.9], basis="fused")
+
+    def test_empty_scores_report_basis(self):
+        from stratakb.rag.confidence import score_confidence
+
+        assert score_confidence([], basis="rerank")["basis"] == "rerank"
+        assert score_confidence([])["basis"] == "similarity"
 
     def test_no_results(self):
         from stratakb.rag.confidence import score_confidence
@@ -534,6 +555,78 @@ class TestAskDomainContext:
             routing.assert_not_awaited()
             openai_cls.assert_not_called()
             assert result["queries_used"] == ["Why was it rejected?"]
+
+
+class _LogitModel:
+    """A fake cross-encoder that applies the activation it is given to fixed logits."""
+
+    def __init__(self, logits):
+        self.logits = logits
+
+    def predict(self, pairs, activation_fn=None):
+        import torch
+
+        logits = torch.tensor(self.logits[: len(pairs)])
+        return activation_fn(logits).numpy() if activation_fn else logits.numpy()
+
+
+def _search_results(scores, similarities):
+    from stratakb.rag.retriever import SearchResult
+
+    return [
+        SearchResult(
+            chunk_id=f"c{i}", content=f"Chunk {i} text", score=score, layer_name="docs",
+            source_file=f"f{i}.md", source_section="", doc_type="", similarity=similarity,
+        )
+        for i, (score, similarity) in enumerate(zip(scores, similarities, strict=True))
+    ]
+
+
+class TestAskConfidence:
+    @pytest.mark.asyncio
+    async def test_hybrid_confidence_uses_similarity(self, no_sdk_env):
+        """Without reranking, confidence reads the cosine similarity, not the fused score."""
+        settings = _rewrite_settings(learning_enabled=False, reranking_enabled=False)
+        ask = _capture_ask(settings)
+        results = _search_results([1.0, 0.95, 0.9], [0.2, 0.15, 0.1])
+        with (
+            patch("stratakb.config.get_settings", return_value=settings),
+            patch("stratakb.rag.retriever.search_chunks", AsyncMock(return_value=results)),
+            patch("stratakb.rag.tools.write_audit_log", AsyncMock()),
+        ):
+            result = await ask(question="What does AC04 mean?", layers=["docs"])
+
+        assert result["status"] == "ok"
+        confidence = result["confidence"]
+        assert confidence["level"] == "low"
+        assert confidence["top_score"] == 0.2
+        assert confidence["basis"] == "similarity"
+        assert [c["similarity"] for c in result["retrieved_chunks"]] == [0.2, 0.15, 0.1]
+
+    @pytest.mark.asyncio
+    async def test_rerank_confidence_uses_probabilities(self, no_sdk_env):
+        """With reranking, confidence reads the cross-encoder's probabilities (0-1)."""
+        settings = _rewrite_settings(learning_enabled=False, reranking_enabled=True)
+        ask = _capture_ask(settings)
+        results = _search_results([1.0, 0.95, 0.9], [0.2, 0.15, 0.1])
+        with (
+            patch("stratakb.config.get_settings", return_value=settings),
+            patch("stratakb.rag.retriever.search_chunks", AsyncMock(return_value=results)),
+            patch("stratakb.rag.tools.write_audit_log", AsyncMock()),
+            patch(
+                "stratakb.rag.reranker._get_reranker",
+                return_value=_LogitModel([1.0, 0.8, 0.7]),
+            ),
+        ):
+            result = await ask(question="What does AC04 mean?", layers=["docs"])
+
+        assert result["status"] == "ok"
+        confidence = result["confidence"]
+        assert confidence["level"] == "medium"
+        assert confidence["top_score"] == 0.7311
+        assert confidence["basis"] == "rerank"
+        assert all(0 < s["relevance_score"] < 1 for s in result["sources"])
+        assert [c["similarity"] for c in result["retrieved_chunks"]] == [0.2, 0.15, 0.1]
 
 
 # ==========================================

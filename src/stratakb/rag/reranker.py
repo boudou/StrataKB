@@ -45,6 +45,23 @@ def _get_reranker(model_name: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"):
     return _reranker
 
 
+def score_pairs(
+    query: str,
+    texts: list[str],
+    model_name: str = "cross-encoder/ms-marco-MiniLM-L-6-v2",
+) -> list[float]:
+    """Score each text against the query as a relevance probability (0-1).
+
+    The sigmoid is set at predict time, so it replaces the model's own default
+    activation: the result is one sigmoid over the logits for any model.
+    """
+    from torch import nn
+
+    reranker = _get_reranker(model_name)
+    scores = reranker.predict([(query, t) for t in texts], activation_fn=nn.Sigmoid())
+    return [float(s) for s in scores]
+
+
 def rerank_results(
     query: str,
     chunks: list[dict],
@@ -60,14 +77,13 @@ def rerank_results(
         model_name: Cross-encoder model to use.
 
     Returns:
-        Top-k chunks sorted by cross-encoder relevance score.
+        Top-k chunks sorted by cross-encoder relevance, each with a
+        "rerank_score": the relevance probability (0-1).
     """
     if not chunks:
         return []
 
-    reranker = _get_reranker(model_name)
-    pairs = [(query, c["content"]) for c in chunks]
-    scores = reranker.predict(pairs)
+    scores = score_pairs(query, [c["content"] for c in chunks], model_name)
 
     # Pair chunks with new scores and sort
     scored = list(zip(chunks, scores))

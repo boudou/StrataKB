@@ -113,10 +113,11 @@ def _mock_pool(conn):
     return pool
 
 
-def _chunk_row(chunk_id):
+def _chunk_row(chunk_id, similarity=0.5):
     return {
         "id": uuid.UUID(chunk_id), "content": "text", "layer_name": "docs",
         "source_file": "f.md", "source_section": "", "doc_type": "", "metadata": {},
+        "similarity": similarity,
     }
 
 
@@ -127,7 +128,9 @@ async def test_hybrid_search_sets_statement_timeout_and_logs_keyword_only():
     hybrid_rows = [{"source": "semantic", "id": cid, "rank": i + 1} for i, cid in enumerate(sem)]
     hybrid_rows.append({"source": "fulltext", "id": kw, "rank": 1})
     conn = AsyncMock()
-    conn.fetch.side_effect = [hybrid_rows, [_chunk_row(sem[0]), _chunk_row(kw)]]
+    conn.fetch.side_effect = [
+        hybrid_rows, [_chunk_row(sem[0], similarity=0.73), _chunk_row(kw, similarity=None)],
+    ]
     settings = SimpleNamespace(
         hnsw_ef_search=40, hybrid_rrf_k=60, hybrid_semantic_weight=0.7,
         hybrid_keyword_weight=0.3, hybrid_keyword_slots=1,
@@ -141,6 +144,10 @@ async def test_hybrid_search_sets_statement_timeout_and_logs_keyword_only():
     statements = [c.args[0] for c in conn.execute.call_args_list]
     assert any(s.startswith("SET LOCAL statement_timeout") for s in statements)
     assert [r.chunk_id for r in results] == [sem[0], kw]
+    # The chunk query computes the cosine similarity against the query vector
+    assert conn.fetch.call_args_list[1].args[2] == "[1.0]"
+    assert results[0].similarity == 0.73
+    assert results[1].similarity is None  # a chunk without an embedding
     done = [e for e in logs if e["event"] == "hybrid_search_complete"]
     assert done[0]["keyword_only_results"] == 1
 
@@ -164,3 +171,58 @@ async def test_vector_search_sets_statement_timeout():
 
     statements = [c.args[0] for c in conn.execute.call_args_list]
     assert any(s.startswith("SET LOCAL statement_timeout") for s in statements)
+
+
+# ==========================================
+# Cosine similarity on real rows (requires DB)
+# ==========================================
+
+
+@pytest.mark.asyncio
+async def test_hybrid_results_carry_cosine_similarity(monkeypatch):
+    """The fused score is normalized to a top of 1.0; similarity stays the real cosine."""
+    from stratakb.config import get_settings
+    from stratakb.core.database import get_pool
+    from stratakb.rag.retriever import search_chunks
+
+    settings = get_settings()
+    pool = await get_pool(settings.database_url)
+    layer = f"hybsim_{uuid.uuid4().hex[:8]}"
+    h = settings.embedding_dimensions // 2
+    close = [1.0] * h + [0.0] * (settings.embedding_dimensions - h)
+    orthogonal = [0.0] * h + [1.0] * (settings.embedding_dimensions - h)
+    close_vector = "[" + ",".join(str(x) for x in close) + "]"
+    orthogonal_vector = "[" + ",".join(str(x) for x in orthogonal) + "]"
+    insert = """
+        INSERT INTO strata_vectors.chunks (layer_name, content, embedding, source_file)
+        VALUES ($1, $2, $3::vector, $4) RETURNING id
+    """
+    monkeypatch.setattr("stratakb.rag.retriever._get_cache", lambda: None)
+    try:
+        async with pool.acquire() as conn:
+            for i in range(8):
+                await conn.execute(
+                    insert, layer, f"Note {i} on payment fees and reporting.",
+                    close_vector, f"close_{i}",
+                )
+            ac04 = str(await conn.fetchval(
+                insert, layer, "Reason code AC04 means the account is closed.",
+                orthogonal_vector, "ac04",
+            ))
+
+        with patch(
+            "stratakb.rag.retriever.embed_texts",
+            new_callable=AsyncMock,
+            return_value=[close],
+        ):
+            results = await search_chunks(
+                settings.database_url, None, "AC04", layers=[layer], top_k=2
+            )
+
+        assert results[0].score == 1.0
+        assert abs(results[0].similarity - 1.0) < 1e-3
+        keyword_only = next(r for r in results if r.chunk_id == ac04)
+        assert abs(keyword_only.similarity) < 1e-3
+    finally:
+        async with pool.acquire() as conn:
+            await conn.execute("DELETE FROM strata_vectors.chunks WHERE layer_name = $1", layer)

@@ -80,7 +80,8 @@ class SearchResult:
     source_section: str
     doc_type: str
     metadata: dict = field(default_factory=dict)
-    similarity_score: float | None = None
+    # Query/chunk cosine similarity (-1..1); None when the chunk has no embedding
+    similarity: float | None = None
 
 
 async def search_chunks(
@@ -197,7 +198,7 @@ async def search_chunks(
                 source_section=row["source_section"] or "",
                 doc_type=row["doc_type"] or "",
                 metadata=meta if isinstance(meta, dict) else {},
-                similarity_score=round(float(row["score"]), 4),
+                similarity=round(float(row["score"]), 4),
             )
         )
 
@@ -393,7 +394,7 @@ async def _hybrid_search(
     uuid_ids = [_uuid.UUID(tid) for tid in top_ids]
     chunk_sql = """
         SELECT id, content, layer_name, source_file, source_section, doc_type, metadata,
-               1 - (embedding <=> $2::vector) AS similarity_score
+               1 - (embedding <=> $2::vector) AS similarity
         FROM strata_vectors.chunks
         WHERE id = ANY($1::uuid[])
     """
@@ -416,15 +417,16 @@ async def _hybrid_search(
             source_section=row["source_section"] or "",
             doc_type=row["doc_type"] or "",
             metadata=meta if isinstance(meta, dict) else {},
-            similarity_score=(
-                round(float(row["similarity_score"]), 4)
-                if row["similarity_score"] is not None else None
+            similarity=(
+                round(float(row["similarity"]), 4)
+                if row["similarity"] is not None else None
             ),
         ))
 
     results.sort(key=lambda r: r.score, reverse=True)
 
-    # Normalize RRF scores to 0-1 range for compatibility with confidence scoring.
+    # Normalize RRF scores to 0-1 for ranking and display only: the top result is
+    # always 1.0, so confidence is judged on `similarity`, never on this score.
     if results:
         max_score = results[0].score
         if max_score > 0:

@@ -56,7 +56,7 @@ def _result(name, layer, *, score=1.0, similarity=0.9, doc_type="markdown"):
         source_section="section",
         doc_type=doc_type,
     )
-    result.similarity_score = similarity
+    result.similarity = similarity
     return result
 
 
@@ -245,7 +245,7 @@ async def test_hybrid_search_keeps_cosine_similarity_separate_from_rrf_rank():
                 "source_section": "",
                 "doc_type": "markdown",
                 "metadata": {},
-                "similarity_score": 0.2,
+                "similarity": 0.2,
             }
         ],
     ]
@@ -260,10 +260,11 @@ async def test_hybrid_search_keeps_cosine_similarity_separate_from_rrf_rank():
         hybrid_rrf_k=60,
         hybrid_semantic_weight=0.7,
         hybrid_keyword_weight=0.3,
+        hybrid_keyword_slots=1,
     )
 
     results = await _hybrid_search(pool, "question", "[1,0]", ["routed"], 1, None, settings)
 
     assert results[0].score == 1.0
-    assert results[0].similarity_score == 0.2
+    assert results[0].similarity == 0.2
     assert conn.fetch.await_args_list[1].args[2] == "[1,0]"

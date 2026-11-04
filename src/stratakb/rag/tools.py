@@ -114,9 +114,10 @@ def register_rag_tools(
 
             fallback_reason = None
             if detected_layers:
-                confidence = score_confidence([
-                    r.similarity_score for r in results if r.similarity_score is not None
-                ])
+                confidence = score_confidence(
+                    [r.similarity for r in results if r.similarity is not None],
+                    basis="similarity",
+                )
                 fallback_reason = _routing_fallback_reason(len(results), top_k, confidence)
                 if fallback_reason:
                     results = await search_chunks(
@@ -290,19 +291,20 @@ def register_rag_tools(
                         {"chunk_id": r.chunk_id, "content": r.content, "score": r.score,
                          "layer": r.layer_name, "source_file": r.source_file,
                          "section": r.source_section, "doc_type": r.doc_type,
-                         "metadata": r.metadata}
+                         "metadata": r.metadata, "similarity": r.similarity}
                         for r in ranked
                     ]
                     reranked_chunks = await asyncio.to_thread(
                         rerank_results, question, chunks_for_rerank, top_k,
                         _settings.reranking_model,
                     )
+                    # The reranker's relevance probabilities (0-1)
                     scores = [c.get("rerank_score", c.get("score", 0)) for c in reranked_chunks]
-                else:
-                    scores = [
-                        r.similarity_score for r in ranked if r.similarity_score is not None
-                    ]
-                return ranked, reranked_chunks, score_confidence(scores)
+                    return ranked, reranked_chunks, score_confidence(scores, basis="rerank")
+                # Cosine similarity, never the fused hybrid score: that one is
+                # normalized so the top result is always 1.0
+                scores = [r.similarity if r.similarity is not None else 0.0 for r in ranked]
+                return ranked, reranked_chunks, score_confidence(scores, basis="similarity")
 
             ranked, reranked_chunks, confidence = await _collect(layers)
             fallback_reason = None
@@ -343,6 +345,7 @@ def register_rag_tools(
                         "chunk_id": r.chunk_id,
                         "content": r.content,
                         "score": r.score,
+                        "similarity": r.similarity,
                         "layer": r.layer_name,
                         "doc_type": r.doc_type,
                         "metadata": r.metadata,
