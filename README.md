@@ -91,7 +91,6 @@ You need [Docker](https://docs.docker.com/get-docker/), [uv](https://docs.astral
 ```bash
 git clone https://github.com/boudou/StrataKB.git
 cd StrataKB
-cp .env.example .env
 docker compose up -d        # PostgreSQL 16 + pgvector on port 5433, schemas created on first start
 uv sync
 ```
@@ -189,10 +188,18 @@ On the stdio transport, `STRATA_USER` and `STRATA_ROLE` set who you are. Whoever
 
 ## Configuration
 
-Settings come from environment variables or `.env`.
+Settings come from four sources, each overriding the one before: the defaults below, the user-level `config.env`, the file named by `STRATAKB_CONFIG`, then environment variables. The user-level file is `%APPDATA%\stratakb\config.env` on Windows, and `$XDG_CONFIG_HOME/stratakb/config.env`, else `~/.config/stratakb/config.env`, elsewhere. Copy `.env.example` there to start.
+
+`./.env` is not read unless you set `STRATAKB_CONFIG=.env`; when the server finds one it does not read, it logs a warning at startup. A `STRATAKB_CONFIG` that names a missing file is logged and skipped. Keys the server does not know, such as `DB_PASSWORD`, are ignored, so one file can serve both. `docker compose` still reads `./.env` itself for its own variables.
+
+```mermaid
+flowchart LR
+    d["Defaults"] --> u["User config.env"] --> c["File named by<br/>STRATAKB_CONFIG"] --> e["Environment<br/>variables"]
+```
 
 | Variable | Default | Description |
 | --- | --- | --- |
+| `STRATAKB_CONFIG` | | A settings file read after the user-level `config.env`; environment variables still win |
 | `DATABASE_URL` | `postgresql://strata:…@localhost:5433/strata` | PostgreSQL connection |
 | `READONLY_DATABASE_URL` | | Connection for `strata_db_query` and `strata_db_explain`; point it at the `strata_readonly` role from `db/03_readonly_role.sql`. Empty means the two tools are off; a superuser, or a member of a superuser or server-access role (such as the Docker `strata` user) is refused |
 | `STRATA_USER`, `STRATA_ROLE` | `developer`, `viewer` | Identity and role on stdio |

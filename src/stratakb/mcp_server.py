@@ -14,7 +14,7 @@ from dataclasses import asdict
 import structlog
 from mcp.server.fastmcp import FastMCP
 
-from stratakb.config import get_settings
+from stratakb.config import config_file_missing, dotenv_warning, get_settings
 from stratakb.core.egress import enforce_local_only, outbound_providers
 from stratakb.core.logging import configure_logging, log_tool_call
 
@@ -45,8 +45,14 @@ async def _lifespan(server: FastMCP):
     """Warm up the DB pool, then answer the client while the model loads.
 
     The MCP SDK reads no message until this yields, so only the fast database
-    steps are awaited here.
+    steps are awaited here. A config file that is not read is logged first.
     """
+
+    # Neither warning carries the path: paths hold the user name
+    if hint := dotenv_warning():
+        logger.warning("dotenv_not_read", hint=hint)
+    if config_file_missing():
+        logger.warning("config_file_not_found", setting="STRATAKB_CONFIG")
 
     # Pre-warm DB connection pool (fast, ~1s; ~2s to fail when refused)
     try:

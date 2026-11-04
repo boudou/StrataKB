@@ -6,6 +6,7 @@ Tests cover:
 - No preload for a remote embedding backend
 - The startup migration runs only after a successful database warm-up
 - The SQL tools role check runs before the lifespan yields
+- An unread ./.env and a missing STRATAKB_CONFIG file are logged, without the path
 
 No database and no model are needed: the pool, the migration and the model
 load are patched.
@@ -136,6 +137,55 @@ async def test_migration_runs_after_warmup(db_ok, monkeypatch):
     async with mcp_server._lifespan(mcp_server.mcp):
         pass
     migrate.assert_awaited_once_with(mcp_server._settings.database_url)
+
+
+async def test_lifespan_warns_unread_dotenv(db_ok, monkeypatch):
+    monkeypatch.setattr(mcp_server._settings, "embedding_backend", "openai")
+    with (
+        patch("stratakb.mcp_server.dotenv_warning", return_value="hint text"),
+        patch("stratakb.mcp_server.config_file_missing", return_value=False),
+        capture_logs() as logs,
+    ):
+        async with mcp_server._lifespan(mcp_server.mcp):
+            pass
+
+    warned = [e for e in logs if e["event"] == "dotenv_not_read"]
+    assert len(warned) == 1
+    assert warned[0]["hint"] == "hint text"
+    assert warned[0]["log_level"] == "warning"
+    assert not any(e["event"] == "config_file_not_found" for e in logs)
+
+
+async def test_lifespan_warns_missing_config_file(db_ok, monkeypatch, tmp_path):
+    monkeypatch.setattr(mcp_server._settings, "embedding_backend", "openai")
+    monkeypatch.setenv("STRATAKB_CONFIG", str(tmp_path / "missing-settings.env"))
+    with (
+        patch("stratakb.mcp_server.dotenv_warning", return_value=None),
+        capture_logs() as logs,
+    ):
+        async with mcp_server._lifespan(mcp_server.mcp):
+            pass
+
+    missing = [e for e in logs if e["event"] == "config_file_not_found"]
+    assert len(missing) == 1
+    assert missing[0]["setting"] == "STRATAKB_CONFIG"
+    assert "missing-settings" not in repr(logs)
+    assert not any(e["event"] == "dotenv_not_read" for e in logs)
+
+
+async def test_lifespan_quiet_without_config_problems(db_ok, monkeypatch):
+    monkeypatch.setattr(mcp_server._settings, "embedding_backend", "openai")
+    with (
+        patch("stratakb.mcp_server.dotenv_warning", return_value=None),
+        patch("stratakb.mcp_server.config_file_missing", return_value=False),
+        capture_logs() as logs,
+    ):
+        async with mcp_server._lifespan(mcp_server.mcp):
+            pass
+
+    events = {e["event"] for e in logs}
+    assert "dotenv_not_read" not in events
+    assert "config_file_not_found" not in events
 
 
 async def test_lifespan_secures_sql_tools(db_ok, secure_sql_tools, monkeypatch):

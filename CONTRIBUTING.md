@@ -6,7 +6,8 @@ Thanks for your interest! Bug reports, ideas and pull requests are welcome. Good
 
 ```bash
 uv sync --extra dev
-cp .env.example .env
+cp .env.example .env          # optional local settings
+export STRATAKB_CONFIG=.env   # ./.env is read only through this
 docker compose up -d       # PostgreSQL + pgvector for the integration tests
 ```
 

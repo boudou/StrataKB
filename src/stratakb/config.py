@@ -2,11 +2,22 @@
 
 from __future__ import annotations
 
+import os
+import sys
+from pathlib import Path
+
 from pydantic_settings import BaseSettings
+
+DOTENV_WARNING = "./.env is not read; set STRATAKB_CONFIG=.env to use it."
 
 
 class Settings(BaseSettings):
-    """Application settings loaded from environment variables."""
+    """Application settings.
+
+    Read, each source overriding the one before: the defaults below, the
+    user-level config.env, the file named by STRATAKB_CONFIG, then
+    environment variables. ./.env is not read unless STRATAKB_CONFIG names it.
+    """
 
     # Database
     database_url: str = "postgresql://strata:strata_dev_password@localhost:5433/strata"
@@ -73,9 +84,67 @@ class Settings(BaseSettings):
     # Logging
     log_level: str = "INFO"
 
-    model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}
+    # utf-8-sig: a file saved with a BOM keeps its first key. Unknown keys,
+    # such as the compose-only ones in .env.example, are ignored.
+    model_config = {"env_file_encoding": "utf-8-sig", "extra": "ignore"}
+
+
+def user_config_file() -> Path:
+    """The user-level config.env, whether or not it exists."""
+    if sys.platform == "win32":
+        appdata = os.environ.get("APPDATA")
+        base = Path(appdata) if appdata else Path.home() / "AppData" / "Roaming"
+    else:
+        xdg = os.environ.get("XDG_CONFIG_HOME")
+        base = Path(xdg) if xdg else Path.home() / ".config"
+    return base / "stratakb" / "config.env"
+
+
+def _named_config_file() -> Path | None:
+    """The path in STRATAKB_CONFIG, or None when it is unset or empty."""
+    value = os.environ.get("STRATAKB_CONFIG")
+    return Path(value).expanduser() if value else None
+
+
+def config_files() -> list[Path]:
+    """The config files that exist, lowest priority first.
+
+    The user-level config.env, then the file named by STRATAKB_CONFIG.
+    A file listed twice is read once.
+    """
+    candidates = [user_config_file()]
+    named = _named_config_file()
+    if named is not None:
+        candidates.append(named)
+
+    files: list[Path] = []
+    seen: set[Path] = set()
+    for path in candidates:
+        if not path.is_file():
+            continue
+        resolved = path.resolve()
+        if resolved not in seen:
+            seen.add(resolved)
+            files.append(path)
+    return files
+
+
+def config_file_missing() -> bool:
+    """True when STRATAKB_CONFIG names a path that is not a file."""
+    named = _named_config_file()
+    return named is not None and not named.is_file()
+
+
+def dotenv_warning() -> str | None:
+    """A hint when ./.env exists but is not among the files read, else None."""
+    dotenv = Path.cwd() / ".env"
+    if not dotenv.is_file():
+        return None
+    if dotenv.resolve() in {path.resolve() for path in config_files()}:
+        return None
+    return DOTENV_WARNING
 
 
 def get_settings() -> Settings:
-    """Get application settings singleton."""
-    return Settings()
+    """Settings from the defaults, the config files and the environment."""
+    return Settings(_env_file=config_files())

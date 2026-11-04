@@ -36,7 +36,7 @@ MAX_BATCH_SIZE = 100
 _OPENAI_DEFAULT_MODEL = "text-embedding-3-large"
 
 _MISSING_KEY_ERROR = (
-    "OpenAI API key not configured. Set OPENAI_API_KEY in .env, "
+    "OpenAI API key not configured. Set OPENAI_API_KEY in the environment or your config file, "
     "or EMBEDDING_BASE_URL for an OpenAI-compatible server."
 )
 
