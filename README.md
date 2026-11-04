@@ -126,11 +126,13 @@ flowchart LR
     z -->|"yes"| t["No text:<br/>skip or remove"]
     z -->|"no"| p["Parse<br/>per format"]
     p -->|"no text"| t
-    p --> c["Chunk"] --> x["Prefix<br/>[layer > file > Page N]"] --> e["Embed"] --> v[("pgvector<br/>replace that file's chunks")]
+    p --> c["Chunk<br/>(the file's own text)"] --> x["Add context for the embedding only<br/>[layer > file > headings or Page N]"] --> e["Embed"] --> v[("pgvector<br/>replace that file's chunks")]
     p -.->|"scanned-looking PDF"| fl["Stored, reported<br/>as flagged"]
 ```
 
 Ingesting a folder again is a sync: unchanged files are skipped, changed files are replaced, new files are added, and files deleted from that folder are removed. Other folders in the same layer are left alone. Files whose names look like secrets (`.env`, `client_secret.json`, `id_rsa`, `*.pem`) are skipped without being opened, and one ingested earlier is removed. Empty files are reported as no text rather than as failures. A PDF that looks scanned (fewer than half its pages have text, or under 200 characters per page on average) is stored for the text it has and reported as flagged. A file that fails to parse is reported and the rest of the run carries on.
+
+Each stored chunk is the document's own text: search results quote your files word for word, and a Markdown or HTML section holds its own heading once. Where the chunk sits (`[layer > file > headings]` for Markdown and HTML, `[layer > file > Page N]` otherwise) is added only to the text that is embedded, so semantic search keeps that context; the heading path is also in the chunk's metadata as `section_path`. Keyword search matches the chunk text, not layer or file names. Chunks stored by earlier versions keep their bracketed prefix until their file is ingested again.
 
 **Ask**
 

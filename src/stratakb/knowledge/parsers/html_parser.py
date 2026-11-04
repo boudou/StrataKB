@@ -70,6 +70,7 @@ def parse_html(file_path: str | Path) -> ParsedDocument:
                 text=text,
                 page_number=i + 1,
                 source_file=source,
+                section_path=section.get("section_path", []),
             ))
 
     logger.info(
@@ -148,11 +149,16 @@ class _SectionParser(HTMLParser):
     def _flush_section(self):
         text = "".join(self._current_text).strip()
         if text or self._current_heading:
-            lines = []
+            # Parent headings go into section_path, not into the section's text
+            path = []
             if self._current_level >= 2 and self._h1_context:
-                lines.append(f"# {self._h1_context}")
+                path.append(self._h1_context)
             if self._current_level >= 3 and self._h2_context:
-                lines.append(f"## {self._h2_context}")
+                path.append(self._h2_context)
+            if self._current_heading:
+                path.append(self._current_heading)
+
+            lines = []
             if self._current_heading:
                 prefix = "#" * self._current_level if self._current_level > 0 else "#"
                 lines.append(f"{prefix} {self._current_heading}")
@@ -164,6 +170,7 @@ class _SectionParser(HTMLParser):
                     "level": self._current_level,
                     "heading": self._current_heading,
                     "text": "\n\n".join(lines),
+                    "section_path": path,
                 })
 
         self._current_text = []

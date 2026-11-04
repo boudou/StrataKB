@@ -6,6 +6,7 @@ Handles inserting, deleting, and querying document chunks with pgvector embeddin
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import asyncpg
 import structlog
@@ -28,6 +29,42 @@ class ChunkRecord:
     doc_type: str = ""
     # strata_core.ingested_files row the chunk came from (None for chunks stored directly)
     file_id: str | None = None
+
+
+def _build_context_prefix(
+    layer_name: str,
+    source_file: str,
+    page_number: int | None = None,
+    section: str | None = None,
+) -> str:
+    """Build a context prefix for a chunk to improve embedding quality.
+
+    Prepends [layer > filename > page/section] to give the embedding model
+    contextual information about where this chunk comes from.
+    """
+    file_stem = Path(source_file).stem if source_file else "unknown"
+
+    parts = [layer_name, file_stem]
+    if section:
+        parts.append(section)
+    elif page_number is not None:
+        parts.append(f"Page {page_number}")
+
+    return f"[{' > '.join(parts)}]\n"
+
+
+def chunk_embed_text(layer_name: str, source_file: str, metadata: dict, content: str) -> str:
+    """Text sent to the embedding model for a chunk: the context prefix, then the content.
+
+    Built from the stored columns only, so ingestion and re-embedding produce the same text.
+    """
+    prefix = _build_context_prefix(
+        layer_name=layer_name,
+        source_file=source_file,
+        page_number=metadata.get("page"),
+        section=" > ".join(metadata.get("section_path") or []),
+    )
+    return prefix + content
 
 
 async def delete_layer_chunks(database_url: str, layer_name: str) -> int:
@@ -156,9 +193,10 @@ async def re_embed_layer(
             f"ALTER TABLE strata_vectors.chunks ALTER COLUMN embedding TYPE vector({new_dimensions})"
         )
 
-    # Load all chunk IDs and content for this layer
+    # Load all chunk IDs, content and the columns the context prefix is built from
     rows = await pool.fetch(
-        "SELECT id, content FROM strata_vectors.chunks WHERE layer_name = $1 ORDER BY id",
+        "SELECT id, content, layer_name, source_file, metadata "
+        "FROM strata_vectors.chunks WHERE layer_name = $1 ORDER BY id",
         layer_name,
     )
     total = len(rows)
@@ -167,7 +205,7 @@ async def re_embed_layer(
     updated = 0
     for i in range(0, total, batch_size):
         batch = rows[i : i + batch_size]
-        texts = [r["content"] for r in batch]
+        texts = [_re_embed_text(r) for r in batch]
         ids = [r["id"] for r in batch]
 
         embeddings = await embed_texts(texts)
@@ -215,6 +253,27 @@ async def re_embed_layer(
         "dimensions": new_dimensions,
         "duration_seconds": round(duration, 1),
     }
+
+
+def _re_embed_text(row) -> str:
+    """Rebuild the text ingestion embedded for a stored chunk row.
+
+    Chunks stored before the prefix left content still start with it; embed those as they are.
+    """
+    import json
+
+    content = row["content"]
+    if content.startswith(f"[{row['layer_name']} >"):
+        return content
+    meta = row["metadata"]
+    if isinstance(meta, str):
+        meta = json.loads(meta)
+    return chunk_embed_text(
+        row["layer_name"],
+        row["source_file"] or "",
+        meta if isinstance(meta, dict) else {},
+        content,
+    )
 
 
 def _embedding_to_pgvector(embedding: list[float]) -> str:

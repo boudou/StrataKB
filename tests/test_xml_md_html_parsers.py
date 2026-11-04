@@ -227,26 +227,43 @@ class TestMarkdownParser:
         assert "# Customer Order Service" in h1_page.text
         assert "orchestrates" in h1_page.text
 
-    def test_h2_inherits_h1_context(self):
+    def test_h2_has_h1_in_section_path(self):
         from stratakb.knowledge.parsers.markdown_parser import parse_markdown
 
         result = parse_markdown(TEST_MD)
-        # Find the "Overview" section
         overview = [p for p in result.pages if "## Overview" in p.text]
-        assert len(overview) >= 1
-        # Should have H1 context
-        assert "# Customer Order" in overview[0].text
+        assert len(overview) == 1
+        assert overview[0].section_path == ["Customer Order Service", "Overview"]
+        # The parent heading is on the side, not in the section's text
+        assert "# Customer Order" not in overview[0].text
 
-    def test_h3_inherits_h1_and_h2_context(self):
+    def test_h3_has_h1_and_h2_in_section_path(self):
         from stratakb.knowledge.parsers.markdown_parser import parse_markdown
 
         result = parse_markdown(TEST_MD)
-        # Find "Key Capabilities" section
         kc = [p for p in result.pages if "### Key Capabilities" in p.text]
         assert len(kc) == 1
-        # Should have H1 and H2 context
-        assert "# Customer Order" in kc[0].text
-        assert "## Overview" in kc[0].text
+        assert kc[0].section_path == ["Customer Order Service", "Overview", "Key Capabilities"]
+        assert "# Customer Order" not in kc[0].text
+        assert "## Overview" not in kc[0].text
+
+    def test_sections_are_slices_of_the_document(self):
+        """Each section's text is the document's own text: own heading once, no parent headings."""
+        from stratakb.knowledge.parsers.markdown_parser import parse_markdown
+
+        source = TEST_MD.read_text(encoding="utf-8")
+        result = parse_markdown(TEST_MD)
+        for page in result.pages:
+            assert page.text in source
+            heading_lines = [ln for ln in page.text.splitlines() if ln.startswith("#")]
+            assert len(heading_lines) == 1
+            assert heading_lines[0].lstrip("#").strip() == page.section_path[-1]
+
+    def test_h1_section_path(self):
+        from stratakb.knowledge.parsers.markdown_parser import parse_markdown
+
+        result = parse_markdown(TEST_MD)
+        assert result.pages[0].section_path == ["Customer Order Service"]
 
     def test_frontmatter_stripped(self):
         from stratakb.knowledge.parsers.markdown_parser import parse_markdown
@@ -370,24 +387,34 @@ class TestHTMLParser:
         assert "SEPA Credit Transfer" in h1_page.text
         assert "euro-denominated" in h1_page.text
 
-    def test_h2_has_h1_context(self):
+    def test_h2_has_h1_in_section_path(self):
         from stratakb.knowledge.parsers.html_parser import parse_html
 
         result = parse_html(TEST_HTML)
-        # Find Message Format section
-        mf = [p for p in result.pages if "Message Format" in p.text and "##" in p.text]
-        assert len(mf) >= 1
-        assert "# SEPA Credit Transfer" in mf[0].text
+        mf = [p for p in result.pages if p.text.startswith("## Message Format")]
+        assert len(mf) == 1
+        assert mf[0].section_path == ["SEPA Credit Transfer", "Message Format"]
+        assert "SEPA Credit Transfer" not in mf[0].text
 
-    def test_h3_has_parent_context(self):
+    def test_h3_has_parents_in_section_path(self):
         from stratakb.knowledge.parsers.html_parser import parse_html
 
         result = parse_html(TEST_HTML)
-        # Find Group Header section
-        gh = [p for p in result.pages if "Group Header" in p.text and "###" in p.text]
+        gh = [p for p in result.pages if p.text.startswith("### Group Header")]
         assert len(gh) == 1
-        assert "# SEPA Credit Transfer" in gh[0].text
-        assert "## Message Format" in gh[0].text
+        assert gh[0].section_path == ["SEPA Credit Transfer", "Message Format", "Group Header"]
+        assert "SEPA Credit Transfer" not in gh[0].text
+        assert "Message Format" not in gh[0].text
+
+    def test_each_section_has_its_own_heading_once(self):
+        from stratakb.knowledge.parsers.html_parser import parse_html
+
+        result = parse_html(TEST_HTML)
+        for page in result.pages[1:]:  # page 0 is the preamble, without a heading
+            heading_lines = [ln for ln in page.text.splitlines() if ln.startswith("#")]
+            assert len(heading_lines) == 1
+            assert heading_lines[0].lstrip("#").strip() == page.section_path[-1]
+        assert result.pages[0].section_path == []
 
     def test_content_preserved(self):
         from stratakb.knowledge.parsers.html_parser import parse_html

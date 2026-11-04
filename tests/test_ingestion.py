@@ -99,8 +99,8 @@ class TestChunking:
         chunks = _chunk_document(doc, layer_name="test", chunk_size=100, chunk_overlap=10)
 
         for chunk in chunks:
-            # Chunks can slightly exceed size due to splitter behavior
-            assert len(chunk.content) <= 200  # generous bound
+            # content carries no prefix, so it stays within the splitter's size
+            assert len(chunk.content) <= 100
 
 
 # ==========================================
@@ -216,6 +216,53 @@ class TestVectorStore:
             # Delete again — should be 0
             deleted = await delete_layer_chunks(db_url, layer)
             assert deleted == 0
+        finally:
+            await delete_layer_chunks(db_url, layer)
+
+    @pytest.mark.asyncio
+    async def test_re_embed_layer_rebuilds_the_prefix(self, db_url):
+        """re_embed_layer embeds what ingestion embeds; old prefixed chunks are kept as stored."""
+        from stratakb.core.database import get_pool
+        from stratakb.knowledge.ingestion import _chunk_document
+        from stratakb.knowledge.parsers.markdown_parser import parse_markdown
+        from stratakb.knowledge.vector_store import (
+            ChunkRecord,
+            chunk_embed_text,
+            delete_layer_chunks,
+            insert_chunks,
+            re_embed_layer,
+        )
+
+        layer = "test_re_embed_prefix"
+        pool = await get_pool(db_url)
+        dims = await pool.fetchval(
+            "SELECT atttypmod FROM pg_attribute "
+            "WHERE attrelid = 'strata_vectors.chunks'::regclass AND attname = 'embedding'"
+        )
+        doc = parse_markdown(FIXTURES_DIR / "test_document.md")
+        new_chunks = _chunk_document(doc, layer_name=layer, chunk_size=500, chunk_overlap=50)
+        old_content = f"[{layer} > legacy > Page 1]\nOld chunk text"
+        chunks = [*new_chunks, ChunkRecord(
+            content=old_content, embedding=[], layer_name=layer,
+            metadata={"page": 1}, source_file="legacy.pdf", doc_type="pdf",
+        )]
+        for c in chunks:
+            c.embedding = [0.1] * dims
+
+        try:
+            await delete_layer_chunks(db_url, layer)
+            await insert_chunks(db_url, chunks)
+            with patch("stratakb.knowledge.embeddings.embed_texts", new_callable=AsyncMock) as mock:
+                mock.side_effect = lambda texts, **kwargs: [[0.2] * dims for _ in texts]
+                stats = await re_embed_layer(db_url, layer, new_dimensions=dims)
+
+            assert stats["chunks_updated"] == len(chunks)
+            sent = [t for call in mock.call_args_list for t in call.args[0]]
+            expected = [
+                chunk_embed_text(c.layer_name, c.source_file, c.metadata, c.content)
+                for c in new_chunks
+            ]
+            assert sorted(sent) == sorted([*expected, old_content])
         finally:
             await delete_layer_chunks(db_url, layer)
 
@@ -353,7 +400,7 @@ class TestIngestionPipeline:
 class TestContextualChunkEnrichment:
     def test_context_prefix_generation(self):
         """Chunks should have a context prefix with layer, file, and section."""
-        from stratakb.knowledge.ingestion import _build_context_prefix
+        from stratakb.knowledge.vector_store import _build_context_prefix
 
         prefix = _build_context_prefix(
             layer_name="sepa",
@@ -365,28 +412,76 @@ class TestContextualChunkEnrichment:
         assert "12" in prefix
 
     def test_context_prefix_prepended_to_content(self):
-        from stratakb.knowledge.ingestion import _build_context_prefix
+        from stratakb.knowledge.vector_store import _build_context_prefix
 
         prefix = _build_context_prefix("iso20022", "some_api.yaml", section="Payment Initiation")
         assert "Payment Initiation" in prefix
 
-    def test_chunk_content_has_prefix(self):
-        """Chunks produced by _chunk_document must start with the context prefix."""
+    def test_chunk_content_has_no_prefix(self):
+        """Stored content is the page's own text; only the embedded text carries the prefix."""
         from stratakb.knowledge.ingestion import _chunk_document
         from stratakb.knowledge.parsers.pdf_parser import parse_pdf
+        from stratakb.knowledge.vector_store import chunk_embed_text
 
         doc = parse_pdf(TEST_PDF)
         chunks = _chunk_document(doc, layer_name="sepa", chunk_size=500, chunk_overlap=50)
+        pages = {p.page_number: p.text for p in doc.pages}
 
         assert len(chunks) > 0
         for chunk in chunks:
-            assert chunk.content.startswith("[sepa >"), (
-                f"Expected prefix '[sepa >' but got: {chunk.content[:60]!r}"
+            assert not chunk.content.startswith("["), chunk.content[:60]
+            assert chunk.content in pages[chunk.metadata["page"]]
+            embedded = chunk_embed_text(
+                chunk.layer_name, chunk.source_file, chunk.metadata, chunk.content
             )
+            assert embedded.startswith("[sepa > test_doc > Page ")
+            assert embedded.endswith(chunk.content)
+
+    def test_markdown_section_path_in_metadata_and_prefix(self):
+        """A Markdown section's heading chain is in the chunk metadata and the embedded prefix."""
+        from stratakb.knowledge.ingestion import _chunk_document
+        from stratakb.knowledge.parsers.markdown_parser import parse_markdown
+        from stratakb.knowledge.vector_store import chunk_embed_text
+
+        doc = parse_markdown(FIXTURES_DIR / "test_document.md")
+        chunks = _chunk_document(doc, layer_name="docs", chunk_size=500, chunk_overlap=50)
+
+        kc = [c for c in chunks if c.content.startswith("### Key Capabilities")]
+        assert len(kc) == 1
+        path = ["Customer Order Service", "Overview", "Key Capabilities"]
+        assert kc[0].metadata["section_path"] == path
+        c = kc[0]
+        embedded = chunk_embed_text(c.layer_name, c.source_file, c.metadata, c.content)
+        assert embedded.startswith(
+            "[docs > test_document > Customer Order Service > Overview > Key Capabilities]\n"
+        )
+        assert "## Overview" not in kc[0].content
+
+    @pytest.mark.asyncio
+    async def test_embed_chunks_sends_prefixed_text(self):
+        """The embedder gets the prefix plus content; the stored content stays as it is."""
+        from stratakb.knowledge.ingestion import _embed_chunks
+        from stratakb.knowledge.vector_store import ChunkRecord
+
+        chunks = [
+            ChunkRecord(
+                content="body", embedding=[], layer_name="l",
+                metadata={"page": 1}, source_file="f.pdf",
+            ),
+            ChunkRecord(
+                content="sec", embedding=[], layer_name="l",
+                metadata={"page": 1, "section_path": ["A", "B"]}, source_file="g.md",
+            ),
+        ]
+        with patch("stratakb.knowledge.ingestion.embed_texts", new_callable=AsyncMock) as mock:
+            mock.side_effect = lambda texts, **kwargs: [[0.0] for _ in texts]
+            await _embed_chunks("key", chunks)
+        assert mock.call_args.args[0] == ["[l > f > Page 1]\nbody", "[l > g > A > B]\nsec"]
+        assert [c.content for c in chunks] == ["body", "sec"]
 
     def test_prefix_contains_filename_stem(self):
         """Context prefix must include the filename stem (without extension)."""
-        from stratakb.knowledge.ingestion import _build_context_prefix
+        from stratakb.knowledge.vector_store import _build_context_prefix
 
         prefix = _build_context_prefix(
             layer_name="iso20022",

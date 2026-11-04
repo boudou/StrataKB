@@ -1,7 +1,7 @@
 """Markdown parser that splits documents by heading hierarchy.
 
-Chunks markdown files by H1/H2/H3 sections, preserving heading context
-so that each chunk is self-contained and searchable.
+Chunks markdown files by H1/H2/H3 sections. Each section keeps its own text;
+the parent headings travel on the side as the page's section path.
 """
 
 from __future__ import annotations
@@ -22,8 +22,8 @@ _HEADING_RE = re.compile(r"^(#{1,3})\s+(.+)$", re.MULTILINE)
 def parse_markdown(file_path: str | Path) -> ParsedDocument:
     """Parse a Markdown file, splitting by heading hierarchy.
 
-    Each H1/H2/H3 section becomes a separate page. The heading context
-    (parent headings) is preserved in each page's text.
+    Each H1/H2/H3 section becomes a separate page whose text is the section's
+    own text. The heading chain is in the page's section_path.
 
     Args:
         file_path: Path to the Markdown file.
@@ -64,6 +64,7 @@ def parse_markdown(file_path: str | Path) -> ParsedDocument:
                 text=section_text,
                 page_number=i + 1,
                 source_file=source,
+                section_path=section.get("section_path", []),
             ))
 
     logger.info(
@@ -78,8 +79,9 @@ def parse_markdown(file_path: str | Path) -> ParsedDocument:
 def _split_by_headings(text: str) -> list[dict]:
     """Split markdown text into sections by H1/H2/H3 headings.
 
-    Returns a list of dicts with keys: level, heading, text.
-    Parent heading context is prepended to each section.
+    Returns a list of dicts with keys: level, heading, text, section_path.
+    The text is the document's own text for the section, heading line included;
+    section_path is the heading chain (parent headings, then this heading).
     """
     matches = list(_HEADING_RE.finditer(text))
 
@@ -108,10 +110,8 @@ def _split_by_headings(text: str) -> list[dict]:
         level = len(match.group(1))  # Number of # chars
         heading = match.group(2).strip()
 
-        # Determine section content (from after this heading to the next heading)
-        start = match.end()
+        # Section text is the document's own text, from this heading to the next one
         end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
-        body = text[start:end].strip()
 
         # Update context
         if level == 1:
@@ -120,20 +120,18 @@ def _split_by_headings(text: str) -> list[dict]:
         elif level == 2:
             h2_context = heading
 
-        # Build section text with context
-        lines = []
+        path = []
         if level >= 2 and h1_context:
-            lines.append(f"# {h1_context}")
+            path.append(h1_context)
         if level >= 3 and h2_context:
-            lines.append(f"## {h2_context}")
-        lines.append(f"{'#' * level} {heading}")
-        if body:
-            lines.append(body)
+            path.append(h2_context)
+        path.append(heading)
 
         sections.append({
             "level": level,
             "heading": heading,
-            "text": "\n\n".join(lines),
+            "text": text[match.start():end].strip(),
+            "section_path": path,
         })
 
     return sections

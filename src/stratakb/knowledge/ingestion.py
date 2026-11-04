@@ -25,7 +25,7 @@ from stratakb.knowledge.layers import LayerNotFoundError, get_layer_status
 from stratakb.knowledge.parsers.pdf_parser import ParsedDocument
 from stratakb.knowledge.parsers.registry import SUPPORTED_PARSERS
 from stratakb.knowledge.policy import is_secret_name
-from stratakb.knowledge.vector_store import ChunkRecord, insert_chunks
+from stratakb.knowledge.vector_store import ChunkRecord, chunk_embed_text, insert_chunks
 
 if TYPE_CHECKING:
     from stratakb.knowledge.selection import FileEntry
@@ -91,7 +91,7 @@ async def _embed_chunks(
     for i in range(0, len(chunks), EMBED_BATCH_SIZE):
         batch = chunks[i:i + EMBED_BATCH_SIZE]
         embeddings = await embed_texts(
-            [c.content for c in batch],
+            [chunk_embed_text(c.layer_name, c.source_file, c.metadata, c.content) for c in batch],
             api_key=api_key,
             model=embedding_model,
             dimensions=embedding_dimensions,
@@ -554,28 +554,6 @@ def _probably_scanned(doc: ParsedDocument) -> bool:
     )
 
 
-def _build_context_prefix(
-    layer_name: str,
-    source_file: str,
-    page_number: int | None = None,
-    section: str | None = None,
-) -> str:
-    """Build a context prefix for a chunk to improve embedding quality.
-
-    Prepends [layer > filename > page/section] to give the embedding model
-    contextual information about where this chunk comes from.
-    """
-    file_stem = Path(source_file).stem if source_file else "unknown"
-
-    parts = [layer_name, file_stem]
-    if section:
-        parts.append(section)
-    elif page_number is not None:
-        parts.append(f"Page {page_number}")
-
-    return f"[{' > '.join(parts)}]\n"
-
-
 def _chunk_document(
     doc: ParsedDocument,
     *,
@@ -602,21 +580,20 @@ def _chunk_document(
 
     for page in doc.pages:
         page_chunks = splitter.split_text(page.text)
+        metadata: dict = {
+            "page": page.page_number,
+            "total_pages": doc.total_pages,
+        }
+        if page.section_path:
+            metadata["section_path"] = list(page.section_path)
         for chunk_text in page_chunks:
-            prefix = _build_context_prefix(
-                layer_name=layer_name,
-                source_file=doc.source_file,
-                page_number=page.page_number,
-            )
+            # content is the page's own text; the context prefix is only embedded
             chunks.append(
                 ChunkRecord(
-                    content=prefix + chunk_text,
+                    content=chunk_text,
                     embedding=[],  # Filled later
                     layer_name=layer_name,
-                    metadata={
-                        "page": page.page_number,
-                        "total_pages": doc.total_pages,
-                    },
+                    metadata=dict(metadata),
                     source_file=doc.source_file,
                     source_section=f"page_{page.page_number}",
                     doc_type=doc_type,

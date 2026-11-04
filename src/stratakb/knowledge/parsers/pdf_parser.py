@@ -20,6 +20,8 @@ class ParsedPage:
     text: str
     page_number: int
     source_file: str
+    # Heading chain of a section, outermost first (Markdown and HTML); empty for other formats
+    section_path: list[str] = field(default_factory=list)
 
 
 @dataclass
