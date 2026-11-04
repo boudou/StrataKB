@@ -29,7 +29,7 @@ def parse_csv(file_path: str | Path) -> ParsedDocument:
         file_path: Path to the CSV file.
 
     Returns:
-        ParsedDocument with one page per row/group.
+        ParsedDocument with one page per row/group, or no pages when the file has no data rows.
     """
     file_path = Path(file_path)
     source = file_path.name
@@ -44,7 +44,7 @@ def parse_csv(file_path: str | Path) -> ParsedDocument:
         with open(file_path, "r", encoding="utf-8-sig") as f:
             reader = csv.DictReader(f)
             if reader.fieldnames is None:
-                return ParsedDocument(source_file=source, error="CSV has no header row")
+                return ParsedDocument(source_file=source, pages=[], total_pages=0)
 
             headers = list(reader.fieldnames)
             rows = []
@@ -57,7 +57,7 @@ def parse_csv(file_path: str | Path) -> ParsedDocument:
         return ParsedDocument(source_file=source, error=f"CSV parse error: {e}")
 
     if not rows:
-        return ParsedDocument(source_file=source, error="CSV file is empty (no data rows)")
+        return ParsedDocument(source_file=source, pages=[], total_pages=0)
 
     pages: list[ParsedPage] = []
 

@@ -302,8 +302,23 @@ class TestMarkdownErrors:
             f.flush()
 
             result = parse_markdown(f.name)
-            assert result.error is not None
-            assert "empty" in result.error.lower()
+            assert result.error is None
+            assert result.pages == []
+            assert result.total_pages == 0
+
+        Path(f.name).unlink()
+
+    def test_whitespace_only_markdown(self):
+        from stratakb.knowledge.parsers.markdown_parser import parse_markdown
+
+        with tempfile.NamedTemporaryFile(suffix=".md", mode="w", delete=False) as f:
+            f.write("  \n\t\n")
+            f.flush()
+
+            result = parse_markdown(f.name)
+            assert result.error is None
+            assert result.pages == []
+            assert result.total_pages == 0
 
         Path(f.name).unlink()
 
@@ -420,8 +435,23 @@ class TestHTMLErrors:
             f.flush()
 
             result = parse_html(f.name)
-            assert result.error is not None
-            assert "empty" in result.error.lower()
+            assert result.error is None
+            assert result.pages == []
+            assert result.total_pages == 0
+
+        Path(f.name).unlink()
+
+    def test_html_without_text(self):
+        from stratakb.knowledge.parsers.html_parser import parse_html
+
+        with tempfile.NamedTemporaryFile(suffix=".html", mode="w", delete=False) as f:
+            f.write("<html><body><p> </p></body></html>")
+            f.flush()
+
+            result = parse_html(f.name)
+            assert result.error is None
+            assert result.pages == []
+            assert result.total_pages == 0
 
         Path(f.name).unlink()
 

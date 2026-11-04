@@ -331,6 +331,37 @@ class TestPolicyAndEmpty:
         assert result.errors == []
         assert result.status == "completed"
 
+    async def test_parses_without_text_are_no_text(self, db_url, layer, tmp_path):
+        _write(tmp_path / "codes.csv", "Code,Name\n")
+        _write(tmp_path / "blank.html", "<html><body><p> </p></body></html>")
+        _write(tmp_path / "a.md", "# Alpha\n\nAlpha content.\n")
+
+        result, _ = await _ingest(db_url, layer, tmp_path)
+
+        outcomes = _outcomes(result)
+        assert outcomes["codes.csv"] == ("skipped", "no_text")
+        assert outcomes["blank.html"] == ("skipped", "no_text")
+        assert outcomes["a.md"] == ("added", None)
+        assert result.files_skipped == 2
+        assert result.docs_failed == 0
+        assert result.errors == []
+        assert result.status == "completed"
+        assert [f["relative_path"] for f in await _files(db_url, layer)] == ["a.md"]
+
+    async def test_tracked_csv_losing_its_rows_removed(self, db_url, layer, tmp_path):
+        codes = _write(tmp_path / "codes.csv", "Code,Name\nA1,Alpha\n")
+        _write(tmp_path / "b.md", "# Beta\n\nBeta content.\n")
+        await _ingest(db_url, layer, tmp_path)
+
+        _write(codes, "Code,Name\n")
+        result, _ = await _ingest(db_url, layer, tmp_path)
+
+        assert _outcomes(result)["codes.csv"] == ("removed", "no_text")
+        assert result.files_removed == 1
+        assert result.errors == []
+        assert {r["source_file"] for r in await _chunks(db_url, layer)} == {"b.md"}
+        assert [f["relative_path"] for f in await _files(db_url, layer)] == ["b.md"]
+
     async def test_tracked_file_becoming_empty_removed(self, db_url, layer, tmp_path):
         a = _write(tmp_path / "a.md", "# Alpha\n\nAlpha content.\n")
         _write(tmp_path / "b.md", "# Beta\n\nBeta content.\n")
