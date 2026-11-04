@@ -27,7 +27,7 @@ The server retrieves; it does not write answers. Your MCP client reads the retur
 - **Query rewriting** (optional): with an Anthropic API key, `strata_ask` expands a question into several searches in the knowledge base's own terminology
 - **Learns from use**: records searches, detects rephrased questions and layer switches, and takes explicit feedback on each result's `interaction_id`. It then learns synonyms, query rewrites that worked (a proven rewrite skips the LLM call) and which layers a question belongs to
 - **Many formats**: PDF, DOCX, Markdown, HTML, CSV, JSON, XML/XSD and OpenAPI/AsyncAPI YAML, each split along its natural structure
-- **Local embeddings by default**: `all-mpnet-base-v2` runs on CPU with no API key; OpenAI embeddings are optional
+- **Local embeddings by default**: `all-mpnet-base-v2` runs on CPU with no API key; OpenAI or any OpenAI-compatible server (Ollama, LM Studio, vLLM) is optional
 - **Roles and audit**: viewer, operator and admin roles on every tool, and an append-only audit log of searches and changes
 - **Privacy guards**: IBANs and card numbers are masked in logs, and IBANs, BICs and account numbers are scrubbed from stored queries; secrets are redacted from audit entries; files whose names look like secrets (`.env`, keys, certificates, credentials) are never read or ingested
 - **Read-only SQL**: inspect the store with schema browsing, sample chunks, vector statistics and `EXPLAIN`
@@ -45,7 +45,7 @@ flowchart LR
 ```mermaid
 flowchart LR
     start["python -m stratakb"] --> db["Connect to PostgreSQL,<br/>update the schema"] --> ready["Answer the client"]
-    db -.->|"background"| m["Load the embedding model"] -.-> s["First search<br/>(waits if still loading)"]
+    db -.->|"background"| m["Load the local embedding model<br/>(local backend only)"] -.-> s["First search<br/>(waits if still loading)"]
 ```
 
 **Ingest**
@@ -93,7 +93,7 @@ docker compose up -d        # PostgreSQL 16 + pgvector on port 5433, schemas cre
 uv sync
 ```
 
-The server answers its client at once and loads the embedding model in the background; a search sent before the model is ready waits for it. The first start downloads the embedding model (about 420 MB) and the first `strata_ask` downloads the reranker (about 90 MB), both into your Hugging Face cache.
+The server answers its client at once and, with the default `local` backend, loads the embedding model in the background; a search sent before the model is ready waits for it. The first start downloads the embedding model (about 420 MB) and the first `strata_ask` downloads the reranker (about 90 MB), both into your Hugging Face cache.
 
 ### Connect an MCP client
 
@@ -191,10 +191,12 @@ Settings come from environment variables or `.env`.
 | `DATABASE_URL` | `postgresql://strata:…@localhost:5433/strata` | PostgreSQL connection |
 | `READONLY_DATABASE_URL` | `DATABASE_URL` | Connection for `strata_db_query` and `strata_db_explain`; point it at the `strata_readonly` role from `db/03_readonly_role.sql` |
 | `STRATA_USER`, `STRATA_ROLE` | `developer`, `viewer` | Identity and role on stdio |
-| `EMBEDDING_BACKEND` | `local` | `local` (sentence-transformers) or `openai` |
-| `EMBEDDING_MODEL` | `all-mpnet-base-v2` | Embedding model |
-| `EMBEDDING_DIMENSIONS` | `768` | Must match the model and the `vector(…)` column |
-| `OPENAI_API_KEY` | | Needed only for the `openai` backend |
+| `EMBEDDING_BACKEND` | `local` | `local` (sentence-transformers) or `openai` (OpenAI, or the OpenAI-compatible server in `EMBEDDING_BASE_URL`) |
+| `EMBEDDING_MODEL` | `all-mpnet-base-v2` | Embedding model; the `openai` backend uses `text-embedding-3-large` unless set |
+| `EMBEDDING_DIMENSIONS` | `768` | Must match the model and the `vector(…)` column; vectors of another length are refused |
+| `EMBEDDING_BASE_URL` | | `openai` backend: an OpenAI-compatible server, ending in `/v1` (for example `http://127.0.0.1:11434/v1`); empty means OpenAI |
+| `EMBEDDING_API_KEY` | | Key for `EMBEDDING_BASE_URL`, only if the server asks for one |
+| `OPENAI_API_KEY` | | Needed for the `openai` backend without `EMBEDDING_BASE_URL`; never sent to that server |
 | `ANTHROPIC_API_KEY` | | Turns on query rewriting in `strata_ask` |
 | `QUERY_REWRITE_MODEL` | `claude-haiku-5-5` | Model used for query rewriting |
 | `HYBRID_SEARCH_ENABLED` | `true` | Vector plus full-text search |
@@ -209,6 +211,23 @@ Settings come from environment variables or `.env`.
 | `LOG_LEVEL` | `INFO` | Structured JSON logs on stderr |
 
 To change the embedding model, update the three `EMBEDDING_*` settings and re-embed each layer with `vector_store.re_embed_layer()`, which re-embeds the stored chunk text in place without re-parsing files.
+
+### Embeddings from a model server
+
+Instead of the in-process model, StrataKB can embed through any server that speaks the OpenAI embeddings API, such as Ollama, LM Studio or vLLM. Your documents and questions then go to that server and nowhere else; no OpenAI key is needed. For a local Ollama:
+
+```bash
+ollama pull nomic-embed-text   # 768 dimensions, matches the default column
+```
+
+```bash
+EMBEDDING_BACKEND=openai
+EMBEDDING_BASE_URL=http://127.0.0.1:11434/v1
+EMBEDDING_MODEL=nomic-embed-text
+# EMBEDDING_API_KEY=           # only if the server asks for a key
+```
+
+The URL ends in `/v1`. A model with other dimensions, for example `mxbai-embed-large` (1024), needs `EMBEDDING_DIMENSIONS` and the `vector(…)` column changed to match. Switching models means re-embedding every layer with `vector_store.re_embed_layer()`, even when the dimensions match: vectors from two models cannot be compared.
 
 ## Project structure
 

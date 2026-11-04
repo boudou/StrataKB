@@ -22,9 +22,15 @@ class Settings(BaseSettings):
     query_rewrite_model: str = "claude-haiku-5-5"
 
     # Embeddings
-    embedding_backend: str = "local"  # "local" or "openai"
-    embedding_model: str = "all-mpnet-base-v2"  # local: sentence-transformers model
+    # "local", or "openai" (OpenAI or an OpenAI-compatible server)
+    embedding_backend: str = "local"
+    # local: sentence-transformers model; openai: text-embedding-3-large unless set
+    embedding_model: str = "all-mpnet-base-v2"
     embedding_dimensions: int = 768  # must match model output
+    # openai backend: an OpenAI-compatible server, e.g. http://127.0.0.1:11434/v1;
+    # empty = OpenAI
+    embedding_base_url: str = ""
+    embedding_api_key: str = ""  # key for EMBEDDING_BASE_URL; OPENAI_API_KEY is never sent there
 
     # HNSW Search Tuning
     hnsw_ef_search: int = 40  # recall vs latency tradeoff (higher = more recall, slower)

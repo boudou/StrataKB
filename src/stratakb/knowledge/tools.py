@@ -213,14 +213,12 @@ def register_knowledge_tools(
                         ingest everything again (a full rebuild).
         """
         from stratakb.config import get_settings
+        from stratakb.knowledge.embeddings import embedding_key_error
         from stratakb.knowledge.ingestion import ingest_documents
 
         _settings = get_settings()
-        if _settings.embedding_backend == "openai" and not openai_api_key:
-            return {
-                "status": "error",
-                "error": "OpenAI API key not configured. Set OPENAI_API_KEY in .env",
-            }
+        if err := embedding_key_error(_settings, openai_api_key):
+            return {"status": "error", "error": err}
 
         user_id, _ = get_current_user()
         try:
@@ -295,6 +293,7 @@ def register_knowledge_tools(
         from pathlib import Path
 
         from stratakb.config import get_settings
+        from stratakb.knowledge.embeddings import embedding_key_error
         from stratakb.knowledge.layers import LayerValidationError
         from stratakb.knowledge.presets import (
             create_preset_layer,
@@ -336,11 +335,8 @@ def register_knowledge_tools(
                 "errors": result.errors[:20] if result.errors else None,
             }
 
-        if _settings.embedding_backend == "openai" and not openai_api_key:
-            return {
-                "status": "error",
-                "error": "OpenAI API key not configured. Set OPENAI_API_KEY in .env",
-            }
+        if err := embedding_key_error(_settings, openai_api_key):
+            return {"status": "error", "error": err}
 
         user_id, _ = get_current_user()
         layer_result = await create_preset_layer(database_url, preset)

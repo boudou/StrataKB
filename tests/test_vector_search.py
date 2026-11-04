@@ -355,6 +355,7 @@ class TestSearchTool:
 
         with patch("stratakb.config.get_settings") as mock_settings:
             mock_settings.return_value.embedding_backend = "openai"
+            mock_settings.return_value.embedding_base_url = ""
             mock_settings.return_value.strata_user = "test"
             mock_settings.return_value.strata_role = "admin"
             result = await fn(query="test query")
