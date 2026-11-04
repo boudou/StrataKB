@@ -28,6 +28,26 @@ _OPENAI_COMPATIBLE_TIMEOUT = 60.0
 # Replies with no usable JSON array since the server started
 _parse_failures = 0
 
+
+def _safe_domain_context(domain_context: str | None) -> str:
+    """Return domain context as safely-quoted data for prompt interpolation.
+
+    The context may originate from DB-backed descriptions. Treat it as data
+    (not instructions) by neutralizing common prompt-boundary tokens and
+    JSON-quoting the final value.
+    """
+    raw = domain_context or _DEFAULT_DOMAIN_CONTEXT
+    cleaned = (
+        raw.replace("```", "`\u200b``")
+        .replace("<system>", "< system >")
+        .replace("</system>", "< /system >")
+        .replace("<assistant>", "< assistant >")
+        .replace("</assistant>", "< /assistant >")
+        .replace("\x00", " ")
+    )
+    return json.dumps(cleaned, ensure_ascii=False)
+
+
 _SYSTEM_PROMPT = """\
 You are a query rewriter for a retrieval system. Take the user's question and produce 2-4 alternative search queries that use the precise terminology of the knowledge base described below.
 
@@ -234,7 +254,7 @@ async def rewrite_query(
         logger.info("query_rewrite_skipped", reason="local_only")
         return [enriched_query]
 
-    system = _SYSTEM_PROMPT.format(domain_context=domain_context or _DEFAULT_DOMAIN_CONTEXT)
+    system = _SYSTEM_PROMPT.format(domain_context=_safe_domain_context(domain_context))
     try:
         if provider == "openai_compatible":
             text = await _call_openai_compatible(settings, model, system, enriched_query)
