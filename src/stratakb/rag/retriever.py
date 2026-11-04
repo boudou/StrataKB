@@ -7,11 +7,13 @@ with optional layer and metadata filtering.
 from __future__ import annotations
 
 import re
+import time
 from dataclasses import dataclass, field
+from datetime import datetime
 
 import structlog
 
-from stratakb.core.database import get_pool
+from stratakb.core.database import fetch_layers_stamp, get_pool
 from stratakb.knowledge.embeddings import embed_texts
 from stratakb.rag.cache import QueryCache
 
@@ -33,6 +35,34 @@ def _get_cache() -> QueryCache | None:
     except Exception:
         pass
     return None
+
+
+# The layers stamp is read at most this often (seconds) per database URL
+_STAMP_INTERVAL = 2.0
+_stamps: dict[str, tuple[int, datetime | None]] = {}
+_checked_at: dict[str, float] = {}
+
+
+async def _maybe_clear(database_url: str) -> None:
+    """Clear the query cache when any process has changed the layers."""
+    now = time.monotonic()
+    last = _checked_at.get(database_url)
+    if last is not None and now - last < _STAMP_INTERVAL:
+        return
+    # Set before the await: concurrent searches skip, a failing DB is retried every 2 s
+    _checked_at[database_url] = now
+    try:
+        stamp = await fetch_layers_stamp(database_url)
+    except Exception as e:
+        logger.warning("query_cache_stamp_failed", error_type=type(e).__name__)
+        return
+    previous = _stamps.get(database_url)
+    _stamps[database_url] = stamp
+    if previous is not None and stamp != previous:
+        cache = _get_cache()
+        if cache:
+            cache.clear()
+        logger.info("query_cache_cleared")
 
 
 @dataclass
@@ -78,6 +108,7 @@ async def search_chunks(
 
     cache = _get_cache()
     if cache:
+        await _maybe_clear(database_url)
         cached = cache.get(query, layers, top_k, metadata_filter)
         if cached is not None:
             return cached

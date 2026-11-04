@@ -164,6 +164,8 @@ async def clear_layer(database_url: str, layer_name: str) -> None:
                 """,
                 layer_name,
             )
+    # After the commit: the recount runs on another connection
+    await _update_layer_stats(database_url, layer_name)
     logger.info(
         "layer_cleared",
         layer=layer_name,
@@ -205,7 +207,7 @@ async def ingest_documents(
        text, then parse, chunk, embed, store
     5. Remove files that are gone from the root
     6. Record ingestion run
-    7. Recount layer stats
+    7. Recount layer stats (always, even when the run fails or is interrupted)
 
     Args:
         database_url: PostgreSQL connection URL.
@@ -255,176 +257,169 @@ async def ingest_documents(
     files = _discover_files(source)
     pool = await get_pool(database_url)
 
-    # Step 3: Full rebuild, or a one-off rebuild of a layer ingested before tracking
-    if replace_all:
-        await clear_layer(database_url, layer_name)
-    else:
-        legacy = await pool.execute(
-            "DELETE FROM strata_vectors.chunks WHERE layer_name = $1 AND file_id IS NULL",
-            layer_name,
-        )
-        legacy_count = int(legacy.split()[-1])
-        if legacy_count > 0:
-            result.rebuilt_legacy = True
-            logger.info("legacy_chunks_removed", layer=layer_name, count=legacy_count)
-
-    rows = await pool.fetch(
-        """
-        SELECT id, relative_path, content_hash FROM strata_core.ingested_files
-        WHERE layer_id = $1 AND source_root = $2
-        """,
-        layer_id,
-        source_root,
-    )
-    tracked = {r["relative_path"]: r for r in rows}
-
-    if not files and (single_file or not tracked):
-        result.errors.append({"error": f"No supported files found at: {source_path}"})
-        await _record_run(database_url, layer_id=layer_id, result=result, source_path=source_path)
-        if result.rebuilt_legacy:
-            await _update_layer_stats(database_url, layer_name)
-        return result
-
-    logger.info("ingestion_started", layer=layer_name, files=len(files))
-
-    async def drop(relative_path: str, previous, reason: str) -> None:
-        """Skip a file, or remove it (row and chunks) when it was tracked."""
-        if previous is None:
-            result.files.append(FileOutcome(relative_path, "skipped", reason))
-            result.files_skipped += 1
-            return
-        await pool.execute("DELETE FROM strata_core.ingested_files WHERE id = $1", previous["id"])
-        result.files.append(FileOutcome(relative_path, "removed", reason))
-        result.files_removed += 1
-
-    def fail(relative_path: str, error: str, reason: str) -> None:
-        result.files.append(FileOutcome(relative_path, "failed", reason))
-        result.docs_failed += 1
-        result.errors.append({"file": relative_path, "error": error})
-
-    # Step 4: Parse, chunk, embed and store each new or changed file
-    seen: set[str] = set()
-    for file_path in files:
-        relative_path = file_path.relative_to(root).as_posix()
-        seen.add(relative_path)
-        previous = tracked.get(relative_path)
-
-        # Checked on the name alone: a secret-looking file is never opened
-        if is_secret_name(relative_path):
-            await drop(relative_path, previous, "secret")
-            continue
-
-        try:
-            data = file_path.read_bytes()
-        except OSError as e:
-            fail(relative_path, str(e), "parse_error")
-            continue
-        content_hash = hashlib.sha256(data).hexdigest()
-
-        if previous is not None and previous["content_hash"] == content_hash:
-            result.files_unchanged += 1
-            result.files.append(FileOutcome(relative_path, "unchanged"))
-            continue
-
-        if not data or (
-            file_path.suffix.lower() not in _BINARY_FORMATS
-            and not data.decode("utf-8-sig", errors="replace").strip()
-        ):
-            await drop(relative_path, previous, "no_text")
-            continue
-
-        try:
-            parsed = _parse_file(file_path)
-        except Exception as e:
-            logger.warning(
-                "file_parse_raised", layer=layer_name, file=relative_path,
-                error_type=type(e).__name__,
-            )
-            fail(relative_path, str(e), "parse_error")
-            continue
-        if parsed.error:
-            fail(relative_path, parsed.error, "parse_error")
-            continue
-        parsed.source_file = relative_path
-
-        doc_chunks = _chunk_document(
-            parsed,
-            layer_name=layer_name,
-            chunk_size=chunk_size,
-            chunk_overlap=chunk_overlap,
-        )
-        if not doc_chunks:
-            await drop(relative_path, previous, "no_text")
-            continue
-
-        try:
-            await _embed_chunks(
-                openai_api_key,
-                doc_chunks,
-                embedding_model=embedding_model,
-                embedding_dimensions=embedding_dimensions,
-            )
-            await _store_file(
-                database_url,
-                layer_id=layer_id,
-                source_root=source_root,
-                relative_path=relative_path,
-                content_hash=content_hash,
-                size_bytes=len(data),
-                chunks=doc_chunks,
-            )
-        except Exception as e:
-            logger.warning(
-                "file_ingestion_failed", layer=layer_name, file=relative_path, error=str(e)
-            )
-            fail(relative_path, str(e), "embed_error")
-            continue
-
-        if previous is None:
-            result.files_added += 1
-            result.files.append(FileOutcome(relative_path, "added"))
-        else:
-            result.files_updated += 1
-            result.files.append(FileOutcome(relative_path, "updated"))
-        result.docs_processed += 1
-        result.chunks_created += len(doc_chunks)
-
-    # Step 5: Remove files ingested from this root that no longer exist
-    if not single_file:
-        gone = [
-            (path, r["id"]) for path, r in tracked.items()
-            if path not in seen and not (root / path).exists()
-        ]
-        if gone:
-            await pool.execute(
-                "DELETE FROM strata_core.ingested_files WHERE id = ANY($1::uuid[])",
-                [file_id for _, file_id in gone],
-            )
-            result.files.extend(FileOutcome(path, "removed", "deleted") for path, _ in gone)
-            result.files_removed += len(gone)
-
-    # Step 6: Record ingestion run
-    if result.docs_failed == 0:
-        result.status = "completed"
-    elif result.docs_processed or result.files_unchanged or result.files_removed:
-        result.status = "partial"
-    else:
-        result.status = "failed"
-    result.duration_seconds = time.monotonic() - start
-    await _record_run(database_url, layer_id=layer_id, result=result, source_path=source_path)
-
-    # Step 7: Recount layer stats
-    await _update_layer_stats(database_url, layer_name)
-
-    # Invalidate cached search results for this layer
     try:
-        from stratakb.rag.cache import _get_cache
-        cache = _get_cache()
-        if cache:
-            evicted = cache.invalidate_layer(layer_name)
-            logger.info("cache_invalidated_after_ingestion", layer=layer_name, evicted=evicted)
-    except Exception:
-        pass  # Cache invalidation is best-effort
+        # Step 3: Full rebuild, or a one-off rebuild of a layer ingested before tracking
+        if replace_all:
+            await clear_layer(database_url, layer_name)
+        else:
+            legacy = await pool.execute(
+                "DELETE FROM strata_vectors.chunks WHERE layer_name = $1 AND file_id IS NULL",
+                layer_name,
+            )
+            legacy_count = int(legacy.split()[-1])
+            if legacy_count > 0:
+                result.rebuilt_legacy = True
+                logger.info("legacy_chunks_removed", layer=layer_name, count=legacy_count)
+
+        rows = await pool.fetch(
+            """
+            SELECT id, relative_path, content_hash FROM strata_core.ingested_files
+            WHERE layer_id = $1 AND source_root = $2
+            """,
+            layer_id,
+            source_root,
+        )
+        tracked = {r["relative_path"]: r for r in rows}
+
+        if not files and (single_file or not tracked):
+            result.errors.append({"error": f"No supported files found at: {source_path}"})
+            await _record_run(
+                database_url, layer_id=layer_id, result=result, source_path=source_path
+            )
+            return result
+
+        logger.info("ingestion_started", layer=layer_name, files=len(files))
+
+        async def drop(relative_path: str, previous, reason: str) -> None:
+            """Skip a file, or remove it (row and chunks) when it was tracked."""
+            if previous is None:
+                result.files.append(FileOutcome(relative_path, "skipped", reason))
+                result.files_skipped += 1
+                return
+            await pool.execute(
+                "DELETE FROM strata_core.ingested_files WHERE id = $1", previous["id"]
+            )
+            result.files.append(FileOutcome(relative_path, "removed", reason))
+            result.files_removed += 1
+
+        def fail(relative_path: str, error: str, reason: str) -> None:
+            result.files.append(FileOutcome(relative_path, "failed", reason))
+            result.docs_failed += 1
+            result.errors.append({"file": relative_path, "error": error})
+
+        # Step 4: Parse, chunk, embed and store each new or changed file
+        seen: set[str] = set()
+        for file_path in files:
+            relative_path = file_path.relative_to(root).as_posix()
+            seen.add(relative_path)
+            previous = tracked.get(relative_path)
+
+            # Checked on the name alone: a secret-looking file is never opened
+            if is_secret_name(relative_path):
+                await drop(relative_path, previous, "secret")
+                continue
+
+            try:
+                data = file_path.read_bytes()
+            except OSError as e:
+                fail(relative_path, str(e), "parse_error")
+                continue
+            content_hash = hashlib.sha256(data).hexdigest()
+
+            if previous is not None and previous["content_hash"] == content_hash:
+                result.files_unchanged += 1
+                result.files.append(FileOutcome(relative_path, "unchanged"))
+                continue
+
+            if not data or (
+                file_path.suffix.lower() not in _BINARY_FORMATS
+                and not data.decode("utf-8-sig", errors="replace").strip()
+            ):
+                await drop(relative_path, previous, "no_text")
+                continue
+
+            try:
+                parsed = _parse_file(file_path)
+            except Exception as e:
+                logger.warning(
+                    "file_parse_raised", layer=layer_name, file=relative_path,
+                    error_type=type(e).__name__,
+                )
+                fail(relative_path, str(e), "parse_error")
+                continue
+            if parsed.error:
+                fail(relative_path, parsed.error, "parse_error")
+                continue
+            parsed.source_file = relative_path
+
+            doc_chunks = _chunk_document(
+                parsed,
+                layer_name=layer_name,
+                chunk_size=chunk_size,
+                chunk_overlap=chunk_overlap,
+            )
+            if not doc_chunks:
+                await drop(relative_path, previous, "no_text")
+                continue
+
+            try:
+                await _embed_chunks(
+                    openai_api_key,
+                    doc_chunks,
+                    embedding_model=embedding_model,
+                    embedding_dimensions=embedding_dimensions,
+                )
+                await _store_file(
+                    database_url,
+                    layer_id=layer_id,
+                    source_root=source_root,
+                    relative_path=relative_path,
+                    content_hash=content_hash,
+                    size_bytes=len(data),
+                    chunks=doc_chunks,
+                )
+            except Exception as e:
+                logger.warning(
+                    "file_ingestion_failed", layer=layer_name, file=relative_path, error=str(e)
+                )
+                fail(relative_path, str(e), "embed_error")
+                continue
+
+            if previous is None:
+                result.files_added += 1
+                result.files.append(FileOutcome(relative_path, "added"))
+            else:
+                result.files_updated += 1
+                result.files.append(FileOutcome(relative_path, "updated"))
+            result.docs_processed += 1
+            result.chunks_created += len(doc_chunks)
+
+        # Step 5: Remove files ingested from this root that no longer exist
+        if not single_file:
+            gone = [
+                (path, r["id"]) for path, r in tracked.items()
+                if path not in seen and not (root / path).exists()
+            ]
+            if gone:
+                await pool.execute(
+                    "DELETE FROM strata_core.ingested_files WHERE id = ANY($1::uuid[])",
+                    [file_id for _, file_id in gone],
+                )
+                result.files.extend(FileOutcome(path, "removed", "deleted") for path, _ in gone)
+                result.files_removed += len(gone)
+
+        # Step 6: Record ingestion run
+        if result.docs_failed == 0:
+            result.status = "completed"
+        elif result.docs_processed or result.files_unchanged or result.files_removed:
+            result.status = "partial"
+        else:
+            result.status = "failed"
+        result.duration_seconds = time.monotonic() - start
+        await _record_run(database_url, layer_id=layer_id, result=result, source_path=source_path)
+    finally:
+        # Step 7: Recount layer stats, even when the run failed or was interrupted
+        await _update_layer_stats(database_url, layer_name)
 
     logger.info(
         "ingestion_completed",
@@ -571,20 +566,27 @@ async def _record_run(
 
 
 async def _update_layer_stats(database_url: str, layer_name: str) -> None:
-    """Recount doc_count and chunk_count from the database and set last_ingested."""
-    pool = await get_pool(database_url)
-    await pool.execute(
-        """
-        UPDATE strata_core.knowledge_layers AS kl
-        SET doc_count = (
-                SELECT COUNT(*) FROM strata_core.ingested_files f WHERE f.layer_id = kl.id
-            ),
-            chunk_count = (
-                SELECT COUNT(*) FROM strata_vectors.chunks c WHERE c.layer_name = kl.name
-            ),
-            last_ingested = NOW(),
-            updated_at = NOW()
-        WHERE kl.name = $1
-        """,
-        layer_name,
-    )
+    """Recount doc_count and chunk_count from the database and set last_ingested.
+
+    Also bumps updated_at, which tells every process's caches the layer
+    changed. A failure is logged, not raised.
+    """
+    try:
+        pool = await get_pool(database_url)
+        await pool.execute(
+            """
+            UPDATE strata_core.knowledge_layers AS kl
+            SET doc_count = (
+                    SELECT COUNT(*) FROM strata_core.ingested_files f WHERE f.layer_id = kl.id
+                ),
+                chunk_count = (
+                    SELECT COUNT(*) FROM strata_vectors.chunks c WHERE c.layer_name = kl.name
+                ),
+                last_ingested = NOW(),
+                updated_at = NOW()
+            WHERE kl.name = $1
+            """,
+            layer_name,
+        )
+    except Exception as e:
+        logger.warning("layer_stats_update_failed", layer=layer_name, error_type=type(e).__name__)

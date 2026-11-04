@@ -9,12 +9,14 @@ from __future__ import annotations
 
 import json
 import re
+import time
+from datetime import datetime
 
 import asyncpg
 import structlog
 from cachetools import TTLCache
 
-from stratakb.core.database import get_pool
+from stratakb.core.database import fetch_layers_stamp, get_pool
 from stratakb.core.migrations import ensure_schema
 
 logger = structlog.get_logger()
@@ -36,9 +38,15 @@ _LAYER_COLUMNS = (
     "created_at, updated_at, origin, owner, root_path"
 )
 
-# Routing patterns and descriptions change only when layers are created or
-# deleted, so search tools read them through a short-lived cache.
+# Search tools read routing patterns and descriptions through a short-lived
+# cache. This process's create, delete and setters clear it at once; a layer
+# change from another process clears it within 2 s (see _maybe_clear).
 _routing_cache: TTLCache = TTLCache(maxsize=1, ttl=60)
+
+# The layers stamp is read at most this often (seconds) per database URL
+_STAMP_INTERVAL = 2.0
+_stamps: dict[str, tuple[int, datetime | None]] = {}
+_checked_at: dict[str, float] = {}
 
 
 class LayerError(Exception):
@@ -395,6 +403,7 @@ async def get_layer_routing(database_url: str) -> dict:
     Returns:
         {"patterns": {layer: [regex, ...]}, "descriptions": {layer: "Display: description"}}
     """
+    await _maybe_clear(database_url)
     cached = _routing_cache.get("routing")
     if cached is not None:
         return cached
@@ -422,6 +431,26 @@ async def get_layer_routing(database_url: str) -> dict:
 
     _routing_cache["routing"] = routing
     return routing
+
+
+async def _maybe_clear(database_url: str) -> None:
+    """Clear the routing cache when any process has changed the layers."""
+    now = time.monotonic()
+    last = _checked_at.get(database_url)
+    if last is not None and now - last < _STAMP_INTERVAL:
+        return
+    # Set before the await: concurrent callers skip, a failing DB is retried every 2 s
+    _checked_at[database_url] = now
+    try:
+        stamp = await fetch_layers_stamp(database_url)
+    except Exception as e:
+        logger.warning("routing_cache_stamp_failed", error_type=type(e).__name__)
+        return
+    previous = _stamps.get(database_url)
+    _stamps[database_url] = stamp
+    if previous is not None and stamp != previous:
+        _routing_cache.clear()
+        logger.info("routing_cache_cleared")
 
 
 def _json_str(obj: dict) -> str:
