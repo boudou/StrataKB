@@ -7,6 +7,8 @@ Tests cover:
 - The startup migration runs only after a successful database warm-up
 - The SQL tools role check runs before the lifespan yields
 - An unread ./.env and a missing STRATAKB_CONFIG file are logged, without the path
+- The lifespan yields without waiting for the embedding checks, and cancels them on exit
+- The embedding checks learn whether the database warm-up succeeded
 
 No database and no model are needed: the pool, the migration and the model
 load are patched.
@@ -14,6 +16,7 @@ load are patched.
 
 from __future__ import annotations
 
+import asyncio
 import threading
 import time
 from contextlib import asynccontextmanager
@@ -44,6 +47,13 @@ def secure_sql_tools():
     """Keep the role check off the network and the global server's tools intact."""
     with patch("stratakb.mcp_server.secure_sql_tools", AsyncMock()) as secure:
         yield secure
+
+
+@pytest.fixture(autouse=True)
+def embedding_checks():
+    """Keep the embedding checks off the network and off a real pool."""
+    with patch("stratakb.mcp_server.run_embedding_checks", AsyncMock()) as checks:
+        yield checks
 
 
 @pytest.fixture
@@ -194,3 +204,52 @@ async def test_lifespan_secures_sql_tools(db_ok, secure_sql_tools, monkeypatch):
         secure_sql_tools.assert_awaited_once_with(
             mcp_server.mcp, mcp_server._settings.readonly_database_url
         )
+
+
+async def test_lifespan_does_not_wait_for_embedding_checks(db_ok, monkeypatch):
+    monkeypatch.setattr(mcp_server._settings, "embedding_backend", "openai")
+    started = asyncio.Event()
+    release = asyncio.Event()
+    order: list[str] = []
+
+    async def blocking_checks(settings, db_ready):
+        started.set()
+        try:
+            await release.wait()
+        except asyncio.CancelledError:
+            order.append("cancelled")
+            raise
+
+    async def close_pool():
+        order.append("close_pool")
+
+    with (
+        patch("stratakb.mcp_server.run_embedding_checks", blocking_checks),
+        patch("stratakb.mcp_server.close_pool", close_pool),
+    ):
+        t0 = time.monotonic()
+        async with mcp_server._lifespan(mcp_server.mcp):
+            assert time.monotonic() - t0 < 1.0
+            await asyncio.wait_for(started.wait(), 1.0)
+            assert not release.is_set()
+
+    assert order == ["cancelled", "close_pool"]
+
+
+async def test_embedding_checks_get_db_ready(db_ok, embedding_checks, monkeypatch):
+    monkeypatch.setattr(mcp_server._settings, "embedding_backend", "openai")
+    async with mcp_server._lifespan(mcp_server.mcp):
+        await asyncio.sleep(0)
+    embedding_checks.assert_awaited_once_with(mcp_server._settings, True)
+
+
+async def test_embedding_checks_without_database(embedding_checks, monkeypatch):
+    monkeypatch.setattr(mcp_server._settings, "embedding_backend", "openai")
+    with (
+        patch("stratakb.mcp_server.get_pool", AsyncMock(side_effect=OSError("refused"))),
+        patch("stratakb.mcp_server.ensure_schema", AsyncMock()),
+        patch("stratakb.mcp_server.close_pool", AsyncMock()),
+    ):
+        async with mcp_server._lifespan(mcp_server.mcp):
+            await asyncio.sleep(0)
+    embedding_checks.assert_awaited_once_with(mcp_server._settings, False)

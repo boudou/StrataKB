@@ -196,7 +196,7 @@ The layer's **description** also tells the query rewriter which terminology the 
 | `strata_feedback` | viewer | Rates a result as helpful or not, per answer or per chunk |
 | `strata_learning_stats` | viewer | What the learning system has recorded and learned |
 | `strata_whoami` | viewer | Your identity and role |
-| `strata_admin_health` | viewer | Database, pgvector and schema status, the local-only switch, the providers that receive data, and whether the SQL tools are on |
+| `strata_admin_health` | viewer | Database, pgvector and schema status, the local-only switch, the providers that receive data, whether the SQL tools are on, and the embedding model and vector column checks |
 | `strata_db_schema` | viewer | Lists tables, or a table's columns and keys |
 | `strata_db_vector_stats` | viewer | Chunk counts per layer, vector dimensions and index sizes |
 | `strata_db_sample_chunks` | viewer | Sample chunks from a layer |
@@ -236,7 +236,7 @@ flowchart LR
 | `STRATA_USER`, `STRATA_ROLE` | `developer`, `viewer` | Identity and role on stdio |
 | `EMBEDDING_BACKEND` | `local` | `local` (sentence-transformers) or `openai` (OpenAI, or the OpenAI-compatible server in `EMBEDDING_BASE_URL`) |
 | `EMBEDDING_MODEL` | `all-mpnet-base-v2` | Embedding model; the `openai` backend uses `text-embedding-3-large` unless set |
-| `EMBEDDING_DIMENSIONS` | `768` | Must match the model and the `vector(…)` column; vectors of another length are refused |
+| `EMBEDDING_DIMENSIONS` | `768` | Must match the model and the `vector(…)` column; vectors of another length are refused, and `strata_admin_health` reports a column of another size |
 | `EMBEDDING_BASE_URL` | | `openai` backend: an OpenAI-compatible server, ending in `/v1` (for example `http://127.0.0.1:11434/v1`); empty means OpenAI |
 | `EMBEDDING_API_KEY` | | Key for `EMBEDDING_BASE_URL`, only if the server asks for one |
 | `OPENAI_API_KEY` | | Needed for the `openai` backend without `EMBEDDING_BASE_URL`; never sent to that server |
@@ -275,6 +275,8 @@ EMBEDDING_MODEL=nomic-embed-text
 ```
 
 The URL ends in `/v1`. A model with other dimensions, for example `mxbai-embed-large` (1024), needs `EMBEDDING_DIMENSIONS` and the `vector(…)` column changed to match. Switching models means re-embedding every layer with `vector_store.re_embed_layer()`, even when the dimensions match: vectors from two models cannot be compared.
+
+Once at startup, in the background, the server asks the server in `EMBEDDING_BASE_URL` for its model list and checks the vector column's size against `EMBEDDING_DIMENSIONS`. `strata_admin_health` reports both under `embedding` (`model` and `vector_column`), and `overall` turns `degraded` when the model is not listed or the sizes differ; the message names the setting to change. `nomic-embed-text` matches `nomic-embed-text:latest`. The check compares names only: a server that serves any requested name under one listed file name (llama.cpp's server does this) can show the model as missing while embedding works, and that report can be ignored. A server that cannot list its models, or is not up yet, shows `unchecked` and does not degrade health. After pulling a model or resizing the column, restart StrataKB to check again.
 
 ### Query rewriting through a model server
 
@@ -327,6 +329,8 @@ Dotted paths are off by default and blocked by `STRATA_LOCAL_ONLY=true`.
 With `STRATA_LOCAL_ONLY=true` the server refuses to start while any blocked path is configured, and the error names each setting that caused it. The embedding calls and query rewriting check the switch again on every call, so a key added later is refused too. The Hugging Face libraries run offline and load the embedding and reranking models from local files only; a model that is not installed fails with a message that says how to install it (`uv run hf download <model>` on a machine that may download, or `EMBEDDING_MODEL` / `RERANKING_MODEL` set to a folder that holds it). The switch does not cover the database: `DATABASE_URL` may point at a team server on purpose.
 
 `strata_admin_health` always lists the switch (`local_only`) and the active outbound providers (`outbound`: provider, purpose, what it sends, destination host and the setting that turns it on), whether the switch is on or not. It never shows keys, credentials, paths or ports.
+
+With `EMBEDDING_BASE_URL` set (and `EMBEDDING_BACKEND` not `local`), the server also asks that server for its model list once at startup. The request carries `EMBEDDING_API_KEY` and nothing about your documents, and with `STRATA_LOCAL_ONLY=true` it is only sent to a server on this machine.
 
 StrataKB cannot control what your MCP client's language model does with the retrieved text. If the client uses a cloud model, the retrieved text goes to that provider. Teams that need the whole path to stay on the machine should embed through an OpenAI-compatible server on this machine (see [Embeddings from a model server](#embeddings-from-a-model-server)), rewrite questions through one too if they want rewriting (see [Query rewriting through a model server](#query-rewriting-through-a-model-server)), and use a client with a local model.
 

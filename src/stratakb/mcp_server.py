@@ -7,6 +7,8 @@ Run with: python -m stratakb
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import threading
 from contextlib import asynccontextmanager
 from dataclasses import asdict
@@ -33,6 +35,11 @@ from stratakb.database_access.tools import (
     secure_sql_tools,
     sql_tools_status,
 )
+from stratakb.knowledge.embedding_checks import (
+    embedding_checks_degraded,
+    embedding_checks_status,
+    run_embedding_checks,
+)
 from stratakb.knowledge.tools import register_knowledge_tools
 from stratakb.learning.tools import register_learning_tools
 from stratakb.rag.tools import register_rag_tools
@@ -55,6 +62,7 @@ async def _lifespan(server: FastMCP):
         logger.warning("config_file_not_found", setting="STRATAKB_CONFIG")
 
     # Pre-warm DB connection pool (fast, ~1s; ~2s to fail when refused)
+    db_ready = False
     try:
         pool = await get_pool(_settings.database_url)
         async with pool.acquire() as conn:
@@ -63,6 +71,7 @@ async def _lifespan(server: FastMCP):
     except Exception as e:
         logger.warning("db_warmup_failed", error=str(e))
     else:
+        db_ready = True
         # Bring an existing database up to the current schema (no-op when
         # current). Skipped when the database is unreachable: ingestion runs
         # it on first use anyway.
@@ -86,9 +95,18 @@ async def _lifespan(server: FastMCP):
             daemon=True,
         ).start()
 
+    # Check the embedding model and the vector column in the background, once
+    # per start; strata_admin_health reports the result. Held in a local so
+    # the task is not garbage-collected mid-run.
+    checks = asyncio.create_task(run_embedding_checks(_settings, db_ready))
+
     try:
         yield {}
     finally:
+        # Cancel before the pool closes: a column read may still be in flight
+        checks.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await checks
         await close_pool()
         logger.info("shutting_down")
 
@@ -143,8 +161,12 @@ async def strata_admin_health() -> dict:
     database schemas, which optional API keys are configured, whether
     STRATA_LOCAL_ONLY is on, and the providers that receive content from
     this machine (name, purpose, what it sends, destination host, setting),
-    and whether the SQL tools (strata_db_query, strata_db_explain) are
-    enabled or, when disabled, why.
+    whether the SQL tools (strata_db_query, strata_db_explain) are
+    enabled or, when disabled, why, and the embedding checks run once at
+    startup: whether the server in EMBEDDING_BASE_URL lists the embedding
+    model, and whether the vector column's size matches EMBEDDING_DIMENSIONS.
+    A missing model or a size mismatch turns overall to degraded; restart
+    the server after fixing either.
     """
     result: dict[str, object] = {}
     current = get_settings()
@@ -161,8 +183,11 @@ async def strata_admin_health() -> dict:
         "status": "configured" if settings.openai_api_key else "not_configured"
     }
 
+    # Embedding model and vector column, checked once at startup
+    result["embedding"] = embedding_checks_status()
+
     # Overall status
-    all_ok = db_status.get("status") == "ok"
+    all_ok = db_status.get("status") == "ok" and not embedding_checks_degraded()
     result["overall"] = "ok" if all_ok else "degraded"
 
     # Where data goes (host names and setting names only, never values)
