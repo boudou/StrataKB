@@ -35,7 +35,10 @@ from stratakb.knowledge.layers import (
     _validate_name,
     _validate_routing_patterns,
     create_layer,
+    get_layer_status,
+    set_origin,
 )
+from stratakb.knowledge.policy import is_secret_name
 
 logger = structlog.get_logger()
 
@@ -180,7 +183,8 @@ def _parse_source_group(preset: LayerPreset, root: Path, group: SourceGroup) -> 
         stats["errors"].append({"group": group.name, "error": error})
         return stats
 
-    files = _discover_files(source_path)
+    # Secret-looking names are never opened, as in a real ingest
+    files = [f for f in _discover_files(source_path) if not is_secret_name(f.name)]
     stats["files"] = len(files)
 
     for file_path in files:
@@ -210,7 +214,12 @@ def _parse_source_group(preset: LayerPreset, root: Path, group: SourceGroup) -> 
 
 
 async def create_preset_layer(database_url: str, preset: LayerPreset) -> dict:
-    """Create the preset's knowledge layer, or report that it already exists."""
+    """Create the preset's knowledge layer, or report that it already exists.
+
+    An existing layer with no recorded origin (made before origins were
+    recorded) is marked as coming from this preset.
+    """
+    origin = f"preset:{preset.name}"
     try:
         layer = await create_layer(
             database_url,
@@ -220,9 +229,13 @@ async def create_preset_layer(database_url: str, preset: LayerPreset) -> dict:
             metadata_schema=preset.metadata_schema,
             chunk_config=preset.chunk_config,
             routing_patterns=preset.routing_patterns,
+            origin=origin,
         )
         return {"status": "created", "layer": layer}
     except LayerExistsError:
+        existing = await get_layer_status(database_url, name=preset.name)
+        if existing.get("origin") is None:
+            await set_origin(database_url, preset.name, origin)
         return {"status": "exists", "message": f"Layer '{preset.name}' already exists"}
 
 

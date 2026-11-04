@@ -2,15 +2,19 @@
 
 Supports two backends:
 - "local": sentence-transformers (free, runs on CPU, no API key needed)
-- "openai": OpenAI text-embedding-3-large (paid, higher quality)
+- "openai": the OpenAI embeddings API, either OpenAI itself
+  (text-embedding-3-large unless EMBEDDING_MODEL is set) or any
+  OpenAI-compatible server (Ollama, LM Studio, vLLM) in EMBEDDING_BASE_URL
 
 Backend is selected via EMBEDDING_BACKEND env var (default: "local").
+Every call refuses vectors whose length differs from EMBEDDING_DIMENSIONS.
 """
 
 from __future__ import annotations
 
 import os
 import threading
+from typing import TYPE_CHECKING
 
 # Skip HuggingFace HTTP checks — model is cached locally after first download.
 # Prevents HEAD requests that add latency on cold start.
@@ -19,10 +23,65 @@ os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
 
 import structlog
 
+if TYPE_CHECKING:
+    from stratakb.config import Settings
+
 logger = structlog.get_logger()
 
 # OpenAI batch limit
 MAX_BATCH_SIZE = 100
+
+# Model used by the openai backend when EMBEDDING_MODEL is unset or left at
+# the local default
+_OPENAI_DEFAULT_MODEL = "text-embedding-3-large"
+
+_MISSING_KEY_ERROR = (
+    "OpenAI API key not configured. Set OPENAI_API_KEY in the environment or your config file, "
+    "or EMBEDDING_BASE_URL for an OpenAI-compatible server."
+)
+
+
+def _hub_repo(model_name: str) -> str:
+    """The Hugging Face repository of a sentence-transformers model name."""
+    return model_name if "/" in model_name else f"sentence-transformers/{model_name}"
+
+
+def _missing_model_error(model_name: str) -> str:
+    """Explain a model that STRATA_LOCAL_ONLY cannot download."""
+    repo = _hub_repo(model_name)
+    return (
+        f"STRATA_LOCAL_ONLY is on and the embedding model {model_name} is not "
+        f"installed on this machine, so it cannot be downloaded. On a machine that "
+        f"may download, run `uv run hf download {repo}`, or set EMBEDDING_MODEL to "
+        f"a folder that holds the model."
+    )
+
+
+def is_model_cached(model_name: str) -> bool:
+    """True when the model can load without a download. Never downloads.
+
+    A folder that holds the model counts as cached. Otherwise the Hugging
+    Face cache must hold both config.json and the weights: a download that
+    stopped half-way leaves config.json next to an incomplete weights file.
+    """
+    try:
+        if os.path.isdir(model_name):
+            return True
+        from huggingface_hub import try_to_load_from_cache
+
+        repo = _hub_repo(model_name)
+        cache_dir = os.environ.get("SENTENCE_TRANSFORMERS_HOME") or None
+
+        def cached(filename: str) -> bool:
+            found = try_to_load_from_cache(repo, filename, cache_dir=cache_dir)
+            return isinstance(found, str)
+
+        return cached("config.json") and (
+            cached("model.safetensors") or cached("pytorch_model.bin")
+        )
+    except Exception:
+        return False
+
 
 # Singleton for local model (loaded once, reused)
 _local_model = None
@@ -40,7 +99,19 @@ def _get_local_model(model_name: str = "all-MiniLM-L6-v2"):
             return _local_model
         from sentence_transformers import SentenceTransformer
 
+        from stratakb.config import get_settings
+
         logger.info("loading_local_embedding_model", model=model_name)
+        if get_settings().strata_local_only:
+            # Local files only, and no online retry
+            try:
+                model = SentenceTransformer(model_name, local_files_only=True)
+            except Exception as e:
+                raise RuntimeError(_missing_model_error(model_name)) from e
+            model._model_name = model_name  # tag for cache check
+            _local_model = model
+            logger.info("local_embedding_model_loaded", model=model_name)
+            return _local_model
         try:
             _local_model = SentenceTransformer(model_name)
         except Exception:
@@ -76,17 +147,12 @@ async def embed_texts(
         return []
 
     # Resolve config defaults
-    if not backend or not model or not dimensions:
-        from stratakb.config import get_settings
+    from stratakb.config import get_settings
 
-        settings = get_settings()
-        backend = backend or settings.embedding_backend
-        model = model or (
-            settings.embedding_model
-            if backend == "local"
-            else "text-embedding-3-large"
-        )
-        dimensions = dimensions or settings.embedding_dimensions
+    settings = get_settings()
+    backend = backend or settings.embedding_backend
+    model = model or resolve_embedding_model(backend, settings.embedding_model)
+    dimensions = dimensions or settings.embedding_dimensions
 
     if backend == "local":
         import asyncio
@@ -94,9 +160,67 @@ async def embed_texts(
         # Run in thread to avoid blocking the event loop — model loading
         # can take 17s+ on first call (PyTorch import + weight loading),
         # and model.encode() is CPU-intensive on every call.
-        return await asyncio.to_thread(_embed_local, texts, model)
+        vectors = await asyncio.to_thread(_embed_local, texts, model)
     else:
-        return await _embed_openai(texts, api_key, model, dimensions)
+        if err := embedding_key_error(settings, api_key, backend):
+            raise ValueError(err)
+        # A custom endpoint gets its own key, never the OpenAI one
+        base_url = settings.embedding_base_url
+        key = settings.embedding_api_key if base_url else api_key
+        vectors = await _embed_openai(texts, key, model, dimensions, base_url=base_url)
+
+    _check_dimensions(vectors, model, dimensions)
+    return vectors
+
+
+def embedding_key_error(
+    settings: Settings, openai_api_key: str, backend: str = ""
+) -> str | None:
+    """Return why embedding cannot run (a missing key or the local-only switch), or None.
+
+    The openai backend needs OPENAI_API_KEY unless EMBEDDING_BASE_URL points
+    it at an OpenAI-compatible server, whose key is optional. The local
+    backend needs no key. With STRATA_LOCAL_ONLY on, only a server on this
+    machine may receive the texts.
+    """
+    backend = backend or settings.embedding_backend
+    if backend == "openai" and not openai_api_key and not settings.embedding_base_url:
+        return _MISSING_KEY_ERROR
+    from stratakb.core.egress import embedding_provider, refusal_line
+
+    if settings.strata_local_only and (provider := embedding_provider(settings, backend)):
+        return refusal_line(provider)
+    return None
+
+
+def resolve_embedding_model(backend: str, configured: str) -> str:
+    """Return the model a backend uses for a configured EMBEDDING_MODEL.
+
+    The openai backend treats an empty value and the local default
+    (all-mpnet-base-v2) as "not set", so a .env that only flips
+    EMBEDDING_BACKEND keeps working.
+    """
+    from stratakb.config import Settings
+
+    local_default = Settings.model_fields["embedding_model"].default
+    if backend == "local":
+        return configured or local_default
+    if not configured or configured == local_default:
+        return _OPENAI_DEFAULT_MODEL
+    return configured
+
+
+def _check_dimensions(vectors: list[list[float]], model: str, dimensions: int) -> None:
+    """Refuse vectors whose length differs from EMBEDDING_DIMENSIONS."""
+    for vector in vectors:
+        n = len(vector)
+        if n != dimensions:
+            raise ValueError(
+                f"The embedding model {model} returns {n}-dimensional vectors, "
+                f"but EMBEDDING_DIMENSIONS is {dimensions}. Set EMBEDDING_DIMENSIONS "
+                f"to {n} and re-embed every layer, or choose a model with "
+                f"{dimensions} dimensions."
+            )
 
 
 def _embed_local(texts: list[str], model_name: str) -> list[list[float]]:
@@ -118,25 +242,30 @@ async def _embed_openai(
     api_key: str,
     model: str,
     dimensions: int,
+    base_url: str = "",
 ) -> list[list[float]]:
-    """Embed texts using OpenAI API."""
-    if not api_key:
-        raise ValueError("OpenAI API key is required for openai embedding backend.")
-
+    """Embed texts using the OpenAI API or an OpenAI-compatible server."""
     from openai import AsyncOpenAI
 
-    client = AsyncOpenAI(api_key=api_key)
+    # Always pass a string key: with None the SDK would read OPENAI_API_KEY
+    # from the environment and send it to the custom server. base_url=None
+    # keeps the SDK default (OpenAI, or OPENAI_BASE_URL).
+    client = AsyncOpenAI(api_key=api_key, base_url=base_url or None)
+    create_kwargs: dict = {"model": model}
+    # Other servers may reject "dimensions" for models that cannot shorten
+    # their output; _check_dimensions catches a server that ignores it.
+    if not base_url or model.startswith("text-embedding-3"):
+        create_kwargs["dimensions"] = dimensions
+    # The SDK asks for base64 by default, which not every server implements
+    if base_url:
+        create_kwargs["encoding_format"] = "float"
     all_embeddings: list[list[float]] = []
 
     for i in range(0, len(texts), MAX_BATCH_SIZE):
         batch = texts[i : i + MAX_BATCH_SIZE]
 
         try:
-            response = await client.embeddings.create(
-                input=batch,
-                model=model,
-                dimensions=dimensions,
-            )
+            response = await client.embeddings.create(input=batch, **create_kwargs)
             sorted_data = sorted(response.data, key=lambda x: x.index)
             batch_embeddings = [item.embedding for item in sorted_data]
             all_embeddings.extend(batch_embeddings)
@@ -161,5 +290,6 @@ async def _embed_openai(
         total_texts=len(texts),
         total_embeddings=len(all_embeddings),
         model=model,
+        endpoint="custom" if base_url else "openai",
     )
     return all_embeddings

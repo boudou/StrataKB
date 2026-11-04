@@ -9,7 +9,43 @@ uv run python scripts/apply_preset.py examples/sepa/preset.yaml             # bu
 
 To keep the documents elsewhere, pass `--docs-root /path/to/docs` (or `docs_root` to the `strata_apply_preset` tool). Missing folders are skipped and reported with their download link.
 
-Standards documents are published under their publishers' terms, so `.gitignore` keeps downloaded PDFs, DOCX, XSD and ZIP files under `examples/` out of git.
+Standards documents are published under their publishers' terms, so `.gitignore` keeps downloaded PDFs, DOCX, XSD and ZIP files under `examples/` out of git. It also keeps the PEPs clone (`peps/source/`) out of git.
+
+## Python PEPs (`peps/`)
+
+The quickest example to try: Python Enhancement Proposals need no account and no manual download, only git. Nothing is committed to this repo; the files stay in your clone under `peps/source/`.
+
+**A few PEPs** (the default, a few seconds):
+
+```bash
+git clone --depth 1 --filter=blob:none --sparse https://github.com/python/peps.git examples/peps/source
+git -C examples/peps/source sparse-checkout set --no-cone /peps/pep-0008.rst /peps/pep-0020.rst /peps/pep-0257.rst /peps/pep-0484.rst /peps/pep-0572.rst /peps/pep-0634.rst /peps/pep-0695.rst /peps/pep-0723.rst
+```
+
+In Git Bash on Windows, put `MSYS_NO_PATHCONV=1` in front of the `sparse-checkout` command; otherwise Git Bash rewrites the `/peps/...` paths and nothing is checked out.
+
+**All PEPs:** `git -C examples/peps/source sparse-checkout set peps`. That is about 770 files and 12,000 chunks, which take a while to embed on a CPU.
+
+**Build the layer:**
+
+```bash
+uv run python scripts/apply_preset.py examples/peps/preset.yaml --dry-run   # parse only, no database
+uv run python scripts/apply_preset.py examples/peps/preset.yaml             # create the layer and ingest
+```
+
+**Update later:** `git -C examples/peps/source pull`, then apply the preset again. Applying rebuilds the layer and re-embeds every file.
+
+**Without the preset:** `uv run stratakb add examples/peps/source/peps` builds a layer named `peps` that has no routing patterns. A later run re-embeds only the files that changed. Use either the preset or `stratakb add` on this folder, not both, or every answer comes back twice.
+
+Questions to try:
+
+| Ask | The answer should cite |
+| --- | --- |
+| How long should a line of Python be? | PEP 8 |
+| What does the walrus operator do? | PEP 572 |
+| How do I declare inline script dependencies? | PEP 723 |
+
+Licence: each PEP is placed in the public domain or under CC0-1.0-Universal (each file says which in its Copyright section).
 
 ## SEPA payments (`sepa/`)
 

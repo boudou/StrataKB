@@ -33,13 +33,17 @@ jobs:
       PGPASSWORD: strata_ci_password
     steps:
       - uses: actions/checkout@v7
-      - uses: astral-sh/setup-uv@v10
+      - uses: astral-sh/setup-uv@v10.3.3
         with:
           enable-cache: true
       - name: Create schemas
         run: |
-          for f in db/01_init.sql db/02_learning.sql db/03_readonly_role.sql src/stratakb/core/sql/04_ingested_files.sql; do
+          for f in src/stratakb/core/sql/01_init.sql src/stratakb/core/sql/02_learning.sql db/03_readonly_role.sql src/stratakb/core/sql/04_ingested_files.sql; do
             psql -h localhost -p 5433 -U strata -d strata -v ON_ERROR_STOP=1 -f "$f"
           done
       - run: uv sync --extra dev --locked
+      - name: Fetch a few PEPs
+        run: |
+          git clone --depth 1 --filter=blob:none --sparse https://github.com/python/peps.git examples/peps/source
+          git -C examples/peps/source sparse-checkout set --no-cone /peps/pep-0008.rst /peps/pep-0020.rst /peps/pep-0257.rst /peps/pep-0484.rst /peps/pep-0572.rst /peps/pep-0634.rst /peps/pep-0695.rst /peps/pep-0723.rst
       - run: uv run pytest

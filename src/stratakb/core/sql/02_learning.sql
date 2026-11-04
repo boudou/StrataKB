@@ -1,5 +1,7 @@
 -- StrataKB learning schema
 -- Self-improving retrieval: captures interactions, feedback, and learned patterns
+-- Idempotent: applied by the server (stratakb.core.migrations) to an empty
+-- database and by docker-compose on a fresh volume.
 
 CREATE EXTENSION IF NOT EXISTS pg_trgm;
 

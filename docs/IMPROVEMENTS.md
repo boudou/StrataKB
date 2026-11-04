@@ -10,7 +10,7 @@ StrataKB lets a developer, or a team of developers, turn their own documents int
 
 | Goal | What the developer sees |
 | --- | --- |
-| **G1 Start in minutes** | One command for one person, no Docker; a short, standard path to a team server. |
+| **G1 Start in minutes** | A few commands for one person (`stratakb db up`, `stratakb add`); a short, standard path to a team server. |
 | **G2 No retrieval knowledge needed** | No chunk sizes, regular expressions, `top_k` or raw scores in the normal path. Defaults that work; advanced settings stay available. |
 | **G3 Fits daily work** | Works from the MCP client, the terminal and scripts; ingests repositories and docs folders; every answer links back to its source. |
 | **G4 Private by default** | Nothing leaves the machine or the team server unless configured, and the docs say exactly what goes where. Private layers stay private inside a team. |
@@ -21,22 +21,22 @@ StrataKB lets a developer, or a team of developers, turn their own documents int
 
 ```mermaid
 flowchart LR
-    G1["G1 Start in minutes"] --- i1["#1 · #3 · #4 · #5 · #24 · #26"]
+    G1["G1 Start in minutes"] --- i1["#1 · #3 · #4 · #24 · #26 · #79"]
     G2["G2 No retrieval knowledge"] --- i2["#1 · #2 · #7 · #10 · #11 · #15 · #21 · #23 · #32 · #64 · #68 · #69"]
     G3["G3 Daily work"] --- i3["#23 · #24 · #25 · #27 · #29 · #30 · #31 · #33 · #35 · #36 · #63 · #65 · #69"]
     G4["G4 Private by default"] --- i4["#1 · #4 · #6 · #14 · #19 · #20 · #22 · #66"]
     G5["G5 Shared by a team"] --- i5["#12 · #16 · #17 · #18 · #19 · #25 · #37 · #38 · #66"]
-    G6["G6 Answers you can prove"] --- i6["#8 · #9 · #10 · #11 · #20 · #23 · #28 · #37 · #63–#69"]
+    G6["G6 Answers you can prove"] --- i6["#8 · #9 · #10 · #11 · #20 · #23 · #28 · #37 · #63–#69 · #72–#78"]
 ```
 
 #13 (server version) and #34 (developer experience) support the others and serve no goal directly.
 
 Changes of direction the goal requires:
-- **Milestone 2 (#63–#69):** verifiable answers are the lead promise, for every kind of layer (contracts, rulebooks, specs). The server never asks a model to write the answer: in *grounded* mode the client writes it and `strata_verify` checks every quote and fact; in *extractive* mode the server returns the document's own sentences. Both issue a receipt that a person can open outside the chat. The mode is a layer setting that a question can make stricter, never looser.
+- **Milestone 2 (#63–#69, #72–#78):** verifiable answers are the lead promise, for every kind of layer (contracts, rulebooks, specs). The server never asks a model to write the answer: in *grounded* mode the client writes it and `strata_verify` checks every quote and fact; in *extractive* mode the server returns the document's own sentences. Both issue a receipt that a person can open outside the chat. The mode is a layer setting that a question can make stricter, never looser.
 - **#27:** cloud OCR and the vision model for figures send document content out. They are opt-in and blocked by the local-only switch (#6).
 - **#30 and #31:** per-layer regular expressions are an advanced option. A layer must work without them, and presets ship the patterns for their domain.
 - **#17:** a team server also needs ingestion from the developer's machine (#18) and per-layer access (#19). Otherwise every developer still needs shell access to the server.
-- **#5:** `init` runs `stratakb add` (#1), so it asks nothing about layers or chunking.
+- **#79:** StrataKB stays on PostgreSQL with pgvector, for one person and for a team. `stratakb db up` starts a local database with Docker Compose; a separate SQLite mode (#5) was dropped.
 - **#25:** git repositories come first among connectors, since that is where developers keep READMEs, ADRs, runbooks and API specs.
 
 ### Order of work
@@ -45,7 +45,7 @@ Each milestone on GitHub holds its issues.
 
 ```mermaid
 flowchart LR
-    m1["1. Five-minute start<br/>#1–#7 · #37 · #38 · #40 · #48–#62"] --> m2["2. Answers you can prove<br/>#8–#11 · #15 · #23 · #63–#69"]
+    m1["1. Five-minute start<br/>#1–#4 · #6 · #7 · #37 · #38 · #40 · #48–#62 · #70 · #79"] --> m2["2. Answers you can prove<br/>#8–#11 · #15 · #23 · #63–#69 · #72–#78"]
     m2 --> m3["3. Team server<br/>#12–#14 · #16–#22"]
     m3 --> m4["4. Daily use and sync<br/>#24–#28"]
     m4 --> m5["5. Depth<br/>#29–#36"]
@@ -55,25 +55,32 @@ Inside milestone 2:
 
 ```mermaid
 flowchart LR
-    d["#63 Document text,<br/>versions, offsets"] --> c["#64 Clause-aware<br/>chunking"]
+    p["#72 Chunks as<br/>document text"] --> d["#63 Document text,<br/>versions, offsets"]
+    d --> c["#64 Clause-aware<br/>chunking"]
+    d --> ro["#73 Read-only access<br/>to documents"]
+    c --> ps["#74 PDF and Word<br/>structure"]
+    c --> cp["#75 Clause patterns<br/>in presets"]
     c --> l["#65 Clause lookup"]
     d --> r["#23 Cited passages,<br/>token budget"]
     d --> rc["#66 Receipts"]
+    r --> l
+    rc --> ret["#76 Receipt retention"]
+    rc --> cli["#77 stratakb receipt"]
     r --> v["#67 strata_verify"]
     rc --> v
     e["#8 Evals → #10 calibration"] --> x["#68 Extractive answers"]
     r --> x
     rc --> x
     c --> x
+    am["#78 Answer mode<br/>layer setting"] --> x
     v --> k["#69 Answer contract, docs"]
     x --> k
 ```
 
-- Milestone 1 comes first because nobody reaches the other features without it. #11 and #9 are small and can ship alongside it.
-- Milestone 2 ships `strata_verify` first (#63 → #23 → #66 → #67): it needs no calibration. #8 and #10 run alongside it, and extractive answers (#68) follow once #10 gives a calibrated "not found" threshold. #64 and #65 run in parallel.
+- Milestone 1 comes first because nobody reaches the other features without it. Shipped so far: #3, #4, #6, #7, #37, #38, #40, #48–#62 and #70; left: `stratakb db up` (#79), the umbrella #1 and #2. #11 and #9 are small and can ship alongside it.
+- Milestone 2 ships `strata_verify` first (#72 → #63 → #23 → #66 → #67): it needs no calibration. #8 and #10 run alongside it, and extractive answers (#68) follow once #10 gives a calibrated "not found" threshold. #64 and #65 run in parallel. #73–#78 are small slices next to their parents; #78 can start any time, and #77 waits for the `stratakb` command (#70).
 - #8 also needs an abstention set and verify-rate and faithfulness metrics for milestone 2.
 - #16 comes before #17, because the SDK 2.x line brings the auth support.
-- #4 comes before #5, so the local mode can install without the 400 MB in-process model.
 
 ---
 

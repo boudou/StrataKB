@@ -8,7 +8,7 @@ from __future__ import annotations
 from mcp.server.fastmcp import FastMCP
 
 from stratakb.core.audit import write_audit_log
-from stratakb.core.auth import get_current_user, require_role
+from stratakb.core.auth import check_role, get_current_user, require_role
 from stratakb.core.logging import log_tool_call
 from stratakb.knowledge.layers import (
     LayerError,
@@ -39,6 +39,18 @@ def _serialize(obj: object) -> object:
     return obj
 
 
+# Who made a layer and the server folder it holds are shown to admins only
+_ADMIN_ONLY_LAYER_FIELDS = ("owner", "root_path")
+
+
+def _for_caller(layer: dict) -> dict:
+    """Drop the admin-only layer fields when the caller is below admin."""
+    _, role = get_current_user()
+    if check_role(role, "admin"):
+        return layer
+    return {k: v for k, v in layer.items() if k not in _ADMIN_ONLY_LAYER_FIELDS}
+
+
 def register_knowledge_tools(
     mcp: FastMCP, database_url: str, openai_api_key: str = ""
 ) -> None:
@@ -56,7 +68,7 @@ def register_knowledge_tools(
         """
         layers = await list_layers(database_url)
         return {
-            "layers": [_serialize(layer) for layer in layers],
+            "layers": [_serialize(_for_caller(layer)) for layer in layers],
             "total": len(layers),
         }
 
@@ -101,6 +113,8 @@ def register_knowledge_tools(
                 metadata_schema=metadata_schema,
                 chunk_config=chunk_config,
                 routing_patterns=routing_patterns,
+                origin="manual",
+                owner=user_id,
             )
             await write_audit_log(
                 database_url,
@@ -130,7 +144,7 @@ def register_knowledge_tools(
         """
         try:
             status = await get_layer_status(database_url, name=name)
-            return {"status": "ok", "layer": _serialize(status)}
+            return {"status": "ok", "layer": _serialize(_for_caller(status))}
         except LayerNotFoundError as e:
             return {"status": "error", "error": str(e)}
 
@@ -179,11 +193,21 @@ def register_knowledge_tools(
         single-file source_path never removes anything. A file that fails to
         parse keeps its previous chunks and is listed in errors.
 
+        Files whose names look like secrets (.env, keys, certificates,
+        credentials, e.g. client_secret.json) are always skipped and never
+        opened; one ingested earlier is removed. Empty files are reported as
+        no text, not as failures: skipped, or removed if ingested earlier.
+        files_skipped counts the skipped files. A PDF that looks scanned
+        (under half its pages have text, or under 200 characters per page on
+        average) is stored for the text it has and counted in files_flagged;
+        it also counts as added or updated.
+
         Unchanged means the same file content (SHA-256). A change to the
         layer's chunk_config or to the embedding model is not detected: use
         replace_all=True after such a change.
 
-        Supported formats: PDF, DOCX, YAML/OpenAPI, CSV, JSON, XML/XSD, Markdown, HTML.
+        Supported formats: PDF, DOCX, YAML/OpenAPI, CSV, JSON, XML/XSD, Markdown, HTML,
+        plain text (.txt), reStructuredText (.rst), AsciiDoc (.adoc).
 
         Args:
             layer_name: Target knowledge layer (must exist). Example: "runbooks"
@@ -193,14 +217,12 @@ def register_knowledge_tools(
                         ingest everything again (a full rebuild).
         """
         from stratakb.config import get_settings
+        from stratakb.knowledge.embeddings import embedding_key_error
         from stratakb.knowledge.ingestion import ingest_documents
 
         _settings = get_settings()
-        if _settings.embedding_backend == "openai" and not openai_api_key:
-            return {
-                "status": "error",
-                "error": "OpenAI API key not configured. Set OPENAI_API_KEY in .env",
-            }
+        if err := embedding_key_error(_settings, openai_api_key):
+            return {"status": "error", "error": err}
 
         user_id, _ = get_current_user()
         try:
@@ -237,6 +259,8 @@ def register_knowledge_tools(
                 "files_updated": result.files_updated,
                 "files_unchanged": result.files_unchanged,
                 "files_removed": result.files_removed,
+                "files_skipped": result.files_skipped,
+                "files_flagged": result.files_flagged,
                 "rebuilt_legacy": result.rebuilt_legacy,
                 "duration_seconds": round(result.duration_seconds, 1),
                 "errors": result.errors if result.errors else None,
@@ -274,6 +298,7 @@ def register_knowledge_tools(
         from pathlib import Path
 
         from stratakb.config import get_settings
+        from stratakb.knowledge.embeddings import embedding_key_error
         from stratakb.knowledge.layers import LayerValidationError
         from stratakb.knowledge.presets import (
             create_preset_layer,
@@ -315,11 +340,8 @@ def register_knowledge_tools(
                 "errors": result.errors[:20] if result.errors else None,
             }
 
-        if _settings.embedding_backend == "openai" and not openai_api_key:
-            return {
-                "status": "error",
-                "error": "OpenAI API key not configured. Set OPENAI_API_KEY in .env",
-            }
+        if err := embedding_key_error(_settings, openai_api_key):
+            return {"status": "error", "error": err}
 
         user_id, _ = get_current_user()
         layer_result = await create_preset_layer(database_url, preset)
