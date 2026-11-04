@@ -19,6 +19,7 @@ Python 3.12+ and [uv](https://docs.astral.sh/uv/) are required.
 - Run `uv run ruff check` on the files you changed and leave them cleaner than you found them.
 - Keep changes focused; one topic per pull request.
 - Match the surrounding code: naming, comment density, idiom.
+- Docs come in two parts. The Quick start at the top of the README (and the wiki's Home page) gets a developer from nothing to a first answer in plain words, with no retrieval terms such as chunks, embeddings or top_k. Everything below it is the reference, and the terms it uses are explained in its Glossary. Say in the pull request which part your change touches, and add a Glossary entry for any new term.
 - Keep the code domain-neutral. Anything specific to one documentation domain belongs in a layer preset under `examples/`, not in `src/`.
 - Name new MCP tools `strata_<verb>_<noun>`, guard them with `@require_role`, and write an audit entry for anything that changes data.
 - Log with structlog only. Logs go to stderr; stdout carries the MCP protocol.

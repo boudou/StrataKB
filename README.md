@@ -10,13 +10,71 @@ Point it at your documentation, organise it in layers, and query it from any MCP
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![PRs welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](CONTRIBUTING.md)
 
-[Quick start](#quick-start) · [Layers and presets](#layers-and-presets) · [Tools](#tools) · [Configuration](#configuration) · [Roadmap](#roadmap)
+[Quick start](#quick-start) · [How it works](#how-it-works) · [Layers and presets](#layers-and-presets) · [Tools](#tools) · [Configuration](#configuration) · [Glossary](#glossary) · [Roadmap](#roadmap)
 
 </div>
 
-StrataKB is a retrieval server for teams. It keeps documents in **knowledge layers**, one per domain (a standard, a product's docs, a team's runbooks), and serves them to MCP clients with hybrid search, reranking and source citations. It runs on PostgreSQL with pgvector, so one instance can serve a whole team, with roles and an audit log.
+StrataKB turns folders of your documents into a knowledge base that your AI tools can ask through the Model Context Protocol (MCP). Each folder becomes a **layer**: a searchable collection named after the folder. One PostgreSQL database holds every layer, so a whole team can share one server, with roles and an audit log.
 
-The server retrieves; it does not write answers. Your MCP client reads the returned context and composes the answer itself.
+StrataKB finds the passages that answer a question and names the files they come from; your MCP client writes the answer from them.
+
+## Quick start
+
+You need [Docker](https://docs.docker.com/get-docker/), [uv](https://docs.astral.sh/uv/) and [Git](https://git-scm.com/). uv installs Python 3.12 if you don't have it.
+
+```mermaid
+flowchart LR
+    i["Install"] --> a["Add a folder"] --> c["Connect your client"] --> q["Ask"]
+```
+
+### 1. Install
+
+```bash
+git clone https://github.com/boudou/StrataKB.git
+cd StrataKB
+docker compose up -d        # the database, in Docker on port 5433
+uv sync
+```
+
+### 2. Add a folder
+
+```bash
+uv run stratakb add path/to/docs
+```
+
+It creates a layer named after the folder and reads the documents in it: PDF, Word, Markdown, HTML, plain text and more. It skips files that look like secrets, code or build output, and lists every file it skipped. Run it again after you edit the documents: it reads only what changed.
+
+The first run downloads a model of about 420 MB into your Hugging Face cache, and the first question downloads one of about 90 MB. To keep everything on this machine, see [Where your data goes](#where-your-data-goes).
+
+### 3. Connect your client
+
+Add the server to your client's MCP configuration (for example a project `.mcp.json`):
+
+```json
+{
+  "mcpServers": {
+    "stratakb": {
+      "command": "uv",
+      "args": ["run", "--directory", "/path/to/StrataKB", "python", "-m", "stratakb"],
+      "env": {
+        "DATABASE_URL": "postgresql://strata:strata_dev_password@localhost:5433/strata",
+        "STRATA_USER": "developer",
+        "STRATA_ROLE": "admin"
+      }
+    }
+  }
+}
+```
+
+Replace /path/to/StrataKB with the folder you cloned into, then restart the client. It starts StrataKB itself.
+
+### 4. Ask
+
+Ask your client a question about the documents, for example *"How do we fail over the database?"*. The client calls StrataKB's `strata_ask` tool, gets back the passages that match and the files they come from, and writes the answer.
+
+No documents at hand? Try the [Python PEPs example](#try-an-example-preset).
+
+The reference below explains how StrataKB works, every tool and every setting; the terms it uses are in the [Glossary](#glossary).
 
 ## Features
 
@@ -87,42 +145,7 @@ flowchart LR
     l -->|"improve"| rt["Routing and rewriting"]
 ```
 
-## Quick start
-
-You need [Docker](https://docs.docker.com/get-docker/), [uv](https://docs.astral.sh/uv/) and [Git](https://git-scm.com/). uv installs Python 3.12 if you don't have it.
-
-```bash
-git clone https://github.com/boudou/StrataKB.git
-cd StrataKB
-docker compose up -d        # PostgreSQL 16 + pgvector on port 5433, schemas created on first start
-uv sync
-```
-
-Any empty PostgreSQL 16 database with pgvector works as well: `stratakb add` and the server create the schema on first use, as long as the user in `DATABASE_URL` may create the `vector` and `pg_trgm` extensions.
-
-The server answers its client at once and, with the default `local` backend, loads the embedding model in the background; a search sent before the model is ready waits for it. The first start downloads the embedding model (about 420 MB) and the first `strata_ask` downloads the reranker (about 90 MB), both into your Hugging Face cache. With `STRATA_LOCAL_ONLY=true` nothing is downloaded; see [Where your data goes](#where-your-data-goes).
-
-### Connect an MCP client
-
-Add the server to your client's MCP configuration (for example a project `.mcp.json`):
-
-```json
-{
-  "mcpServers": {
-    "stratakb": {
-      "command": "uv",
-      "args": ["run", "--directory", "/path/to/StrataKB", "python", "-m", "stratakb"],
-      "env": {
-        "DATABASE_URL": "postgresql://strata:strata_dev_password@localhost:5433/strata",
-        "STRATA_USER": "developer",
-        "STRATA_ROLE": "admin"
-      }
-    }
-  }
-}
-```
-
-### Build your first layer
+## Adding folders
 
 Point `stratakb add` at a folder of documents. It creates one layer for the folder, named after it, and ingests what it finds:
 
@@ -147,17 +170,6 @@ flowchart LR
 A drive root, your home folder (or a folder above it) and system folders need `--allow-broad`; a run that adds or updates more than 2,000 files or 500 MB, or removes at least 10 files that are more than half of the layer's files, needs `--yes`. At a terminal the command asks instead; in a script it refuses and names the flag. Exit codes: `0` done, `1` some files failed (the rest are stored), `2` refused or a usage error (nothing written), `3` the database is unreachable or its schema can't be updated, `130` interrupted (stored files stay; the next run carries on). The first run with the `local` backend downloads the embedding model and says so.
 
 `stratakb` with no command, or `stratakb serve`, starts the MCP server, as `python -m stratakb` does.
-
-The repository also ships three example presets. The quickest to try is Python PEPs: git fetches eight PEPs in a few seconds, with no account:
-
-```bash
-git clone --depth 1 --filter=blob:none --sparse https://github.com/python/peps.git examples/peps/source
-git -C examples/peps/source sparse-checkout set --no-cone /peps/pep-0008.rst /peps/pep-0020.rst /peps/pep-0257.rst /peps/pep-0484.rst /peps/pep-0572.rst /peps/pep-0634.rst /peps/pep-0695.rst /peps/pep-0723.rst
-uv run python scripts/apply_preset.py examples/peps/preset.yaml --dry-run   # parse only, no database
-uv run python scripts/apply_preset.py examples/peps/preset.yaml             # create the layer and ingest
-```
-
-Then ask from your client, for example *"How long should a line of Python be?"*. The SEPA preset includes a small sample of reason codes, so it works before you download anything (ask *"What does reject reason AC04 mean?"*); the ISO 20022 preset needs the downloaded schemas. [examples/README.md](examples/README.md) has the PEPs options (all PEPs, updates, Git Bash on Windows) and lists where to download the SEPA rulebooks and ISO 20022 documents.
 
 From an MCP client without a shell, either write a preset (below) or call `strata_create_knowledge_layer` followed by `strata_ingest_documents` with a folder path. Run `strata_ingest_documents` again after editing the documents: it re-embeds only what changed. Pass `replace_all=True` to rebuild the whole layer, for example after changing its `chunk_config` or the embedding model.
 
@@ -186,6 +198,19 @@ sources:
 Apply it with `scripts/apply_preset.py` or the `strata_apply_preset` tool. Applying a preset again rebuilds the layer from scratch. Ready-made presets are in [examples/](examples/README.md): Python PEPs (the quickest to try), SEPA payments and ISO 20022 messaging.
 
 The layer's **description** also tells the query rewriter which terminology the layer uses, so a clear description improves `strata_ask`.
+
+### Try an example preset
+
+The repository also ships three example presets. The quickest to try is Python PEPs: git fetches eight PEPs in a few seconds, with no account:
+
+```bash
+git clone --depth 1 --filter=blob:none --sparse https://github.com/python/peps.git examples/peps/source
+git -C examples/peps/source sparse-checkout set --no-cone /peps/pep-0008.rst /peps/pep-0020.rst /peps/pep-0257.rst /peps/pep-0484.rst /peps/pep-0572.rst /peps/pep-0634.rst /peps/pep-0695.rst /peps/pep-0723.rst
+uv run python scripts/apply_preset.py examples/peps/preset.yaml --dry-run   # parse only, no database
+uv run python scripts/apply_preset.py examples/peps/preset.yaml             # create the layer and ingest
+```
+
+Then ask from your client, for example *"How long should a line of Python be?"*. The SEPA preset includes a small sample of reason codes, so it works before you download anything (ask *"What does reject reason AC04 mean?"*); the ISO 20022 preset needs the downloaded schemas. [examples/README.md](examples/README.md) has the PEPs options (all PEPs, updates, Git Bash on Windows) and lists where to download the SEPA rulebooks and ISO 20022 documents.
 
 ## Tools
 
@@ -261,6 +286,12 @@ flowchart LR
 
 To change the embedding model, update the three `EMBEDDING_*` settings and re-embed each layer with `vector_store.re_embed_layer()`, which re-embeds the stored chunk text in place without re-parsing files.
 
+### Database and models
+
+Any empty PostgreSQL 16 database with pgvector works as well: `stratakb add` and the server create the schema on first use, as long as the user in `DATABASE_URL` may create the `vector` and `pg_trgm` extensions.
+
+The server answers its client at once and, with the default `local` backend, loads the embedding model in the background; a search sent before the model is ready waits for it. The first start downloads the embedding model (about 420 MB) and the first `strata_ask` downloads the reranker (about 90 MB), both into your Hugging Face cache. With `STRATA_LOCAL_ONLY=true` nothing is downloaded; see [Where your data goes](#where-your-data-goes).
+
 ### Embeddings from a model server
 
 Instead of the in-process model, StrataKB can embed through any server that speaks the OpenAI embeddings API, such as Ollama, LM Studio or vLLM. Your documents and questions then go to that server and nowhere else; no OpenAI key is needed. With `STRATA_LOCAL_ONLY=true` only a server on this machine (`127.0.0.1`, `::1`, `localhost`) is allowed. For a local Ollama:
@@ -335,6 +366,21 @@ With `STRATA_LOCAL_ONLY=true` the server refuses to start while any blocked path
 With `EMBEDDING_BASE_URL` set (and `EMBEDDING_BACKEND` not `local`), the server also asks that server for its model list once at startup. The request carries `EMBEDDING_API_KEY` and nothing about your documents, and with `STRATA_LOCAL_ONLY=true` it is only sent to a server on this machine.
 
 StrataKB cannot control what your MCP client's language model does with the retrieved text. If the client uses a cloud model, the retrieved text goes to that provider. Teams that need the whole path to stay on the machine should embed through an OpenAI-compatible server on this machine (see [Embeddings from a model server](#embeddings-from-a-model-server)), rewrite questions through one too if they want rewriting (see [Query rewriting through a model server](#query-rewriting-through-a-model-server)), and use a client with a local model.
+
+## Glossary
+
+- **Chunk**: a passage of a document, cut along its headings or structure. Search returns chunks, each with its file and section.
+- **Confidence**: `high`, `medium` or `low`, from the search scores, returned with every `strata_ask` result; a low one comes with a warning.
+- **Embedding**: a list of numbers that stands for a chunk's meaning, so similar meanings get similar numbers. The embedding model (`all-mpnet-base-v2` by default) makes them; the vector column stores them (`EMBEDDING_DIMENSIONS`, 768 by default).
+- **HNSW**: the pgvector index that finds similar embeddings quickly; `HNSW_EF_SEARCH` trades recall for speed.
+- **Hybrid search**: a search by meaning (embeddings) and a search by words (PostgreSQL full-text search), merged into one list with RRF.
+- **interaction_id**: the id on each search and ask result; pass it to `strata_feedback` to rate the result.
+- **Layer**: a named collection of documents, usually one folder or one domain, with its own chunking and routing rules.
+- **Query rewriting**: optional; a language model turns a question into several searches in the layer's own terms. Learned rewrites are reused without the model.
+- **Reranking**: in `strata_ask`, a second model (a cross-encoder, `RERANKING_MODEL`) reads the question with each candidate chunk and puts the best first.
+- **Routing patterns**: a layer's regular expressions. When a question names no layers, those whose patterns match are searched first.
+- **RRF** (Reciprocal Rank Fusion): how hybrid search merges its two lists by rank, weighted by `HYBRID_SEMANTIC_WEIGHT` and `HYBRID_KEYWORD_WEIGHT`, with the constant `HYBRID_RRF_K`.
+- **top_k**: how many chunks a tool returns: 5 by default for `strata_search`, 10 for `strata_ask`.
 
 ## Project structure
 
