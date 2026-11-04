@@ -20,6 +20,12 @@ import structlog
 
 from stratakb.core.database import get_pool
 from stratakb.core.migrations import ensure_schema
+from stratakb.knowledge.documents import (
+    build_document_text,
+    page_starts,
+    prune_documents,
+    store_document_version,
+)
 from stratakb.knowledge.embeddings import embed_texts
 from stratakb.knowledge.layers import LayerNotFoundError, get_layer_status
 from stratakb.knowledge.parsers.pdf_parser import ParsedDocument
@@ -109,8 +115,15 @@ async def _store_file(
     content_hash: str,
     size_bytes: int,
     chunks: list[ChunkRecord],
+    document_text: str,
+    page_map: list[list[int]] | None = None,
+    text_origin: str = "text",
 ) -> None:
-    """Replace one file's row and chunks in a single transaction."""
+    """Replace one file's row, document version and chunks in a single transaction.
+
+    The text is stored as the file's current document version (reused when
+    unchanged); versions no chunk references any more are pruned afterwards.
+    """
     pool = await get_pool(database_url)
     async with pool.acquire() as conn:
         async with conn.transaction():
@@ -134,13 +147,34 @@ async def _store_file(
                 len(chunks),
             )
             await conn.execute("DELETE FROM strata_vectors.chunks WHERE file_id = $1", file_id)
+            document_id, _ = await store_document_version(
+                conn,
+                layer_id=layer_id,
+                file_id=file_id,
+                source_root=source_root,
+                relative_path=relative_path,
+                text=document_text,
+                page_map=page_map,
+                text_origin=text_origin,
+            )
             for chunk in chunks:
                 chunk.file_id = file_id
+                chunk.document_id = document_id
+                # Checked here so a stored span always holds the chunk's text
+                if chunk.char_start is not None and (
+                    document_text[chunk.char_start:chunk.char_end] != chunk.content
+                ):
+                    logger.warning(
+                        "chunk_offsets_mismatch", file=relative_path, char_start=chunk.char_start
+                    )
+                    chunk.char_start = chunk.char_end = None
             await insert_chunks(database_url, chunks, conn=conn)
+            # Only after the insert: until then the current version is unreferenced
+            await prune_documents(conn, layer_id)
 
 
 async def clear_layer(database_url: str, layer_name: str) -> None:
-    """Delete every chunk and ingested_files row of a layer."""
+    """Delete every chunk and ingested_files row of a layer, and its unreferenced documents."""
     await ensure_schema(database_url)
     pool = await get_pool(database_url)
     async with pool.acquire() as conn:
@@ -155,6 +189,11 @@ async def clear_layer(database_url: str, layer_name: str) -> None:
                 """,
                 layer_name,
             )
+            layer_id = await conn.fetchval(
+                "SELECT id FROM strata_core.knowledge_layers WHERE name = $1", layer_name
+            )
+            if layer_id is not None:
+                await prune_documents(conn, layer_id)
     # After the commit: the recount runs on another connection
     await _update_layer_stats(database_url, layer_name)
     logger.info(
@@ -341,9 +380,11 @@ async def ingest_documents(
                 result.files.append(FileOutcome(relative_path, "skipped", reason))
                 result.files_skipped += 1
                 return
-            await pool.execute(
-                "DELETE FROM strata_core.ingested_files WHERE id = $1", previous["id"]
-            )
+            async with pool.acquire() as conn, conn.transaction():
+                await conn.execute(
+                    "DELETE FROM strata_core.ingested_files WHERE id = $1", previous["id"]
+                )
+                await prune_documents(conn, layer_id)
             result.files.append(FileOutcome(relative_path, "removed", reason))
             result.files_removed += 1
 
@@ -430,6 +471,7 @@ async def ingest_documents(
                 fail(relative_path, str(e), "embed_error")
                 continue
 
+            document_text, page_map = build_document_text(parsed)
             try:
                 await _store_file(
                     database_url,
@@ -439,6 +481,8 @@ async def ingest_documents(
                     content_hash=content_hash,
                     size_bytes=len(data),
                     chunks=doc_chunks,
+                    document_text=document_text,
+                    page_map=page_map,
                 )
             except (asyncpg.PostgresConnectionError, asyncpg.InterfaceError, OSError):
                 # A lost database is an error for the whole run, not one failed file
@@ -474,10 +518,12 @@ async def ingest_documents(
                 if path not in seen and (files is not None or not (root / path).exists())
             ]
             if gone:
-                await pool.execute(
-                    "DELETE FROM strata_core.ingested_files WHERE id = ANY($1::uuid[])",
-                    [file_id for _, file_id in gone],
-                )
+                async with pool.acquire() as conn, conn.transaction():
+                    await conn.execute(
+                        "DELETE FROM strata_core.ingested_files WHERE id = ANY($1::uuid[])",
+                        [file_id for _, file_id in gone],
+                    )
+                    await prune_documents(conn, layer_id)
                 result.files.extend(
                     FileOutcome(
                         path, "removed", "deleted" if not (root / path).exists() else "not_selected"
@@ -561,7 +607,11 @@ def _chunk_document(
     chunk_size: int,
     chunk_overlap: int,
 ) -> list[ChunkRecord]:
-    """Split a parsed document into chunks using LangChain text splitter."""
+    """Split a parsed document into chunks using LangChain text splitter.
+
+    Each chunk gets char_start and char_end into the document text (see
+    documents.build_document_text), or None when its text is not found.
+    """
     from langchain_text_splitters import RecursiveCharacterTextSplitter
 
     splitter = RecursiveCharacterTextSplitter(
@@ -578,7 +628,7 @@ def _chunk_document(
 
     chunks: list[ChunkRecord] = []
 
-    for page in doc.pages:
+    for page, page_start in zip(doc.pages, page_starts(doc), strict=True):
         page_chunks = splitter.split_text(page.text)
         metadata: dict = {
             "page": page.page_number,
@@ -586,7 +636,23 @@ def _chunk_document(
         }
         if page.section_path:
             metadata["section_path"] = list(page.section_path)
+        # Overlapping chunks repeat text, and a page can repeat itself: a chunk
+        # starts after the previous one's start and at most chunk_overlap
+        # characters before its end, so search from there
+        prev_start, prev_end = -1, 0
         for chunk_text in page_chunks:
+            pos = page.text.find(chunk_text, max(prev_start + 1, prev_end - chunk_overlap))
+            if pos < 0:
+                pos = page.text.find(chunk_text, prev_start + 1)
+            if pos < 0:
+                logger.warning(
+                    "chunk_offsets_not_found", file=doc.source_file, page=page.page_number
+                )
+                char_start = char_end = None
+            else:
+                prev_start, prev_end = pos, pos + len(chunk_text)
+                char_start = page_start + pos
+                char_end = char_start + len(chunk_text)
             # content is the page's own text; the context prefix is only embedded
             chunks.append(
                 ChunkRecord(
@@ -597,6 +663,8 @@ def _chunk_document(
                     source_file=doc.source_file,
                     source_section=f"page_{page.page_number}",
                     doc_type=doc_type,
+                    char_start=char_start,
+                    char_end=char_end,
                 )
             )
 

@@ -82,6 +82,7 @@ async def test_sql_files_apply_twice(db_url):
         "04_ingested_files.sql",
         "05_add_folder.sql",
         "06_readonly_grants.sql",
+        "07_documents.sql",
         "12_answer_mode.sql",
     ):
         sql = migrations._load_sql(name)
@@ -109,7 +110,7 @@ async def fresh_url(db_url):
 async def test_builds_an_empty_database(fresh_url):
     await migrations.ensure_schema(fresh_url)
 
-    assert await _recorded(fresh_url) == {1, 2, 4, 5, 6, 12}
+    assert await _recorded(fresh_url) == {1, 2, 4, 5, 6, 7, 12}
     conn = await asyncpg.connect(fresh_url)
     try:
         for table in (
@@ -182,7 +183,7 @@ async def test_records_existing_objects_without_running(db_url):
     await _owner_execute(db_url, "DROP TABLE strata_core.schema_migrations")
     with patch.object(migrations, "_load_sql", side_effect=AssertionError("file was run")):
         await migrations.ensure_schema(db_url)
-    assert await _recorded(db_url) == {1, 2, 4, 5, 6, 12}
+    assert await _recorded(db_url) == {1, 2, 4, 5, 6, 7, 12}
     assert db_url in migrations._checked
 
 
@@ -223,7 +224,7 @@ async def test_applies_missing_05(db_url):
         await conn.close()
     assert {"origin", "owner", "root_path"} <= columns
     assert index == "strata_core.knowledge_layers_root_path_key"
-    assert await _recorded(db_url) == {1, 2, 4, 5, 6, 12}
+    assert await _recorded(db_url) == {1, 2, 4, 5, 6, 7, 12}
 
 
 async def test_applies_missing_12_existing_layers_read_grounded(db_url):
@@ -249,7 +250,7 @@ async def test_applies_missing_12_existing_layers_read_grounded(db_url):
         finally:
             await conn.close()
         assert mode == "grounded"
-        assert await _recorded(db_url) == {1, 2, 4, 5, 6, 12}
+        assert await _recorded(db_url) == {1, 2, 4, 5, 6, 7, 12}
     finally:
         await _owner_execute(
             db_url,
@@ -257,10 +258,46 @@ async def test_applies_missing_12_existing_layers_read_grounded(db_url):
         )
 
 
+async def test_applies_missing_07_older_chunks_keep_null_offsets(db_url):
+    await _owner_execute(
+        db_url,
+        """
+        DELETE FROM strata_vectors.chunks WHERE layer_name = 'test_mig_documents';
+        ALTER TABLE strata_vectors.chunks
+            DROP COLUMN document_id, DROP COLUMN char_start, DROP COLUMN char_end;
+        DROP TABLE strata_vectors.documents;
+        DELETE FROM strata_core.schema_migrations WHERE version = 7;
+        INSERT INTO strata_vectors.chunks (layer_name, content, source_file)
+        VALUES ('test_mig_documents', 'Older chunk', 'old.md');
+        """,
+    )
+    try:
+        await migrations.ensure_schema(db_url)
+
+        conn = await asyncpg.connect(db_url)
+        try:
+            assert await conn.fetchval(
+                "SELECT to_regclass('strata_vectors.documents') IS NOT NULL"
+            )
+            row = await conn.fetchrow(
+                "SELECT document_id, char_start, char_end FROM strata_vectors.chunks "
+                "WHERE layer_name = 'test_mig_documents'"
+            )
+        finally:
+            await conn.close()
+        assert tuple(row) == (None, None, None)
+        assert await _recorded(db_url) == {1, 2, 4, 5, 6, 7, 12}
+    finally:
+        await _owner_execute(
+            db_url,
+            "DELETE FROM strata_vectors.chunks WHERE layer_name = 'test_mig_documents'",
+        )
+
+
 async def test_concurrent_calls(db_url):
     await _owner_execute(db_url, "DROP TABLE strata_core.schema_migrations")
     await asyncio.gather(migrations.ensure_schema(db_url), migrations.ensure_schema(db_url))
-    assert await _recorded(db_url) == {1, 2, 4, 5, 6, 12}
+    assert await _recorded(db_url) == {1, 2, 4, 5, 6, 7, 12}
 
 
 async def test_broken_file_raises_naming_it(db_url):
@@ -293,11 +330,11 @@ async def test_non_owner_schema_present(db_url, readonly_url):
             await migrations.ensure_schema(readonly_url)
         events = [entry for entry in logs if entry["event"] == "migration_not_recorded"]
         assert len(events) == 1
-        assert events[0]["versions"] == [1, 2, 4, 5, 6, 12]
+        assert events[0]["versions"] == [1, 2, 4, 5, 6, 7, 12]
         assert readonly_url in migrations._checked
     finally:
         await migrations.ensure_schema(db_url)
-    assert await _recorded(db_url) == {1, 2, 4, 5, 6, 12}
+    assert await _recorded(db_url) == {1, 2, 4, 5, 6, 7, 12}
 
 
 async def test_non_owner_schema_missing(db_url, readonly_url):

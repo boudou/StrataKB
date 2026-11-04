@@ -29,6 +29,11 @@ class ChunkRecord:
     doc_type: str = ""
     # strata_core.ingested_files row the chunk came from (None for chunks stored directly)
     file_id: str | None = None
+    # strata_vectors.documents version and the span of its text the chunk holds
+    # (None for chunks stored directly, or when the span could not be found)
+    document_id: int | None = None
+    char_start: int | None = None
+    char_end: int | None = None
 
 
 def _build_context_prefix(
@@ -108,14 +113,17 @@ async def insert_chunks(
             chunk.source_section,
             chunk.doc_type,
             chunk.file_id,
+            chunk.document_id,
+            chunk.char_start,
+            chunk.char_end,
         )
         for chunk in chunks
     ]
     sql = """
         INSERT INTO strata_vectors.chunks
             (layer_name, content, embedding, metadata, source_file, source_section,
-             doc_type, file_id)
-        VALUES ($1, $2, $3::vector, $4::jsonb, $5, $6, $7, $8)
+             doc_type, file_id, document_id, char_start, char_end)
+        VALUES ($1, $2, $3::vector, $4::jsonb, $5, $6, $7, $8, $9, $10, $11)
         """
 
     if conn is not None:

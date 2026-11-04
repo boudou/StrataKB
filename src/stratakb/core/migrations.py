@@ -134,6 +134,19 @@ MIGRATIONS: list[tuple[int, str, str]] = [
         """,
     ),
     (
+        7,
+        "07_documents.sql",
+        """
+        SELECT to_regclass('strata_vectors.documents') IS NOT NULL
+            AND (
+                SELECT count(*) = 3 FROM information_schema.columns
+                WHERE table_schema = 'strata_vectors'
+                  AND table_name = 'chunks'
+                  AND column_name IN ('document_id', 'char_start', 'char_end')
+            )
+        """,
+    ),
+    (
         12,
         "12_answer_mode.sql",
         """
