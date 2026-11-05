@@ -295,6 +295,99 @@ class TestMarkdownParser:
 
         Path(f.name).unlink()
 
+    @staticmethod
+    def _parse(tmp_path, source: str):
+        from stratakb.knowledge.parsers.markdown_parser import parse_markdown
+
+        path = tmp_path / "doc.md"
+        path.write_text(source, encoding="utf-8")
+        result = parse_markdown(path)
+        assert result.error is None
+        for page in result.pages:
+            assert page.text in source
+        return result
+
+    def test_hash_lines_in_backtick_fence_are_not_headings(self, tmp_path):
+        source = (
+            "# Install\n\nRun this:\n\n"
+            "```bash\n# install deps\nuv sync\n```\n"
+            "\nDone.\n\n## Next\n\ntext\n"
+        )
+        result = self._parse(tmp_path, source)
+        assert result.total_pages == 2
+        first, second = result.pages
+        assert "```bash\n# install deps\nuv sync\n```" in first.text
+        assert "Done." in first.text
+        assert first.section_path == ["Install"]
+        assert second.text.startswith("## Next")
+        assert second.section_path == ["Install", "Next"]
+
+    def test_hash_lines_in_tilde_fence_are_not_headings(self, tmp_path):
+        source = (
+            "# Install\n\n~~~\n## not a heading\n```\n# still code\n~~~\n"
+            "\n## Next\n\ntext\n"
+        )
+        result = self._parse(tmp_path, source)
+        assert result.total_pages == 2
+        assert "## not a heading" in result.pages[0].text
+        assert "# still code" in result.pages[0].text
+        assert result.pages[0].section_path == ["Install"]
+        assert result.pages[1].section_path == ["Install", "Next"]
+
+    def test_longer_fence_is_not_closed_by_shorter_one(self, tmp_path):
+        source = "# A\n\n````\n```\n# code\n```\n````\n\n## B\n\ntext\n"
+        result = self._parse(tmp_path, source)
+        assert [p.section_path for p in result.pages] == [["A"], ["A", "B"]]
+        assert "# code" in result.pages[0].text
+
+    def test_unclosed_fence_runs_to_end(self, tmp_path):
+        source = "# A\n\n```\n# code\n\n## Not a heading either\n"
+        result = self._parse(tmp_path, source)
+        assert result.total_pages == 1
+        assert result.pages[0].section_path == ["A"]
+        assert "## Not a heading either" in result.pages[0].text
+
+    def test_inline_triple_backticks_do_not_open_fence(self, tmp_path):
+        source = "# A\n\n```x```\n\n## B\n\ntext\n"
+        result = self._parse(tmp_path, source)
+        assert [p.section_path for p in result.pages] == [["A"], ["A", "B"]]
+
+    def test_frontmatter_comment_is_not_heading(self, tmp_path):
+        source = "---\ntitle: x\n# a yaml comment\n---\n\n# Real\n\ntext\n"
+        result = self._parse(tmp_path, source)
+        assert result.total_pages == 1
+        assert result.pages[0].section_path == ["Real"]
+        assert result.pages[0].text.startswith("# Real")
+
+    def test_frontmatter_text_before_first_heading_is_preamble(self, tmp_path):
+        source = "---\ntitle: x\n...\nIntro text.\n\n# Real\n\ntext\n"
+        result = self._parse(tmp_path, source)
+        assert [p.text for p in result.pages] == ["Intro text.", "# Real\n\ntext"]
+
+    def test_leading_thematic_break_is_not_frontmatter(self, tmp_path):
+        source = (
+            "---\n\n# Intro\n\nSome text\n\n| a | b |\n|---|---|\n| 1 | 2 |\n"
+            "\n## Next\n\nmore\n"
+        )
+        result = self._parse(tmp_path, source)
+        sections = [(p.section_path, p.text) for p in result.pages]
+        assert sections[0] == ([], "---")
+        assert sections[1][0] == ["Intro"]
+        assert sections[1][1].startswith("# Intro\n\nSome text\n\n| a | b |\n|---|---|")
+        assert sections[2] == (["Intro", "Next"], "## Next\n\nmore")
+
+    def test_dashes_inside_a_line_do_not_close_frontmatter(self, tmp_path):
+        source = "---\ntitle: Wait --- what\n# yaml comment\n---\n\n# Real\n\ntext\n"
+        result = self._parse(tmp_path, source)
+        assert [p.section_path for p in result.pages] == [["Real"]]
+        assert result.pages[0].text == "# Real\n\ntext"
+
+    def test_bare_hash_line_does_not_take_next_line(self, tmp_path):
+        source = "# A\n\n#\nplain line\n\n## B\n\ntext\n"
+        result = self._parse(tmp_path, source)
+        assert [p.section_path for p in result.pages] == [["A"], ["A", "B"]]
+        assert "plain line" in result.pages[0].text
+
 
 class TestMarkdownErrors:
     def test_nonexistent_file(self):
@@ -357,10 +450,12 @@ class TestHTMLParser:
         from stratakb.knowledge.parsers.html_parser import parse_html
 
         result = parse_html(TEST_HTML)
-        # Preamble (title text) + H1: SEPA Credit Transfer + H2: Message Format
-        # + H3: Group Header + H3: Payment Information + H2: Processing Rules
-        # + H3: Validation = 7
-        assert result.total_pages == 7
+        # H1: SEPA Credit Transfer + H2: Message Format + H3: Group Header
+        # + H3: Payment Information + H2: Processing Rules + H3: Validation = 6
+        # (the <title> is not section text)
+        assert result.total_pages == 6
+        assert result.pages[0].text.startswith("# SEPA Credit Transfer")
+        assert all("SEPA Credit Transfer Guide" not in p.text for p in result.pages)
 
     def test_strips_script_and_style(self):
         from stratakb.knowledge.parsers.html_parser import parse_html
@@ -382,8 +477,7 @@ class TestHTMLParser:
         from stratakb.knowledge.parsers.html_parser import parse_html
 
         result = parse_html(TEST_HTML)
-        # Page 0 is preamble (title), page 1 is the H1 section
-        h1_page = result.pages[1]
+        h1_page = result.pages[0]
         assert "SEPA Credit Transfer" in h1_page.text
         assert "euro-denominated" in h1_page.text
 
@@ -410,11 +504,10 @@ class TestHTMLParser:
         from stratakb.knowledge.parsers.html_parser import parse_html
 
         result = parse_html(TEST_HTML)
-        for page in result.pages[1:]:  # page 0 is the preamble, without a heading
+        for page in result.pages:
             heading_lines = [ln for ln in page.text.splitlines() if ln.startswith("#")]
             assert len(heading_lines) == 1
             assert heading_lines[0].lstrip("#").strip() == page.section_path[-1]
-        assert result.pages[0].section_path == []
 
     def test_content_preserved(self):
         from stratakb.knowledge.parsers.html_parser import parse_html
@@ -434,9 +527,48 @@ class TestHTMLParser:
             result = parse_html(f.name)
             assert result.error is None
             assert result.total_pages == 1
-            assert "Simple content" in result.pages[0].text
+            assert result.pages[0].text == "Simple content"
+            assert result.pages[0].section_path == ["Test"]
 
         Path(f.name).unlink()
+
+    def test_title_only_in_nav_page_not_in_text(self, tmp_path):
+        from stratakb.knowledge.parsers.html_parser import parse_html
+
+        path = tmp_path / "nav.html"
+        path.write_text(
+            "<html><head><title>My Page</title></head><body><nav>only nav</nav></body></html>",
+            encoding="utf-8",
+        )
+        result = parse_html(path)
+        assert result.error is None
+        assert result.total_pages == 1
+        assert result.pages[0].text == "only nav"
+        assert result.pages[0].section_path == ["My Page"]
+
+    def test_title_entities_unescaped(self, tmp_path):
+        from stratakb.knowledge.parsers.html_parser import parse_html
+
+        path = tmp_path / "amp.html"
+        path.write_text(
+            "<html><head><title>T &amp;\n  U</title></head><body><p>body</p></body></html>",
+            encoding="utf-8",
+        )
+        result = parse_html(path)
+        assert result.pages[0].text == "body"
+        assert result.pages[0].section_path == ["T & U"]
+
+    def test_text_before_first_heading_gets_title_path(self, tmp_path):
+        from stratakb.knowledge.parsers.html_parser import parse_html
+
+        path = tmp_path / "intro.html"
+        path.write_text(
+            "<html><head><title>Guide</title></head><body><p>Intro</p><h1>Main</h1><p>x</p></body></html>",
+            encoding="utf-8",
+        )
+        result = parse_html(path)
+        assert [p.text for p in result.pages] == ["Intro", "# Main\n\nx"]
+        assert [p.section_path for p in result.pages] == [["Guide"], ["Main"]]
 
 
 class TestHTMLErrors:

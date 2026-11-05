@@ -15,8 +15,19 @@ from stratakb.knowledge.parsers.pdf_parser import ParsedDocument, ParsedPage
 
 logger = structlog.get_logger()
 
-# Matches ATX headings: # H1, ## H2, ### H3
-_HEADING_RE = re.compile(r"^(#{1,3})\s+(.+)$", re.MULTILINE)
+# Matches ATX headings: # H1, ## H2, ### H3 (the space after # stays on the line)
+_HEADING_RE = re.compile(r"^(#{1,3})[ \t]+(.+)$", re.MULTILINE)
+
+# Fenced code block delimiters (CommonMark): up to 3 spaces, then 3+ backticks or tildes
+_FENCE_OPEN_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
+_FENCE_CLOSE_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})[ \t]*$")
+
+# Leading YAML front matter: a first line holding only '---' (not followed by a
+# blank line, which would make it a thematic break), up to a line holding only '---' or '...'
+_FRONTMATTER_RE = re.compile(
+    r"\A\s*---[ \t]*\n(?![ \t]*\n).*?^(?:---|\.\.\.)[ \t]*$",
+    re.DOTALL | re.MULTILINE,
+)
 
 
 def parse_markdown(file_path: str | Path) -> ParsedDocument:
@@ -83,7 +94,13 @@ def _split_by_headings(text: str) -> list[dict]:
     The text is the document's own text for the section, heading line included;
     section_path is the heading chain (parent headings, then this heading).
     """
-    matches = list(_HEADING_RE.finditer(text))
+    # '#' lines inside code fences or the front matter are not headings
+    fm_end = _frontmatter_end(text)
+    skipped = _non_heading_ranges(text, fm_end)
+    matches = [
+        m for m in _HEADING_RE.finditer(text)
+        if not any(start <= m.start() < end for start, end in skipped)
+    ]
 
     if not matches:
         return []
@@ -94,17 +111,14 @@ def _split_by_headings(text: str) -> list[dict]:
 
     sections: list[dict] = []
 
-    # Handle any preamble before the first heading
-    preamble = text[:matches[0].start()].strip()
+    # Handle any preamble before the first heading (the front matter is not text)
+    preamble = text[fm_end:matches[0].start()].strip()
     if preamble:
-        # Strip YAML frontmatter
-        preamble_clean = _strip_frontmatter(preamble)
-        if preamble_clean.strip():
-            sections.append({
-                "level": 0,
-                "heading": "Preamble",
-                "text": preamble_clean.strip(),
-            })
+        sections.append({
+            "level": 0,
+            "heading": "Preamble",
+            "text": preamble,
+        })
 
     for i, match in enumerate(matches):
         level = len(match.group(1))  # Number of # chars
@@ -137,10 +151,43 @@ def _split_by_headings(text: str) -> list[dict]:
     return sections
 
 
-def _strip_frontmatter(text: str) -> str:
-    """Remove YAML frontmatter (--- ... ---) from the beginning of text."""
-    if text.startswith("---"):
-        end = text.find("---", 3)
-        if end != -1:
-            return text[end + 3:]
-    return text
+def _frontmatter_end(text: str) -> int:
+    """Return the offset just past the leading YAML front matter, or 0 when there is none."""
+    match = _FRONTMATTER_RE.match(text)
+    return match.end() if match else 0
+
+
+def _non_heading_ranges(text: str, fm_end: int) -> list[tuple[int, int]]:
+    """Return (start, end) offsets of the leading front matter and of fenced code blocks.
+
+    fm_end is _frontmatter_end(text). A fence opens with 3+ backticks or tildes
+    (a backtick fence's info string has no backtick, else the line is inline
+    code) and closes on a line holding only the same character, at least as
+    many times. An unclosed fence runs to the end.
+    """
+    ranges: list[tuple[int, int]] = []
+    pos = fm_end
+    if fm_end:
+        ranges.append((0, fm_end))
+
+    fence = ""
+    fence_start = 0
+    start = 0
+    for line in text.split("\n"):
+        line_start, start = start, start + len(line) + 1
+        if line_start < pos:
+            continue
+        if fence:
+            close = _FENCE_CLOSE_RE.match(line)
+            if close and close.group(1)[0] == fence[0] and len(close.group(1)) >= len(fence):
+                ranges.append((fence_start, start))
+                fence = ""
+            continue
+        opening = _FENCE_OPEN_RE.match(line)
+        if opening and not (opening.group(1)[0] == "`" and "`" in opening.group(2)):
+            fence = opening.group(1)
+            fence_start = line_start
+
+    if fence:
+        ranges.append((fence_start, len(text)))
+    return ranges

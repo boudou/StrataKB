@@ -6,6 +6,7 @@ Converts HTML documents into clean text, splitting by heading elements
 
 from __future__ import annotations
 
+import html as html_lib
 import re
 from html.parser import HTMLParser
 from pathlib import Path
@@ -48,18 +49,21 @@ def parse_html(file_path: str | Path) -> ParsedDocument:
     title = _extract_title(raw)
 
     # Parse HTML to structured sections
-    parser = _SectionParser()
+    parser = _SectionParser(title)
     parser.feed(raw)
     sections = parser.get_sections()
 
     if not sections:
-        # No headings — return as single page with stripped text
+        # No section text — return as single page with stripped text
         text = _strip_tags(raw).strip()
         if not text:
             return ParsedDocument(source_file=source, pages=[], total_pages=0)
-        if title:
-            text = f"# {title}\n\n{text}"
-        page = ParsedPage(text=text, page_number=1, source_file=source)
+        page = ParsedPage(
+            text=text,
+            page_number=1,
+            source_file=source,
+            section_path=[title] if title else [],
+        )
         return ParsedDocument(source_file=source, pages=[page], total_pages=1)
 
     pages: list[ParsedPage] = []
@@ -83,19 +87,23 @@ def parse_html(file_path: str | Path) -> ParsedDocument:
 
 
 class _SectionParser(HTMLParser):
-    """HTML parser that splits content by h1-h3 headings."""
+    """HTML parser that splits content by h1-h3 headings.
+
+    The <title> is not section text: it is the section_path of text under no heading.
+    """
 
     _HEADING_TAGS = {"h1", "h2", "h3"}
 
-    def __init__(self):
+    def __init__(self, title: str = ""):
         super().__init__()
+        self._title = title
         self._sections: list[dict] = []
         self._current_text: list[str] = []
         self._current_heading: str = ""
         self._current_level: int = 0
         self._in_heading: bool = False
         self._heading_text: list[str] = []
-        self._skip_tags = {"script", "style", "nav", "footer", "header"}
+        self._skip_tags = {"script", "style", "title", "nav", "footer", "header"}
         self._skip_depth: int = 0
         self._h1_context = ""
         self._h2_context = ""
@@ -150,7 +158,7 @@ class _SectionParser(HTMLParser):
         text = "".join(self._current_text).strip()
         if text or self._current_heading:
             # Parent headings go into section_path, not into the section's text
-            path = []
+            path = [self._title] if self._current_level == 0 and self._title else []
             if self._current_level >= 2 and self._h1_context:
                 path.append(self._h1_context)
             if self._current_level >= 3 and self._h2_context:
@@ -183,15 +191,17 @@ class _SectionParser(HTMLParser):
 
 
 def _extract_title(html: str) -> str:
-    """Extract text from <title> tag."""
+    """Extract text from <title> tag, unescaped, with whitespace runs collapsed."""
     match = re.search(r"<title[^>]*>(.*?)</title>", html, re.IGNORECASE | re.DOTALL)
-    return match.group(1).strip() if match else ""
+    if not match:
+        return ""
+    return re.sub(r"\s+", " ", html_lib.unescape(match.group(1))).strip()
 
 
 def _strip_tags(html: str) -> str:
     """Remove all HTML tags and return clean text."""
-    # Remove script/style content
-    html = re.sub(r"<(script|style)[^>]*>.*?</\1>", "", html, flags=re.IGNORECASE | re.DOTALL)
+    # Remove script/style/title content
+    html = re.sub(r"<(script|style|title)[^>]*>.*?</\1>", "", html, flags=re.IGNORECASE | re.DOTALL)
     # Remove tags
     text = re.sub(r"<[^>]+>", " ", html)
     # Collapse whitespace
