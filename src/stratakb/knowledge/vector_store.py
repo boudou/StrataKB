@@ -36,6 +36,9 @@ class ChunkRecord:
     document_id: int | None = None
     char_start: int | None = None
     char_end: int | None = None
+    # Path of the innermost section the chunk lies in ('7 Termination > 7.2'),
+    # None outside any section or without a structure map
+    clause_path: str | None = None
 
 
 def _build_context_prefix(
@@ -118,14 +121,15 @@ async def insert_chunks(
             chunk.document_id,
             chunk.char_start,
             chunk.char_end,
+            chunk.clause_path,
         )
         for chunk in chunks
     ]
     sql = """
         INSERT INTO strata_vectors.chunks
             (layer_name, content, embedding, metadata, source_file, source_section,
-             doc_type, file_id, document_id, char_start, char_end)
-        VALUES ($1, $2, $3::vector, $4::jsonb, $5, $6, $7, $8, $9, $10, $11)
+             doc_type, file_id, document_id, char_start, char_end, clause_path)
+        VALUES ($1, $2, $3::vector, $4::jsonb, $5, $6, $7, $8, $9, $10, $11, $12)
         """
 
     if conn is not None:

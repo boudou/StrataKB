@@ -18,6 +18,7 @@ import asyncpg
 import structlog
 
 from stratakb.knowledge.parsers.pdf_parser import ParsedDocument
+from stratakb.knowledge.structure import Section
 
 logger = structlog.get_logger()
 
@@ -131,6 +132,34 @@ async def store_document_version(
         )
     logger.info("document_version_stored", relative_path=relative_path, version=version)
     return document_id, version
+
+
+async def store_sections(
+    conn: asyncpg.Connection, document_id: int, sections: Sequence[Section]
+) -> None:
+    """Store a document version's structure map, unless it already has one.
+
+    A reused version keeps the sections stored with it (its text, and so its
+    map, is the same); a version stored before the map existed gets one.
+    """
+    if not sections:
+        return
+    if await conn.fetchval(
+        "SELECT EXISTS (SELECT 1 FROM strata_vectors.document_sections WHERE document_id = $1)",
+        document_id,
+    ):
+        return
+    await conn.executemany(
+        """
+        INSERT INTO strata_vectors.document_sections
+            (document_id, label, title, path, depth, char_start, char_end)
+        VALUES ($1, $2, $3, $4, $5, $6, $7)
+        """,
+        [
+            (document_id, s.label, s.title, s.path, s.depth, s.char_start, s.char_end)
+            for s in sections
+        ],
+    )
 
 
 def _version_lock_key(layer_id: str, source_root: str, relative_path: str) -> int:

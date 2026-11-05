@@ -128,7 +128,7 @@ flowchart LR
     z -->|"yes"| t["No text:<br/>skip or remove"]
     z -->|"no"| p["Parse<br/>per format"]
     p -->|"no text"| t
-    p --> c["Chunk<br/>(the file's own text)"] --> x["Add context for the embedding only<br/>[layer > file > headings or Page N]"] --> e["Embed"] --> v[("Store the document text<br/>(new version if it changed)<br/>and that file's chunks")]
+    p --> sm["Structure map<br/>(headings, numbered clauses)"] --> c["Chunk inside each section<br/>(the file's own text)"] --> x["Add context for the embedding only<br/>[layer > file > headings or Page N]"] --> e["Embed"] --> v[("Store the document text<br/>(new version if it changed)<br/>and that file's chunks")]
     p -.->|"scanned-looking PDF,<br/>CSV over 10,000 rows"| fl["Stored, reported<br/>as flagged"]
     h -->|"can't read"| fe["Failed, keeps earlier chunks<br/>(read_error, parse_error)"]
     p -->|"parser rejects"| fe
@@ -149,6 +149,15 @@ Every file gets an outcome, and most outcomes a reason. `stratakb add --json` li
 Each stored chunk is the document's own text as its parser extracted it (for Markdown and plain text, the file's characters; for PDF, HTML and other formats, the extracted text): search results quote that text exactly, and a Markdown or HTML section holds its own heading once. Where the chunk sits (`[layer > file > headings]` for Markdown and HTML, `[layer > file > Page N]` otherwise) is added only to the text that is embedded, so semantic search keeps that context; the heading path is also in the chunk's metadata as `section_path`. In Markdown, the front matter (a leading `---` block of `key: value` lines) is never part of the text, `#` lines inside code fences (```` ``` ```` or `~~~`) are not headings, so a shell comment does not split a code block, and headings may be indented up to three spaces or underlined with `===` / `---`. An HTML page's first `<title>` outside an inline `<svg>` is not part of the text: it is the section path of text that sits under no heading (the whole page, when it has no headings), while an SVG's `<title>` stays in the text. Keyword search matches the chunk text, not layer or file names. Chunks stored by earlier versions keep their bracketed prefix until their file is ingested again.
 
 Each file's extracted text is stored once as a document, and every chunk records where in that text it sits (a character range, from which the page and the line range follow), so a passage can be located and checked against its source. Lines count from the start of the page for PDFs and from the start of the document for other formats. When a file's text changes, the next ingest stores it as a new version; versions that no chunk uses any more are removed. Chunks ingested before this was added have no position until their file is ingested again.
+
+Chunks follow the document's structure. Each document gets a structure map: its headings and numbered clauses, each with a path such as `7 Termination > 7.2 Termination for cause` and the range of the text it covers, found without any configuration. The map recognises Markdown, reStructuredText and AsciiDoc headings (and so the headings the other parsers write, such as one per XSD type), numbered headings (`4.3.2`, `7.`, `7(2)(b)`) and keyword headings (`Article 12`, `Section 3`, `Annex II`). A numbered line counts as a clause only when it continues the numbering (`7.3` or `8` after `7.2`) and follows a blank line, a heading or the end of a sentence, so a numbered list inside a clause, or a wrapped line that starts with `30 days` or `Article 6`, is not one. Table-of-contents entries are skipped, so the body's clauses keep their numbers. A chunk never crosses a section boundary (or a PDF page): a short section is one chunk, and a section longer than `chunk_size` is split, with every piece keeping the section's path. The path of the innermost section is stored with each chunk (`clause_path`); text before the first heading has none. A document with no detectable structure is split by size alone, as before. Chunks ingested before this was added have no clause path until their file is ingested again.
+
+```mermaid
+flowchart LR
+    t["Document text"] --> d{"Headings or<br/>numbered clauses?"}
+    d -->|"yes"| m["Structure map:<br/>path and range per section"] --> s["Cut at every section start;<br/>split long sections by size"] --> c["Chunks with<br/>clause_path"]
+    d -->|"no"| z["Split by size"] --> c2["Chunks without<br/>clause_path"]
+```
 
 **Ask**
 
