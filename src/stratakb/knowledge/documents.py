@@ -171,6 +171,28 @@ async def prune_documents(
     return int(result.split()[-1])
 
 
+async def fetch_cited_documents(
+    conn: asyncpg.Connection, ends: dict[int, int]
+) -> dict[int, dict]:
+    """Path, page map and text up to the given end of each cited document.
+
+    ends maps a document id to the furthest char_end cited in it; only the
+    text before it is read, which is all locate() needs.
+    """
+    if not ends:
+        return {}
+    rows = await conn.fetch(
+        """
+        SELECT d.id, d.relative_path, d.page_map, left(d.text, x.max_end) AS text
+        FROM strata_vectors.documents d
+        JOIN unnest($1::bigint[], $2::int[]) AS x(id, max_end) ON x.id = d.id
+        """,
+        list(ends),
+        list(ends.values()),
+    )
+    return {row["id"]: dict(row) for row in rows}
+
+
 def locate(
     text: str,
     page_map: list[list[int]] | str | None,

@@ -83,6 +83,10 @@ class Settings(BaseSettings):
     reranking_model: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"
     reranking_candidate_multiplier: int = 3  # over-retrieve factor (top_k * this)
 
+    # Answers: strata_ask returns the best passages that fit this many tokens
+    # (about four characters each); the first passage always comes back
+    answer_token_budget: int = 1500
+
     # Learning System
     learning_enabled: bool = True
     learning_store_raw_queries: bool = False  # if True, stores queries without PII scrubbing

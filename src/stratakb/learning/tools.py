@@ -5,11 +5,52 @@ Registers feedback, stats, and reset tools.
 
 from __future__ import annotations
 
+import re
+
 from mcp.server.fastmcp import FastMCP
 
 from stratakb.core.audit import write_audit_log
 from stratakb.core.auth import get_current_user, require_role
 from stratakb.core.logging import log_tool_call
+
+_PASSAGE_ID = re.compile(r"[Ss]([1-9][0-9]*)")
+
+
+async def _resolve_passage_ids(
+    store, interaction_id: str, chunk_feedback: dict
+) -> tuple[dict, str | None]:
+    """Replace S<n> keys with the chunk id of the interaction's n-th result.
+
+    Other keys are chunk ids and stay. Returns the resolved feedback and an
+    error message, or None.
+    """
+    if not any(_PASSAGE_ID.fullmatch(str(key)) for key in chunk_feedback):
+        return chunk_feedback, None
+    results = await store.get_interaction_results(interaction_id)
+    if results is None:
+        return chunk_feedback, (
+            f"Unknown interaction_id '{interaction_id}'. Pass the interaction_id "
+            "from a strata_search or strata_ask response."
+        )
+    resolved: dict = {}
+    unknown: list[str] = []
+    for key, rating in chunk_feedback.items():
+        match = _PASSAGE_ID.fullmatch(str(key))
+        if match is None:
+            resolved[key] = rating
+            continue
+        n = int(match.group(1))
+        chunk_id = results[n - 1].get("chunk_id") if n <= len(results) else None
+        if chunk_id is None:
+            unknown.append(str(key))
+        else:
+            resolved[chunk_id] = rating
+    if unknown:
+        return chunk_feedback, (
+            f"Unknown passage id(s) {', '.join(unknown)} for this interaction: "
+            f"it returned {len(results)} passage(s)."
+        )
+    return resolved, None
 
 
 def register_learning_tools(mcp: FastMCP, database_url: str) -> None:
@@ -36,11 +77,20 @@ def register_learning_tools(mcp: FastMCP, database_url: str) -> None:
             helpful: Whether the results answered the question.
             correct_layer: If results were from wrong layer, specify the correct one.
             better_query: If you found better search terms, share them here.
-            chunk_feedback: Per-chunk feedback: {chunk_id: "useful"|"wrong"|"outdated"}.
+            chunk_feedback: Per-passage feedback: {"S1": "useful"|"wrong"|"outdated"},
+                using the passage ids of the strata_ask response, or chunk ids.
         """
         from stratakb.learning.store import LearningStore
 
         store = LearningStore(database_url)
+
+        # Passage ids (S1, S2, ...) name the interaction's results in order
+        if chunk_feedback:
+            chunk_feedback, error = await _resolve_passage_ids(
+                store, interaction_id, chunk_feedback
+            )
+            if error:
+                return {"status": "error", "error": error}
 
         # Store explicit helpful/not-helpful signal
         stored = await store.store_feedback(

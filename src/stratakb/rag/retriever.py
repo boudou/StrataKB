@@ -85,6 +85,11 @@ class SearchResult:
     metadata: dict = field(default_factory=dict)
     # Query/chunk cosine similarity (-1..1); None when the chunk has no embedding
     similarity: float | None = None
+    # The stored document and the span of its text this chunk holds; None for
+    # chunks ingested before documents were stored
+    document_id: int | None = None
+    char_start: int | None = None
+    char_end: int | None = None
 
 
 async def search_chunks(
@@ -168,7 +173,10 @@ async def search_chunks(
             source_file,
             source_section,
             doc_type,
-            metadata
+            metadata,
+            document_id,
+            char_start,
+            char_end
         FROM strata_vectors.chunks
         {where_clause}
         ORDER BY embedding <=> $1::vector
@@ -217,6 +225,9 @@ def _row_to_result(row, score: float, similarity: float | None) -> SearchResult:
         doc_type=row["doc_type"] or "",
         metadata=meta if isinstance(meta, dict) else {},
         similarity=round(float(similarity), 4) if similarity is not None else None,
+        document_id=row.get("document_id"),
+        char_start=row.get("char_start"),
+        char_end=row.get("char_end"),
     )
 
 
@@ -423,6 +434,7 @@ async def _hybrid_search(
     uuid_ids = [uuid.UUID(tid) for tid in top_ids]
     chunk_sql = """
         SELECT id, content, layer_name, source_file, source_section, doc_type, metadata,
+               document_id, char_start, char_end,
                1 - (embedding <=> $2::vector) AS similarity
         FROM strata_vectors.chunks
         WHERE id = ANY($1::uuid[])

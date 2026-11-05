@@ -580,7 +580,9 @@ class TestAskDomainContext:
             patch("stratakb.rag.tools.write_audit_log", AsyncMock()),
             patch("openai.AsyncOpenAI", return_value=client) as openai_cls,
         ):
-            result = await ask(question="Why was it rejected?", layers=["sepa"])
+            result = await ask(
+                question="Why was it rejected?", layers=["sepa"], response_format="detailed"
+            )
 
         assert result["status"] == "ok"
         if configured:
@@ -631,7 +633,9 @@ class TestAskConfidence:
             patch("stratakb.rag.retriever.search_chunks", AsyncMock(return_value=results)),
             patch("stratakb.rag.tools.write_audit_log", AsyncMock()),
         ):
-            result = await ask(question="What does AC04 mean?", layers=["docs"])
+            result = await ask(
+                question="What does AC04 mean?", layers=["docs"], response_format="detailed"
+            )
 
         assert result["status"] == "ok"
         confidence = result["confidence"]
@@ -655,7 +659,9 @@ class TestAskConfidence:
                 return_value=_LogitModel([1.0, 0.8, 0.7]),
             ),
         ):
-            result = await ask(question="What does AC04 mean?", layers=["docs"])
+            result = await ask(
+                question="What does AC04 mean?", layers=["docs"], response_format="detailed"
+            )
 
         assert result["status"] == "ok"
         confidence = result["confidence"]
@@ -669,6 +675,7 @@ class TestAskConfidence:
 _ASK_CHUNK_KEYS = [
     "chunk_id", "content", "score", "similarity", "rerank_score",
     "layer", "source_file", "section", "doc_type", "metadata",
+    "document_id", "char_start", "char_end",
 ]
 
 
@@ -699,7 +706,7 @@ async def _ask_with(by_query, *, reranking=False, logits=None):
         patch("stratakb.rag.tools.write_audit_log", AsyncMock()),
         patch("stratakb.rag.reranker._get_reranker", return_value=_LogitModel(logits or [])),
     ):
-        return await ask(question="q", layers=["docs"])
+        return await ask(question="q", layers=["docs"], response_format="detailed")
 
 
 class TestAskOrdering:

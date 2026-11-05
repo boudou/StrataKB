@@ -84,7 +84,10 @@ async def test_ask_cites_pep8_with_a_confidence(peps_layer):
     from stratakb.mcp_server import mcp
 
     response = _payload(
-        await mcp.call_tool("strata_ask", {"question": QUESTION, "layers": [peps_layer]})
+        await mcp.call_tool(
+            "strata_ask",
+            {"question": QUESTION, "layers": [peps_layer], "response_format": "detailed"},
+        )
     )
 
     assert response["status"] == "ok", response

@@ -155,8 +155,12 @@ Each file's extracted text is stored once as a document, and every chunk records
 ```mermaid
 flowchart LR
     q["Question"] --> r["Route to layers"] --> rw["Rewrite<br/>(optional)"] --> h["Hybrid search per query<br/>cache, HNSW + full-text, RRF"]
-    h --> d["Deduplicate"] --> rr["Cross-encoder<br/>rerank"] --> o["Chunks, sources,<br/>confidence"]
-    o --> a["Your MCP client<br/>writes the answer"]
+    h --> d["Deduplicate"] --> rr["Cross-encoder<br/>rerank"] --> b["Keep the best passages<br/>that fit ANSWER_TOKEN_BUDGET"]
+    b --> c["Cite each passage<br/>file, page, lines, headings"] --> o{"Best passage<br/>scores"}
+    o -->|"high"| f["found"]
+    o -->|"medium"| pf["partly_found<br/>+ next step"]
+    o -->|"low or none"| nf["not_found<br/>+ next step"]
+    f & pf & nf --> a["Your MCP client<br/>writes the answer"]
 ```
 
 **Learn**
@@ -257,11 +261,11 @@ Then ask from your client, for example *"How long should a line of Python be?"*.
 
 | Tool | Role | What it does |
 | --- | --- | --- |
-| `strata_ask` | viewer | Rewrites a question, searches in parallel, reranks, returns context with citations and a confidence level |
+| `strata_ask` | viewer | Rewrites a question, searches in parallel, reranks, and returns found, partly found or not found with the best passages, each with its file, page, lines and headings ([what it returns](#what-strata_ask-returns)) |
 | `strata_search` | viewer | Hybrid search for exact terms and identifiers, with optional layer and metadata filters, and a confidence level |
 | `strata_list_knowledge_layers` | viewer | Lists layers with document and chunk counts |
 | `strata_get_layer_status` | viewer | One layer's configuration and ingestion history |
-| `strata_feedback` | viewer | Rates a result as helpful or not, per answer or per chunk |
+| `strata_feedback` | viewer | Rates a result as helpful or not, per answer or per passage (`S1`) or chunk |
 | `strata_learning_stats` | viewer | What the learning system has recorded and learned |
 | `strata_whoami` | viewer | Your identity and role |
 | `strata_admin_health` | viewer | Database, pgvector and schema status, the local-only switch, the providers that receive data, whether the SQL tools are on, and the embedding model and vector column checks |
@@ -288,6 +292,39 @@ The `stratakb add` command has no role check: whoever can reach the database wit
 `strata_feedback` and `strata_reset_learning` each write one audit entry. A feedback entry holds the interaction id and the rating, not the suggested query or layer; a reset entry names the layer, or says it reset everything.
 
 Each `strata_apply_preset` run writes one audit entry with the layer, whether it was created, updated or already up to date, the names of the settings that changed (never their values) and the number of documents and chunks ingested. A refused run writes none.
+
+### What `strata_ask` returns
+
+By default the answer is short: a status, the mode and the passages, each with its own citation, so the client can quote and cite without matching ids to a sources list.
+
+```json
+{
+  "status": "found",
+  "mode": "grounded",
+  "passages": [
+    {
+      "id": "S1",
+      "ref": "d42:1830-1905",
+      "text": "7.2 Either party may end this agreement\nwith ninety days' written notice.",
+      "citation": {
+        "file": "contracts/acme-msa.md",
+        "page": null,
+        "lines": "30-31",
+        "clause_path": "Master agreement > 7 Termination",
+        "layer": "contracts"
+      }
+    }
+  ],
+  "interaction_id": "…"
+}
+```
+
+- `status` is `found` when the best passage scores high, `partly_found` when it scores medium, and `not_found` when it scores low or nothing came back. The last two add a `next_step`, such as adding a folder with `stratakb add` when no layer covers the question. The thresholds are the provisional ones of [Confidence](#glossary).
+- `mode` is `grounded`: the client writes the answer from the passages and cites them by id.
+- The passages come best first and fill a budget of about 1,500 tokens (`ANSWER_TOKEN_BUDGET`); the first passage always comes back, and `top_k` (default 10) only bounds the search before that.
+- Each passage's `text` is the stored document's own text. `ref` names its span in the stored document (`d<document id>:<start>-<end>`), or the chunk (`c<chunk id>`) for a chunk ingested before documents were stored. The citation has the file's path relative to the ingested folder, the page (PDFs; `page_end` too when the passage spans pages), the line range (from the page's start for PDFs) and the heading path. A chunk ingested before documents were stored is cited by its file name, without lines.
+- `interaction_id` goes to `strata_feedback`, which takes passage ids: `{"S1": "useful", "S2": "wrong"}`.
+- `response_format: "detailed"` returns everything as well: `confidence`, the query variants (`queries_used`), `retrieved_chunks` with their ids, scores and metadata, `sources`, with `status` `ok` and the found, partly found or not found in `answer_status`.
 
 ## Configuration
 
@@ -325,6 +362,7 @@ flowchart LR
 | `RERANKING_ENABLED` | `true` | Cross-encoder reranking in `strata_ask` |
 | `RERANKING_MODEL` | `cross-encoder/ms-marco-MiniLM-L-6-v2` | Reranker |
 | `RERANKING_CANDIDATE_MULTIPLIER` | `3` | `strata_ask` reranks `top_k` times this many candidates |
+| `ANSWER_TOKEN_BUDGET` | `1500` | How much text `strata_ask` returns: the best passages that fit this many tokens (about four characters each); the first passage always comes back |
 | `CACHE_ENABLED`, `CACHE_TTL_SECONDS` | `true`, `600` | Query result cache, cleared per layer on ingestion |
 | `CACHE_MAXSIZE` | `500` | Query results kept in the cache |
 | `LEARNING_ENABLED` | `true` | Record interactions and learn from them |
@@ -448,7 +486,7 @@ StrataKB cannot control what your MCP client's language model does with the retr
 ## Glossary
 
 - **Chunk**: a passage of a document, cut along its headings or structure. Search returns chunks, each with its file and section.
-- **Confidence**: `high`, `medium` or `low`, returned with every `strata_ask` and `strata_search` result; a low one comes with a warning. It is judged on the reranker's relevance probability (0 to 1) or, with reranking off, on each chunk's `similarity` (how similar the question and the chunk are by meaning); the result says which (`basis`: `rerank` or `similarity`). Each `strata_ask` chunk carries `score` (its merged rank, best 1.0), `similarity`, `rerank_score` (null with reranking off), `source_file` and `section`, and each source's `relevance_score` is the score confidence was judged on. `strata_search` results carry each chunk's `similarity` (with hybrid search on, the default, its `score` is the fused rank, where the best result is always 1.0), and `strata_search` judges its confidence on that similarity (`basis` `similarity`), never on the fused `score`; a chunk without an embedding counts as similarity 0. The learning loop stores the confidence the tool returned, and each stored result keeps its `similarity`. The thresholds are provisional until the evaluation suite measures them.
+- **Confidence**: `high`, `medium` or `low`, returned with every `strata_search` result and with `strata_ask` in `response_format: "detailed"`; a low one comes with a warning. `strata_ask`'s `found`, `partly_found` or `not_found` is read from the best passage's score on the same thresholds. It is judged on the reranker's relevance probability (0 to 1) or, with reranking off, on each chunk's `similarity` (how similar the question and the chunk are by meaning); the result says which (`basis`: `rerank` or `similarity`). Each detailed `strata_ask` chunk carries `score` (its merged rank, best 1.0), `similarity`, `rerank_score` (null with reranking off), `source_file` and `section`, and each source's `relevance_score` is the score confidence was judged on. `strata_search` results carry each chunk's `similarity` (with hybrid search on, the default, its `score` is the fused rank, where the best result is always 1.0), and `strata_search` judges its confidence on that similarity (`basis` `similarity`), never on the fused `score`; a chunk without an embedding counts as similarity 0. The learning loop stores the confidence the tool returned, and each stored result keeps its `similarity`. The thresholds are provisional until the evaluation suite measures them.
 - **Embedding**: a list of numbers that stands for a chunk's meaning, so similar meanings get similar numbers. The embedding model (`all-mpnet-base-v2` by default) makes them; the vector column stores them (`EMBEDDING_DIMENSIONS`, 768 by default).
 - **HNSW**: the pgvector index that finds similar embeddings quickly; `HNSW_EF_SEARCH` trades recall for speed.
 - **Hybrid search**: a search by meaning (embeddings) and a search by words (PostgreSQL full-text search), merged into one list with RRF.
@@ -458,7 +496,7 @@ StrataKB cannot control what your MCP client's language model does with the retr
 - **Reranking**: in `strata_ask`, a second model (a cross-encoder, `RERANKING_MODEL`) reads the question with each candidate chunk and puts the best first.
 - **Routing patterns**: a layer's regular expressions. When a question names no layers, those whose patterns match are searched first.
 - **RRF** (Reciprocal Rank Fusion): how hybrid search merges its two lists by rank, weighted by `HYBRID_SEMANTIC_WEIGHT` and `HYBRID_KEYWORD_WEIGHT`, with the constant `HYBRID_RRF_K`. The best full-text matches keep `HYBRID_KEYWORD_SLOTS` places in the results, because a chunk found only by words would otherwise rank below every chunk found by meaning. `strata_ask` merges the results of its searches (one per rewritten query) the same way, by rank with `HYBRID_RRF_K`: a chunk several searches find comes first, and ties go to the more similar chunk.
-- **top_k**: how many chunks a tool returns: 5 by default for `strata_search`, 10 for `strata_ask`.
+- **top_k**: how many chunks a tool returns: 5 by default for `strata_search`; for `strata_ask` (10 by default) how many each search returns before `ANSWER_TOKEN_BUDGET` trims them.
 
 ## Project structure
 

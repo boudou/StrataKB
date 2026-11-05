@@ -8,15 +8,25 @@ from __future__ import annotations
 import asyncio
 from typing import TYPE_CHECKING, Any, NamedTuple
 
+import structlog
 from mcp.server.fastmcp import FastMCP
 
 from stratakb.core.audit import write_audit_log
 from stratakb.core.auth import get_current_user, require_role
 from stratakb.core.logging import log_tool_call
-from stratakb.rag.confidence import score_confidence, similarity_or_zero
+from stratakb.rag.confidence import answer_status, score_confidence, similarity_or_zero
+from stratakb.rag.passages import (
+    RESPONSE_FORMATS,
+    build_passages,
+    next_step,
+    pack_passages,
+    shape_ask_response,
+)
 
 if TYPE_CHECKING:
     from stratakb.rag.retriever import SearchResult
+
+logger = structlog.get_logger()
 
 
 async def _detect_layers(database_url: str, query: str, learning_enabled: bool) -> list[str]:
@@ -120,7 +130,36 @@ def _ask_chunk(r: SearchResult, score: float) -> dict[str, Any]:
         "section": r.source_section,
         "doc_type": r.doc_type,
         "metadata": r.metadata,
+        "document_id": r.document_id,
+        "char_start": r.char_start,
+        "char_end": r.char_end,
     }
+
+
+async def _cited_documents(
+    database_url: str, chunks: list[dict[str, Any]]
+) -> dict[int, dict[str, Any]]:
+    """The stored documents the chunks cite, read in one query.
+
+    A chunk without offsets cites no document. When the read fails, the
+    passages are cited by file name only.
+    """
+    ends: dict[int, int] = {}
+    for c in chunks:
+        if c.get("document_id") is not None and c.get("char_end") is not None:
+            ends[c["document_id"]] = max(ends.get(c["document_id"], 0), c["char_end"])
+    if not ends:
+        return {}
+    try:
+        from stratakb.core.database import get_pool
+        from stratakb.knowledge.documents import fetch_cited_documents
+
+        pool = await get_pool(database_url)
+        async with pool.acquire() as conn:
+            return await fetch_cited_documents(conn, ends)
+    except Exception as e:
+        logger.warning("cited_documents_fetch_failed", error_type=type(e).__name__)
+        return {}
 
 
 def _basis_score(chunk: dict[str, Any], basis: str) -> float:
@@ -391,7 +430,15 @@ def register_rag_tools(
                 if fallback_reason:
                     collected = await _collect(None)
                     layers = None
-            chunks, confidence = collected.chunks, collected.confidence
+            # The best chunks that fit the answer budget; confidence and the
+            # answer status are judged on what is returned
+            chunks = pack_passages(collected.chunks, _settings.answer_token_budget)
+            basis = collected.confidence["basis"]
+            confidence = score_confidence(
+                [_basis_score(c, basis) for c in chunks], basis=basis
+            )
+            passages = build_passages(chunks, await _cited_documents(database_url, chunks))
+            status = answer_status(confidence, len(passages))
 
             sources = []
             if include_sources:
@@ -422,7 +469,8 @@ def register_rag_tools(
                     "routing_fallback": bool(fallback_reason),
                 },
                 result_summary=(
-                    f"{collected.candidate_count} chunks, confidence={confidence['level']}"
+                    f"{collected.candidate_count} chunks, {len(passages)} passages, "
+                    f"confidence={confidence['level']}"
                 ),
             )
 
@@ -433,7 +481,13 @@ def register_rag_tools(
                 "confidence": confidence,
                 "retrieved_chunks": chunks,
                 "total_chunks": len(chunks),
+                "answer_status": status,
+                # Extractive answers (the document's own sentences) come later
+                "mode": "grounded",
+                "passages": passages,
             }
+            if step := next_step(status):
+                response["next_step"] = step
 
             if include_sources:
                 response["sources"] = sources
@@ -457,15 +511,23 @@ def register_rag_tools(
         layers: list[str] | None = None,
         include_sources: bool = True,
         top_k: int = 10,
+        response_format: str = "concise",
     ) -> dict:
-        """Ask a question of the knowledge base and get context with source citations.
+        """Ask a question of the knowledge base and get cited passages to answer from.
 
         This is the primary knowledge tool. It rewrites the question into the
         knowledge base's terminology, runs several searches in parallel,
-        deduplicates and reranks the results, and returns the retrieved
-        context with source citations. The server does not write an answer;
-        the client composes it from the returned context. The response carries
-        an interaction_id to pass to strata_feedback.
+        reranks the results, and returns the best passages that fit a token
+        budget (ANSWER_TOKEN_BUDGET, about 1,500 tokens). The server does not
+        write an answer; the client composes it from the passages and cites
+        them by id.
+
+        The response: status is found, partly_found or not_found, with a
+        next_step for the last two; mode is grounded; passages lists S1, S2,
+        ... in order of relevance, each with its exact text, a ref to the span
+        of the stored document, and a citation (file path, page, lines, clause
+        path, layer). interaction_id goes to strata_feedback, where passages
+        can be rated by id ({"S1": "useful"}).
 
         Args:
             question: Natural language question.
@@ -474,9 +536,20 @@ def register_rag_tools(
                       "Explain the pain.001 group header"
             layers: Optional list of layer names to search within.
                     Auto-detected from question if omitted.
-            include_sources: Include source citations (default true).
-            top_k: Max results per query (1-50, default 10).
+            include_sources: With response_format "detailed", add a sources list
+                    (default true).
+            top_k: Advanced: max results per search (1-50, default 10); the
+                   token budget then trims them.
+            response_format: "concise" (default) or "detailed", which adds scores,
+                    confidence, query variants, chunk ids and metadata.
         """
+        if response_format not in RESPONSE_FORMATS:
+            return {
+                "status": "error",
+                "error": f"response_format must be one of {', '.join(RESPONSE_FORMATS)}.",
+            }
         if _tracker:
-            return await _tracker.track_ask(_ask, question, layers, include_sources, top_k)
-        return await _ask(question, layers, include_sources, top_k)
+            full = await _tracker.track_ask(_ask, question, layers, include_sources, top_k)
+        else:
+            full = await _ask(question, layers, include_sources, top_k)
+        return shape_ask_response(full, response_format)
