@@ -258,6 +258,8 @@ async def test_column_mismatch_degrades_health():
     assert column["setting_dimensions"] == 768
     for text in ("1024", "768", "EMBEDDING_DIMENSIONS"):
         assert text in column["detail"]
+    assert "re_embed_all_layers" in column["detail"]
+    assert "re_embed_layer()" not in column["detail"]
     assert result["overall"] == "degraded"
     assert any(e["event"] == "vector_column_mismatch" for e in logs)
 

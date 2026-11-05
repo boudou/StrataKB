@@ -137,8 +137,9 @@ async def check_vector_column(database_url: str, dimensions: int) -> dict:
         "detail": (
             f"The vector column holds {size}-dimensional vectors, but "
             f"EMBEDDING_DIMENSIONS is {dimensions}. Set EMBEDDING_DIMENSIONS to "
-            f"{size}, or re-embed every layer with vector_store.re_embed_layer() "
-            "to resize the column, then restart StrataKB."
+            f"{size}, or re-embed every layer at once with "
+            "vector_store.re_embed_all_layers(), which resizes the column, "
+            "then restart StrataKB."
         ),
     }
 

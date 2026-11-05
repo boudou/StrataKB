@@ -304,7 +304,13 @@ flowchart LR
 | `STRATA_LOCAL_ONLY` | `false` | Refuse to start while any provider would send content off this machine, and load models from local files only; see [Where your data goes](#where-your-data-goes) |
 | `LOG_LEVEL` | `INFO` | Structured JSON logs on stderr |
 
-To change the embedding model, update `EMBEDDING_BACKEND`, `EMBEDDING_MODEL` and `EMBEDDING_DIMENSIONS` (and `EMBEDDING_BASE_URL` for a model server), then re-embed each layer with `vector_store.re_embed_layer()`, which resizes the vector column when the dimensions change and re-embeds the stored chunk text in place without re-parsing files.
+To change the embedding model, update `EMBEDDING_BACKEND`, `EMBEDDING_MODEL` and `EMBEDDING_DIMENSIONS` (and `EMBEDDING_BASE_URL` for a model server), then re-embed every layer at once with `vector_store.re_embed_all_layers()`. It re-embeds the stored chunk text in place without re-parsing files, all layers in one transaction, and resizes the vector column once when the dimensions change; if anything fails, every layer and the column stay as they were. While it resizes the column, searches and ingests wait until it finishes.
+
+```bash
+uv run python -c "import asyncio; from stratakb.config import get_settings; from stratakb.knowledge.vector_store import re_embed_all_layers; print(asyncio.run(re_embed_all_layers(get_settings().database_url)))"
+```
+
+Every layer shares the one vector column, so `vector_store.re_embed_layer()` re-embeds a single layer at the column's current size only, and refuses any other size.
 
 ### Database and models
 
@@ -329,7 +335,7 @@ EMBEDDING_MODEL=nomic-embed-text
 # EMBEDDING_API_KEY=           # only if the server asks for a key
 ```
 
-The URL ends in `/v1`. A model with other dimensions, for example `mxbai-embed-large` (1024), needs `EMBEDDING_DIMENSIONS` and the `vector(…)` column changed to match. Switching models means re-embedding every layer with `vector_store.re_embed_layer()`, even when the dimensions match: vectors from two models cannot be compared.
+The URL ends in `/v1`. A model with other dimensions, for example `mxbai-embed-large` (1024), needs `EMBEDDING_DIMENSIONS` changed to match; `vector_store.re_embed_all_layers()` then resizes the `vector(…)` column (see [Configuration](#configuration)). Switching models means re-embedding every layer with it, even when the dimensions match: vectors from two models cannot be compared.
 
 Once at startup, in the background, the server asks the server in `EMBEDDING_BASE_URL` for its model list and checks the vector column's size against `EMBEDDING_DIMENSIONS`. `strata_admin_health` reports both under `embedding` (`model` and `vector_column`), and `overall` turns `degraded` when the model is not listed or the sizes differ; the message names the setting to change. `nomic-embed-text` matches `nomic-embed-text:latest`. The check compares names only: a server that serves any requested name under one listed file name (llama.cpp's server does this) can show the model as missing while embedding works, and that report can be ignored. A server that cannot list its models, or is not up yet, shows `unchecked` and does not degrade health. After pulling a model or resizing the column, restart StrataKB to check again.
 
