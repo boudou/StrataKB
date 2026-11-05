@@ -675,7 +675,7 @@ class TestAskConfidence:
 _ASK_CHUNK_KEYS = [
     "chunk_id", "content", "score", "similarity", "rerank_score",
     "layer", "source_file", "section", "doc_type", "metadata",
-    "document_id", "char_start", "char_end",
+    "document_id", "char_start", "char_end", "clause_path",
 ]
 
 

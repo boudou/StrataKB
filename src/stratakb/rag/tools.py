@@ -133,6 +133,7 @@ def _ask_chunk(r: SearchResult, score: float) -> dict[str, Any]:
         "document_id": r.document_id,
         "char_start": r.char_start,
         "char_end": r.char_end,
+        "clause_path": r.clause_path,
     }
 
 

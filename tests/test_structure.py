@@ -442,3 +442,47 @@ async def test_ingest_stores_the_map_and_clause_paths(db_url, layer, tmp_path):
     sections, chunks = await _stored(db_url, layer)
     assert {r["document_id"] for r in sections} == {c["document_id"] for c in chunks}
     assert [r["label"] for r in sections][-2:] == ["annex ii", "annex iii"]
+
+
+async def test_search_results_carry_the_clause_path_into_citations(db_url, layer, tmp_path):
+    from stratakb.rag.passages import cite
+    from stratakb.rag.retriever import search_chunks
+    from stratakb.rag.tools import _ask_chunk
+
+    src = tmp_path / "docs"
+    src.mkdir()
+    shutil.copy(FIXTURES / "contract.md", src / "contract.md")
+    await _ingest(db_url, layer, src)
+    _, chunks = await _stored(db_url, layer)
+    stored = {c["content"]: c["clause_path"] for c in chunks}
+
+    with (
+        patch("stratakb.rag.retriever._get_cache", return_value=None),
+        patch(
+            "stratakb.rag.retriever.embed_texts", new_callable=AsyncMock,
+            return_value=[FAKE_EMBEDDING],
+        ),
+    ):
+        results = await search_chunks(db_url, "fake-key", "termination", layers=[layer], top_k=50)
+
+    assert results
+    assert {r.clause_path for r in results} >= {"2 Termination > 2.1 Notice"}
+    for r in results:
+        assert r.clause_path == stored[r.content]
+        chunk = _ask_chunk(r, r.score)
+        if r.clause_path:
+            assert cite(chunk, None)["clause_path"] == r.clause_path
+
+
+def test_cite_prefers_the_structure_map_path():
+    from stratakb.rag.passages import cite
+
+    chunk = {
+        "source_file": "a.md",
+        "layer": "specs",
+        "clause_path": "7 Termination > 7.2 Notice",
+        "metadata": {"section_path": ["Master agreement"]},
+    }
+    assert cite(chunk, None)["clause_path"] == "7 Termination > 7.2 Notice"
+    del chunk["clause_path"]
+    assert cite(chunk, None)["clause_path"] == "Master agreement"

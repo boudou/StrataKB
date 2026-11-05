@@ -90,6 +90,9 @@ class SearchResult:
     document_id: int | None = None
     char_start: int | None = None
     char_end: int | None = None
+    # The clause or section the chunk sits in (" > "-joined); None when the
+    # document had no detectable structure or predates the structure map
+    clause_path: str | None = None
 
 
 async def search_chunks(
@@ -176,7 +179,8 @@ async def search_chunks(
             metadata,
             document_id,
             char_start,
-            char_end
+            char_end,
+            clause_path
         FROM strata_vectors.chunks
         {where_clause}
         ORDER BY embedding <=> $1::vector
@@ -228,6 +232,7 @@ def _row_to_result(row, score: float, similarity: float | None) -> SearchResult:
         document_id=row.get("document_id"),
         char_start=row.get("char_start"),
         char_end=row.get("char_end"),
+        clause_path=row.get("clause_path"),
     )
 
 
@@ -434,7 +439,7 @@ async def _hybrid_search(
     uuid_ids = [uuid.UUID(tid) for tid in top_ids]
     chunk_sql = """
         SELECT id, content, layer_name, source_file, source_section, doc_type, metadata,
-               document_id, char_start, char_end,
+               document_id, char_start, char_end, clause_path,
                1 - (embedding <=> $2::vector) AS similarity
         FROM strata_vectors.chunks
         WHERE id = ANY($1::uuid[])

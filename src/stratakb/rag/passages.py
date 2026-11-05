@@ -57,9 +57,13 @@ def passage_ref(chunk: dict[str, Any]) -> str:
     return f"c{chunk['chunk_id']}"
 
 
-def _clause_path(metadata: dict[str, Any]) -> str | None:
-    """The clause or heading chain the chunk sits under, joined with " > "."""
-    path = metadata.get("clause_path") or metadata.get("section_path")
+def _clause_path(chunk: dict[str, Any], metadata: dict[str, Any]) -> str | None:
+    """The clause or heading chain the chunk sits under, joined with " > ".
+
+    The structure map's path (chunks.clause_path) wins; chunks stored before
+    it fall back to the parser's section path in the metadata.
+    """
+    path = chunk.get("clause_path") or metadata.get("clause_path") or metadata.get("section_path")
     if isinstance(path, list):
         path = " > ".join(str(part) for part in path if part)
     return path or None
@@ -78,7 +82,7 @@ def cite(chunk: dict[str, Any], document: dict[str, Any] | None) -> dict[str, An
         "file": chunk.get("source_file") or None,
         "page": None,
         "lines": None,
-        "clause_path": _clause_path(metadata),
+        "clause_path": _clause_path(chunk, metadata),
         "layer": chunk.get("layer"),
     }
     if document is not None and chunk.get("char_start") is not None:
