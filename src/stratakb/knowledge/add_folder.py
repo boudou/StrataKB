@@ -26,11 +26,10 @@ from collections.abc import Callable, Collection
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal, get_args
-from urllib.parse import urlsplit
 from uuid import uuid4
 
 from stratakb.core.audit import write_audit_log
-from stratakb.core.database import get_pool
+from stratakb.core.database import get_pool, url_host_port
 from stratakb.knowledge.ingestion import Outcome, ingest_documents
 from stratakb.knowledge.layers import (
     MAX_OWNER_LENGTH,
@@ -202,13 +201,7 @@ def refused(
 
 def db_target(database_url: str) -> str:
     """host:port of a database URL, never its user, password or database name."""
-    try:
-        parts = urlsplit(database_url)
-        host = parts.hostname or "localhost"
-        port = parts.port or 5432
-    except ValueError:
-        return "localhost:5432"
-    return f"{host}:{port}"
+    return url_host_port(database_url)
 
 
 def resolve_owner(settings: Any) -> str:

@@ -439,7 +439,11 @@ async def _add(args: argparse.Namespace, settings: Any) -> Report:
     )
     progress = _Progress() if _isatty(sys.stderr) else None
     try:
-        await ensure_schema(url)
+        # stderr: stdout carries only the report
+        await ensure_schema(
+            url,
+            on_setup=lambda db: _err(f"Setting up StrataKB in the empty database at {db}."),
+        )
         plan = await add_folder.plan(url, args.path, options)
         root = plan.root
         layer = plan.layer

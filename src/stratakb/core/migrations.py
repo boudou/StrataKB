@@ -4,17 +4,22 @@ An empty database gets every file here, in version order, at startup or on
 first use; a database created before a schema change gets only the missing
 ones, so neither needs a manual SQL step. Fresh Docker volumes also get the
 files from docker-compose. Applied versions are recorded in
-strata_core.schema_migrations.
+strata_core.schema_migrations. Setting up an empty database names it
+(host:port/database, never the user or password), and is refused in
+PostgreSQL's postgres and template databases.
 """
 
 from __future__ import annotations
 
 import enum
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
 import asyncpg
 import structlog
+
+from stratakb.core.database import url_host_port
 
 logger = structlog.get_logger()
 
@@ -404,6 +409,18 @@ def _owner_fix(file_name: str) -> str:
     return f"Apply {SQL_DIR / file_name} as the database owner (psql -f)."
 
 
+def _reserved_database(name: str) -> str | None:
+    """What kind of PostgreSQL system database name is, or None for any other.
+
+    Exact and case-sensitive, as PostgreSQL database names are.
+    """
+    if name == "postgres":
+        return "maintenance database"
+    if name.startswith("template"):
+        return "template database"
+    return None
+
+
 def _error_for(stage: _Stage, exc: asyncpg.PostgresError, current: str) -> MigrationError:
     """The MigrationError for exc raised at stage, with current as the file to fix."""
     errors = _STAGE_ERRORS[stage]
@@ -418,7 +435,9 @@ def _error_for(stage: _Stage, exc: asyncpg.PostgresError, current: str) -> Migra
     )
 
 
-async def ensure_schema(database_url: str) -> None:
+async def ensure_schema(
+    database_url: str, *, on_setup: Callable[[str], None] | None = None
+) -> None:
     """Apply and record every numbered migration the database is missing.
 
     Runs once per process and database URL, in one transaction under an
@@ -426,10 +445,16 @@ async def ensure_schema(database_url: str) -> None:
     without running its file; a file that runs must leave its presence query
     true. Connection errors (a connect timeout included) propagate unchanged.
 
+    Args:
+        database_url: The database to check and update.
+        on_setup: Called with host:port/database when the database has no
+            strata_core schema yet, before anything is created; keep it cheap.
+
     Raises:
         MigrationError: If a migration fails, if a lock is not granted within
-            _TIMEOUT_S seconds, if the schema cannot be read, or if the schema
-            is out of date and this user may not update it.
+            _TIMEOUT_S seconds, if the schema cannot be read, if the schema
+            is out of date and this user may not update it, or if the
+            database to set up is postgres or a template database.
     """
     if database_url in _checked:
         return
@@ -456,9 +481,25 @@ async def ensure_schema(database_url: str) -> None:
                 # The advisory lock keeps other StrataKB processes from racing.
                 missing = await conn.fetchrow(
                     "SELECT to_regnamespace('strata_core') IS NULL AS no_schema, "
-                    "to_regclass('strata_core.schema_migrations') IS NULL AS no_table"
+                    "to_regclass('strata_core.schema_migrations') IS NULL AS no_table, "
+                    "current_database() AS database"
                 )
                 if missing["no_schema"]:
+                    # Setting up: name the database, and refuse a system one
+                    # before the first write (the transaction rolls back)
+                    name = missing["database"]
+                    target = f"{url_host_port(database_url)}/{name}"
+                    kind = _reserved_database(name)
+                    if kind is not None:
+                        raise MigrationError(
+                            f'Refusing to set up StrataKB in {target}: "{name}" is '
+                            f"PostgreSQL's {kind}, not a database for your data. "
+                            "Create one (CREATE DATABASE strata;) and point "
+                            "DATABASE_URL at it."
+                        )
+                    logger.info("setting_up_database", target=target)
+                    if on_setup is not None:
+                        on_setup(target)
                     await conn.execute("CREATE SCHEMA strata_core")
                 if missing["no_table"]:
                     await conn.execute(_SCHEMA_MIGRATIONS_DDL)

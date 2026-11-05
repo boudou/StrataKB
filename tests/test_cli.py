@@ -223,6 +223,22 @@ def test_exit_3_when_the_database_is_unreachable(cli_env, capsys):
     assert "secret_pw" not in captured.err
 
 
+@pytest.mark.parametrize("json_flag", [[], ["--json"]])
+def test_add_names_the_database_it_sets_up(cli_env, capsys, json_flag):
+    async def set_up(url, *, on_setup=None):
+        on_setup("db.example:5433/strata")
+
+    cli_env["schema"].side_effect = set_up
+    code, _, _ = _run(["add", ROOT, *json_flag])
+    assert code == 0
+    captured = capsys.readouterr()
+    line = "Setting up StrataKB in the empty database at db.example:5433/strata."
+    assert line in captured.err
+    assert line not in captured.out
+    if json_flag:
+        json.loads(captured.out)
+
+
 def test_unreachable_json_hint_names_db_up(cli_env, capsys):
     cli_env["schema"].side_effect = OSError("connection refused")
     code, _, _ = _run(["add", ROOT, "--json"])
