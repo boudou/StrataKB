@@ -177,7 +177,7 @@ async def re_embed_layer(
         new_dimensions: New vector dimensions (0 = auto from config).
 
     Returns:
-        Stats dict with chunks_updated, batches, duration_seconds.
+        Stats dict with layer_name, chunks_updated, model, dimensions, duration_seconds.
 
     Raises:
         ValueError: new_dimensions differs from the shared column's size.
@@ -203,14 +203,17 @@ async def re_embed_layer(
             "with vector_store.re_embed_all_layers(), which resizes the column."
         )
 
-    # Load all chunk IDs, content and the columns the context prefix is built from
-    rows = await pool.fetch(
-        "SELECT id, content, layer_name, source_file, metadata "
-        "FROM strata_vectors.chunks WHERE layer_name = $1 ORDER BY id",
-        layer_name,
-    )
-    counts = await _re_embed_rows(
-        pool, rows, new_dimensions, start, batch_size=batch_size, layer=layer_name
+    async def write(ids: list, embeddings: list[list[float]]) -> None:
+        await _update_embeddings(pool, ids, embeddings)
+
+    counts = await _re_embed_batches(
+        pool,
+        new_dimensions,
+        start,
+        batch_size=batch_size,
+        write=write,
+        layer_name=layer_name,
+        layer=layer_name,
     )
     updated = sum(counts.values())
 
@@ -236,6 +239,9 @@ async def re_embed_layer(
 # An HNSW index refuses vector columns wider than this
 _HNSW_MAX_DIMENSIONS = 2000
 
+# Session temporary table that holds the new vectors between the two phases
+_STAGING = "pg_temp.re_embed_staging"
+
 
 async def re_embed_all_layers(
     database_url: str,
@@ -245,11 +251,13 @@ async def re_embed_all_layers(
 ) -> dict:
     """Re-embed every chunk of every layer, resizing the shared vector column once.
 
-    Everything runs in one transaction: on any error the column size and every
-    stored vector stay as they were. When the size changes, the column is
-    altered under an exclusive lock, so searches and ingests wait until the
-    commit; otherwise searches keep reading the old vectors and only writes
-    to the chunks table wait.
+    Runs in two phases on one connection. Phase 1 embeds every chunk, one batch
+    of rows at a time, and stages the new vectors in a temporary table; it takes
+    no lock on the chunks table, so searches and ingests continue. Phase 2 is one
+    transaction: it locks the table, resizes the column when the size changes,
+    copies the staged vectors in, and embeds any chunk added during phase 1.
+    Writes wait for all of phase 2, and searches wait too while it resizes the
+    column. On any error, the column size and every stored vector stay as they were.
 
     Args:
         database_url: PostgreSQL connection URL.
@@ -270,41 +278,75 @@ async def re_embed_all_layers(
     settings = get_settings()
     target = int(new_dimensions or settings.embedding_dimensions)
 
-    pool = await get_pool(database_url)
-    if target > _HNSW_MAX_DIMENSIONS and await _vector_column_size(pool) != target:
+    # The shipped schema always has the HNSW index, so no column can be wider than this
+    if target > _HNSW_MAX_DIMENSIONS:
         raise ValueError(
             f"The search index takes at most {_HNSW_MAX_DIMENSIONS} dimensions; {target} is "
             f"too many. Choose a model or EMBEDDING_DIMENSIONS of {_HNSW_MAX_DIMENSIONS} or fewer."
         )
 
+    pool = await get_pool(database_url)
     start = time.monotonic()
-    # Every statement stays on this connection: a second one would wait on our own lock
-    async with pool.acquire() as conn, conn.transaction():
-        size = await _vector_column_size(conn)
-        if size != target:
-            logger.info("resizing_vector_column", old=size, new=target)
-            # USING NULL: the old vectors cannot be cast; every row is re-embedded below
-            await conn.execute(
-                "ALTER TABLE strata_vectors.chunks "
-                f"ALTER COLUMN embedding TYPE vector({target}) USING NULL"
-            )
-        else:
-            # Searches keep reading; writes to chunks (and a second re-embed) wait
-            await conn.execute("LOCK TABLE strata_vectors.chunks IN SHARE ROW EXCLUSIVE MODE")
+    # Every statement stays on this connection: the staging table belongs to its session
+    async with pool.acquire() as conn:
+        # A pooled connection keeps temporary tables, so drop any leftover first
+        await conn.execute(f"DROP TABLE IF EXISTS {_STAGING}")
+        await conn.execute(
+            "CREATE TEMP TABLE re_embed_staging (id uuid PRIMARY KEY, embedding text NOT NULL)"
+        )
+        try:
+            # Phase 1: embed without locking the chunks table
+            async def stage(ids: list, embeddings: list[list[float]]) -> None:
+                await conn.execute(
+                    f"INSERT INTO {_STAGING} (id, embedding) "
+                    "SELECT * FROM unnest($1::uuid[], $2::text[])",
+                    [str(uid) for uid in ids],
+                    [_embedding_to_pgvector(emb) for emb in embeddings],
+                )
 
-        rows = await conn.fetch(
-            "SELECT id, content, layer_name, source_file, metadata "
-            "FROM strata_vectors.chunks ORDER BY layer_name, id"
-        )
-        layers = await _re_embed_rows(
-            conn, rows, target, start, batch_size=batch_size, layers="all"
-        )
+            await _re_embed_batches(
+                conn, target, start, batch_size=batch_size, write=stage, layers="all"
+            )
+
+            # Phase 2: one short transaction swaps the staged vectors in
+            async with conn.transaction():
+                # Searches keep reading; writes to chunks (and a second re-embed) wait
+                await conn.execute("LOCK TABLE strata_vectors.chunks IN SHARE ROW EXCLUSIVE MODE")
+                size = await _vector_column_size(conn)
+                if size != target:
+                    logger.info("resizing_vector_column", old=size, new=target)
+                    # USING NULL: the old vectors cannot be cast; the staged ones replace them
+                    await conn.execute(
+                        "ALTER TABLE strata_vectors.chunks "
+                        f"ALTER COLUMN embedding TYPE vector({target}) USING NULL"
+                    )
+                layers = await _swap_staged(conn, max(batch_size, 1000))
+
+                # Chunks added during phase 1 were not staged: embed them under the lock
+                async def update(ids: list, embeddings: list[list[float]]) -> None:
+                    await _update_embeddings(conn, ids, embeddings)
+
+                caught_up = await _re_embed_batches(
+                    conn,
+                    target,
+                    start,
+                    batch_size=batch_size,
+                    write=update,
+                    unstaged_only=True,
+                    layers="all",
+                    phase="catch_up",
+                )
+                for layer, n in caught_up.items():
+                    layers[layer] = layers.get(layer, 0) + n
+        finally:
+            await conn.execute(f"DROP TABLE IF EXISTS {_STAGING}")
     updated = sum(layers.values())
 
     duration = time.monotonic() - start
     logger.info(
         "re_embed_complete",
-        layers=len(layers),
+        layers="all",
+        layer_count=len(layers),
         chunks_updated=updated,
         model=settings.embedding_model,
         dimensions=target,
@@ -323,38 +365,90 @@ async def re_embed_all_layers(
     }
 
 
-async def _re_embed_rows(
-    db, rows, dimensions: int, start: float, *, batch_size: int, **log_ctx
-) -> dict[str, int]:
-    """Embed the given chunk rows in batches and write the new vectors.
+def _chunk_filter(
+    after_id, *, layer_name: str | None, unstaged_only: bool
+) -> tuple[str, list]:
+    """Build the WHERE clause and its arguments for a chunk read (empty when nothing is set)."""
+    clauses: list[str] = []
+    args: list = []
+    if after_id is not None:
+        args.append(after_id)
+        clauses.append(f"c.id > ${len(args)}")
+    if layer_name is not None:
+        args.append(layer_name)
+        clauses.append(f"c.layer_name = ${len(args)}")
+    if unstaged_only:
+        clauses.append(f"NOT EXISTS (SELECT 1 FROM {_STAGING} s WHERE s.id = c.id)")
+    return (" WHERE " + " AND ".join(clauses) if clauses else ""), args
 
-    Takes a pool or a connection (only execute is used), so a caller can keep
-    every write inside its own transaction. log_ctx tags the log lines.
+
+async def _fetch_chunk_batch(
+    db, after_id, limit: int, *, layer_name: str | None = None, unstaged_only: bool = False
+) -> list:
+    """Read the next batch of chunk rows after after_id, in id order (keyset pagination).
+
+    Takes a pool or a connection: both have fetch. Each call is its own short
+    statement, so no snapshot or cursor stays open between batches.
+    """
+    where, args = _chunk_filter(after_id, layer_name=layer_name, unstaged_only=unstaged_only)
+    args.append(limit)
+    return await db.fetch(
+        "SELECT c.id, c.content, c.layer_name, c.source_file, c.metadata "
+        f"FROM strata_vectors.chunks c{where} ORDER BY c.id LIMIT ${len(args)}",
+        *args,
+    )
+
+
+async def _re_embed_batches(
+    db,
+    dimensions: int,
+    start: float,
+    *,
+    batch_size: int,
+    write,
+    layer_name: str | None = None,
+    unstaged_only: bool = False,
+    **log_ctx,
+) -> dict[str, int]:
+    """Read chunk rows one batch at a time, embed them and hand the vectors to write.
+
+    Takes a pool or a connection, so a caller can keep every statement on its
+    own connection or transaction. write(ids, embeddings) stores the vectors.
+    log_ctx tags the log lines.
 
     Returns:
-        Number of chunks updated per layer.
+        Number of chunks embedded per layer.
     """
     import time
 
     from stratakb.config import get_settings
     from stratakb.knowledge.embeddings import embed_texts
 
-    total = len(rows)
+    where, args = _chunk_filter(None, layer_name=layer_name, unstaged_only=unstaged_only)
+    total = await db.fetchval(f"SELECT count(*) FROM strata_vectors.chunks c{where}", *args)
     logger.info(
         "re_embed_started", **log_ctx, total_chunks=total, model=get_settings().embedding_model
     )
 
     counts: dict[str, int] = {}
     updated = 0
-    for i in range(0, total, batch_size):
-        batch = rows[i : i + batch_size]
+    batches = 0
+    after_id = None
+    while True:
+        batch = await _fetch_chunk_batch(
+            db, after_id, batch_size, layer_name=layer_name, unstaged_only=unstaged_only
+        )
+        if not batch:
+            break
         embeddings = await embed_texts([_re_embed_text(r) for r in batch], dimensions=dimensions)
-        await _update_embeddings(db, [r["id"] for r in batch], embeddings)
+        await write([r["id"] for r in batch], embeddings)
         for r in batch:
             counts[r["layer_name"]] = counts.get(r["layer_name"], 0) + 1
         updated += len(batch)
+        batches += 1
+        after_id = batch[-1]["id"]
 
-        if (i + batch_size) % (batch_size * 5) == 0 or i + batch_size >= total:
+        if batches % 5 == 0 or updated >= total:
             logger.info(
                 "re_embed_progress",
                 **log_ctx,
@@ -363,6 +457,46 @@ async def _re_embed_rows(
                 elapsed=round(time.monotonic() - start, 1),
             )
 
+    return counts
+
+
+async def _swap_staged(conn, batch_size: int) -> dict[str, int]:
+    """Copy the staged vectors into the chunks they belong to, batch_size ids at a time.
+
+    Bounded batches keep each statement under the pool's command timeout. A
+    chunk deleted since it was staged matches nothing and is not counted.
+
+    Returns:
+        Number of chunks updated per layer.
+    """
+    counts: dict[str, int] = {}
+    after_id = None
+    while True:
+        if after_id is None:
+            ids = await conn.fetch(
+                f"SELECT id FROM {_STAGING} ORDER BY id LIMIT $1", batch_size
+            )
+        else:
+            ids = await conn.fetch(
+                f"SELECT id FROM {_STAGING} WHERE id > $1 ORDER BY id LIMIT $2",
+                after_id,
+                batch_size,
+            )
+        if not ids:
+            break
+        rows = await conn.fetch(
+            f"""
+            UPDATE strata_vectors.chunks AS c
+            SET embedding = s.embedding::vector
+            FROM {_STAGING} s
+            WHERE s.id = ANY($1::uuid[]) AND c.id = s.id
+            RETURNING c.layer_name
+            """,
+            [r["id"] for r in ids],
+        )
+        for r in rows:
+            counts[r["layer_name"]] = counts.get(r["layer_name"], 0) + 1
+        after_id = ids[-1]["id"]
     return counts
 
 

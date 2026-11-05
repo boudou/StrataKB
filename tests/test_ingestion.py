@@ -236,10 +236,7 @@ class TestVectorStore:
 
         layer = "test_re_embed_prefix"
         pool = await get_pool(db_url)
-        dims = await pool.fetchval(
-            "SELECT atttypmod FROM pg_attribute "
-            "WHERE attrelid = 'strata_vectors.chunks'::regclass AND attname = 'embedding'"
-        )
+        dims = await self._column_size(pool)
         doc = parse_markdown(FIXTURES_DIR / "test_document.md")
         new_chunks = _chunk_document(doc, layer_name=layer, chunk_size=500, chunk_overlap=50)
         old_content = f"[{layer} > legacy > Page 1]\nOld chunk text"
@@ -269,9 +266,16 @@ class TestVectorStore:
 
     @staticmethod
     async def _column_size(pool) -> int:
+        from stratakb.knowledge.vector_store import _vector_column_size
+
+        return await _vector_column_size(pool)
+
+    @staticmethod
+    async def _staging_tables(pool) -> int:
+        """Temporary re-embed staging tables left in any session."""
         return await pool.fetchval(
-            "SELECT atttypmod FROM pg_attribute "
-            "WHERE attrelid = 'strata_vectors.chunks'::regclass AND attname = 'embedding'"
+            "SELECT count(*) FROM pg_class "
+            "WHERE relname = 're_embed_staging' AND relpersistence = 't'"
         )
 
     @staticmethod
@@ -358,6 +362,7 @@ class TestVectorStore:
                 "[" + ",".join(["0.2"] * new) + "]",
             )
             assert set(layers) <= {r["layer_name"] for r in found}
+            assert await self._staging_tables(pool) == 0
         finally:
             with patch("stratakb.knowledge.embeddings.embed_texts", new_callable=AsyncMock) as mock:
                 mock.side_effect = lambda texts, **kw: [[0.1] * kw["dimensions"] for _ in texts]
@@ -397,9 +402,157 @@ class TestVectorStore:
             assert calls == 2
             assert await self._column_size(pool) == size
             assert await self._vectors(pool, layers[0]) == before
+            assert await self._staging_tables(pool) == 0
         finally:
             for layer in layers:
                 await delete_layer_chunks(db_url, layer)
+
+    @pytest.mark.asyncio
+    async def test_re_embed_reads_one_batch_at_a_time(self, db_url):
+        """Neither re-embed function holds more than one batch of chunk rows."""
+        from stratakb.core.database import get_pool
+        from stratakb.knowledge import vector_store
+        from stratakb.knowledge.vector_store import (
+            ChunkRecord,
+            delete_layer_chunks,
+            insert_chunks,
+            re_embed_all_layers,
+            re_embed_layer,
+        )
+
+        layer = "test_re_embed_batches"
+        pool = await get_pool(db_url)
+        size = await self._column_size(pool)
+        fetched: list[int] = []
+        original = vector_store._fetch_chunk_batch
+
+        async def recording(*args, **kwargs):
+            rows = await original(*args, **kwargs)
+            fetched.append(len(rows))
+            return rows
+
+        try:
+            await delete_layer_chunks(db_url, layer)
+            await insert_chunks(db_url, [
+                ChunkRecord(
+                    content=f"chunk {n}", embedding=[0.1] * size, layer_name=layer,
+                    metadata={"page": n}, source_file="doc.md", doc_type="md",
+                )
+                for n in range(5)
+            ])
+            with (
+                patch("stratakb.knowledge.embeddings.embed_texts", new_callable=AsyncMock) as mock,
+                patch.object(vector_store, "_fetch_chunk_batch", recording),
+            ):
+                mock.side_effect = lambda texts, **kw: [[0.2] * kw["dimensions"] for _ in texts]
+                one = await re_embed_layer(db_url, layer, batch_size=2)
+                assert fetched and max(fetched) <= 2
+                assert sum(fetched) == 5
+                fetched.clear()
+                every = await re_embed_all_layers(db_url, batch_size=2, new_dimensions=size)
+
+            assert one["chunks_updated"] == 5
+            assert every["layers"][layer] == 5
+            assert every["resized"] is False
+            assert fetched and max(fetched) <= 2
+            assert all(len(call.args[0]) <= 2 for call in mock.call_args_list)
+        finally:
+            await delete_layer_chunks(db_url, layer)
+
+    @pytest.mark.asyncio
+    async def test_re_embed_all_layers_embeds_before_locking(self, db_url):
+        """The model runs while no lock blocks searches or ingests on the chunks table."""
+        from stratakb.core.database import get_pool
+        from stratakb.knowledge.vector_store import delete_layer_chunks, re_embed_all_layers
+
+        layers = ("test_re_embed_a", "test_re_embed_b")
+        pool = await get_pool(db_url)
+        size = await self._column_size(pool)
+        locks: list[int] = []
+
+        async def embed(texts, **kw):
+            locks.append(await pool.fetchval(
+                "SELECT count(*) FROM pg_locks "
+                "WHERE relation = 'strata_vectors.chunks'::regclass AND granted "
+                "AND mode IN ('AccessExclusiveLock', 'ShareRowExclusiveLock')"
+            ))
+            return [[0.2] * kw["dimensions"] for _ in texts]
+
+        try:
+            await self._insert_two_layers(db_url, layers, size)
+            with patch("stratakb.knowledge.embeddings.embed_texts", new_callable=AsyncMock) as mock:
+                mock.side_effect = embed
+                stats = await re_embed_all_layers(db_url, batch_size=1, new_dimensions=size + 8)
+
+            assert stats["resized"] is True
+            assert locks and set(locks) == {0}
+        finally:
+            with patch("stratakb.knowledge.embeddings.embed_texts", new_callable=AsyncMock) as mock:
+                mock.side_effect = lambda texts, **kw: [[0.1] * kw["dimensions"] for _ in texts]
+                await re_embed_all_layers(db_url, new_dimensions=size)
+            for layer in layers:
+                await delete_layer_chunks(db_url, layer)
+        assert await self._column_size(pool) == size
+
+    @pytest.mark.asyncio
+    async def test_re_embed_all_layers_catches_up_new_chunks(self, db_url):
+        """A chunk added while the model runs gets the new size; a deleted one is skipped."""
+        from stratakb.core.database import get_pool
+        from stratakb.knowledge.vector_store import (
+            ChunkRecord,
+            delete_layer_chunks,
+            insert_chunks,
+            re_embed_all_layers,
+        )
+
+        layers = ("test_re_embed_a", "test_re_embed_b")
+        late = "test_re_embed_late"
+        pool = await get_pool(db_url)
+        size = await self._column_size(pool)
+        new = size + 8
+        calls = 0
+
+        async def embed(texts, **kw):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                await insert_chunks(db_url, [ChunkRecord(
+                    content="late chunk", embedding=[0.1] * size, layer_name=late,
+                    metadata={}, source_file="late.md", doc_type="md",
+                )])
+                await pool.execute(
+                    "DELETE FROM strata_vectors.chunks WHERE id = "
+                    "(SELECT id FROM strata_vectors.chunks WHERE layer_name = $1 "
+                    "ORDER BY id DESC LIMIT 1)",
+                    layers[1],
+                )
+            return [[0.2] * kw["dimensions"] for _ in texts]
+
+        try:
+            await delete_layer_chunks(db_url, late)
+            await self._insert_two_layers(db_url, layers, size)
+            with patch("stratakb.knowledge.embeddings.embed_texts", new_callable=AsyncMock) as mock:
+                mock.side_effect = embed
+                stats = await re_embed_all_layers(db_url, batch_size=1, new_dimensions=new)
+
+            assert stats["resized"] is True
+            assert stats["layers"][late] == 1
+            assert stats["layers"][layers[0]] == 2
+            assert stats["layers"][layers[1]] == 1
+            rows = await pool.fetch(
+                "SELECT vector_dims(embedding) AS d FROM strata_vectors.chunks "
+                "WHERE layer_name = ANY($1::text[])",
+                [*layers, late],
+            )
+            assert len(rows) == 4
+            assert {r["d"] for r in rows} == {new}
+        finally:
+            with patch("stratakb.knowledge.embeddings.embed_texts", new_callable=AsyncMock) as mock:
+                mock.side_effect = lambda texts, **kw: [[0.1] * kw["dimensions"] for _ in texts]
+                await re_embed_all_layers(db_url, new_dimensions=size)
+            for layer in (*layers, late):
+                await delete_layer_chunks(db_url, layer)
+        assert await self._column_size(pool) == size
 
     @pytest.mark.asyncio
     async def test_re_embed_all_layers_refuses_over_index_limit(self, db_url):

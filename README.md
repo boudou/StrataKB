@@ -319,7 +319,21 @@ flowchart LR
 | `STRATA_LOCAL_ONLY` | `false` | Refuse to start while any provider would send content off this machine, and load models from local files only; see [Where your data goes](#where-your-data-goes) |
 | `LOG_LEVEL` | `INFO` | Structured JSON logs on stderr |
 
-To change the embedding model, update `EMBEDDING_BACKEND`, `EMBEDDING_MODEL` and `EMBEDDING_DIMENSIONS` (and `EMBEDDING_BASE_URL` for a model server), then re-embed every layer at once with `vector_store.re_embed_all_layers()`. It re-embeds the stored chunk text in place without re-parsing files, all layers in one transaction, and resizes the vector column once when the dimensions change; if anything fails, every layer and the column stay as they were. While it resizes the column, searches and ingests wait until it finishes.
+To change the embedding model, update `EMBEDDING_BACKEND`, `EMBEDDING_MODEL` and `EMBEDDING_DIMENSIONS` (and `EMBEDDING_BASE_URL` for a model server), then re-embed every layer at once with `vector_store.re_embed_all_layers()`. It re-embeds the stored chunk text without re-parsing files and resizes the vector column once when the dimensions change; if anything fails, every layer and the column stay as they were. It works in two phases. First it reads the chunks a batch at a time, embeds them and keeps the new vectors aside, while searches and ingests carry on as usual. Then one short transaction locks the chunks table, resizes the column if needed, writes the new vectors and embeds any chunk added in the meantime. Ingests wait for that transaction, and searches wait too when it resizes the column. Under the lock the model embeds only the chunks added during the first phase, usually none.
+
+```mermaid
+flowchart LR
+    A["Phase 1: read a batch of chunks"] --> B["Embed it with the new model"]
+    B --> C["Keep the vectors aside"]
+    C -->|more chunks| A
+    C -->|all done| D["Phase 2: lock the chunks table"]
+    D --> E{"Dimensions changed?"}
+    E -->|yes| F["Resize the vector column"]
+    E -->|no| G["Write the new vectors"]
+    F --> G
+    G --> H["Embed chunks added during phase 1"]
+    H --> I["Commit"]
+```
 
 ```bash
 uv run python -c "import asyncio; from stratakb.config import get_settings; from stratakb.knowledge.vector_store import re_embed_all_layers; print(asyncio.run(re_embed_all_layers(get_settings().database_url)))"
