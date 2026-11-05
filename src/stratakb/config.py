@@ -19,10 +19,12 @@ class Settings(BaseSettings):
     environment variables. ./.env is not read unless STRATAKB_CONFIG names it.
     """
 
-    # Database
-    database_url: str = "postgresql://strata:strata_dev_password@localhost:5433/strata"
+    # Database (127.0.0.1, not localhost: on Windows localhost resolves to ::1
+    # first, and Docker in WSL forwards IPv4 only)
+    database_url: str = "postgresql://strata:strata_dev_password@127.0.0.1:5433/strata"
     # Connection for strata_db_query and strata_db_explain; empty = the SQL tools
-    # are not registered. A superuser role is refused at startup.
+    # are not registered. A superuser, a member of a superuser or server-access
+    # role, or a role that can't be checked is refused at startup.
     # Point it at the strata_readonly role from db/03_readonly_role.sql.
     readonly_database_url: str = ""
 

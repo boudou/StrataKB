@@ -56,6 +56,14 @@ def test_no_config_files_by_default():
     assert get_settings().strata_role == "viewer"
 
 
+def test_default_database_url_uses_ipv4_loopback(monkeypatch):
+    # localhost resolves to ::1 first on Windows, and Docker in WSL forwards IPv4 only
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    url = get_settings().database_url
+    assert "@127.0.0.1:5433/" in url
+    assert "localhost" not in url
+
+
 def test_user_file_is_under_the_user_folder(tmp_path):
     assert user_config_file() == tmp_path / "user" / "stratakb" / "config.env"
 

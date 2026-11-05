@@ -569,7 +569,7 @@ def test_db_up_creates_the_container(cli_env, capsys):
 
 
 def test_db_up_nothing_to_configure(capsys):
-    default_url = "postgresql://strata:strata_dev_password@localhost:5433/strata"
+    default_url = "postgresql://strata:strata_dev_password@127.0.0.1:5433/strata"
     with patch("stratakb.config.get_settings", return_value=_settings(database_url=default_url)):
         code, _, _ = _db(["db", "up"])
     assert code == 0

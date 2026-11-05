@@ -273,7 +273,7 @@ flowchart LR
 | Variable | Default | Description |
 | --- | --- | --- |
 | `STRATAKB_CONFIG` | | A settings file read after the user-level `config.env`; environment variables still win |
-| `DATABASE_URL` | `postgresql://strata:…@localhost:5433/strata` | PostgreSQL connection |
+| `DATABASE_URL` | `postgresql://strata:…@127.0.0.1:5433/strata` | PostgreSQL connection |
 | `READONLY_DATABASE_URL` | | Connection for `strata_db_query` and `strata_db_explain`; point it at the `strata_readonly` role from `db/03_readonly_role.sql`. Empty means the two tools are off; a superuser, or a member of a superuser or server-access role (such as the Docker `strata` user) is refused |
 | `STRATA_USER`, `STRATA_ROLE` | `developer`, `viewer` | Identity and role on stdio |
 | `EMBEDDING_BACKEND` | `local` | `local` (sentence-transformers) or `openai` (OpenAI, or the OpenAI-compatible server in `EMBEDDING_BASE_URL`) |
