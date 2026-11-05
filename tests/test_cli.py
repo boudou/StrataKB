@@ -389,6 +389,96 @@ def test_local_only_keeps_hugging_face_offline(cli_env, monkeypatch):
     assert os.environ["TRANSFORMERS_OFFLINE"] == "1"
 
 
+REMOTE_EMBEDDINGS = {"embedding_backend": "openai", "embedding_base_url": "http://gpu-box:11434/v1"}
+
+
+@pytest.fixture
+def hf_flags(monkeypatch):
+    """Put back the offline flags that a local-only add sets."""
+    monkeypatch.setenv("HF_HUB_OFFLINE", "0")
+    monkeypatch.setenv("TRANSFORMERS_OFFLINE", "0")
+
+
+def test_local_only_refuses_a_remote_embedding_url(cli_env, hf_flags, capsys):
+    settings = _settings(strata_local_only=True, **REMOTE_EMBEDDINGS)
+    with patch("stratakb.config.get_settings", return_value=settings):
+        code, plan_mock, apply_mock = _run(["add", ROOT])
+    assert code == 2
+    plan_mock.assert_not_called()
+    apply_mock.assert_not_called()
+    cli_env["schema"].assert_not_awaited()
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "EMBEDDING_BASE_URL" in captured.err
+    assert "STRATA_LOCAL_ONLY" in captured.err
+    assert "gpu-box" in captured.err
+
+
+def test_local_only_refusal_json(hf_flags, capsys):
+    settings = _settings(strata_local_only=True, **REMOTE_EMBEDDINGS)
+    with patch("stratakb.config.get_settings", return_value=settings):
+        code, _, apply_mock = _run(["add", ROOT, "--json"])
+    assert code == 2
+    apply_mock.assert_not_called()
+    data = json.loads(capsys.readouterr().out)
+    assert tuple(data) == REPORT_KEYS
+    assert data["reason"] == "local_only"
+    assert data["exit_code"] == 2
+    assert data["layer"] is None
+    assert not any(data["counts"].values())
+
+
+def test_local_only_refuses_the_openai_default(hf_flags, monkeypatch, capsys):
+    monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+    monkeypatch.delenv("EMBEDDING_BASE_URL", raising=False)
+    settings = _settings(strata_local_only=True, embedding_backend="openai")
+    with patch("stratakb.config.get_settings", return_value=settings):
+        code, _, apply_mock = _run(["add", ROOT])
+    assert code == 2
+    apply_mock.assert_not_called()
+    assert "EMBEDDING_BACKEND" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    "rewrite",
+    [
+        {"anthropic_api_key": "sk-ant-test"},
+        {
+            "query_rewrite_provider": "openai_compatible",
+            "query_rewrite_base_url": "http://gpu-box:11434/v1",
+            "query_rewrite_model": "llama3.2",
+        },
+    ],
+    ids=["anthropic_key", "remote_rewrite"],
+)
+def test_local_only_ignores_query_rewriting(hf_flags, rewrite):
+    settings = _settings(strata_local_only=True, embedding_backend="local", **rewrite)
+    with patch("stratakb.config.get_settings", return_value=settings):
+        code, _, apply_mock = _run(["add", ROOT])
+    assert code == 0
+    apply_mock.assert_awaited_once()
+
+
+def test_local_only_allows_a_loopback_embedding_url(hf_flags):
+    settings = _settings(
+        strata_local_only=True,
+        embedding_backend="openai",
+        embedding_base_url="http://127.0.0.1:11434/v1",
+    )
+    with patch("stratakb.config.get_settings", return_value=settings):
+        code, _, apply_mock = _run(["add", ROOT])
+    assert code == 0
+    apply_mock.assert_awaited_once()
+
+
+def test_remote_embedding_url_runs_when_local_only_is_off():
+    settings = _settings(**REMOTE_EMBEDDINGS)
+    with patch("stratakb.config.get_settings", return_value=settings):
+        code, _, apply_mock = _run(["add", ROOT])
+    assert code == 0
+    apply_mock.assert_awaited_once()
+
+
 def test_add_leaves_offline_flags_when_local_only_is_off(monkeypatch):
     monkeypatch.setenv("HF_HUB_OFFLINE", "0")
     code, _, _ = _run(["add", ROOT])

@@ -359,9 +359,19 @@ def _run_add(args: argparse.Namespace) -> int:
     settings = get_settings()
     if settings.strata_local_only:
         # Before add_folder imports huggingface_hub, which reads these once
-        from stratakb.core.egress import keep_hugging_face_offline
+        from stratakb.core.egress import (
+            embedding_provider,
+            keep_hugging_face_offline,
+            refusal_line,
+        )
 
         keep_hugging_face_offline()
+        # Only the embedding side: add never rewrites queries, so an Anthropic
+        # key or a remote rewrite endpoint does not stop it
+        if provider := embedding_provider(settings):
+            from stratakb.knowledge.add_folder import refused
+
+            return _finish(refused("local_only", refusal_line(provider), root=root), args)
 
     try:
         report = asyncio.run(_add(args, settings))
