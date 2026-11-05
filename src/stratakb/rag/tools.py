@@ -437,15 +437,16 @@ def register_rag_tools(
                 if fallback_reason:
                     collected = await _collect(None)
                     layers = None
-            # The best chunks that fit the answer budget; confidence and the
-            # answer status are judged on what is returned
+            # The best chunks that fit the answer budget; confidence is judged
+            # on the reranked chunks, the answer status on what is returned
             chunks = pack_passages(collected.chunks, _settings.answer_token_budget)
-            basis = collected.confidence["basis"]
-            confidence = score_confidence(
-                [_basis_score(c, basis) for c in chunks], basis=basis
-            )
+            confidence = collected.confidence
+            basis = confidence["basis"]
             passages = build_passages(chunks, await _cited_documents(database_url, chunks))
-            status = answer_status(confidence, len(passages))
+            status = answer_status(
+                score_confidence([_basis_score(c, basis) for c in chunks], basis=basis),
+                len(passages),
+            )
 
             sources = []
             if include_sources:
@@ -525,9 +526,10 @@ def register_rag_tools(
         This is the primary knowledge tool. It rewrites the question into the
         knowledge base's terminology, runs several searches in parallel,
         reranks the results, and returns the best passages that fit a token
-        budget (ANSWER_TOKEN_BUDGET, about 1,500 tokens). The server does not
-        write an answer; the client composes it from the passages and cites
-        them by id.
+        budget (ANSWER_TOKEN_BUDGET, about 1,500 tokens, each passage's id,
+        ref and citation counted with its text; at most 50 passages). The
+        server does not write an answer; the client composes it from the
+        passages and cites them by id.
 
         The response: status is found, partly_found or not_found, with a
         next_step for the last two; mode is grounded; passages lists S1, S2,

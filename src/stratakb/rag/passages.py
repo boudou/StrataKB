@@ -5,16 +5,28 @@ numbered S1, S2, ... in it, so S<n> is the n-th retrieved chunk the
 learning loop records. Each passage carries a ref that names the exact span
 of the stored document text it holds, and a citation a developer can open:
 the file's relative path, the page, the line range and the clause path.
+The budget counts each passage's id, ref and citation with its text, and an
+answer holds at most MAX_PASSAGES passages, all of which the learning loop
+stores, so feedback by passage id resolves for every one.
 """
 
 from __future__ import annotations
 
+import json
 import math
 from typing import Any
 
 from stratakb.knowledge.documents import locate
 
 RESPONSE_FORMATS = ("concise", "detailed")
+
+# The most passages an answer returns, and results the learning loop stores
+MAX_PASSAGES = 50
+# The tokens a passage costs in the response beyond its own indent-2 JSON: the
+# deeper indentation inside the response's passages list and the page, lines
+# and page_end a stored document adds (measured on FastMCP's indent-2 JSON
+# with six-digit spans and three-digit pages: about 81 characters)
+RESPONSE_SLACK_TOKENS = 21
 
 _NEXT_STEPS = {
     "not_found": (
@@ -33,16 +45,23 @@ def estimate_tokens(text: str) -> int:
     return math.ceil(len(text) / 4)
 
 
-def pack_passages(chunks: list[dict[str, Any]], budget: int) -> list[dict[str, Any]]:
-    """The leading chunks, in order, whose text fits the token budget.
+def passage_cost(chunk: dict[str, Any]) -> int:
+    """The tokens a chunk costs as a passage: its id, ref, text and citation as JSON."""
+    passage = json.dumps(build_passages([chunk], {})[0], indent=2, ensure_ascii=False)
+    return estimate_tokens(passage) + RESPONSE_SLACK_TOKENS
 
-    Packing stops before the chunk that would pass the budget; the first
-    chunk is always kept, however long.
+
+def pack_passages(chunks: list[dict[str, Any]], budget: int) -> list[dict[str, Any]]:
+    """The leading chunks, in order, whose passages fit the token budget.
+
+    Each passage costs its text plus its id, ref and citation (passage_cost).
+    Packing stops before the chunk that would pass the budget, and after
+    MAX_PASSAGES passages; the first chunk is always kept, however long.
     """
     kept: list[dict[str, Any]] = []
     used = 0
-    for chunk in chunks:
-        cost = estimate_tokens(chunk["content"])
+    for chunk in chunks[:MAX_PASSAGES]:
+        cost = passage_cost(chunk)
         if kept and used + cost > budget:
             break
         kept.append(chunk)

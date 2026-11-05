@@ -16,6 +16,7 @@ from stratakb.config import get_settings
 from stratakb.learning.pii import scrub_query
 from stratakb.learning.signals import detect_reformulation, detect_layer_switch, detect_follow_up
 from stratakb.learning.store import LearningStore
+from stratakb.rag.passages import MAX_PASSAGES
 
 logger = structlog.get_logger()
 
@@ -156,7 +157,8 @@ class Tracker:
                 "layer": c.get("layer"),
                 "source_file": c.get("source_file"),
             }
-            for c in chunks[:20]  # Cap stored results
+            # Every passage an answer can return, so feedback by passage id resolves
+            for c in chunks[:MAX_PASSAGES]
         ]
 
         interaction = await self.store.store_interaction(
