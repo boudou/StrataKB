@@ -418,6 +418,11 @@ class TestMarkdownParser:
         assert "Note: x" in all_text
         assert "prose" in all_text
 
+    def test_frontmatter_key_with_spaces(self, tmp_path):
+        source = "---\ntitle: x\ndate created: 2024\n---\n# H\n\nbody\n"
+        result = self._parse(tmp_path, source)
+        assert [(p.section_path, p.text) for p in result.pages] == [(["H"], "# H\n\nbody")]
+
     def test_setext_headings(self, tmp_path):
         source = "Title\n=====\n\nintro\n\nPart\n----\n\nbody\n"
         result = self._parse(tmp_path, source)
@@ -666,6 +671,17 @@ class TestHTMLParser:
     def test_svg_title_is_not_glued_to_neighbours(self, tmp_path):
         result = self._parse(tmp_path, "<p>x<svg><title>Chart</title></svg>y</p>")
         assert result.pages[0].text == "x\nChart\ny"
+
+    def test_svg_title_is_not_heading_text(self, tmp_path):
+        result = self._parse(
+            tmp_path,
+            "<h1><svg><title>link icon</title></svg>Install</h1><p>Run it."
+            "<svg><title>Diagram</title></svg></p>",
+        )
+        assert [p.section_path for p in result.pages] == [["Install"]]
+        assert result.pages[0].text.startswith("# Install\n\n")
+        assert "link icon" not in result.pages[0].text
+        assert "Diagram" in result.pages[0].text
 
     def test_title_without_head_element(self, tmp_path):
         result = self._parse(tmp_path, "<!doctype html><title>Doc</title><p>text</p>")

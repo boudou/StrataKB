@@ -36,8 +36,9 @@ _FRONTMATTER_RE = re.compile(
     re.DOTALL | re.MULTILINE,
 )
 
-# A YAML key line ('key:', '"key":' or "'key':", then a space or the line end)
-_YAML_KEY_RE = re.compile(r"""^(?:[\w.-]+|"[^"\n]*"|'[^'\n]*')[ \t]*:(?:[ \t]|$)""")
+# A YAML key line ('key:', '"key":' or "'key':", then a space or the line end).
+# A plain key runs up to the first ': ' and may hold spaces ('date created: 2024')
+_YAML_KEY_RE = re.compile(r"""^(?:"[^"\n]*"|'[^'\n]*'|[^\s#"'][^\n]*?)[ \t]*:(?:[ \t]|$)""")
 
 
 def parse_markdown(file_path: str | Path) -> ParsedDocument:

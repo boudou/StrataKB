@@ -85,7 +85,8 @@ class _SectionParser(HTMLParser):
     """HTML parser that splits content by h1-h3 headings.
 
     The page title (the first <title> outside an <svg>) is not section text; it
-    is kept in self.title. A <title> inside an <svg> is ordinary text.
+    is kept in self.title. A <title> inside an <svg> is ordinary text, except
+    inside a heading, where it is left out of the heading text (an icon's label).
     """
 
     _HEADING_TAGS = {"h1", "h2", "h3"}
@@ -103,6 +104,7 @@ class _SectionParser(HTMLParser):
         self._skip_depth: int = 0
         self._svg_depth: int = 0
         self._in_page_title: bool = False
+        self._in_svg_title: bool = False
         self._title_parts: list[str] = []
         self._h1_context = ""
         self._h2_context = ""
@@ -129,6 +131,8 @@ class _SectionParser(HTMLParser):
             self._heading_text = []
             self._current_level = int(tag[1])
 
+        if tag == "title":
+            self._in_svg_title = True
         if tag == "br":
             self._current_text.append("\n")
         elif tag in ("p", "div", "li", "tr", "title"):
@@ -151,6 +155,7 @@ class _SectionParser(HTMLParser):
 
         if tag == "title":
             # An SVG title is text: keep it apart from the text after it
+            self._in_svg_title = False
             self._current_text.append("\n")
         elif tag in self._HEADING_TAGS and self._in_heading:
             self._in_heading = False
@@ -169,7 +174,8 @@ class _SectionParser(HTMLParser):
         if self._skip_depth > 0:
             return
         if self._in_heading:
-            self._heading_text.append(data)
+            if not self._in_svg_title:
+                self._heading_text.append(data)
         else:
             self._current_text.append(data)
 
