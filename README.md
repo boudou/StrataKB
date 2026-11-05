@@ -199,7 +199,7 @@ chunk_config: {chunk_size: 1200, chunk_overlap: 150}
 routing_patterns:            # questions matching any of these search this layer first
   - '\brunbooks?\b'
   - '\b(failover|incident|on-?call)\b'
-answer_mode: grounded        # or extractive; grounded when left out
+answer_mode: grounded        # or extractive; grounded for a new layer when left out
 sources:
   - name: runbooks
     path: runbooks
@@ -208,11 +208,24 @@ sources:
     download: https://wiki.example.com/postmortems   # shown when the folder is missing
 ```
 
-Apply it with `scripts/apply_preset.py` or the `strata_apply_preset` tool. Applying a preset again rebuilds the layer from scratch. Ready-made presets are in [examples/](examples/README.md): Python PEPs (the quickest to try), SEPA payments and ISO 20022 messaging.
+Apply it with `scripts/apply_preset.py` or the `strata_apply_preset` tool. Ready-made presets are in [examples/](examples/README.md): Python PEPs (the quickest to try), SEPA payments and ISO 20022 messaging.
+
+Edit the preset and apply it again to change the layer: the layer takes the preset's `display_name`, `description`, `metadata_schema`, `chunk_config`, `routing_patterns` and `answer_mode`, the result lists the settings that changed (`layer_changes`), and the chunks are rebuilt from the sources. There is no need to delete the layer first. A layer with the same name that was not made by this preset (one made with `stratakb add`, `strata_create_knowledge_layer` or another preset) is refused and left unchanged; rename the preset's `name` or delete that layer. `strata_apply_preset` with `dry_run=true` also lists the settings that would change (`layer_check`), while the script's `--dry-run` only parses the files and needs no database.
+
+```mermaid
+flowchart TD
+    A[Apply preset] --> B{Layer exists?}
+    B -- no --> C[Create layer from the YAML]
+    B -- yes --> D{Made by}
+    D -- "this preset, or no origin recorded" --> E[Update the settings that differ]
+    D -- "stratakb add, manual, another preset" --> F[Refuse: nothing changed]
+    C --> G[Clear chunks, ingest every source]
+    E --> G
+```
 
 The layer's **description** also tells the query rewriter which terminology the layer uses, so a clear description improves `strata_ask`.
 
-The layer's **answer_mode** says how its questions are to be answered: `grounded` (the default) means your client writes the answer from the cited passages; `extractive` is for layers where paraphrase is not acceptable, answered with the document's own sentences. Any other value is refused. `strata_list_knowledge_layers` shows each layer's mode, applying a preset again sets the mode of an existing layer, and layers created before this setting read as `grounded`. The server records the mode but does not act on it yet: extractive answers are on the [roadmap](#roadmap).
+The layer's **answer_mode** says how its questions are to be answered: `grounded` (the default) means your client writes the answer from the cited passages; `extractive` is for layers where paraphrase is not acceptable, answered with the document's own sentences. Any other value is refused. `strata_list_knowledge_layers` shows each layer's mode, applying a preset again sets the mode of an existing layer when the preset gives one (a preset without `answer_mode` leaves the layer's mode alone), and layers created before this setting read as `grounded`. The server records the mode but does not act on it yet: extractive answers are on the [roadmap](#roadmap).
 
 ### Try an example preset
 
@@ -246,7 +259,7 @@ Then ask from your client, for example *"How long should a line of Python be?"*.
 | `strata_db_explain` | operator | Query plan for a SQL statement (only with `READONLY_DATABASE_URL`) |
 | `strata_create_knowledge_layer` | admin | Creates a layer |
 | `strata_ingest_documents` | admin | Syncs a file or folder into a layer: adds, replaces and removes files; reports added, updated, unchanged, removed, skipped and flagged |
-| `strata_apply_preset` | admin | Creates a layer from a preset and ingests its sources |
+| `strata_apply_preset` | admin | Creates or updates a layer from a preset and ingests its sources |
 | `strata_delete_knowledge_layer` | admin | Deletes a layer and its chunks |
 | `strata_reset_learning` | admin | Clears learned patterns |
 | `strata_admin_audit_log` | admin | Queries the audit log |

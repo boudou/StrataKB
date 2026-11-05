@@ -5,6 +5,7 @@ Registers knowledge layer management tools with the MCP server.
 
 from __future__ import annotations
 
+import structlog
 from mcp.server.fastmcp import FastMCP
 
 from stratakb.core.audit import write_audit_log
@@ -20,6 +21,8 @@ from stratakb.knowledge.layers import (
     get_layer_status,
     list_layers,
 )
+
+logger = structlog.get_logger()
 
 
 def _serialize(obj: object) -> object:
@@ -281,13 +284,17 @@ def register_knowledge_tools(
         A preset is a YAML file describing one layer (name, description,
         chunking, routing patterns) and the folders to ingest into it. This
         tool:
-        1. Creates the layer if it does not exist yet
+        1. Creates the layer, or updates an existing layer made by this preset
+           to the preset's settings; a layer with the same name made another
+           way is refused and left unchanged
         2. Deletes the layer's existing chunks
         3. Ingests every source folder listed in the preset
 
+        The result lists the layer settings that changed (layer_changes).
         Source folders that are missing are skipped and reported together with
         their download link, if the preset gives one. Use dry_run=True to check
-        that all files parse, without a database or embeddings.
+        that all files parse, without embeddings; it also reports which layer
+        settings would change (layer_check).
 
         Args:
             preset_path: Path to the preset YAML file. Example: "examples/sepa/preset.yaml"
@@ -301,6 +308,7 @@ def register_knowledge_tools(
         from stratakb.knowledge.embeddings import embedding_key_error
         from stratakb.knowledge.layers import LayerValidationError
         from stratakb.knowledge.presets import (
+            check_preset_layer,
             create_preset_layer,
             dry_run_parse,
             ingest_preset,
@@ -321,6 +329,12 @@ def register_knowledge_tools(
 
         if dry_run:
             result = dry_run_parse(preset, root)
+            try:
+                layer_check = await check_preset_layer(database_url, preset)
+            except Exception as e:
+                # No message: it can hold the database URL
+                logger.warning("preset_layer_check_failed", error_type=type(e).__name__)
+                layer_check = {"status": "unknown", "changes": []}
             return {
                 "status": "dry_run_complete",
                 "layer": preset.name,
@@ -338,6 +352,7 @@ def register_knowledge_tools(
                     for name, stats in result.group_stats.items()
                 },
                 "errors": result.errors[:20] if result.errors else None,
+                "layer_check": layer_check,
             }
 
         if err := embedding_key_error(_settings, openai_api_key):
@@ -345,6 +360,9 @@ def register_knowledge_tools(
 
         user_id, _ = get_current_user()
         layer_result = await create_preset_layer(database_url, preset)
+        if layer_result["status"] == "refused":
+            # Nothing was changed, so there is nothing to audit
+            return {"status": "error", "error": layer_result["message"]}
         ingest_result = await ingest_preset(database_url, openai_api_key, preset, root)
 
         await write_audit_log(
@@ -363,5 +381,6 @@ def register_knowledge_tools(
         return {
             "status": "completed",
             "layer": layer_result["status"],
+            "layer_changes": layer_result["changes"],
             "ingestion": ingest_result,
         }

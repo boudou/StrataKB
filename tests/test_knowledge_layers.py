@@ -670,3 +670,96 @@ class TestLayerFieldsForCaller:
             status = await mcp._tool_manager.get_tool("strata_get_layer_status").fn(name="x")
 
         assert status["layer"] == self.LAYER
+
+
+class TestUpdateLayer:
+    """update_layer sets only the settings it is given (require database)."""
+
+    async def test_update_layer_sets_only_given_columns(self, db_url):
+        from stratakb.knowledge.layers import create_layer, get_layer_status, update_layer
+
+        name = "test_update_layer"
+        await _drop_layers(db_url, name)
+        try:
+            await create_layer(
+                db_url, name=name, display_name="Update", description="old",
+                chunk_config={"chunk_size": 800, "chunk_overlap": 100},
+                routing_patterns=["old"], answer_mode="extractive", origin="preset:x",
+            )
+            before = await get_layer_status(db_url, name=name)
+            updated = await update_layer(
+                db_url, name, description="new", routing_patterns=["new", "newer"]
+            )
+            after = await get_layer_status(db_url, name=name)
+
+            assert updated["description"] == "new"
+            assert after["description"] == "new"
+            assert after["routing_patterns"] == ["new", "newer"]
+            assert after["chunk_config"] == before["chunk_config"]
+            assert after["answer_mode"] == "extractive"
+            assert after["origin"] == "preset:x"
+            assert after["display_name"] == "Update"
+            assert after["updated_at"] > before["updated_at"]
+        finally:
+            await _drop_layers(db_url, name)
+
+    async def test_update_layer_writes_jsonb_and_strips_display_name(self, db_url):
+        from stratakb.knowledge.layers import create_layer, get_layer_status, update_layer
+
+        name = "test_update_layer_json"
+        await _drop_layers(db_url, name)
+        try:
+            await create_layer(db_url, name=name, display_name="Json")
+            await update_layer(
+                db_url, name, display_name="  Renamed  ",
+                metadata_schema={"type": "object"},
+                chunk_config={"chunk_size": 500, "chunk_overlap": 50},
+                answer_mode="extractive",
+            )
+            after = await get_layer_status(db_url, name=name)
+            assert after["display_name"] == "Renamed"
+            assert after["metadata_schema"] == {"type": "object"}
+            assert after["chunk_config"] == {
+                "chunk_size": 500, "chunk_overlap": 50, "splitting_strategy": "recursive",
+            }
+            assert after["answer_mode"] == "extractive"
+        finally:
+            await _drop_layers(db_url, name)
+
+    async def test_update_layer_missing_layer(self, db_url):
+        from stratakb.knowledge.layers import update_layer
+
+        await _drop_layers(db_url, "test_update_missing")
+        with pytest.raises(LayerNotFoundError):
+            await update_layer(db_url, "test_update_missing", description="x")
+
+    async def test_update_layer_validates(self, db_url):
+        from stratakb.knowledge.layers import create_layer, get_layer_status, update_layer
+
+        name = "test_update_layer_bad"
+        await _drop_layers(db_url, name)
+        try:
+            await create_layer(db_url, name=name, display_name="Bad", description="kept")
+            with pytest.raises(LayerValidationError):
+                await update_layer(
+                    db_url, name, description="changed",
+                    chunk_config={"chunk_size": 200, "chunk_overlap": 200},
+                )
+            with pytest.raises(LayerValidationError):
+                await update_layer(db_url, name, routing_patterns=["(unclosed"])
+            assert (await get_layer_status(db_url, name=name))["description"] == "kept"
+        finally:
+            await _drop_layers(db_url, name)
+
+    async def test_update_layer_without_settings_writes_nothing(self, db_url):
+        from stratakb.knowledge.layers import create_layer, get_layer_status, update_layer
+
+        name = "test_update_layer_noop"
+        await _drop_layers(db_url, name)
+        try:
+            await create_layer(db_url, name=name, display_name="Noop")
+            before = await get_layer_status(db_url, name=name)
+            result = await update_layer(db_url, name)
+            assert result["updated_at"] == before["updated_at"]
+        finally:
+            await _drop_layers(db_url, name)

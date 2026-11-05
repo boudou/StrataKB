@@ -394,6 +394,68 @@ async def set_layer_answer_mode(database_url: str, layer_name: str, answer_mode:
     await _set_column(database_url, layer_name, "answer_mode", answer_mode)
 
 
+async def update_layer(
+    database_url: str,
+    name: str,
+    *,
+    display_name: str | None = None,
+    description: str | None = None,
+    metadata_schema: dict | None = None,
+    chunk_config: dict | None = None,
+    routing_patterns: list[str] | None = None,
+    answer_mode: str | None = None,
+) -> dict:
+    """Set the given settings of a layer in one UPDATE; None leaves a setting as it is.
+
+    Returns the updated layer record (unchanged when no setting is given).
+    Raises LayerNotFoundError if the layer doesn't exist.
+    Raises LayerValidationError if a value is invalid; nothing is written then.
+    """
+    # Column name -> (value, SQL cast); column names are literals, never caller input
+    values: dict[str, tuple[str, str]] = {}
+    if display_name is not None:
+        if not display_name.strip():
+            raise LayerValidationError("display_name is required.")
+        values["display_name"] = (display_name.strip(), "")
+    if description is not None:
+        values["description"] = (description, "")
+    if metadata_schema is not None:
+        if not isinstance(metadata_schema, dict):
+            raise LayerValidationError("metadata_schema must be a JSON object.")
+        values["metadata_schema"] = (_json_str(metadata_schema), "::jsonb")
+    if chunk_config is not None:
+        values["chunk_config"] = (_json_str(_validate_chunk_config(chunk_config)), "::jsonb")
+    if routing_patterns is not None:
+        patterns = _validate_routing_patterns(routing_patterns)
+        values["routing_patterns"] = (json.dumps(patterns), "::jsonb")
+    if answer_mode is not None:
+        values["answer_mode"] = (_validate_answer_mode(answer_mode), "")
+
+    if not values:
+        return await get_layer_status(database_url, name=name)
+
+    assignments = ", ".join(
+        f"{column} = ${i}{cast}" for i, (column, (_, cast)) in enumerate(values.items(), start=2)
+    )
+    await ensure_schema(database_url)
+    pool = await get_pool(database_url)
+    row = await pool.fetchrow(
+        f"""
+        UPDATE strata_core.knowledge_layers
+        SET {assignments}, updated_at = NOW()
+        WHERE name = $1
+        RETURNING {_LAYER_COLUMNS}
+        """,
+        name,
+        *(value for value, _ in values.values()),
+    )
+    if row is None:
+        raise LayerNotFoundError(f"Knowledge layer '{name}' not found.")
+    _routing_cache.clear()
+    logger.info("layer_updated", layer=name, fields=list(values))
+    return _layer_dict(row)
+
+
 async def delete_layer(database_url: str, *, name: str) -> dict:
     """Delete a knowledge layer and all its chunks.
 
