@@ -45,14 +45,16 @@ def parse_csv(file_path: str | Path) -> ParsedDocument:
 
     try:
         with open(file_path, "r", encoding="utf-8-sig") as f:
-            reader = csv.DictReader(f)
-            if reader.fieldnames is None:
+            reader = csv.reader(f)
+            headers = next(reader, None)
+            if headers is None:
                 return ParsedDocument(source_file=source, pages=[], total_pages=0)
 
-            headers = list(reader.fieldnames)
-            rows = list(itertools.islice(reader, MAX_ROWS))
+            # Blank lines are not rows: skip them before the row limit
+            data = (row for row in reader if row)
+            rows = list(itertools.islice(data, MAX_ROWS))
             # Count the rest without keeping it
-            rows_left_out = sum(1 for _ in reader)
+            rows_left_out = sum(1 for _ in data)
 
     except Exception as e:
         return ParsedDocument(source_file=source, error=f"CSV parse error: {e}")
@@ -68,10 +70,11 @@ def parse_csv(file_path: str | Path) -> ParsedDocument:
     if not rows:
         return ParsedDocument(source_file=source, pages=[], total_pages=0)
 
+    labels = _column_labels(headers)
     pages: list[ParsedPage] = []
 
     for page_num, row in enumerate(rows, start=1):
-        text = _row_to_text(row, headers, source)
+        text = _row_to_text(row, labels)
         if text.strip():
             pages.append(ParsedPage(
                 text=text,
@@ -96,7 +99,25 @@ def parse_csv(file_path: str | Path) -> ParsedDocument:
     )
 
 
-def _row_to_text(row: dict, headers: list[str], source: str) -> str:
+def _column_labels(headers: list[str]) -> list[str]:
+    """Label each column by its header name.
+
+    An empty name becomes "Column N" (N is the 1-based position), and the
+    second and later uses of a name get a number: "Name (2)", "Name (3)".
+    """
+    labels = []
+    seen: dict[str, int] = {}
+    for position, header in enumerate(headers, start=1):
+        name = header.strip()
+        if not name:
+            labels.append(f"Column {position}")
+            continue
+        seen[name] = seen.get(name, 0) + 1
+        labels.append(name if seen[name] == 1 else f"{name} ({seen[name]})")
+    return labels
+
+
+def _row_to_text(values: list[str], labels: list[str]) -> str:
     """Convert a CSV row into structured text with column labels."""
     lines = []
 
@@ -110,23 +131,21 @@ def _row_to_text(row: dict, headers: list[str], source: str) -> str:
     ]
     title = ""
     for col in title_candidates:
-        if col in row and row[col] and row[col].strip():
-            title = row[col].strip()
-            break
+        if col in labels:
+            index = labels.index(col)
+            if index < len(values) and values[index].strip():
+                title = values[index].strip()
+                break
 
     if title:
         lines.append(f"# {title}")
 
-    # A short row has None for its missing fields: treat them as empty cells
-    for header in headers:
-        value = (row.get(header) or "").strip()
+    # A short row simply has fewer values; a long row's extra values past the
+    # header are labelled by position
+    for position, raw in enumerate(values, start=1):
+        value = raw.strip()
         if value:
-            lines.append(f"**{header}:** {value}")
-
-    # A long row has its extra values under the None key: label them by position
-    for position, extra in enumerate(row.get(None) or [], start=len(headers) + 1):
-        value = (extra or "").strip()
-        if value:
-            lines.append(f"**Column {position}:** {value}")
+            label = labels[position - 1] if position <= len(labels) else f"Column {position}"
+            lines.append(f"**{label}:** {value}")
 
     return "\n".join(lines)

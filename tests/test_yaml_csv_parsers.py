@@ -315,6 +315,80 @@ class TestCSVParser:
         assert "**Column 4:** 4" in first
         assert "Column" not in result.pages[1].text
 
+    def test_empty_header_labelled_by_position(self, tmp_path):
+        from stratakb.knowledge.parsers.csv_parser import parse_csv
+
+        path = tmp_path / "empty_header.csv"
+        path.write_text("a,,c\n1,2,3\n", encoding="utf-8")
+        result = parse_csv(path)
+        assert result.error is None
+        assert result.total_pages == 1
+        lines = result.pages[0].text.splitlines()
+        assert lines == ["**a:** 1", "**Column 2:** 2", "**c:** 3"]
+        assert not [line for line in lines if line.startswith("**:**")]
+
+    def test_empty_header_in_long_row(self, tmp_path):
+        from stratakb.knowledge.parsers.csv_parser import parse_csv
+
+        path = tmp_path / "empty_header_long.csv"
+        path.write_text("a,,c\n1,2,3,4\n", encoding="utf-8")
+        result = parse_csv(path)
+        lines = result.pages[0].text.splitlines()
+        assert lines == ["**a:** 1", "**Column 2:** 2", "**c:** 3", "**Column 4:** 4"]
+
+    def test_repeated_header_keeps_both_values(self, tmp_path):
+        from stratakb.knowledge.parsers.csv_parser import parse_csv
+
+        path = tmp_path / "repeated.csv"
+        path.write_text("name,value,name\nx,1,y\n", encoding="utf-8")
+        result = parse_csv(path)
+        assert result.error is None
+        lines = result.pages[0].text.splitlines()
+        assert lines.count("**name:** x") == 1
+        assert lines.count("**name (2):** y") == 1
+        assert lines.count("**value:** 1") == 1
+
+    def test_repeated_title_column_uses_first(self, tmp_path):
+        from stratakb.knowledge.parsers.csv_parser import parse_csv
+
+        path = tmp_path / "repeated_title.csv"
+        path.write_text("Name,Name\nx,y\n", encoding="utf-8")
+        result = parse_csv(path)
+        text = result.pages[0].text
+        assert text.startswith("# x\n")
+        assert "**Name:** x" in text
+        assert "**Name (2):** y" in text
+
+    def test_header_whitespace_stripped(self, tmp_path):
+        from stratakb.knowledge.parsers.csv_parser import parse_csv
+
+        path = tmp_path / "spaced.csv"
+        path.write_text("Code, Name\nA1,Foo\n", encoding="utf-8")
+        result = parse_csv(path)
+        text = result.pages[0].text
+        assert text.startswith("# Foo\n")
+        assert "**Name:** Foo" in text
+        assert "** Name:**" not in text
+
+    def test_blank_lines_skipped(self, tmp_path):
+        from unittest.mock import patch
+
+        from stratakb.knowledge.parsers.csv_parser import parse_csv
+
+        path = tmp_path / "blank.csv"
+        path.write_text("a,b\n1,2\n\n3,4\n", encoding="utf-8")
+        result = parse_csv(path)
+        assert result.error is None
+        assert result.total_pages == 2
+        assert [p.page_number for p in result.pages] == [1, 2]
+        assert result.rows_left_out == 0
+
+        path.write_text("a,b\n1,2\n\n\n3,4\n", encoding="utf-8")
+        with patch("stratakb.knowledge.parsers.csv_parser.MAX_ROWS", 1):
+            result = parse_csv(path)
+        assert result.total_pages == 1
+        assert result.rows_left_out == 1
+
     def test_nonexistent_csv(self):
         from stratakb.knowledge.parsers.csv_parser import parse_csv
 
