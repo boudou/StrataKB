@@ -179,7 +179,7 @@ async def test_vector_search_sets_statement_timeout():
 
 
 @pytest.mark.asyncio
-async def test_hybrid_results_carry_cosine_similarity(monkeypatch):
+async def test_hybrid_results_carry_cosine_similarity(monkeypatch, vacuumed_chunks):
     """The fused score is normalized to a top of 1.0; similarity stays the real cosine."""
     from stratakb.config import get_settings
     from stratakb.core.database import get_pool

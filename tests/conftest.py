@@ -29,6 +29,24 @@ def _migrate_test_db():
         migrations._checked.clear()
 
 
+@pytest.fixture
+async def vacuumed_chunks():
+    """Vacuum the chunks table before a test that ranks through the HNSW index.
+
+    Many tests insert and then delete the same fake embeddings. Until vacuum
+    repairs the HNSW graph, rows added afterwards can be unreachable from its
+    entry point, so an index scan returns fewer rows than the table holds.
+    Autovacuum does this in a running server; a test can run first.
+    """
+    from stratakb.config import get_settings
+
+    conn = await asyncpg.connect(get_settings().database_url)
+    try:
+        await conn.execute("VACUUM strata_vectors.chunks")
+    finally:
+        await conn.close()
+
+
 @pytest.fixture(autouse=True)
 async def _reset_db_pool():
     """Reset the global connection pools after each test.

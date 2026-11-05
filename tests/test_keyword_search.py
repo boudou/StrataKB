@@ -199,7 +199,7 @@ _CLOSE_CHUNKS = 8
 
 
 @pytest.mark.asyncio
-async def test_keyword_only_chunk_reaches_results(monkeypatch):
+async def test_keyword_only_chunk_reaches_results(monkeypatch, vacuumed_chunks):
     from unittest.mock import AsyncMock, patch
 
     from stratakb.config import get_settings

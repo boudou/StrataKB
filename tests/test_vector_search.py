@@ -376,7 +376,7 @@ def db_url():
 
 class TestVectorSearchIntegration:
     @pytest.mark.asyncio
-    async def test_search_with_ingested_data(self, db_url):
+    async def test_search_with_ingested_data(self, db_url, vacuumed_chunks):
         """End-to-end: ingest data with fake embeddings, then search."""
         from stratakb.knowledge.layers import LayerNotFoundError, create_layer, delete_layer
         from stratakb.knowledge.vector_store import ChunkRecord, insert_chunks
