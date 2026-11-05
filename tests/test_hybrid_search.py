@@ -1,3 +1,4 @@
+import json
 import uuid
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -10,6 +11,7 @@ from stratakb.rag.retriever import (
     _fuse_rrf,
     _hybrid_search,
     _reserve_keyword_slots,
+    _search_fetch,
 )
 
 
@@ -171,6 +173,44 @@ async def test_vector_search_sets_statement_timeout():
 
     statements = [c.args[0] for c in conn.execute.call_args_list]
     assert any(s.startswith("SET LOCAL statement_timeout") for s in statements)
+
+
+@pytest.mark.asyncio
+async def test_search_fetch_sets_search_settings_in_one_transaction():
+    conn = AsyncMock()
+    conn.fetch.return_value = ["row"]
+
+    rows = await _search_fetch(
+        _mock_pool(conn), SimpleNamespace(hnsw_ef_search=40), "SELECT 1", [7]
+    )
+
+    statements = [c.args[0] for c in conn.execute.call_args_list]
+    assert statements == [
+        "SET LOCAL hnsw.ef_search = 40",
+        "SET LOCAL statement_timeout = '10s'",
+    ]
+    conn.transaction.assert_called_once()
+    assert conn.fetch.call_args.args == ("SELECT 1", 7)
+    assert rows == ["row"]
+
+
+@pytest.mark.asyncio
+async def test_hybrid_search_parses_json_string_metadata():
+    cid = str(uuid.uuid4())
+    row = _chunk_row(cid)
+    row["metadata"] = json.dumps({"k": "v"})
+    row["source_section"] = None
+    conn = AsyncMock()
+    conn.fetch.side_effect = [[{"source": "semantic", "id": cid, "rank": 1}], [row]]
+    settings = SimpleNamespace(
+        hnsw_ef_search=40, hybrid_rrf_k=60, hybrid_semantic_weight=0.7,
+        hybrid_keyword_weight=0.3, hybrid_keyword_slots=1,
+    )
+
+    results = await _hybrid_search(_mock_pool(conn), "q", "[1.0]", None, 3, None, settings)
+
+    assert results[0].metadata == {"k": "v"}
+    assert results[0].source_section == ""
 
 
 # ==========================================

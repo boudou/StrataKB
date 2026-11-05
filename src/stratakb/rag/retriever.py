@@ -6,8 +6,10 @@ with optional layer and metadata filtering.
 
 from __future__ import annotations
 
+import json
 import re
 import time
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
 
@@ -174,33 +176,8 @@ async def search_chunks(
     """
 
     pool = await get_pool(database_url)
-    async with pool.acquire() as conn:
-        async with conn.transaction():
-            await conn.execute(f"SET LOCAL hnsw.ef_search = {settings.hnsw_ef_search}")
-            await conn.execute(f"SET LOCAL statement_timeout = '{_SEARCH_TIMEOUT}s'")
-            rows = await conn.fetch(sql, *params)
-
-    results = []
-    for row in rows:
-        import json
-
-        meta = row["metadata"]
-        if isinstance(meta, str):
-            meta = json.loads(meta)
-
-        results.append(
-            SearchResult(
-                chunk_id=str(row["id"]),
-                content=row["content"],
-                score=round(float(row["score"]), 4),
-                layer_name=row["layer_name"],
-                source_file=row["source_file"] or "",
-                source_section=row["source_section"] or "",
-                doc_type=row["doc_type"] or "",
-                metadata=meta if isinstance(meta, dict) else {},
-                similarity=round(float(row["score"]), 4),
-            )
-        )
+    rows = await _search_fetch(pool, settings, sql, params)
+    results = [_row_to_result(row, row["score"], row["score"]) for row in rows]
 
     if cache:
         cache.put(query, layers, top_k, results, metadata_filter)
@@ -215,6 +192,33 @@ async def search_chunks(
     )
 
     return results
+
+
+async def _search_fetch(pool, settings, sql: str, params: list) -> list:
+    """Run one search query in a transaction with the search settings."""
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            await conn.execute(f"SET LOCAL hnsw.ef_search = {settings.hnsw_ef_search}")
+            await conn.execute(f"SET LOCAL statement_timeout = '{_SEARCH_TIMEOUT}s'")
+            return await conn.fetch(sql, *params)
+
+
+def _row_to_result(row, score: float, similarity: float | None) -> SearchResult:
+    """Map a chunk row to a SearchResult with the given score and similarity."""
+    meta = row["metadata"]
+    if isinstance(meta, str):
+        meta = json.loads(meta)
+    return SearchResult(
+        chunk_id=str(row["id"]),
+        content=row["content"],
+        score=round(float(score), 4),
+        layer_name=row["layer_name"],
+        source_file=row["source_file"] or "",
+        source_section=row["source_section"] or "",
+        doc_type=row["doc_type"] or "",
+        metadata=meta if isinstance(meta, dict) else {},
+        similarity=round(float(similarity), 4) if similarity is not None else None,
+    )
 
 
 def _embedding_to_pgvector(embedding: list[float]) -> str:
@@ -271,29 +275,24 @@ def _reserve_keyword_slots(
 
     A chunk only the full-text leg found scores below almost every vector
     rank, so an exact term the embedding misses would never be returned.
-    The keyword ranks 1..n (n = slots, at most top_k - 1, so the fused #1
-    always stays) each replace the lowest-scored unprotected entry when they
-    are missing, and keep their own fused score.
+    Rule: keep the keyword ranks 1..n (n = slots, at most top_k - 1, so the
+    fused #1 always stays), then fill the other top_k - n places with the best
+    unprotected fused entries. Every entry keeps its own fused score.
 
     Returns:
         At most top_k (chunk_id, fused_score), highest first.
     """
     n = max(0, min(slots, top_k - 1))
-    chosen = list(fused[:top_k])
-    protected = [cid for cid, _ in sorted(keyword, key=lambda x: x[1])[:n]]
-    present = {cid for cid, _ in chosen}
-    missing = [cid for cid in protected if cid not in present]
-    if not missing:
-        return chosen
-
-    scores = dict(fused)
-    keep = set(protected)
-    for cid in missing:
-        # chosen is sorted highest first: drop the last entry that is not protected
-        drop = max(i for i, (c, _) in enumerate(chosen) if c not in keep)
-        chosen.pop(drop)
-        chosen.append((cid, scores[cid]))
-    return sorted(chosen, key=lambda x: x[1], reverse=True)
+    protected = {cid for cid, _ in sorted(keyword, key=lambda x: x[1])[:n]}
+    room = top_k - len(protected)
+    kept = []
+    for cid, score in fused:
+        if cid in protected:
+            kept.append((cid, score))
+        elif room > 0:
+            kept.append((cid, score))
+            room -= 1
+    return kept
 
 
 def _build_hybrid_sql(
@@ -367,11 +366,7 @@ async def _hybrid_search(
     """Execute hybrid search with RRF fusion."""
     sql, params = _build_hybrid_sql(query_vector, query, layers, top_k, metadata_filter)
 
-    async with pool.acquire() as conn:
-        async with conn.transaction():
-            await conn.execute(f"SET LOCAL hnsw.ef_search = {settings.hnsw_ef_search}")
-            await conn.execute(f"SET LOCAL statement_timeout = '{_SEARCH_TIMEOUT}s'")
-            rows = await conn.fetch(sql, *params)
+    rows = await _search_fetch(pool, settings, sql, params)
 
     semantic_ranks = [(str(r["id"]), r["rank"]) for r in rows if r["source"] == "semantic"]
     keyword_ranks = [(str(r["id"]), r["rank"]) for r in rows if r["source"] == "fulltext"]
@@ -390,8 +385,7 @@ async def _hybrid_search(
     if not top_ids:
         return []
 
-    import uuid as _uuid
-    uuid_ids = [_uuid.UUID(tid) for tid in top_ids]
+    uuid_ids = [uuid.UUID(tid) for tid in top_ids]
     chunk_sql = """
         SELECT id, content, layer_name, source_file, source_section, doc_type, metadata,
                1 - (embedding <=> $2::vector) AS similarity
@@ -401,28 +395,10 @@ async def _hybrid_search(
     async with pool.acquire() as conn:
         chunk_rows = await conn.fetch(chunk_sql, uuid_ids, query_vector)
 
-    import json
-    results = []
-    for row in chunk_rows:
-        chunk_id = str(row["id"])
-        meta = row["metadata"]
-        if isinstance(meta, str):
-            meta = json.loads(meta)
-        results.append(SearchResult(
-            chunk_id=chunk_id,
-            content=row["content"],
-            score=round(fused_scores.get(chunk_id, 0.0), 4),
-            layer_name=row["layer_name"],
-            source_file=row["source_file"] or "",
-            source_section=row["source_section"] or "",
-            doc_type=row["doc_type"] or "",
-            metadata=meta if isinstance(meta, dict) else {},
-            similarity=(
-                round(float(row["similarity"]), 4)
-                if row["similarity"] is not None else None
-            ),
-        ))
-
+    results = [
+        _row_to_result(row, fused_scores.get(str(row["id"]), 0.0), row["similarity"])
+        for row in chunk_rows
+    ]
     results.sort(key=lambda r: r.score, reverse=True)
 
     # Normalize RRF scores to 0-1 for ranking and display only: the top result is
