@@ -20,12 +20,12 @@ import structlog
 from stratakb.config import Settings
 from stratakb.core.database import get_pool
 from stratakb.core.egress import (
-    embedding_provider,
     keyless_request_options,
     openai_compatible_client,
     unauthorized_detail,
 )
-from stratakb.knowledge.embeddings import resolve_embedding_model
+from stratakb.knowledge.embeddings import embedding_local_only_error, resolve_embedding_model
+from stratakb.knowledge.vector_store import _vector_column_size
 
 logger = structlog.get_logger()
 
@@ -33,12 +33,20 @@ _TIMEOUT_SECONDS = 5.0
 _MAX_LISTED = 20
 _MAX_ID_CHARS = 100
 
-_COLUMN_SIZE_QUERY = (
-    "SELECT atttypmod FROM pg_attribute "
-    "WHERE attrelid = 'strata_vectors.chunks'::regclass AND attname = 'embedding'"
-)
+_MODELS_UNLISTED = "could not list the server's models"
+_COLUMN_UNREAD = "could not read the vector column"
 
 _checks: dict[str, dict] = {}
+
+
+def _unchecked(event: str, reason: str, **fields) -> dict:
+    """Log a check that could not run and return its "unchecked" result.
+
+    The fields go into the result only; the log carries the reason, which
+    never holds the URL or a key.
+    """
+    logger.warning(event, reason=reason)
+    return {"status": "unchecked", **fields, "reason": reason}
 
 
 def reset_embedding_checks() -> None:
@@ -90,7 +98,7 @@ async def check_embedding_model(settings: Settings) -> dict:
     """Check that the server in EMBEDDING_BASE_URL lists the embedding model."""
     if settings.embedding_backend == "local" or not settings.embedding_base_url:
         return {"status": "skipped", "reason": "only checked for an EMBEDDING_BASE_URL server"}
-    if settings.strata_local_only and embedding_provider(settings) is not None:
+    if embedding_local_only_error(settings):
         return {
             "status": "skipped",
             "reason": "STRATA_LOCAL_ONLY is on and EMBEDDING_BASE_URL is not on this machine",
@@ -109,12 +117,11 @@ async def check_embedding_model(settings: Settings) -> dict:
         ids = {m.id async for m in client.models.list(**keyless_request_options(key))}
     except Exception as e:
         # Only the class name: an SDK error text can echo the request URL
-        logger.warning("embedding_model_unchecked", error=type(e).__name__)
-        result = {
-            "status": "unchecked",
-            "model": model,
-            "reason": f"could not list the server's models: {type(e).__name__}",
-        }
+        result = _unchecked(
+            "embedding_model_unchecked",
+            f"{_MODELS_UNLISTED}: {type(e).__name__}",
+            model=model,
+        )
         detail = unauthorized_detail(e, key, "EMBEDDING_API_KEY")
         if detail is not None:
             result["detail"] = detail
@@ -141,16 +148,12 @@ async def check_vector_column(database_url: str, dimensions: int) -> dict:
     """Compare the vector column's declared size with EMBEDDING_DIMENSIONS."""
     try:
         pool = await get_pool(database_url)
-        size = await asyncio.wait_for(pool.fetchval(_COLUMN_SIZE_QUERY), _TIMEOUT_SECONDS)
+        size = await asyncio.wait_for(_vector_column_size(pool), _TIMEOUT_SECONDS)
     except Exception as e:
-        reason = f"could not read the vector column: {type(e).__name__}"
-        logger.warning("vector_column_unchecked", reason=reason)
-        return {"status": "unchecked", "reason": reason}
+        return _unchecked("vector_column_unchecked", f"{_COLUMN_UNREAD}: {type(e).__name__}")
 
     if size is None or size <= 0:
-        reason = "the vector column has no fixed size"
-        logger.warning("vector_column_unchecked", reason=reason)
-        return {"status": "unchecked", "reason": reason}
+        return _unchecked("vector_column_unchecked", "the vector column has no fixed size")
     if size == dimensions:
         return {"status": "ok", "column_dimensions": size, "setting_dimensions": dimensions}
     logger.warning(
@@ -182,22 +185,20 @@ async def run_embedding_checks(settings: Settings, db_ready: bool) -> None:
     try:
         _checks["model"] = await check_embedding_model(settings)
     except Exception as e:
-        _checks["model"] = {
-            "status": "unchecked",
-            "reason": f"could not list the server's models: {type(e).__name__}",
-        }
+        _checks["model"] = _unchecked(
+            "embedding_model_unchecked", f"{_MODELS_UNLISTED}: {type(e).__name__}"
+        )
 
     if not db_ready:
-        reason = "the database was unreachable at startup"
-        logger.warning("vector_column_unchecked", reason=reason)
-        _checks["vector_column"] = {"status": "unchecked", "reason": reason}
+        _checks["vector_column"] = _unchecked(
+            "vector_column_unchecked", "the database was unreachable at startup"
+        )
         return
     try:
         _checks["vector_column"] = await check_vector_column(
             settings.database_url, settings.embedding_dimensions
         )
     except Exception as e:
-        _checks["vector_column"] = {
-            "status": "unchecked",
-            "reason": f"could not read the vector column: {type(e).__name__}",
-        }
+        _checks["vector_column"] = _unchecked(
+            "vector_column_unchecked", f"{_COLUMN_UNREAD}: {type(e).__name__}"
+        )

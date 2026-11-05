@@ -7,6 +7,7 @@ Tests cover:
 - Vectors of the wrong length are refused on both backends
 - strata_search and strata_ingest_documents need no OpenAI key with a base URL
 - is_model_cached needs config.json and the weights, and never downloads
+- The OpenAI path refuses an empty key without a base URL, whatever the backend name
 """
 
 from __future__ import annotations
@@ -133,6 +134,29 @@ class TestCustomEndpoint:
             pytest.raises(ValueError, match="API key"),
         ):
             await embed_texts(["x"], api_key="", backend="openai")
+
+    @pytest.mark.asyncio
+    async def test_embed_openai_refuses_empty_key_without_base_url(self):
+        from stratakb.knowledge.embeddings import _embed_openai
+
+        with (
+            patch("openai.AsyncOpenAI") as client_cls,
+            pytest.raises(ValueError, match="API key"),
+        ):
+            await _embed_openai(["x"], "", "m", 768)
+        client_cls.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_misspelt_backend_without_key_is_refused(self):
+        from stratakb.knowledge.embeddings import embed_texts
+
+        with (
+            patch("stratakb.config.get_settings", return_value=_settings()),
+            patch("openai.AsyncOpenAI") as client_cls,
+            pytest.raises(ValueError, match="API key"),
+        ):
+            await embed_texts(["x"], api_key="", backend="opnai")
+        client_cls.assert_not_called()
 
 
 class TestDimensionCheck:
@@ -295,6 +319,16 @@ def test_is_model_cached_accepts_a_local_folder(tmp_path):
     from stratakb.knowledge.embeddings import is_model_cached
 
     assert is_model_cached(str(tmp_path)) is True
+
+
+@pytest.mark.parametrize("folder", [r"C:\no\such\folder", "/no/such/folder", "./mpnet"])
+def test_is_model_cached_counts_a_folder_path(folder):
+    from stratakb.knowledge.embeddings import is_model_cached
+
+    lookup = MagicMock(side_effect=AssertionError("a folder path looked up the hub cache"))
+    with patch("huggingface_hub.try_to_load_from_cache", lookup):
+        assert is_model_cached(folder) is True
+    lookup.assert_not_called()
 
 
 def test_is_model_cached_uses_the_default_cache_without_the_variable(monkeypatch):

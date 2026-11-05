@@ -11,8 +11,10 @@ Tests cover:
 - The client gets EMBEDDING_API_KEY only, never OPENAI_API_KEY
 - A vector column of another size degrades health and names both numbers
 - No column check without a database at startup
+- A check that raises is stored as unchecked and logged
 - Neither the URL's credentials, its port nor the key reach health or logs
-- The real column matches the default EMBEDDING_DIMENSIONS (database)
+- The real column matches the default EMBEDDING_DIMENSIONS, and
+  strata_db_vector_stats reports the same size (database)
 
 The HTTP client and the pool are patched, except in the database test.
 """
@@ -374,6 +376,44 @@ async def test_column_unchecked_without_database():
     get_pool.assert_not_called()
 
 
+async def test_model_check_failure_is_logged():
+    with (
+        patch.object(
+            embedding_checks, "check_embedding_model", AsyncMock(side_effect=RuntimeError("x"))
+        ),
+        patch.object(
+            embedding_checks, "check_vector_column", AsyncMock(return_value={"status": "ok"})
+        ),
+        capture_logs() as logs,
+    ):
+        await run_embedding_checks(_settings(), db_ready=True)
+
+    assert embedding_checks_status()["model"] == {
+        "status": "unchecked",
+        "reason": "could not list the server's models: RuntimeError",
+    }
+    assert any(e["event"] == "embedding_model_unchecked" for e in logs)
+
+
+async def test_column_check_failure_is_logged():
+    with (
+        patch.object(
+            embedding_checks, "check_embedding_model", AsyncMock(return_value={"status": "ok"})
+        ),
+        patch.object(
+            embedding_checks, "check_vector_column", AsyncMock(side_effect=RuntimeError("x"))
+        ),
+        capture_logs() as logs,
+    ):
+        await run_embedding_checks(_settings(), db_ready=True)
+
+    assert embedding_checks_status()["vector_column"] == {
+        "status": "unchecked",
+        "reason": "could not read the vector column: RuntimeError",
+    }
+    assert any(e["event"] == "vector_column_unchecked" for e in logs)
+
+
 async def test_pending_before_the_checks_run():
     settings = _settings()
     result = await _health(settings)
@@ -434,3 +474,26 @@ async def test_real_column_matches_default():
     assert ok == {"status": "ok", "column_dimensions": 768, "setting_dimensions": 768}
     assert mismatch["status"] == "mismatch"
     assert mismatch["column_dimensions"] == 768
+
+
+async def test_vector_stats_reports_the_column_size():
+    import asyncpg
+    from mcp.server.fastmcp import FastMCP
+
+    from stratakb.config import get_settings
+    from stratakb.database_access.tools import register_database_tools
+
+    db_url = get_settings().database_url
+    try:
+        conn = await asyncpg.connect(db_url, timeout=5)
+    except Exception:
+        pytest.skip("database not reachable")
+    await conn.close()
+
+    server = FastMCP("test")
+    register_database_tools(server, db_url, "")
+    with patch("stratakb.config.get_settings", return_value=_settings()):
+        stats = await server._tool_manager.get_tool("strata_db_vector_stats").fn()
+
+    column = await check_vector_column(db_url, 768)
+    assert stats["embedding_dimensions"] == column["column_dimensions"]
