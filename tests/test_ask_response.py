@@ -17,10 +17,13 @@ import pytest
 from stratakb.rag.passages import (
     MAX_PASSAGES,
     RESPONSE_SLACK_TOKENS,
+    ChunkRef,
+    DocumentRef,
     build_passages,
     cite,
     estimate_tokens,
     pack_passages,
+    parse_ref,
     passage_cost,
     passage_ref,
 )
@@ -197,6 +200,15 @@ class TestRefAndCitation:
             == "d7:30-41"
         assert passage_ref({"chunk_id": "abc", "document_id": None, "char_start": None}) == "cabc"
         assert passage_ref({"chunk_id": "abc"}) == "cabc"
+
+    def test_parse_ref_reads_what_passage_ref_writes(self):
+        chunk_id = str(uuid4())
+        document = {"chunk_id": chunk_id, "document_id": 7, "char_start": 30, "char_end": 41}
+        assert parse_ref(passage_ref(document)) == DocumentRef(7, 30, 41)
+        assert parse_ref(passage_ref({"chunk_id": chunk_id})) == ChunkRef(chunk_id)
+        assert parse_ref(passage_ref({"chunk_id": chunk_id.upper()})) == ChunkRef(chunk_id)
+        for malformed in ("d7:30", "cabc", "x7:1-2", "d7:1-2 ", ""):
+            assert parse_ref(malformed) is None
 
     def test_pdf_citation_has_page_and_lines_on_the_page(self):
         text = "page one\nline two\n\nfirst\nsecond\nthird"

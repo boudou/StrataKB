@@ -271,10 +271,11 @@ Then ask from your client, for example *"How long should a line of Python be?"*.
 | Tool | Role | What it does |
 | --- | --- | --- |
 | `strata_ask` | viewer | Rewrites a question, searches in parallel, reranks, and returns found, partly found or not found with the best passages, each with its file, page, lines and headings ([what it returns](#what-strata_ask-returns)) |
+| `strata_verify` | viewer | Checks a drafted answer against the passages it cites: every quote, number, date, amount, code and clause reference must be in them. A verified draft gets a receipt ([checking a drafted answer](#checking-a-drafted-answer)) |
 | `strata_search` | viewer | Hybrid search for exact terms and identifiers, with optional layer and metadata filters, and a confidence level |
 | `strata_list_knowledge_layers` | viewer | Lists layers with document and chunk counts |
 | `strata_get_layer_status` | viewer | One layer's configuration and ingestion history |
-| `strata_get_receipt` | viewer | Opens a receipt (`rcpt_…`, also the resource `strata://receipts/{receipt_id}`): the stored quotes of an answer, each in its surrounding document text, flagged when its source changed since. Open to whoever asked and to anyone who may read every cited layer, for `RECEIPT_RETENTION_DAYS` (90 by default). Receipts are issued by `strata_verify` and extractive answers, which are not built yet ([roadmap](#roadmap)) |
+| `strata_get_receipt` | viewer | Opens a receipt (`rcpt_…`, also the resource `strata://receipts/{receipt_id}`): the stored quotes of an answer, each in its surrounding document text, flagged when its source changed since. Open to whoever asked and to anyone who may read every cited layer, for `RECEIPT_RETENTION_DAYS` (90 by default). Receipts are issued by `strata_verify`; extractive answers will issue them too ([roadmap](#roadmap)) |
 | `strata_feedback` | viewer | Rates a result as helpful or not, per answer or per passage (`S1`) or chunk |
 | `strata_learning_stats` | viewer | What the learning system has recorded and learned |
 | `strata_whoami` | viewer | Your identity and role |
@@ -337,6 +338,33 @@ By default the answer is short: a status, the mode and the passages, each with i
 - Each passage's `text` is the stored document's own text. `ref` names its span in the stored document (`d<document id>:<start>-<end>`), or the chunk (`c<chunk id>`) for a chunk ingested before documents were stored. The citation has the file's path relative to the ingested folder, the page (PDFs; `page_end` too when the passage spans pages), the line range (from the page's start for PDFs) and the clause path from the structure map (for a chunk without one, such as one stored before the map existed or text before the first heading, the parser's heading path when it has one). A chunk ingested before documents were stored is cited by its file name, without lines.
 - `interaction_id` goes to `strata_feedback`, which takes passage ids for every passage returned: `{"S1": "useful", "S2": "wrong"}`.
 - `response_format: "detailed"` returns everything as well: `confidence`, the query variants (`queries_used`), `retrieved_chunks` with their ids, scores and metadata, `sources`, with `status` `ok` and the found, partly found or not found in `answer_status`.
+
+### Checking a drafted answer
+
+After your client writes an answer from the passages, it can pass the draft and the passages' `ref`s (in order, so the first is `S1`) to `strata_verify` before showing it:
+
+```json
+{
+  "draft": "Either party may end the agreement with 90 days' notice [S1]: \"Either party may end this agreement with ninety days' written notice.\" [S1]",
+  "passages": ["d42:1830-1905"]
+}
+```
+
+```mermaid
+flowchart LR
+    D["Draft + refs"] --> T["Read each span<br/>from the store"]
+    T --> C{Quotes and facts<br/>in the passages?}
+    C -->|yes| V["verified + receipt"]
+    C -->|no| F["flags: the text,<br/>and the passages searched"]
+```
+
+- The passages' text is read from the stored documents, never taken from the request. A `ref` must lie inside its document and span at most twice the layer's `chunk_size`, so a citation cannot be widened to a whole document. A `ref` that names nothing stored, or a layer you may not read, is refused with one message for both.
+- **Quotes:** every quoted span (`"…" [S2]`) must appear in the passage it cites (in any passage when it cites none), after whitespace, quote marks and dashes are normalised; `...` inside a quote marks an omission.
+- **Facts:** every number, date, amount, percentage, code (such as `AC01`, `pacs.008` or an IBAN) and clause reference outside the quotes must appear in at least one passage. Both sides are normalised: `30 days` matches `thirty (30) days`, `1,000.00` matches `1000`, `EUR 1.000,00` matches `1000 EUR`, and `2026-11-04` matches `4 November 2026`. An amount matches only an amount or a plain number, never a day count, clause number or year. A date such as `04/11/2026`, which could be either day or month first, only matches as written. The `1.` and `2)` of a numbered list are not facts.
+- **Citations:** an `[S5]` when four passages were given is flagged.
+- The result is `verified` with a `receipt_id` (open it with `strata_get_receipt`), or `flagged` with a list of flags, each naming the text, why, and the passages searched, for example `"13 days" not found in S1–S4`. At most 50 flags are listed; `more_flags` counts the rest. The receipt keeps the passages and the draft, with IBANs, BICs and account numbers in the draft replaced by placeholders.
+- Both checks run in Python, without a model: nothing leaves the machine. They catch a changed quote, number, date, amount, code or clause, not a paraphrase that changes the meaning without changing a fact. For layers where that is not acceptable, use `answer_mode: extractive` ([roadmap](#roadmap)).
+- Each call writes one audit entry (`verify`) with counts and, when verified, the receipt id; never the draft.
 
 ## Configuration
 
@@ -525,7 +553,7 @@ src/stratakb/
     sql/              Schema, applied in version order by the server: 01_init, 02_learning, then the 04–12 upgrades
   knowledge/          Layers, presets, ingestion pipeline, structure map, parsers, embeddings, vector store
     add_folder.py     Turns one folder into one layer and keeps it in sync
-  rag/                Retriever (hybrid + RRF), reranker, cache, routing, query rewriter, cited passages, receipts, tools
+  rag/                Retriever (hybrid + RRF), reranker, cache, routing, query rewriter, cited passages, receipts, verify, tools
   learning/           Interaction tracking, signals, synonyms, promotion, feedback tools
   database_access/    Read-only SQL and introspection tools
 tests/                pytest suite
@@ -555,7 +583,7 @@ The target: ask your own documents (contracts, rulebooks, specs, runbooks) and g
 1. **Five-minute start**: add a folder in one step, a one-command local mode, any OpenAI-compatible model provider, and a clear statement of where data goes.
 2. **Answers you can prove** (planned): every claim can be checked against its source, so you can be sure the model did not make it up.
    - Each passage comes with its exact location: file, page, line range and clause (`7 Termination > 7.2`), and documents are chunked along their clauses and sections.
-   - **Grounded mode:** your client writes the answer, and `strata_verify` checks that every quote, number, date, amount, code and clause reference in it appears in the cited passages.
+   - **Grounded mode** (available): your client writes the answer, and `strata_verify` checks that every quote, number, date, amount, code and clause reference in it appears in the cited passages.
    - **Extractive mode:** for layers where paraphrase is not acceptable, the server answers with the document's own sentences, chosen without a language model.
    - **Receipts:** every verified or extractive answer gets a receipt you can open outside the chat, showing the quotes in context and whether the document changed since.
    - An honest "not found" instead of a confident guess, and smaller responses that cost fewer tokens.

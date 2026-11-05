@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import json
 import math
+import re
+from dataclasses import dataclass
 from typing import Any
 
 from stratakb.knowledge.documents import locate
@@ -74,6 +76,35 @@ def passage_ref(chunk: dict[str, Any]) -> str:
     if chunk.get("document_id") is not None and chunk.get("char_start") is not None:
         return f"d{chunk['document_id']}:{chunk['char_start']}-{chunk['char_end']}"
     return f"c{chunk['chunk_id']}"
+
+
+@dataclass(frozen=True)
+class DocumentRef:
+    """A span of a stored document's text: d<document_id>:<char_start>-<char_end>."""
+
+    document_id: int
+    char_start: int
+    char_end: int
+
+
+@dataclass(frozen=True)
+class ChunkRef:
+    """A stored chunk named by its id: c<chunk_id>."""
+
+    chunk_id: str
+
+
+_DOCUMENT_REF = re.compile(r"d(\d{1,18}):(\d{1,9})-(\d{1,9})")
+_CHUNK_REF = re.compile(r"c([0-9a-fA-F]{8}-(?:[0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12})")
+
+
+def parse_ref(ref: str) -> DocumentRef | ChunkRef | None:
+    """The span or chunk a ref written by passage_ref names; None when malformed."""
+    if m := _DOCUMENT_REF.fullmatch(ref):
+        return DocumentRef(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+    if m := _CHUNK_REF.fullmatch(ref):
+        return ChunkRef(m.group(1).lower())
+    return None
 
 
 def _clause_path(chunk: dict[str, Any], metadata: dict[str, Any]) -> str | None:

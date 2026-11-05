@@ -1,9 +1,9 @@
 """Receipts: a stored, checkable record of what the server returned or verified.
 
-A receipt holds the question (always PII-scrubbed), the answer mode and each
-quote with the document version it came from (id, version, SHA-256, offsets,
-clause path, text origin) and the quote's own text, so it still opens after
-its source changed or was deleted. Opening one shows every quote in its
+A receipt holds the question and any draft answer (both always PII-scrubbed),
+the answer mode and each quote with the document version it came from (id,
+version, SHA-256, offsets, clause path, text origin) and the quote's own text,
+so it still opens after its source changed or was deleted. Opening one shows every quote in its
 surrounding text and flags a source that changed since. Issuing and opening
 are audited; the audit entry holds the receipt id and counts, never quote
 text. Receipts older than RECEIPT_RETENTION_DAYS are pruned (prune_receipts).
@@ -83,8 +83,9 @@ async def issue_receipt(
     {"document_id", "char_start", "char_end"} and optionally "clause_path".
     Everything else (version, SHA-256, text origin, layer, file and the quote
     text) is read from the stored document, so a receipt records what the
-    knowledge base holds, not what a caller claims. The question is scrubbed
-    with scrub_query whatever LEARNING_STORE_RAW_QUERIES says.
+    knowledge base holds, not what a caller claims. The question and the
+    draft are scrubbed with scrub_query whatever LEARNING_STORE_RAW_QUERIES
+    says.
 
     Raises:
         ReceiptError: For an unknown kind, an unknown document or a span
@@ -141,7 +142,7 @@ async def issue_receipt(
         layers = sorted({q["layer"] for q in stored})
         body: dict = {"quotes": stored}
         if draft is not None:
-            body["draft"] = draft
+            body["draft"] = scrub_query(draft)
         if verification is not None:
             body["verification"] = verification
 

@@ -41,6 +41,7 @@ from stratakb.learning.tools import register_learning_tools
 from stratakb.rag.receipt_tools import register_receipt_tools
 from stratakb.rag.receipts import prune_receipts
 from stratakb.rag.tools import register_rag_tools
+from stratakb.rag.verify_tools import register_verify_tools
 
 logger = structlog.get_logger()
 
@@ -151,8 +152,9 @@ _INSTRUCTIONS = (
     "StrataKB is a knowledge base of documents organised in layers, one per "
     "domain (for example a standard, a product's docs or a team's runbooks). "
     "Use strata_ask to answer questions with cited context, strata_search for "
-    "exact terms and identifiers, and strata_list_knowledge_layers to see what "
-    "the knowledge base covers. Admin tools create layers, ingest documents and "
+    "exact terms and identifiers, strata_verify to check a drafted answer's "
+    "quotes and facts against the cited passages, and strata_list_knowledge_layers "
+    "to see what the knowledge base covers. Admin tools create layers, ingest documents and "
     "apply layer presets."
 )
 
@@ -169,6 +171,7 @@ def build_server(settings: Settings) -> FastMCP:
     register_knowledge_tools(mcp, settings.database_url, settings.openai_api_key)
     register_rag_tools(mcp, settings.database_url, settings.openai_api_key)
     register_receipt_tools(mcp, settings.database_url)
+    register_verify_tools(mcp, settings.database_url)
     register_database_tools(mcp, settings.database_url, settings.readonly_database_url)
     register_learning_tools(mcp, settings.database_url)
     _register_admin_tools(mcp, settings)
