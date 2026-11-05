@@ -90,7 +90,7 @@ The reference below explains how StrataKB works, every tool and every setting; t
 - **Local embeddings by default**: `all-mpnet-base-v2` runs on CPU with no API key; OpenAI or any OpenAI-compatible server (Ollama, LM Studio, vLLM) is optional
 - **Roles and audit**: viewer, operator and admin roles on every tool, and an append-only audit log of searches and changes
 - **Local-only switch**: `STRATA_LOCAL_ONLY=true` refuses to start while any setting would send content off this machine, and keeps model downloads off; see [Where your data goes](#where-your-data-goes)
-- **Privacy guards**: IBANs and card numbers are masked in logs, and IBANs, BICs and account numbers are scrubbed from stored queries; secrets are redacted from audit entries; files whose names look like secrets (`.env`, keys, certificates, credentials) are never read or ingested
+- **Privacy guards**: IBANs and card numbers are masked in logs, and IBANs, BICs and account numbers are scrubbed from stored queries and audited questions; secrets are redacted from audit entries; files whose names look like secrets (`.env`, keys, certificates, credentials) are never read or ingested
 - **Read-only SQL**: inspect the store with schema browsing, sample chunks, vector statistics and `EXPLAIN`
 
 ## How it works
@@ -299,6 +299,8 @@ On the stdio transport, `STRATA_USER` and `STRATA_ROLE` set who you are. Whoever
 
 The `stratakb add` command has no role check: whoever can reach the database with `DATABASE_URL` can add a folder. Each run writes one audit entry with the tool name `cli:add`, the folder, the run id and the counts per outcome (no file names). Its user is `STRATA_USER` when you set it, otherwise `os:` plus your login name, a name nobody verified.
 
+`strata_search` and `strata_ask` each write one audit entry with the first 200 characters of the query or question, with IBANs, BICs and account numbers replaced by placeholders (`[IBAN_REDACTED]`, `[BIC_REDACTED]`, `[ACCT_REDACTED]`), plus the layers searched and whether routing fell back. `AUDIT_STORE_RAW_QUERIES=true` keeps the question as written; `LEARNING_STORE_RAW_QUERIES` has no effect on the audit log.
+
 `strata_feedback` and `strata_reset_learning` each write one audit entry. A feedback entry holds the interaction id and the rating, not the suggested query or layer; a reset entry names the layer, or says it reset everything.
 
 Each `strata_apply_preset` run writes one audit entry with the layer, whether it was created, updated or already up to date, the names of the settings that changed (never their values) and the number of documents and chunks ingested. A refused run writes none.
@@ -377,6 +379,7 @@ flowchart LR
 | `CACHE_MAXSIZE` | `500` | Query results kept in the cache |
 | `LEARNING_ENABLED` | `true` | Record interactions and learn from them |
 | `LEARNING_STORE_RAW_QUERIES` | `false` | Store queries without scrubbing personal data |
+| `AUDIT_STORE_RAW_QUERIES` | `false` | Keep questions in audit entries without scrubbing personal data; independent of `LEARNING_STORE_RAW_QUERIES` |
 | `LEARNING_SESSION_TIMEOUT_MINUTES` | `30` | Idle minutes that end a session for rephrase detection |
 | `LEARNING_PROMOTE_EVERY_N_QUERIES` | `50` | Interactions between promotion runs |
 | `LEARNING_MIN_SUCCESS_RATE` | `0.6` | Lowest success rate for a learned rewrite to be used |

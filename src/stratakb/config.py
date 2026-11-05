@@ -87,6 +87,9 @@ class Settings(BaseSettings):
     # (about four characters each); the first passage always comes back
     answer_token_budget: int = 1500
 
+    # Audit: if True, search and ask entries keep questions without PII scrubbing
+    audit_store_raw_queries: bool = False
+
     # Learning System
     learning_enabled: bool = True
     learning_store_raw_queries: bool = False  # if True, stores queries without PII scrubbing

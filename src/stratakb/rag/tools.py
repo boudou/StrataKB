@@ -14,6 +14,7 @@ from mcp.server.fastmcp import FastMCP
 from stratakb.core.audit import write_audit_log
 from stratakb.core.auth import get_current_user, require_role
 from stratakb.core.logging import log_tool_call
+from stratakb.learning.pii import scrub_query
 from stratakb.rag.confidence import answer_status, score_confidence, similarity_or_zero
 from stratakb.rag.passages import (
     RESPONSE_FORMATS,
@@ -65,6 +66,11 @@ def _routing_fallback_reason(
     if confidence["level"] == "low":
         return "low_confidence"
     return None
+
+
+def _audit_text(text: str, store_raw: bool) -> str:
+    """The question or query as an audit entry keeps it: scrubbed, then cut to 200."""
+    return (text if store_raw else scrub_query(text))[:200]
 
 
 def _fuse_query_results(
@@ -259,7 +265,7 @@ def register_rag_tools(
                 action="search",
                 tool_name="strata_search",
                 parameters={
-                    "query": query[:200],
+                    "query": _audit_text(query, _settings.audit_store_raw_queries),
                     "layers": layers,
                     "top_k": top_k,
                     "routing_fallback": bool(fallback_reason),
@@ -464,7 +470,7 @@ def register_rag_tools(
                 action="ask",
                 tool_name="strata_ask",
                 parameters={
-                    "question": question[:200],
+                    "question": _audit_text(question, _settings.audit_store_raw_queries),
                     "layers": layers,
                     "queries_used": len(queries),
                     "routing_fallback": bool(fallback_reason),
