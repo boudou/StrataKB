@@ -39,6 +39,8 @@ from stratakb.knowledge.policy import is_secret_name
 from stratakb.knowledge.vector_store import ChunkRecord, chunk_embed_text, insert_chunks
 
 if TYPE_CHECKING:
+    from uuid import UUID
+
     from stratakb.knowledge.selection import FileEntry
 
 logger = structlog.get_logger()
@@ -150,7 +152,8 @@ async def _store_file(
     """Replace one file's row, document version and chunks in a single transaction.
 
     The text is stored as the file's current document version (reused when
-    unchanged); versions no chunk references any more are pruned afterwards.
+    unchanged); this file's versions no chunk references any more are pruned
+    afterwards.
     """
     pool = await get_pool(database_url)
     async with pool.acquire() as conn:
@@ -198,29 +201,52 @@ async def _store_file(
                     chunk.char_start = chunk.char_end = None
             await insert_chunks(database_url, chunks, conn=conn)
             # Only after the insert: until then the current version is unreferenced
-            await prune_documents(conn, layer_id)
+            await prune_documents(
+                conn, layer_id, source_root=source_root, relative_paths=[relative_path]
+            )
+
+
+async def _remove_files(
+    pool: asyncpg.Pool,
+    *,
+    layer_id: str,
+    source_root: str,
+    files: Sequence[tuple[str, UUID]],
+) -> None:
+    """Remove tracked files, given as (relative path, ingested_files id), in one transaction.
+
+    Deleting the rows cascades to their chunks and unlinks their documents,
+    so their versions are pruned afterwards.
+    """
+    async with pool.acquire() as conn, conn.transaction():
+        await conn.execute(
+            "DELETE FROM strata_core.ingested_files WHERE id = ANY($1::uuid[])",
+            [file_id for _, file_id in files],
+        )
+        await prune_documents(
+            conn, layer_id, source_root=source_root, relative_paths=[path for path, _ in files]
+        )
 
 
 async def clear_layer(database_url: str, layer_name: str) -> None:
     """Delete every chunk and ingested_files row of a layer, and its unreferenced documents."""
     await ensure_schema(database_url)
     pool = await get_pool(database_url)
+    files = 0
     async with pool.acquire() as conn:
         async with conn.transaction():
-            chunks = await conn.execute(
-                "DELETE FROM strata_vectors.chunks WHERE layer_name = $1", layer_name
-            )
-            files = await conn.execute(
-                """
-                DELETE FROM strata_core.ingested_files
-                WHERE layer_id = (SELECT id FROM strata_core.knowledge_layers WHERE name = $1)
-                """,
-                layer_name,
-            )
             layer_id = await conn.fetchval(
                 "SELECT id FROM strata_core.knowledge_layers WHERE name = $1", layer_name
             )
+            # By name: this also removes legacy chunks that have no file row
+            chunks = await conn.execute(
+                "DELETE FROM strata_vectors.chunks WHERE layer_name = $1", layer_name
+            )
             if layer_id is not None:
+                deleted = await conn.execute(
+                    "DELETE FROM strata_core.ingested_files WHERE layer_id = $1", layer_id
+                )
+                files = int(deleted.split()[-1])
                 await prune_documents(conn, layer_id)
     # After the commit: the recount runs on another connection
     await _update_layer_stats(database_url, layer_name)
@@ -228,7 +254,7 @@ async def clear_layer(database_url: str, layer_name: str) -> None:
         "layer_cleared",
         layer=layer_name,
         chunks=int(chunks.split()[-1]),
-        files=int(files.split()[-1]),
+        files=files,
     )
 
 
@@ -409,11 +435,12 @@ async def ingest_documents(
                 result.files.append(FileOutcome(relative_path, "skipped", reason))
                 result.files_skipped += 1
                 return
-            async with pool.acquire() as conn, conn.transaction():
-                await conn.execute(
-                    "DELETE FROM strata_core.ingested_files WHERE id = $1", previous["id"]
-                )
-                await prune_documents(conn, layer_id)
+            await _remove_files(
+                pool,
+                layer_id=layer_id,
+                source_root=source_root,
+                files=[(relative_path, previous["id"])],
+            )
             result.files.append(FileOutcome(relative_path, "removed", reason))
             result.files_removed += 1
 
@@ -547,12 +574,9 @@ async def ingest_documents(
                 if path not in seen and (files is not None or not (root / path).exists())
             ]
             if gone:
-                async with pool.acquire() as conn, conn.transaction():
-                    await conn.execute(
-                        "DELETE FROM strata_core.ingested_files WHERE id = ANY($1::uuid[])",
-                        [file_id for _, file_id in gone],
-                    )
-                    await prune_documents(conn, layer_id)
+                await _remove_files(
+                    pool, layer_id=layer_id, source_root=source_root, files=gone
+                )
                 result.files.extend(
                     FileOutcome(
                         path, "removed", "deleted" if not (root / path).exists() else "not_selected"

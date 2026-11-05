@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import json
 from bisect import bisect_right
+from collections.abc import Sequence
 from pathlib import Path
 
 import asyncpg
@@ -26,6 +27,10 @@ PAGE_SEPARATOR = "\n\n"
 # Formats whose page numbers are real pages; for the others a "page" is a
 # section or a record, so no page map is stored
 _PAGED_FORMATS = {".pdf"}
+
+# First key of the two-key advisory lock that serializes version numbering
+# per file; Postgres keeps it apart from the one-key migration lock
+_VERSION_LOCK_NAMESPACE = 0x53544B44
 
 
 def page_starts(doc: ParsedDocument) -> list[int]:
@@ -73,60 +78,95 @@ async def store_document_version(
     not by file row, so a layer that was cleared and ingested again continues
     its numbering while older versions are still stored, and same-named files
     from different roots keep separate versions.
+
+    Numbering is serialized per file: a transaction-scoped advisory lock on
+    (layer, source root, relative path) makes a concurrent call for the same
+    file wait until the first caller's transaction ends, and then read the
+    version it committed. The function opens its own transaction (a savepoint
+    inside the caller's), so the lock holds until the outermost one ends.
     """
     sha256 = hashlib.sha256(text.encode("utf-8")).hexdigest()
-    latest = await conn.fetchrow(
-        """
-        SELECT id, version, sha256 FROM strata_vectors.documents
-        WHERE layer_id = $1 AND source_root = $2 AND relative_path = $3
-        ORDER BY version DESC LIMIT 1
-        """,
-        layer_id,
-        source_root,
-        relative_path,
-    )
-    if latest is not None and latest["sha256"] == sha256:
+    async with conn.transaction():
         await conn.execute(
-            "UPDATE strata_vectors.documents SET file_id = $2 WHERE id = $1",
-            latest["id"],
-            file_id,
+            "SELECT pg_advisory_xact_lock($1, $2)",
+            _VERSION_LOCK_NAMESPACE,
+            _version_lock_key(layer_id, source_root, relative_path),
         )
-        return latest["id"], latest["version"]
+        latest = await conn.fetchrow(
+            """
+            SELECT id, version, sha256 FROM strata_vectors.documents
+            WHERE layer_id = $1 AND source_root = $2 AND relative_path = $3
+            ORDER BY version DESC LIMIT 1
+            """,
+            layer_id,
+            source_root,
+            relative_path,
+        )
+        if latest is not None and latest["sha256"] == sha256:
+            await conn.execute(
+                "UPDATE strata_vectors.documents SET file_id = $2 WHERE id = $1",
+                latest["id"],
+                file_id,
+            )
+            return latest["id"], latest["version"]
 
-    version = 1 if latest is None else latest["version"] + 1
-    document_id = await conn.fetchval(
-        """
-        INSERT INTO strata_vectors.documents
-            (layer_id, file_id, source_root, relative_path, version, text, sha256,
-             page_map, text_origin)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-        RETURNING id
-        """,
-        layer_id,
-        file_id,
-        source_root,
-        relative_path,
-        version,
-        text,
-        sha256,
-        json.dumps(page_map) if page_map is not None else None,
-        text_origin,
-    )
+        version = 1 if latest is None else latest["version"] + 1
+        document_id = await conn.fetchval(
+            """
+            INSERT INTO strata_vectors.documents
+                (layer_id, file_id, source_root, relative_path, version, text, sha256,
+                 page_map, text_origin)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+            RETURNING id
+            """,
+            layer_id,
+            file_id,
+            source_root,
+            relative_path,
+            version,
+            text,
+            sha256,
+            json.dumps(page_map) if page_map is not None else None,
+            text_origin,
+        )
     logger.info("document_version_stored", relative_path=relative_path, version=version)
     return document_id, version
 
 
-async def prune_documents(conn: asyncpg.Connection, layer_id: str) -> int:
-    """Delete the layer's documents that no chunk references; return the count."""
+def _version_lock_key(layer_id: str, source_root: str, relative_path: str) -> int:
+    """One file's advisory lock key: signed 32 bits, the same in every process."""
+    identity = f"{layer_id}\x00{source_root}\x00{relative_path}".encode()
+    return int.from_bytes(hashlib.sha256(identity).digest()[:4], "big", signed=True)
+
+
+async def prune_documents(
+    conn: asyncpg.Connection,
+    layer_id: str,
+    *,
+    source_root: str | None = None,
+    relative_paths: Sequence[str] | None = None,
+) -> int:
+    """Delete documents that no chunk references; return the count.
+
+    Without source_root and relative_paths the whole layer is swept; with
+    them, only those files' versions. Pass both or neither.
+    """
+    if (source_root is None) != (relative_paths is None):
+        raise ValueError("Pass both source_root and relative_paths, or neither")
+    scope = ""
+    args: list = [layer_id]
+    if source_root is not None:
+        scope = "AND d.source_root = $2 AND d.relative_path = ANY($3::text[])"
+        args += [source_root, list(relative_paths)]
     result = await conn.execute(
-        """
+        f"""
         DELETE FROM strata_vectors.documents d
-        WHERE d.layer_id = $1
+        WHERE d.layer_id = $1 {scope}
           AND NOT EXISTS (
               SELECT 1 FROM strata_vectors.chunks c WHERE c.document_id = d.id
           )
         """,
-        layer_id,
+        *args,
     )
     return int(result.split()[-1])
 

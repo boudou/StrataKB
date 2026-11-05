@@ -97,6 +97,31 @@ async def _assert_offsets_match(db_url: str, layer: str) -> dict:
     return {d["relative_path"]: d for d in docs.values()}
 
 
+async def _layer_id(db_url: str, layer: str):
+    from stratakb.core.database import get_pool
+
+    pool = await get_pool(db_url)
+    return await pool.fetchval(
+        "SELECT id FROM strata_core.knowledge_layers WHERE name = $1", layer
+    )
+
+
+async def _store_bare_document(
+    db_url: str, layer: str, source_root: str, relative_path: str, text: str
+) -> None:
+    """Store a document version that no chunk references."""
+    from stratakb.core.database import get_pool
+    from stratakb.knowledge.documents import store_document_version
+
+    layer_id = await _layer_id(db_url, layer)
+    pool = await get_pool(db_url)
+    async with pool.acquire() as conn, conn.transaction():
+        await store_document_version(
+            conn, layer_id=layer_id, file_id=None, source_root=source_root,
+            relative_path=relative_path, text=text, page_map=None,
+        )
+
+
 def _copy(name: str, dest: Path) -> Path:
     dest.mkdir(parents=True, exist_ok=True)
     return Path(shutil.copy(FIXTURES / name, dest / name))
@@ -345,6 +370,93 @@ class TestVersions:
         b.unlink()
         await _ingest(db_url, layer, tmp_path)
         assert [d["relative_path"] for d in await _documents(db_url, layer)] == ["a.md"]
+
+    async def test_store_prunes_only_its_own_file(self, db_url, layer, tmp_path):
+        root = tmp_path.resolve().as_posix()
+        # A document no chunk references, as another path may leave behind
+        await _store_bare_document(db_url, layer, root, "a.md", "Alpha.")
+
+        b = tmp_path / "b.md"
+        b.write_text("# B\n\nFirst text about failover.\n", encoding="utf-8")
+        await _ingest(db_url, layer, b)
+        b.write_text("# B\n\nSecond text about restores.\n", encoding="utf-8")
+        await _ingest(db_url, layer, b)
+
+        docs = await _documents(db_url, layer)
+        assert [(d["relative_path"], d["version"]) for d in docs] == [("a.md", 1), ("b.md", 2)]
+
+    async def test_removed_file_keeps_other_files_documents(self, db_url, layer, tmp_path):
+        root = tmp_path.resolve().as_posix()
+        (tmp_path / "a.md").write_text("# A\n\nAlpha.\n", encoding="utf-8")
+        b = tmp_path / "b.md"
+        b.write_text("# B\n\nBeta.\n", encoding="utf-8")
+        await _ingest(db_url, layer, tmp_path)
+        await _store_bare_document(db_url, layer, root, "c.md", "Gamma.")
+
+        # An emptied file is removed as having no text
+        b.write_text("", encoding="utf-8")
+        result = await _ingest(db_url, layer, tmp_path)
+        assert ("b.md", "removed", "no_text") in [
+            (f.relative_path, f.outcome, f.reason) for f in result.files
+        ]
+        assert [d["relative_path"] for d in await _documents(db_url, layer)] == ["a.md", "c.md"]
+
+    @pytest.mark.parametrize("same_text", [False, True])
+    async def test_concurrent_versions_numbered(self, db_url, layer, same_text):
+        import asyncio
+
+        from stratakb.core.database import get_pool
+        from stratakb.knowledge.documents import store_document_version
+
+        pool = await get_pool(db_url)
+        layer_id = await _layer_id(db_url, layer)
+
+        def store(conn, text):
+            return store_document_version(
+                conn, layer_id=layer_id, file_id=None, source_root="/race",
+                relative_path="race.md", text=text, page_map=None,
+            )
+
+        async with pool.acquire() as conn_a, pool.acquire() as conn_b:
+            tx_a = conn_a.transaction()
+            await tx_a.start()
+            tx_b = conn_b.transaction()
+            await tx_b.start()
+            try:
+                first = await store(conn_a, "First text.")
+                task = asyncio.create_task(
+                    store(conn_b, "First text." if same_text else "Second text.")
+                )
+                # B must be waiting on A before A commits
+                pid = conn_b.get_server_pid()
+                async with asyncio.timeout(5):
+                    while await pool.fetchval(
+                        "SELECT wait_event_type FROM pg_stat_activity WHERE pid = $1", pid
+                    ) != "Lock":
+                        await asyncio.sleep(0.05)
+                await tx_a.commit()
+                second = await task
+                await tx_b.commit()
+            except BaseException:
+                with contextlib.suppress(Exception):
+                    await tx_a.rollback()
+                with contextlib.suppress(Exception):
+                    await tx_b.rollback()
+                raise
+
+        assert first[1] == 1
+        if same_text:
+            assert second == first
+        else:
+            assert second[1] == 2
+        versions = [
+            r["version"] for r in await pool.fetch(
+                "SELECT version FROM strata_vectors.documents"
+                " WHERE layer_id = $1 AND relative_path = 'race.md' ORDER BY version",
+                layer_id,
+            )
+        ]
+        assert versions == ([1] if same_text else [1, 2])
 
     async def test_clear_layer_prunes_documents(self, db_url, layer, tmp_path):
         from stratakb.knowledge.ingestion import clear_layer
