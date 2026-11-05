@@ -1,0 +1,33 @@
+name: Links
+
+# External links in the repository and the wiki, once a week. Reports only:
+# a site that is down for a day should not turn anything red.
+on:
+  schedule:
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  links:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Clone the wiki
+        run: git clone --depth 1 "https://github.com/${{ github.repository }}.wiki.git" wiki
+      - name: Check the repository's links
+        uses: lycheeverse/lychee-action@v2
+        with:
+          args: --include-fragments --no-progress --max-retries 3 --root-dir "${{ github.workspace }}" --exclude-path wiki './**/*.md'
+          output: lychee-repo.md
+          fail: false
+          jobSummary: true
+      - name: Check the wiki's links
+        uses: lycheeverse/lychee-action@v2
+        with:
+          args: --include-fragments --no-progress --max-retries 3 --root-dir "${{ github.workspace }}/wiki" 'wiki/**/*.md'
+          output: lychee-wiki.md
+          fail: false
+          jobSummary: true

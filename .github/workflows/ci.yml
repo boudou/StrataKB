@@ -9,6 +9,16 @@ on:
 permissions:
   contents: read
 
+# A new push to a pull request cancels its run still going; runs on main finish
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  PEPS: >-
+    /peps/pep-0008.rst /peps/pep-0020.rst /peps/pep-0257.rst /peps/pep-0484.rst
+    /peps/pep-0572.rst /peps/pep-0634.rst /peps/pep-0695.rst /peps/pep-0723.rst
+
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -36,14 +46,117 @@ jobs:
       - uses: astral-sh/setup-uv@v10.3.3
         with:
           enable-cache: true
+      - run: uv sync --extra dev --locked
+      # The database starts empty, as a new user's does: the server's own
+      # migrations build the schemas, then the read-only role is added
       - name: Create schemas
         run: |
-          for f in src/stratakb/core/sql/01_init.sql src/stratakb/core/sql/02_learning.sql db/03_readonly_role.sql src/stratakb/core/sql/04_ingested_files.sql; do
-            psql -h localhost -p 5433 -U strata -d strata -v ON_ERROR_STOP=1 -f "$f"
-          done
-      - run: uv sync --extra dev --locked
+          uv run python -c "import asyncio, os; from stratakb.core.migrations import ensure_schema; asyncio.run(ensure_schema(os.environ['DATABASE_URL']))"
+          psql -h localhost -p 5433 -U strata -d strata -v ON_ERROR_STOP=1 -f db/03_readonly_role.sql
       - name: Fetch a few PEPs
         run: |
           git clone --depth 1 --filter=blob:none --sparse https://github.com/python/peps.git examples/peps/source
-          git -C examples/peps/source sparse-checkout set --no-cone /peps/pep-0008.rst /peps/pep-0020.rst /peps/pep-0257.rst /peps/pep-0484.rst /peps/pep-0572.rst /peps/pep-0634.rst /peps/pep-0695.rst /peps/pep-0723.rst
+          git -C examples/peps/source sparse-checkout set --no-cone $PEPS
       - run: uv run pytest
+
+  # Search and ask with the real embedding and reranking models, nothing patched
+  e2e:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_DB: strata
+          POSTGRES_USER: strata
+          POSTGRES_PASSWORD: strata_ci_password
+        ports:
+          - 5433:5432
+        options: >-
+          --health-cmd "pg_isready -U strata"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgresql://strata:strata_ci_password@localhost:5433/strata
+      STRATA_E2E: "1"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.3.3
+        with:
+          enable-cache: true
+      - run: uv sync --extra dev --locked
+      - name: Create schemas
+        run: uv run python -c "import asyncio, os; from stratakb.core.migrations import ensure_schema; asyncio.run(ensure_schema(os.environ['DATABASE_URL']))"
+      - name: Cache the models
+        uses: actions/cache@v6
+        with:
+          path: ~/.cache/huggingface
+          key: hf-${{ runner.os }}-all-mpnet-base-v2-ms-marco-MiniLM-L-6-v2
+      # The server loads models offline first; fetch them here so the tests
+      # find them in the cache.
+      - name: Download the models
+        env:
+          HF_HUB_OFFLINE: "0"
+        run: >-
+          uv run python -c "from huggingface_hub import snapshot_download;
+          snapshot_download('sentence-transformers/all-mpnet-base-v2');
+          snapshot_download('cross-encoder/ms-marco-MiniLM-L-6-v2')"
+      - name: Fetch a few PEPs
+        run: |
+          git clone --depth 1 --filter=blob:none --sparse https://github.com/python/peps.git examples/peps/source
+          git -C examples/peps/source sparse-checkout set --no-cone $PEPS
+      - run: uv run pytest tests/test_e2e_real_model.py -v
+
+  # Ruff on the lines a pull request changes, and line endings on its files.
+  # The rest of the tree has older ruff findings that are fixed separately.
+  lint:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    env:
+      BASE: origin/${{ github.base_ref }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: astral-sh/setup-uv@v10.3.3
+      - name: Ruff on changed lines
+        run: python3 scripts/ruff_changed_lines.py "$BASE" uvx ruff@0.17.3
+      - name: LF line endings in changed files
+        run: |
+          mapfile -t files < <(git diff --name-only --diff-filter=ACMR "$BASE"...HEAD)
+          if [ ${#files[@]} -eq 0 ]; then exit 0; fi
+          crlf=$(git ls-files --eol -- "${files[@]}" | awk -F'\t' '$1 ~ /^i\/crlf / {print $2}')
+          if [ -n "$crlf" ]; then
+            while IFS= read -r f; do
+              echo "::error file=$f::stored with CRLF line endings; the repository stores LF"
+            done <<< "$crlf"
+            exit 1
+          fi
+
+  # Attribution trailers, home-folder paths and private terms in the commits,
+  # the title, the body and the added lines (see CONTRIBUTING.md)
+  repo-rules:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha }}
+      - name: Check the repository rules
+        env:
+          BASE: origin/${{ github.base_ref }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+          STRATA_PRIVATE_TERMS: ${{ secrets.STRATA_PRIVATE_TERMS }}
+        run: python3 scripts/check_repo_rules.py "$BASE"
+
+  # Known vulnerabilities in the dependencies a pull request adds or bumps
+  dependency-review:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/dependency-review-action@v5.0.0
+        with:
+          fail-on-severity: high

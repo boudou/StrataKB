@@ -30,6 +30,7 @@ Notable changes to StrataKB. The format follows [Keep a Changelog](https://keepa
 - At startup the server checks, in the background, that the embedding server lists the configured model and that the vector column matches `EMBEDDING_DIMENSIONS`; `strata_admin_health` reports both under `embedding`.
 - Ingestion flags PDFs that look scanned (`files_flagged`, reason `probably_scanned`).
 - Numbered schema migrations, recorded in `strata_core.schema_migrations`. The server and `stratakb add` build an empty database from the schema files shipped in the package, and bring an existing one up to date.
+- More CI checks: an end-to-end job with the real embedding and reranking models, a stdio smoke test, ruff and LF line endings on changed files, a repository-rules check (`scripts/check_repo_rules.py`), dependency review, Mermaid and offline link checks on Markdown changes, and a weekly external-link check of the repository and the wiki. The test database now starts empty and is built by the server's own migrations. See "What CI checks" in CONTRIBUTING.md.
 
 ### Changed
 
