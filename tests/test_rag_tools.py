@@ -18,6 +18,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from stratakb.core.egress import PLACEHOLDER_API_KEY
 
 # ==========================================
 # Layer detection tests
@@ -413,7 +414,7 @@ class TestOpenAICompatibleRewriter:
         openai_cls.assert_called_once()
         kwargs = openai_cls.call_args.kwargs
         assert kwargs["base_url"] == _LOCAL_URL
-        assert kwargs["api_key"] == ""
+        assert kwargs["api_key"] == PLACEHOLDER_API_KEY
         assert kwargs["max_retries"] == 0
         anthropic_cls.assert_not_called()
 
@@ -438,7 +439,7 @@ class TestOpenAICompatibleRewriter:
         ):
             await rewrite_query("q")
         kwargs = openai_cls.call_args.kwargs
-        assert kwargs["api_key"] == ""
+        assert kwargs["api_key"] == PLACEHOLDER_API_KEY
         assert kwargs["base_url"] == _LOCAL_URL
 
         settings = _compatible_settings(query_rewrite_api_key="endpoint-key")
