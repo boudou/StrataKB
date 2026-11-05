@@ -16,11 +16,6 @@ import os
 import threading
 from typing import TYPE_CHECKING
 
-# Skip HuggingFace HTTP checks — model is cached locally after first download.
-# Prevents HEAD requests that add latency on cold start.
-os.environ.setdefault("HF_HUB_OFFLINE", "1")
-os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
-
 import structlog
 
 if TYPE_CHECKING:
@@ -83,6 +78,24 @@ def is_model_cached(model_name: str) -> bool:
         return False
 
 
+def load_cached_first(model_cls, model_name: str, missing_error: str):
+    """Load a sentence-transformers model, from local files when it is cached.
+
+    A cached model loads without HTTP checks. On a cache miss the model is
+    loaded again with the network, which downloads it, unless
+    STRATA_LOCAL_ONLY is on: then the miss raises missing_error.
+    """
+    from stratakb.config import get_settings
+
+    try:
+        return model_cls(model_name, local_files_only=True)
+    except Exception as e:
+        if get_settings().strata_local_only:
+            raise RuntimeError(missing_error) from e
+        logger.info("retrying_model_load_online", model=model_name)
+        return model_cls(model_name)
+
+
 # Singleton for local model (loaded once, reused)
 _local_model = None
 _local_model_lock = threading.Lock()
@@ -99,27 +112,12 @@ def _get_local_model(model_name: str = "all-MiniLM-L6-v2"):
             return _local_model
         from sentence_transformers import SentenceTransformer
 
-        from stratakb.config import get_settings
-
         logger.info("loading_local_embedding_model", model=model_name)
-        if get_settings().strata_local_only:
-            # Local files only, and no online retry
-            try:
-                model = SentenceTransformer(model_name, local_files_only=True)
-            except Exception as e:
-                raise RuntimeError(_missing_model_error(model_name)) from e
-            model._model_name = model_name  # tag for cache check
-            _local_model = model
-            logger.info("local_embedding_model_loaded", model=model_name)
-            return _local_model
-        try:
-            _local_model = SentenceTransformer(model_name)
-        except Exception:
-            # If offline mode fails (model not cached), retry with network
-            os.environ.pop("HF_HUB_OFFLINE", None)
-            logger.info("retrying_model_load_online", model=model_name)
-            _local_model = SentenceTransformer(model_name)
-        _local_model._model_name = model_name  # tag for cache check
+        model = load_cached_first(
+            SentenceTransformer, model_name, _missing_model_error(model_name)
+        )
+        model._model_name = model_name  # tag for cache check
+        _local_model = model
         logger.info("local_embedding_model_loaded", model=model_name)
     return _local_model
 

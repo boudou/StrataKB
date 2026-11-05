@@ -25,22 +25,18 @@ def _get_reranker(model_name: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"):
             return _reranker
         from sentence_transformers import CrossEncoder
 
-        from stratakb.config import get_settings
+        from stratakb.knowledge.embeddings import load_cached_first
 
         logger.info("loading_reranker_model", model=model_name)
-        if get_settings().strata_local_only:
-            try:
-                _reranker = CrossEncoder(model_name, local_files_only=True)
-            except Exception as e:
-                raise RuntimeError(
-                    f"STRATA_LOCAL_ONLY is on and the reranking model {model_name} is "
-                    f"not installed on this machine, so it cannot be downloaded. On a "
-                    f"machine that may download, run `uv run hf download {model_name}`, "
-                    f"set RERANKING_MODEL to a folder that holds the model, or set "
-                    f"RERANKING_ENABLED=false."
-                ) from e
-        else:
-            _reranker = CrossEncoder(model_name)
+        _reranker = load_cached_first(
+            CrossEncoder,
+            model_name,
+            f"STRATA_LOCAL_ONLY is on and the reranking model {model_name} is "
+            f"not installed on this machine, so it cannot be downloaded. On a "
+            f"machine that may download, run `uv run hf download {model_name}`, "
+            f"set RERANKING_MODEL to a folder that holds the model, or set "
+            f"RERANKING_ENABLED=false.",
+        )
         logger.info("reranker_model_loaded", model=model_name)
     return _reranker
 
