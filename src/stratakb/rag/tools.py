@@ -65,15 +65,17 @@ def _fuse_query_results(
     compare across searches; positions do. A chunk earns 1 / (k + rank) from
     each search that finds it, so one found by several searches comes first.
     Ties go to the higher similarity, then to the first seen. Each chunk is
-    represented by its most similar copy. The results are never modified (the
-    search cache shares them); the fused score, best 1.0, travels alongside.
+    represented by its most similar copy. Chunks are told apart by their
+    chunk_id, so two different chunks with the same text both stay. The
+    results are never modified (the search cache shares them); the fused
+    score, best 1.0, travels alongside.
     """
     fused: dict[str, float] = {}
     best: dict[str, SearchResult] = {}
     for results in batch_results:
         seen: set[str] = set()
         for rank, r in enumerate(results, start=1):
-            key = str(hash(r.content[:200]))
+            key = r.chunk_id
             if key in seen:
                 continue
             seen.add(key)

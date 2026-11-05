@@ -642,11 +642,11 @@ _ASK_CHUNK_KEYS = [
 ]
 
 
-def _result(name, score, similarity):
+def _result(name, score, similarity, *, content=None, layer="docs"):
     from stratakb.rag.retriever import SearchResult
 
     return SearchResult(
-        chunk_id=name, content=f"{name} text", score=score, layer_name="docs",
+        chunk_id=name, content=content or f"{name} text", score=score, layer_name=layer,
         source_file=f"{name}.md", source_section="", doc_type="", similarity=similarity,
     )
 
@@ -743,6 +743,53 @@ class TestAskOrdering:
         await _ask_with(by_query)
 
         assert {q: [r.score for r in rs] for q, rs in by_query.items()} == before
+
+    @pytest.mark.asyncio
+    async def test_ask_keeps_chunks_sharing_a_prefix_in_one_query(self, no_sdk_env):
+        prefix = "x" * 200
+        by_query = {
+            "q": [
+                _result("a", 1.0, 0.5, content=prefix + " alpha"),
+                _result("b", 0.8, 0.4, content=prefix + " beta"),
+            ],
+        }
+        result = await _ask_with(by_query)
+
+        assert {c["chunk_id"] for c in result["retrieved_chunks"]} == {"a", "b"}
+
+    @pytest.mark.asyncio
+    async def test_ask_keeps_chunks_sharing_a_prefix_across_queries(self, no_sdk_env):
+        prefix = "x" * 200
+        by_query = {
+            "one": [_result("a", 1.0, 0.5, content=prefix + " alpha")],
+            "two": [_result("b", 1.0, 0.4, content=prefix + " beta")],
+        }
+        result = await _ask_with(by_query)
+
+        assert {c["chunk_id"] for c in result["retrieved_chunks"]} == {"a", "b"}
+
+    @pytest.mark.asyncio
+    async def test_ask_keeps_identical_text_from_two_layers(self, no_sdk_env):
+        text = "A shared glossary entry that two layers both store."
+        by_query = {
+            "q": [
+                _result("docs-copy", 1.0, 0.5, content=text, layer="docs"),
+                _result("glossary-copy", 0.9, 0.5, content=text, layer="glossary"),
+            ],
+        }
+        result = await _ask_with(by_query)
+
+        ids = {c["chunk_id"] for c in result["retrieved_chunks"]}
+        assert ids == {"docs-copy", "glossary-copy"}
+        assert {s["layer"] for s in result["sources"]} == {"docs", "glossary"}
+
+    @pytest.mark.asyncio
+    async def test_ask_lists_chunk_found_by_two_queries_once(self, no_sdk_env):
+        by_query = {"one": [_result("both", 1.0, 0.5)], "two": [_result("both", 1.0, 0.5)]}
+        result = await _ask_with(by_query)
+
+        assert [c["chunk_id"] for c in result["retrieved_chunks"]] == ["both"]
+        assert result["retrieved_chunks"][0]["score"] == 1.0
 
 
 # ==========================================
