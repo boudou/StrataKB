@@ -11,6 +11,7 @@ Tests cover:
 
 from __future__ import annotations
 
+import contextlib
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
@@ -390,6 +391,51 @@ class TestIngestionPipeline:
                 await delete_layer(db_url, name=layer_name)
             except LayerNotFoundError:
                 pass
+
+    @pytest.mark.asyncio
+    async def test_layer_chunk_config_is_used(self, db_url, tmp_path):
+        """A layer's stored chunk_config sets the chunk size, not the defaults."""
+        from stratakb.core.database import get_pool
+        from stratakb.knowledge.ingestion import ingest_documents
+        from stratakb.knowledge.layers import LayerNotFoundError, create_layer, delete_layer
+
+        layer_name = "test_ingestion_chunk_config"
+        source = tmp_path / "words.txt"
+        source.write_text("word " * 200, encoding="utf-8")
+        try:
+            with contextlib.suppress(LayerNotFoundError):
+                await delete_layer(db_url, name=layer_name)
+            await create_layer(
+                db_url,
+                name=layer_name,
+                display_name="Test Chunk Config",
+                chunk_config={"chunk_size": 300, "chunk_overlap": 0},
+            )
+
+            with patch(
+                "stratakb.knowledge.ingestion.embed_texts",
+                new_callable=AsyncMock,
+            ) as mock_embed:
+                mock_embed.side_effect = lambda texts, **kwargs: [[0.01] * 768 for _ in texts]
+                result = await ingest_documents(
+                    db_url,
+                    "fake-key",
+                    layer_name=layer_name,
+                    source_path=str(source),
+                )
+
+            assert result.docs_processed == 1
+            pool = await get_pool(db_url)
+            rows = await pool.fetch(
+                "SELECT content FROM strata_vectors.chunks WHERE layer_name = $1",
+                layer_name,
+            )
+            lengths = [len(r["content"]) for r in rows]
+            assert len(lengths) > 1
+            assert max(lengths) <= 300
+        finally:
+            with contextlib.suppress(LayerNotFoundError):
+                await delete_layer(db_url, name=layer_name)
 
 
 # ==========================================

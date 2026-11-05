@@ -303,9 +303,9 @@ async def ingest_documents(
         return result
 
     layer_id = layer["id"]
-    chunk_config = layer.get("chunk_config", {})
-    chunk_size = chunk_config.get("chunk_size", 1000) if isinstance(chunk_config, dict) else 1000
-    chunk_overlap = chunk_config.get("chunk_overlap", 200) if isinstance(chunk_config, dict) else 200
+    chunk_config = layer["chunk_config"]
+    chunk_size = chunk_config.get("chunk_size", 1000)
+    chunk_overlap = chunk_config.get("chunk_overlap", 200)
 
     # Step 2: Discover files
     source = Path(source_path)

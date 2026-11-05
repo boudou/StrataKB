@@ -41,6 +41,9 @@ _LAYER_COLUMNS = (
     "created_at, updated_at, origin, owner, root_path, answer_mode"
 )
 
+# asyncpg returns jsonb as text (the pool sets no JSON codec): decoded in _layer_dict
+_JSONB_COLUMNS = ("metadata_schema", "chunk_config", "routing_patterns")
+
 # Search tools read routing patterns and descriptions through a short-lived
 # cache. This process's create, delete and setters clear it at once; a layer
 # change from another process clears it within 2 s (see _maybe_clear).
@@ -127,6 +130,15 @@ def _validate_length(field: str, value: str | None, limit: int) -> None:
         raise LayerValidationError(f"{field} must be at most {limit} characters.")
 
 
+def _layer_dict(row: asyncpg.Record) -> dict:
+    """Return a layer row as a dict, with its jsonb columns decoded."""
+    layer = dict(row)
+    for column in _JSONB_COLUMNS:
+        if isinstance(layer.get(column), str):
+            layer[column] = json.loads(layer[column])
+    return layer
+
+
 async def list_layers(database_url: str) -> list[dict]:
     """Return all configured knowledge layers."""
     await ensure_schema(database_url)
@@ -138,7 +150,7 @@ async def list_layers(database_url: str) -> list[dict]:
         ORDER BY name
         """
     )
-    return [dict(r) for r in rows]
+    return [_layer_dict(r) for r in rows]
 
 
 async def create_layer(
@@ -210,7 +222,7 @@ async def create_layer(
 
     _routing_cache.clear()
     logger.info("layer_created", layer=name)
-    return dict(row)
+    return _layer_dict(row)
 
 
 async def get_layer_status(database_url: str, *, name: str) -> dict:
@@ -239,7 +251,7 @@ async def get_layer_status(database_url: str, *, name: str) -> dict:
     )
     if row is None:
         raise LayerNotFoundError(f"Knowledge layer '{name}' not found.")
-    return dict(row)
+    return _layer_dict(row)
 
 
 async def find_layer_by_root(database_url: str, root_path: str) -> dict | None:
@@ -254,7 +266,7 @@ async def find_layer_by_root(database_url: str, root_path: str) -> dict | None:
         """,
         root_path,
     )
-    return dict(row) if row is not None else None
+    return _layer_dict(row) if row is not None else None
 
 
 async def find_overlapping_roots(database_url: str, root_path: str) -> list[dict]:
@@ -278,7 +290,7 @@ async def find_overlapping_roots(database_url: str, root_path: str) -> list[dict
         """,
         root_path,
     )
-    return [dict(r) for r in rows]
+    return [_layer_dict(r) for r in rows]
 
 
 async def layer_holds_folder(database_url: str, layer_name: str, root_path: str) -> bool:

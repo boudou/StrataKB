@@ -174,12 +174,23 @@ class TestLayerCRUDIntegration:
             layers = await list_layers(db_url)
             names = [l["name"] for l in layers]
             assert layer_name in names
+            listed = next(row for row in layers if row["name"] == layer_name)
 
             # Status
             status = await get_layer_status(db_url, name=layer_name)
             assert status["name"] == layer_name
             assert status["chunk_count"] == 0
             assert status["ingestion_run_count"] == 0
+
+            # The jsonb columns come back decoded, not as JSON text
+            for layer in (created, listed, status):
+                assert layer["chunk_config"] == {
+                    "chunk_size": 500,
+                    "chunk_overlap": 100,
+                    "splitting_strategy": "recursive",
+                }
+                assert layer["metadata_schema"] == {"test_field": "string"}
+                assert layer["routing_patterns"] == []
 
             # Delete
             result = await delete_layer(db_url, name=layer_name)
@@ -377,6 +388,7 @@ class TestFolderFieldsIntegration:
             await create_layer(db_url, name=name, display_name="Find", root_path=root)
             found = await find_layer_by_root(db_url, root)
             assert found is not None and found["name"] == name
+            assert isinstance(found["chunk_config"], dict)
             assert await find_layer_by_root(db_url, f"{ROOT}/other") is None
         finally:
             await _drop_layers(db_url, name)
