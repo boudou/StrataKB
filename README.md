@@ -274,7 +274,7 @@ Then ask from your client, for example *"How long should a line of Python be?"*.
 | `strata_search` | viewer | Hybrid search for exact terms and identifiers, with optional layer and metadata filters, and a confidence level |
 | `strata_list_knowledge_layers` | viewer | Lists layers with document and chunk counts |
 | `strata_get_layer_status` | viewer | One layer's configuration and ingestion history |
-| `strata_get_receipt` | viewer | Opens a receipt (`rcpt_…`, also the resource `strata://receipts/{receipt_id}`): the stored quotes of an answer, each in its surrounding document text, flagged when its source changed since. Open to whoever asked and to anyone who may read every cited layer. Receipts are issued by `strata_verify` and extractive answers, which are not built yet ([roadmap](#roadmap)) |
+| `strata_get_receipt` | viewer | Opens a receipt (`rcpt_…`, also the resource `strata://receipts/{receipt_id}`): the stored quotes of an answer, each in its surrounding document text, flagged when its source changed since. Open to whoever asked and to anyone who may read every cited layer, for `RECEIPT_RETENTION_DAYS` (90 by default). Receipts are issued by `strata_verify` and extractive answers, which are not built yet ([roadmap](#roadmap)) |
 | `strata_feedback` | viewer | Rates a result as helpful or not, per answer or per passage (`S1`) or chunk |
 | `strata_learning_stats` | viewer | What the learning system has recorded and learned |
 | `strata_whoami` | viewer | Your identity and role |
@@ -380,6 +380,7 @@ flowchart LR
 | `LEARNING_ENABLED` | `true` | Record interactions and learn from them |
 | `LEARNING_STORE_RAW_QUERIES` | `false` | Store queries without scrubbing personal data |
 | `AUDIT_STORE_RAW_QUERIES` | `false` | Keep questions in audit entries without scrubbing personal data; independent of `LEARNING_STORE_RAW_QUERIES` |
+| `RECEIPT_RETENTION_DAYS` | `90` | Days a receipt is kept; the server deletes older ones at startup and then once a day, with the document versions only they kept, and records each prune in the audit log. `0` keeps receipts forever |
 | `LEARNING_SESSION_TIMEOUT_MINUTES` | `30` | Idle minutes that end a session for rephrase detection |
 | `LEARNING_PROMOTE_EVERY_N_QUERIES` | `50` | Interactions between promotion runs |
 | `LEARNING_MIN_SUCCESS_RATE` | `0.6` | Lowest success rate for a learned rewrite to be used |

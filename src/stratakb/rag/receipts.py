@@ -6,7 +6,7 @@ clause path, text origin) and the quote's own text, so it still opens after
 its source changed or was deleted. Opening one shows every quote in its
 surrounding text and flags a source that changed since. Issuing and opening
 are audited; the audit entry holds the receipt id and counts, never quote
-text.
+text. Receipts older than RECEIPT_RETENTION_DAYS are pruned (prune_receipts).
 """
 
 from __future__ import annotations
@@ -21,6 +21,7 @@ from stratakb.core.audit import write_audit_log
 from stratakb.core.auth import check_role, get_current_user
 from stratakb.core.database import get_pool
 from stratakb.core.migrations import ensure_schema
+from stratakb.knowledge.documents import prune_documents
 from stratakb.learning.pii import scrub_query
 
 logger = structlog.get_logger()
@@ -279,3 +280,56 @@ async def open_receipt(
         if key in body:
             result[key] = body[key]
     return result
+
+
+async def prune_receipts(database_url: str, retention_days: int) -> dict:
+    """Delete receipts older than retention_days and the versions only they kept.
+
+    Then sweeps every layer those receipts cited with prune_documents, which
+    removes the versions no chunk and no other receipt references; current
+    versions keep their chunks and stay. 0 deletes nothing. A run that deleted
+    something is audited as user "system" with the counts. Safe to run from
+    several servers at once: a receipt already deleted is simply not counted.
+
+    Returns:
+        {"receipts": deleted receipts, "documents": pruned document versions}
+    """
+    if retention_days <= 0:
+        return {"receipts": 0, "documents": 0}
+    await ensure_schema(database_url)
+    pool = await get_pool(database_url)
+    async with pool.acquire() as conn, conn.transaction():
+        # NOW() is the transaction's start, so both statements share one cutoff
+        cutoff = "NOW() - make_interval(days => $1)"
+        layer_ids = await conn.fetch(
+            f"""
+            SELECT DISTINCT d.layer_id
+            FROM strata_core.receipts r
+            JOIN strata_core.receipt_documents rd ON rd.receipt_id = r.id
+            JOIN strata_vectors.documents d ON d.id = rd.document_id
+            WHERE r.issued_at < {cutoff}
+            """,
+            retention_days,
+        )
+        deleted = await conn.execute(
+            f"DELETE FROM strata_core.receipts WHERE issued_at < {cutoff}", retention_days
+        )
+        receipts = int(deleted.split()[-1])
+        documents = 0
+        for row in layer_ids:
+            documents += await prune_documents(conn, row["layer_id"])
+
+    counts = {"receipts": receipts, "documents": documents}
+    if receipts:
+        await write_audit_log(
+            database_url,
+            user_id="system",
+            action="receipt_prune",
+            tool_name="receipt_retention",
+            parameters={"retention_days": retention_days, **counts},
+            result_summary=(
+                f"Deleted {receipts} receipts and {documents} document versions"
+            ),
+        )
+        logger.info("receipts_pruned", **counts)
+    return counts

@@ -6,6 +6,7 @@ import os
 import sys
 from pathlib import Path
 
+from pydantic import Field
 from pydantic_settings import BaseSettings
 
 DOTENV_WARNING = "./.env is not read; set STRATAKB_CONFIG=.env to use it."
@@ -89,6 +90,10 @@ class Settings(BaseSettings):
 
     # Audit: if True, search and ask entries keep questions without PII scrubbing
     audit_store_raw_queries: bool = False
+
+    # Receipts: days a receipt is kept, with the document versions only it
+    # cites; 0 keeps them forever. Pruned at startup and then once a day.
+    receipt_retention_days: int = Field(default=90, ge=0)
 
     # Learning System
     learning_enabled: bool = True

@@ -11,6 +11,8 @@ Tests cover:
 - The lifespan yields without waiting for the embedding checks, and cancels them on exit
 - The embedding checks learn whether the database warm-up succeeded
 - The lifespan wired by build_server uses the settings the server was built with
+- Receipt retention prunes at startup without blocking, logs a failure, is
+  cancelled on exit, and never runs with RECEIPT_RETENTION_DAYS=0
 
 No database and no model are needed: the pool, the migration and the model
 load are patched.
@@ -58,6 +60,13 @@ def embedding_checks():
     """Keep the embedding checks off the network and off a real pool."""
     with patch("stratakb.mcp_server.run_embedding_checks", AsyncMock()) as checks:
         yield checks
+
+
+@pytest.fixture(autouse=True)
+def prune_receipts():
+    """Keep the receipt retention task off a real pool."""
+    with patch("stratakb.mcp_server.prune_receipts", AsyncMock()) as prune:
+        yield prune
 
 
 @pytest.fixture
@@ -268,3 +277,49 @@ async def test_embedding_checks_without_database(embedding_checks, settings, ser
         async with mcp_server._lifespan(server, settings):
             await asyncio.sleep(0)
     embedding_checks.assert_awaited_once_with(settings, False)
+
+
+async def test_receipt_retention_runs_at_startup(db_ok, prune_receipts, settings, server):
+    settings = settings.model_copy(update={"receipt_retention_days": 30})
+    async with mcp_server._lifespan(server, settings):
+        await asyncio.sleep(0)
+    prune_receipts.assert_awaited_once_with(settings.database_url, 30)
+
+
+async def test_receipt_retention_off_with_zero(db_ok, prune_receipts, settings, server):
+    settings = settings.model_copy(update={"receipt_retention_days": 0})
+    async with mcp_server._lifespan(server, settings):
+        await asyncio.sleep(0)
+    prune_receipts.assert_not_awaited()
+
+
+async def test_receipt_retention_failure_logged(db_ok, prune_receipts, settings, server):
+    prune_receipts.side_effect = OSError("refused")
+    with capture_logs() as logs:
+        async with mcp_server._lifespan(server, settings):
+            await asyncio.sleep(0)
+
+    failed = [e for e in logs if e["event"] == "receipt_prune_failed"]
+    assert len(failed) == 1
+    assert failed[0]["error_type"] == "OSError"
+    assert failed[0]["log_level"] == "warning"
+
+
+async def test_receipt_retention_cancelled_on_exit(db_ok, settings, server):
+    started = asyncio.Event()
+    cancelled = asyncio.Event()
+
+    async def blocking_prune(database_url, days):
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+
+    with patch("stratakb.mcp_server.prune_receipts", blocking_prune):
+        t0 = time.monotonic()
+        async with mcp_server._lifespan(server, settings):
+            assert time.monotonic() - t0 < 1.0
+            await asyncio.wait_for(started.wait(), 1.0)
+    assert cancelled.is_set()

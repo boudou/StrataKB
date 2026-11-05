@@ -39,6 +39,7 @@ from stratakb.knowledge.embedding_checks import (
 from stratakb.knowledge.tools import register_knowledge_tools
 from stratakb.learning.tools import register_learning_tools
 from stratakb.rag.receipt_tools import register_receipt_tools
+from stratakb.rag.receipts import prune_receipts
 from stratakb.rag.tools import register_rag_tools
 
 logger = structlog.get_logger()
@@ -98,15 +99,40 @@ async def _lifespan(server: FastMCP, settings: Settings):
     # the task is not garbage-collected mid-run.
     checks = asyncio.create_task(run_embedding_checks(settings, db_ready))
 
+    # Expire old receipts now and once a day, in the background
+    retention = asyncio.create_task(_receipt_retention_loop(settings))
+
     try:
         yield {}
     finally:
-        # Cancel before the pool closes: a column read may still be in flight
-        checks.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await checks
+        # Cancel before the pool closes: a column read or a prune may still
+        # be in flight
+        for task in (checks, retention):
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
         await close_pool()
         logger.info("shutting_down")
+
+
+RECEIPT_PRUNE_INTERVAL_SECONDS = 24 * 60 * 60
+
+
+async def _receipt_retention_loop(settings: Settings) -> None:
+    """Prune expired receipts now and every 24 hours; 0 days never runs.
+
+    A failed run is logged and retried at the next interval, so a database
+    that is down at startup is pruned once it is back.
+    """
+    days = settings.receipt_retention_days
+    if days <= 0:
+        return
+    while True:
+        try:
+            await prune_receipts(settings.database_url, days)
+        except Exception as e:
+            logger.warning("receipt_prune_failed", error_type=type(e).__name__)
+        await asyncio.sleep(RECEIPT_PRUNE_INTERVAL_SECONDS)
 
 
 def _preload_embedding_model_sync(model_name: str) -> None:
