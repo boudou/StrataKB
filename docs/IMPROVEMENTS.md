@@ -36,7 +36,7 @@ Changes of direction the goal requires:
 - **#27:** cloud OCR and the vision model for figures send document content out. They are opt-in and blocked by the local-only switch (#6).
 - **#30 and #31:** per-layer regular expressions are an advanced option. A layer must work without them, and presets ship the patterns for their domain.
 - **#17:** a team server also needs ingestion from the developer's machine (#18) and per-layer access (#19). Otherwise every developer still needs shell access to the server.
-- **#79:** StrataKB stays on PostgreSQL with pgvector, for one person and for a team. `stratakb db up` starts a local database with Docker Compose; a separate SQLite mode (#5) was dropped.
+- **#79:** StrataKB stays on PostgreSQL with pgvector, for one person and for a team. `stratakb db up` starts a local database in Docker; a separate SQLite mode (#5) was dropped.
 - **#25:** git repositories come first among connectors, since that is where developers keep READMEs, ADRs, runbooks and API specs.
 
 ### Order of work
@@ -77,7 +77,7 @@ flowchart LR
     x --> k
 ```
 
-- Milestone 1 comes first because nobody reaches the other features without it. Shipped so far: #3, #4, #6, #7, #37, #38, #40, #48–#62 and #70; left: `stratakb db up` (#79), the umbrella #1 and #2. #9 and #11 shipped alongside it.
+- Milestone 1 comes first because nobody reaches the other features without it. Shipped so far: #3, #4, #6, #7, #37, #38, #40, #48–#62, #70 and `stratakb db up` (#79); left: the umbrella #1 and #2, and the bug follow-ups. #9 and #11 shipped alongside it.
 - Milestone 2 ships `strata_verify` first (#72 → #63 → #23 → #66 → #67): it needs no calibration. #72, #63, #78 and #10 have shipped; #10 put confidence on a meaningful scale with provisional thresholds. #8 runs alongside, and extractive answers (#68) follow once #8 calibrates the "not found" threshold. #64 and #65 run in parallel. #73–#78 are small slices next to their parents; #78 can start any time, and #77 waits for the `stratakb` command (#70).
 - #8 also needs an abstention set and verify-rate and faithfulness metrics for milestone 2.
 - #16 comes before #17, because the SDK 2.x line brings the auth support.

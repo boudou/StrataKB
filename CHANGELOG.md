@@ -33,6 +33,8 @@ Notable changes to StrataKB. The format follows [Keep a Changelog](https://keepa
 - A routed search (no layers given) that returns fewer results than asked for, or only low-confidence ones, runs again across all layers. `strata_search` and `strata_ask` report `routing_fallback` with the reason (`insufficient_results` or `low_confidence`); layers you name are never broadened. Results carry the query/chunk cosine `similarity` next to the fused rank score.
 - `HYBRID_KEYWORD_SLOTS` (default 1): hybrid search keeps places for the best full-text matches, so an exact term or identifier the embedding misses (a reason code, a message name) still reaches the results. The `hybrid_search_complete` log reports `keyword_only_results`.
 - Each ingested document's extracted text is stored once per version in the new `strata_vectors.documents` table (migration `07_documents.sql`), and every chunk records where it sits in that text (`char_start`, `char_end`). A document's version goes up only when its text changes; old versions are removed once no chunk uses them. Chunks ingested before this change have no offsets and stay searchable. Backups made with `scripts/backup_restore.py` do not include the stored text yet.
+- `stratakb db up` starts a local PostgreSQL with pgvector in Docker (container `stratakb-db`, volume `stratakb-data`, `127.0.0.1:5433` or `--port`), waits until it accepts connections and builds the schema; it needs no checkout of the repository. Run again, it leaves a running database alone and starts a stopped one with its data. `stratakb db down` stops it and keeps the volume. The Quick start uses it; `docker compose` stays for development. When `stratakb add` or the server cannot reach the database, the message ends with "Run `stratakb db up` to start a local database."
+- `vector_store.re_embed_all_layers()` re-embeds every layer in one transaction and resizes the shared vector column once when the dimensions change.
 - Layers have an `answer_mode`, `grounded` (default) or `extractive` (migration `12_answer_mode.sql`). Presets set it with an `answer_mode` key, and layer listings show it. The server records the mode but does not act on it yet.
 
 ### Changed
@@ -51,6 +53,7 @@ Notable changes to StrataKB. The format follows [Keep a Changelog](https://keepa
 - `strata_search` no longer turns words in the question into metadata filters.
 - `strata_ask` confidence is judged on a meaningful scale: the reranker's relevance probability (0 to 1, the reranker now applies a sigmoid) or, with reranking off, the query/chunk cosine similarity. Before, hybrid scores were divided by the top score, so almost any answer came back `high`. The result reports the `basis` (`rerank` or `similarity`). The thresholds are provisional. Confidence stored for earlier interactions is on the old scale.
 - Both search queries run with a 10 s statement timeout.
+- A schema update waits at most 30 seconds for a lock another process holds, then stops and names the lock.
 
 ### Fixed
 
@@ -66,6 +69,8 @@ Notable changes to StrataKB. The format follows [Keep a Changelog](https://keepa
 - The CI and release workflows pin `astral-sh/setup-uv` to a tag that exists.
 - The embedding and reranking models are downloaded when they are not cached. Before, the server switched Hugging Face to offline mode when it loaded, so a new install could not ingest, search or ask until the models were downloaded by hand. A cached model still loads without contacting Hugging Face, and with `STRATA_LOCAL_ONLY=true` nothing is downloaded.
 - Each layer is chunked with its own `chunk_size` and `chunk_overlap`. Before, the stored settings came back from the database as text and every layer was chunked at 1000/200. Layer listings return `chunk_config` and `metadata_schema` as objects and `routing_patterns` as a list.
+- `vector_store.re_embed_layer()` no longer resizes the vector column that every layer shares, which left the other layers unsearchable and locked the whole table. It refuses a new size and points at `re_embed_all_layers()`; the startup check's message says the same.
+- A half-built schema (`01_init.sql` applied without `02_learning.sql`) is repaired instead of failing the update. A user without `USAGE` on the StrataKB schemas is told which privilege is missing, instead of being sent to a schema file. Migration 06 is no longer recorded when the database user could not revoke the grants it removes.
 - `strata_search` interactions store a confidence judged on the query/chunk similarity, with its level. Before, they stored the top fused score, which is always 1.0, and no level, so the learning loop never learned from searches. `strata_search` results now carry each chunk's `similarity`.
 
 ### Security

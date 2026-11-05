@@ -424,7 +424,7 @@ src/stratakb/
   cli.py              The stratakb command: add a folder, start a local database, or start the server
   mcp_server.py       MCP server: admin and user tools
   core/               Database pool, roles, audit log, logging, schema migrations, local database in Docker
-    sql/              Schema, applied in version order by the server: 01_init, 02_learning, then 04–06 upgrades
+    sql/              Schema, applied in version order by the server: 01_init, 02_learning, then the 04–12 upgrades
   knowledge/          Layers, presets, ingestion pipeline, parsers, embeddings, vector store
     add_folder.py     Turns one folder into one layer and keeps it in sync
   rag/                Retriever (hybrid + RRF), reranker, cache, routing, query rewriter, tools
