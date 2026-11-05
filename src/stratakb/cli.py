@@ -152,7 +152,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 
 def _serve() -> int:
-    # Lazy: the server module reads settings and configures logging on import
+    # Lazy: the server module imports every tool module, which db and add do not need
     from stratakb.mcp_server import main as serve_main
 
     serve_main()

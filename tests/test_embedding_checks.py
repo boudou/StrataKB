@@ -109,7 +109,8 @@ async def _health(settings: Settings) -> dict:
             AsyncMock(return_value={"status": "ok"}),
         ),
     ):
-        return await mcp_server.strata_admin_health()
+        server = mcp_server.build_server(settings)
+        return await server._tool_manager.get_tool("strata_admin_health").fn()
 
 
 # ==========================================

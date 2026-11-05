@@ -456,15 +456,18 @@ class TestSqlToolsGate:
         from unittest.mock import patch
 
         from stratakb import mcp_server
+        from stratakb.config import get_settings
         from stratakb.database_access import tools
 
+        # Building a server resets the SQL tools status, so build first
+        server = mcp_server.build_server(get_settings())
         tools._sql_tools.clear()
         tools._sql_tools.update(status="disabled", reason="READONLY_DATABASE_URL is not set")
         with patch(
             "stratakb.mcp_server.check_connection",
             AsyncMock(return_value={"status": "ok"}),
         ):
-            result = await mcp_server.strata_admin_health()
+            result = await server._tool_manager.get_tool("strata_admin_health").fn()
 
         assert result["sql_tools"] == {
             "status": "disabled",
