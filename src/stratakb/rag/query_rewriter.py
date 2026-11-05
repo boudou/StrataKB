@@ -144,10 +144,8 @@ async def _call_openai_compatible(
     settings: Settings, model: str, system: str, query: str
 ) -> str | None:
     """Ask the OpenAI-compatible endpoint in QUERY_REWRITE_BASE_URL and return the reply text."""
-    from stratakb.core.egress import openai_compatible_client
+    from stratakb.core.egress import keyless_request_options, openai_compatible_client
 
-    # Always pass both: with None the SDK reads OPENAI_API_KEY and OPENAI_BASE_URL,
-    # and OPENAI_API_KEY must never reach a custom endpoint
     client = openai_compatible_client(
         settings.query_rewrite_api_key,
         settings.query_rewrite_base_url,
@@ -161,6 +159,7 @@ async def _call_openai_compatible(
             {"role": "system", "content": system},
             {"role": "user", "content": query},
         ],
+        **keyless_request_options(settings.query_rewrite_api_key),
     )
     if not response.choices:
         return None
@@ -260,7 +259,15 @@ async def rewrite_query(
         else:
             text = await _call_anthropic(anthropic_api_key, model, system, enriched_query)
     except Exception as e:
-        logger.warning("query_rewrite_failed", error=str(e), query=query[:100])
+        hint = None
+        if provider == "openai_compatible":
+            from stratakb.core.egress import unauthorized_detail
+
+            hint = unauthorized_detail(e, settings.query_rewrite_api_key, "QUERY_REWRITE_API_KEY")
+        if hint:
+            logger.warning("query_rewrite_failed", error=str(e), query=query[:100], hint=hint)
+        else:
+            logger.warning("query_rewrite_failed", error=str(e), query=query[:100])
         return [enriched_query]
 
     queries = _extract_queries(text)

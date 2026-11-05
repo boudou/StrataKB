@@ -23,7 +23,7 @@ logger = structlog.get_logger()
 
 _OPENAI_DEFAULT_URL = "https://api.openai.com/v1"
 _ANTHROPIC_DEFAULT_URL = "https://api.anthropic.com"
-# Sent to an OpenAI-compatible endpoint configured without a key
+# Satisfies the SDK's construction check; never sent, see keyless_request_options
 PLACEHOLDER_API_KEY = "unused"
 
 
@@ -114,24 +114,58 @@ def rewrite_model_unset(model: str) -> bool:
 def openai_compatible_client(api_key: str, base_url: str, **options):
     """Build an AsyncOpenAI client for a base URL from StrataKB's own settings.
 
-    Pass a string key: with None the SDK reads OPENAI_API_KEY. With no
+    The key is always a string, so the SDK reads no OPENAI_API_KEY, and
+    admin_api_key is empty, so it reads no OPENAI_ADMIN_KEY. With no
     organization or project the SDK reads OPENAI_ORG_ID and OPENAI_PROJECT_ID
     and sends them as headers; Omit() drops both, so neither reaches the
     configured endpoint.
 
     An empty key means a keyless server (a default Ollama, llama.cpp or
-    vLLM). The SDK refuses an empty key and will not drop the Authorization
-    header from client defaults, so the request carries the placeholder
-    PLACEHOLDER_API_KEY, which a keyless server ignores, and never
-    OPENAI_API_KEY or OPENAI_ADMIN_KEY from the environment.
+    vLLM). The SDK refuses to build a client without a key, so it gets
+    PLACEHOLDER_API_KEY; every call passes keyless_request_options(api_key),
+    which sends no Authorization header at all.
     """
     import openai
 
     return openai.AsyncOpenAI(
         api_key=api_key or PLACEHOLDER_API_KEY,
+        admin_api_key="",
         base_url=base_url,
         default_headers={"OpenAI-Organization": openai.Omit(), "OpenAI-Project": openai.Omit()},
         **options,
+    )
+
+
+def keyless_request_options(api_key: str) -> dict:
+    """Return the per-call options for an openai_compatible_client request.
+
+    With no key the request carries no Authorization header. The SDK accepts
+    an omitted Authorization only from the call's own headers, not from the
+    client defaults, so this goes into every call. With a key it is empty.
+    """
+    if api_key:
+        return {}
+    import openai
+
+    return {"extra_headers": {"Authorization": openai.Omit()}}
+
+
+def unauthorized_detail(error: Exception, api_key: str, setting: str) -> str | None:
+    """Explain a 401 from an OpenAI-compatible server, naming the key setting.
+
+    Returns None for any other error. Names the setting only, never its
+    value, the URL or the error text.
+    """
+    if getattr(error, "status_code", None) != 401:
+        return None
+    if not api_key:
+        return (
+            f"The server answered 401 (unauthorized) and {setting} is not set. "
+            "Set it to the key the server expects, then restart StrataKB."
+        )
+    return (
+        f"The server answered 401 (unauthorized) to {setting}. "
+        "Check the key, then restart StrataKB."
     )
 
 
