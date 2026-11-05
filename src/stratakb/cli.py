@@ -29,6 +29,7 @@ from typing import TYPE_CHECKING, Any
 import structlog
 
 if TYPE_CHECKING:
+    from stratakb.core.local_db import DownOutcome, UpState
     from stratakb.knowledge.add_folder import Plan, Report
 
 logger = structlog.get_logger()
@@ -58,6 +59,8 @@ class _ArgumentParser(argparse.ArgumentParser):
 
 
 def _parser() -> _ArgumentParser:
+    from stratakb.config import LOCAL_DB_PORT
+
     parser = _ArgumentParser(
         prog="stratakb",
         description="StrataKB: a layered knowledge base for MCP clients. "
@@ -105,8 +108,8 @@ def _parser() -> _ArgumentParser:
     up.add_argument(
         "--port",
         type=_port,
-        default=5433,
-        help="host port on 127.0.0.1 when the container is created (default: 5433)",
+        default=LOCAL_DB_PORT,
+        help="host port on 127.0.0.1 when the container is created (default: %(default)s)",
     )
     db_commands.add_parser("down", help="stop the local database; its data stays")
     return parser
@@ -244,10 +247,32 @@ class _Progress:
 
 # ── db ───────────────────────────────────────────────────
 
+_UP_TEXT: dict[UpState, str] = {
+    "created": "created",
+    "started": "started",
+    "running": "already running",
+}
 
-def _run_db(args: argparse.Namespace) -> int:
+
+def _connection_errors() -> tuple[type[BaseException], ...]:
+    """The errors that mean the database can't be reached."""
     import asyncpg
 
+    return (
+        OSError,
+        asyncpg.PostgresConnectionError,
+        asyncpg.InvalidAuthorizationSpecificationError,
+        asyncpg.InvalidCatalogNameError,
+        asyncpg.InterfaceError,
+    )
+
+
+def _first_line(text: str) -> str:
+    lines = text.strip().splitlines()
+    return lines[0] if lines else "no message"
+
+
+def _run_db(args: argparse.Namespace) -> int:
     from stratakb.config import config_files, get_settings, user_config_file
     from stratakb.core import local_db
     from stratakb.core.logging import configure_logging
@@ -267,17 +292,14 @@ def _run_db(args: argparse.Namespace) -> int:
     except (local_db.LocalDbError, MigrationError) as e:
         _err(str(e))
         return EXIT_DATABASE
-    except (
-        OSError,
-        asyncpg.PostgresConnectionError,
-        asyncpg.InvalidAuthorizationSpecificationError,
-        asyncpg.InvalidCatalogNameError,
-        asyncpg.InterfaceError,
-    ) as e:
+    except _connection_errors() as e:
         _err(f"Can't reach the database in {local_db.CONTAINER} ({type(e).__name__}).")
         return EXIT_DATABASE
+    except Exception as e:
+        _err(f"stratakb db {args.db_command} failed ({type(e).__name__}): {_first_line(str(e))}")
+        return EXIT_DATABASE
 
-    state = {"created": "created", "started": "started"}.get(result.state, "already running")
+    state = _UP_TEXT[result.state]
     _out(
         f"Database ready at 127.0.0.1:{result.port} "
         f"(container {local_db.CONTAINER}, {state})."
@@ -298,7 +320,7 @@ def _run_db(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
-def _down_text(outcome: str) -> str:
+def _down_text(outcome: DownOutcome) -> str:
     from stratakb.core.local_db import CONTAINER, VOLUME
 
     if outcome == "stopped":
@@ -366,8 +388,6 @@ def _finish(report: Report, args: argparse.Namespace) -> int:
 
 async def _add(args: argparse.Namespace, settings: Any) -> Report:
     """Plan, confirm and apply one add; every failure becomes a refusal report."""
-    import asyncpg
-
     from stratakb.core.database import close_pool
     from stratakb.core.migrations import MigrationError, ensure_schema
     from stratakb.knowledge import add_folder
@@ -418,13 +438,7 @@ async def _add(args: argparse.Namespace, settings: Any) -> Report:
         finally:
             if progress is not None:
                 progress.finish()
-    except (
-        OSError,
-        asyncpg.PostgresConnectionError,
-        asyncpg.InvalidAuthorizationSpecificationError,
-        asyncpg.InvalidCatalogNameError,
-        asyncpg.InterfaceError,
-    ) as e:
+    except _connection_errors() as e:
         return refuse("db_unreachable", _unreachable_message(target, e), EXIT_DATABASE)
     except MigrationError as e:
         return refuse("schema", str(e), EXIT_DATABASE)

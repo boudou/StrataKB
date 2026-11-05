@@ -12,19 +12,22 @@ import shutil
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
+from typing import Literal
 from urllib.parse import urlsplit
 
 import asyncpg
 
+from stratakb.config import (
+    LOCAL_DB_NAME,
+    LOCAL_DB_PASSWORD,
+    LOCAL_DB_PORT,
+    LOCAL_DB_USER,
+    local_database_url,
+)
+
 CONTAINER = "stratakb-db"
 VOLUME = "stratakb-data"
 IMAGE = "pgvector/pgvector:pg16"
-DEFAULT_PORT = 5433
-
-# The defaults of DATABASE_URL in config.py; the container binds 127.0.0.1 only
-_USER = "strata"
-_PASSWORD = "strata_dev_password"
-_DATABASE = "strata"
 
 _READY_TIMEOUT_S = 60
 _INFO_TIMEOUT_S = 20
@@ -32,7 +35,11 @@ _INFO_TIMEOUT_S = 20
 START_HINT = "Run stratakb db up to start a local database."
 
 _LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1"}
-_PORT_IN_USE = ("port is already allocated", "address already in use")
+# Docker Desktop on Windows says "Ports are not available" when a host process holds the port
+_PORT_IN_USE = ("port is already allocated", "address already in use", "ports are not available")
+
+UpState = Literal["created", "started", "running"]
+DownOutcome = Literal["stopped", "not_running", "missing"]
 
 
 class LocalDbError(Exception):
@@ -41,7 +48,7 @@ class LocalDbError(Exception):
 
 @dataclass
 class UpResult:
-    state: str  # "created", "started" or "running"
+    state: UpState
     port: int
     url: str
 
@@ -75,8 +82,10 @@ async def _docker(*args: str, timeout: float | None = None) -> tuple[int, str, s
         proc.kill()
         await proc.wait()
         return -1, "", "timed out"
+    # communicate() waits for the process, so returncode is set
+    assert proc.returncode is not None
     return (
-        proc.returncode if proc.returncode is not None else -1,
+        proc.returncode,
         out.decode("utf-8", errors="replace").strip(),
         err.decode("utf-8", errors="replace").strip(),
     )
@@ -119,10 +128,6 @@ async def _host_port() -> int:
         raise LocalDbError(f"docker port {CONTAINER} printed no port.") from None
 
 
-def container_url(port: int) -> str:
-    return f"postgresql://{_USER}:{_PASSWORD}@127.0.0.1:{port}/{_DATABASE}"
-
-
 def points_here(database_url: str, port: int) -> bool:
     """True when database_url is the container's database on this port."""
     try:
@@ -130,9 +135,9 @@ def points_here(database_url: str, port: int) -> bool:
         return (
             parts.hostname in _LOCAL_HOSTS
             and (parts.port or 5432) == port
-            and parts.path.lstrip("/") == _DATABASE
-            and parts.username == _USER
-            and parts.password == _PASSWORD
+            and parts.path.lstrip("/") == LOCAL_DB_NAME
+            and parts.username == LOCAL_DB_USER
+            and parts.password == LOCAL_DB_PASSWORD
         )
     except ValueError:
         return False
@@ -175,21 +180,22 @@ def _port_message(port: int) -> str:
     )
 
 
-async def up(port: int = DEFAULT_PORT, notify: Callable[[str], None] | None = None) -> UpResult:
+async def up(port: int = LOCAL_DB_PORT, notify: Callable[[str], None] | None = None) -> UpResult:
     """Start the container, creating it on first use, and bring its schema up to date."""
     say = notify or (lambda _text: None)
     await _check_daemon()
     status = await _status()
 
+    state: UpState
     if status is None:
         say(f"Creating the container {CONTAINER} (the first run downloads the image {IMAGE})…")
         code, _, err = await _docker(
             "run", "-d",
             "--name", CONTAINER,
             "--restart", "unless-stopped",
-            "-e", f"POSTGRES_DB={_DATABASE}",
-            "-e", f"POSTGRES_USER={_USER}",
-            "-e", f"POSTGRES_PASSWORD={_PASSWORD}",
+            "-e", f"POSTGRES_DB={LOCAL_DB_NAME}",
+            "-e", f"POSTGRES_USER={LOCAL_DB_USER}",
+            "-e", f"POSTGRES_PASSWORD={LOCAL_DB_PASSWORD}",
             "-p", f"127.0.0.1:{port}:5432",
             "-v", f"{VOLUME}:/var/lib/postgresql/data",
             IMAGE,
@@ -226,7 +232,7 @@ async def up(port: int = DEFAULT_PORT, notify: Callable[[str], None] | None = No
             f"{CONTAINER} already uses port {actual}; "
             "--port applies only when the container is created."
         )
-    url = container_url(actual)
+    url = local_database_url(actual)
     say("Waiting for the database…")
     await _wait_ready(url)
 
@@ -237,8 +243,8 @@ async def up(port: int = DEFAULT_PORT, notify: Callable[[str], None] | None = No
     return UpResult(state=state, port=actual, url=url)
 
 
-async def down() -> str:
-    """Stop the container and keep its volume: "stopped", "not_running" or "missing"."""
+async def down() -> DownOutcome:
+    """Stop the container and keep its volume."""
     await _check_daemon()
     status = await _status()
     if status is None:

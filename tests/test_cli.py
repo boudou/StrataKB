@@ -10,6 +10,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import typing
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import asyncpg
@@ -82,8 +83,11 @@ def _report(**overrides) -> Report:
 
 @pytest.fixture(autouse=True)
 def cli_env(monkeypatch, tmp_path):
-    """No config files, no ./.env, no logging changes, no real database or model."""
+    """No config files, no ./.env, no DATABASE_URL in the environment, no logging
+    changes, no real database or model."""
     monkeypatch.delenv("STRATAKB_CONFIG", raising=False)
+    # The suite runs with DATABASE_URL set; db up reports on it
+    monkeypatch.delenv("DATABASE_URL", raising=False)
     monkeypatch.setenv("APPDATA", str(tmp_path / "appdata"))
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
     monkeypatch.chdir(tmp_path)
@@ -497,12 +501,6 @@ def _verbs(docker) -> list[str]:
     return [c.args[0] for c in docker.call_args_list]
 
 
-@pytest.fixture(autouse=True)
-def _no_database_url(monkeypatch):
-    # The suite runs with DATABASE_URL set; db up reports on it
-    monkeypatch.delenv("DATABASE_URL", raising=False)
-
-
 def test_db_up_without_docker_exits_3(capsys):
     with patch.object(local_db.shutil, "which", return_value=None):
         code = cli.main(["db", "up"])
@@ -569,7 +567,7 @@ def test_db_up_creates_the_container(cli_env, capsys):
 
 
 def test_db_up_nothing_to_configure(capsys):
-    default_url = "postgresql://strata:strata_dev_password@127.0.0.1:5433/strata"
+    default_url = Settings(_env_file=None).database_url
     with patch("stratakb.config.get_settings", return_value=_settings(database_url=default_url)):
         code, _, _ = _db(["db", "up"])
     assert code == 0
@@ -616,10 +614,19 @@ def test_db_up_unpauses(capsys):
     assert "run" not in verbs
 
 
-def test_db_up_port_in_use(capsys):
-    docker = _fake_docker(
-        run=(125, "", "docker: Error response from daemon: ... port is already allocated.")
-    )
+@pytest.mark.parametrize(
+    "message",
+    [
+        "docker: Error response from daemon: ... port is already allocated.",
+        "Bind for 127.0.0.1:5433 failed: address already in use",
+        # Docker Desktop on Windows, when a host process holds the port
+        "docker: Error response from daemon: Ports are not available: exposing port "
+        "TCP 127.0.0.1:5433 -> 0.0.0.0:0: listen tcp 127.0.0.1:5433: bind: Only one usage "
+        "of each socket address (protocol/network address/port) is normally permitted.",
+    ],
+)
+def test_db_up_port_in_use(capsys, message):
+    docker = _fake_docker(run=(125, "", message))
     code, docker, wait_ready = _db(["db", "up"], docker)
     assert code == 3
     wait_ready.assert_not_called()
@@ -676,6 +683,32 @@ def test_db_up_schema_error_exits_3(cli_env, capsys):
     captured = capsys.readouterr()
     assert captured.out == ""
     assert "Apply 05_add_folder.sql as the owner." in captured.err
+
+
+def test_db_up_unexpected_error_exits_3(cli_env, capsys):
+    cli_env["schema"].side_effect = asyncpg.PostgresError("relation x does not exist\nmore")
+    code, _, _ = _db(["db", "up"], _fake_docker("running"))
+    assert code == 3
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "Traceback" not in captured.err
+    # Progress lines come first; the error is the last line, and only its first line
+    last = captured.err.strip().splitlines()[-1]
+    assert last == "stratakb db up failed (PostgresError): relation x does not exist"
+
+
+def test_db_down_unexpected_error_exits_3(capsys):
+    with patch.object(local_db, "down", AsyncMock(side_effect=RuntimeError("boom"))):
+        code = cli.main(["db", "down"])
+    assert code == 3
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "Traceback" not in captured.err
+    assert captured.err.strip().splitlines() == ["stratakb db down failed (RuntimeError): boom"]
+
+
+def test_up_text_covers_every_state():
+    assert set(cli._UP_TEXT) == set(typing.get_args(local_db.UpState))
 
 
 @pytest.mark.parametrize(
