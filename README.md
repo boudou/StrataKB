@@ -276,7 +276,7 @@ Then ask from your client, for example *"How long should a line of Python be?"*.
 | `strata_search` | viewer | Hybrid search for exact terms and identifiers, with optional layer and metadata filters, and a confidence level; a clause or section the query names (`clause 7.2`) comes first, verbatim |
 | `strata_list_knowledge_layers` | viewer | Lists layers with document and chunk counts |
 | `strata_get_layer_status` | viewer | One layer's configuration and ingestion history |
-| `strata_get_receipt` | viewer | Opens a receipt (`rcpt_…`, also the resource `strata://receipts/{receipt_id}`): the stored quotes of an answer, each in its surrounding document text, marked current, changed (with the newer version) or gone (its file was removed from its folder or its layer was deleted). Open to whoever asked, to admins, and to anyone who may read every cited layer, for `RECEIPT_RETENTION_DAYS` (90 by default). Receipts are issued by `strata_verify`; extractive answers will issue them too ([roadmap](#roadmap)) |
+| `strata_get_receipt` | viewer | Opens a receipt (`rcpt_…`, also the resource `strata://receipts/{receipt_id}`): the stored quotes of an answer, each in its surrounding document text, marked current, changed (with the newer version) or gone (its file was removed from its folder or its layer was deleted). Open to whoever asked, to admins, and to anyone who may read every cited layer, for `RECEIPT_RETENTION_DAYS` (90 by default). From the command line: `stratakb receipt <id>`. Receipts are issued by `strata_verify`; extractive answers will issue them too ([roadmap](#roadmap)) |
 | `strata_feedback` | viewer | Rates a result as helpful or not, per answer or per passage (`S1`) or chunk |
 | `strata_learning_stats` | viewer | What the learning system has recorded and learned |
 | `strata_whoami` | viewer | Your identity and role |
@@ -367,6 +367,15 @@ flowchart LR
 - The result is `verified` with a `receipt_id` (open it with `strata_get_receipt`), or `flagged` with a list of flags, each naming the text, why, and the passages searched, for example `"13 days" not found in S1–S4`. At most 50 flags are listed; `more_flags` counts the rest. The receipt keeps the passages and the draft, with IBANs, BICs and account numbers in the draft replaced by placeholders.
 - Both checks run in Python, without a model: nothing leaves the machine. They catch a changed quote, number, date, amount, code or clause, not a paraphrase that changes the meaning without changing a fact. For layers where that is not acceptable, use `answer_mode: extractive` ([roadmap](#roadmap)).
 - Each call writes one audit entry (`verify`) with counts and, when verified, the receipt id; never the draft.
+
+To check an answer outside the chat, open its receipt from the command line:
+
+```bash
+uv run stratakb receipt rcpt_…          # each quote marked >>> <<< in its context, with current, changed or gone
+uv run stratakb receipt rcpt_… --json   # the same data as strata_get_receipt
+```
+
+It makes the same access check as `strata_get_receipt`, with `STRATA_USER` and `STRATA_ROLE` as on stdio, and writes the same audit entry with the tool name `cli:receipt`. An unknown receipt, or one you may not open, exits with code `1` and one line on stderr; an unreachable database exits with `3`. The text form shows control characters from documents, file names, questions and drafts as escapes such as `\x1b`, so a document cannot hide or rewrite what your terminal shows.
 
 ## Configuration
 

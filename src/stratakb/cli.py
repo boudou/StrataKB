@@ -5,6 +5,7 @@
     stratakb add <path> ...   turn a folder into a layer, or sync it
     stratakb db up            start a local database in Docker, creating it on first use
     stratakb db down          stop it; its data stays
+    stratakb receipt <id>     open a receipt: its quotes in context
 
 Each subcommand is a subparser and a handler; a new one adds both and
 nothing else. The command owns the terminal (prompts, progress, the report
@@ -112,6 +113,18 @@ def _parser() -> _ArgumentParser:
         help="host port on 127.0.0.1 when the container is created (default: %(default)s)",
     )
     db_commands.add_parser("down", help="stop the local database; its data stays")
+
+    receipt = commands.add_parser(
+        "receipt",
+        help="open a receipt: its quotes in context, and whether the source changed",
+        description="Open a receipt as the strata_get_receipt tool does: each "
+        "quote in its surrounding document text, marked current, changed or "
+        "gone. STRATA_USER and STRATA_ROLE say who you are.",
+    )
+    receipt.add_argument("receipt_id", metavar="id", help="the receipt id (rcpt_…)")
+    receipt.add_argument(
+        "--json", action="store_true", help="print the receipt as the tool returns it"
+    )
     return parser
 
 
@@ -148,6 +161,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _run_db(args)
     if args.command == "add":
         return _run_add(args)
+    if args.command == "receipt":
+        return _run_receipt(args)
     return _serve()
 
 
@@ -526,6 +541,89 @@ def _unreachable_message(target: str, error: BaseException) -> str:
     )
 
 
+# ── receipt ──────────────────────────────────────────────
+
+
+def _run_receipt(args: argparse.Namespace) -> int:
+    """Open a receipt with the tool's access check; its audit entry is cli:receipt."""
+    from stratakb.config import config_file_missing, dotenv_warning, get_settings
+    from stratakb.core.auth import PermissionDeniedError, check_role, get_current_user
+    from stratakb.core.logging import configure_logging
+
+    # A refusal is one line; open_receipt's receipt_refused warning is in the audit log
+    configure_logging("ERROR")
+    _use_utf8_output()
+
+    if config_file_missing():
+        return _receipt_failed(
+            "STRATAKB_CONFIG names a file that does not exist. "
+            "Fix the path or unset STRATAKB_CONFIG.",
+            args,
+            EXIT_REFUSED,
+        )
+    if hint := dotenv_warning():
+        _err(hint)
+    user_id, role = get_current_user()
+    # The tool's own role check (require_role("viewer"))
+    if not check_role(role, "viewer"):
+        message = str(PermissionDeniedError(user_id, role, "viewer", "cli:receipt"))
+        return _receipt_failed(message, args, EXIT_FAILED)
+
+    url = get_settings().database_url
+    try:
+        receipt = asyncio.run(_open_receipt(url, args.receipt_id, user_id, role))
+    except KeyboardInterrupt:
+        _err("Interrupted.")
+        return EXIT_INTERRUPTED
+    except _ReceiptOpenError as e:
+        return _receipt_failed(str(e), args, e.exit_code)
+
+    if args.json:
+        _out(json.dumps({"status": "ok", "receipt": receipt}, ensure_ascii=False, indent=2))
+    else:
+        _out(render_receipt(receipt))
+    return EXIT_OK
+
+
+class _ReceiptOpenError(Exception):
+    """A receipt that could not be opened: the one-line message and the exit code."""
+
+    def __init__(self, message: str, exit_code: int) -> None:
+        super().__init__(message)
+        self.exit_code = exit_code
+
+
+async def _open_receipt(url: str, receipt_id: str, user_id: str, role: str) -> dict:
+    """open_receipt, with every failure turned into a _ReceiptOpenError."""
+    from stratakb.core.database import close_pool
+    from stratakb.core.migrations import MigrationError
+    from stratakb.knowledge.add_folder import db_target
+    from stratakb.rag.receipts import ReceiptAccessError, open_receipt
+
+    try:
+        return await open_receipt(url, receipt_id, user_id, role, tool_name="cli:receipt")
+    except ReceiptAccessError as e:
+        raise _ReceiptOpenError(str(e), EXIT_FAILED) from None
+    except _connection_errors() as e:
+        raise _ReceiptOpenError(_unreachable_message(db_target(url), e), EXIT_DATABASE) from None
+    except MigrationError as e:
+        raise _ReceiptOpenError(str(e), EXIT_DATABASE) from None
+    except Exception as e:
+        logger.error("receipt_open_failed", error_type=type(e).__name__)
+        message = f"Opening the receipt failed ({type(e).__name__})."
+        raise _ReceiptOpenError(message, EXIT_FAILED) from None
+    finally:
+        await close_pool()
+
+
+def _receipt_failed(message: str, args: argparse.Namespace, exit_code: int) -> int:
+    """One line on stderr; with --json, the tool's error form on stdout too."""
+    _err(message)
+    if args.json:
+        _out(json.dumps({"status": "error", "error": message}, ensure_ascii=False))
+    return exit_code
+
+
 # ── Rendering ────────────────────────────────────────────
 
 
@@ -576,6 +674,62 @@ def render_text(report: Report) -> str:
     lines.append(
         f"Next: ask in your MCP client: what do the docs in {report.layer} say about …?"
     )
+    return "\n".join(lines)
+
+
+def _visible(value: Any) -> str:
+    """Text safe for a terminal: control characters become visible escapes.
+
+    Document text, file names and the caller's question and draft can carry
+    ANSI or OSC sequences, a carriage return or a backspace that would hide
+    or rewrite what is shown. Newlines and tabs stay.
+    """
+    out = []
+    for char in str(value):
+        if char.isprintable() or char in "\n\t":
+            out.append(char)
+        elif ord(char) <= 0xFF:
+            out.append(f"\\x{ord(char):02x}")
+        else:
+            out.append(f"\\u{ord(char):04x}")
+    return "".join(out)
+
+
+def render_receipt(receipt: dict) -> str:
+    """A receipt for a person to read: each quote marked >>> <<< in its context."""
+    from stratakb.rag.receipts import CONTEXT_CHARS
+
+    v = _visible
+    lines = [
+        f"Receipt {v(receipt['receipt_id'])} ({v(receipt['kind'])}, {v(receipt['mode'])} mode)"
+    ]
+    layers = ", ".join(v(layer) for layer in receipt["layers"]) or "none"
+    lines.append(f"Issued {v(receipt['issued_at'])} by {v(receipt['issued_by'])}; layers: {layers}")
+    if receipt.get("question"):
+        lines.append(f"Question: {v(receipt['question'])}")
+    if receipt.get("draft"):
+        lines.append(f"Draft: {v(receipt['draft'])}")
+    for position, quote in enumerate(receipt["quotes"], start=1):
+        where = [f"layer {v(quote['layer'])}", f"v{v(quote['version'])}"]
+        if quote.get("clause_path"):
+            where.append(f"clause {v(quote['clause_path'])}")
+        where.append(f"chars {v(quote['char_start'])}-{v(quote['char_end'])}")
+        lines.append("")
+        lines.append(
+            f"[{position}] {v(quote['file'])} ({', '.join(where)}): {v(quote['status'])}"
+        )
+        if quote.get("note"):
+            lines.append(f"    {v(quote['note'])}")
+        # An ellipsis where the shown context stops short of the text around it
+        before = "…" if len(quote["context_before"]) == CONTEXT_CHARS else ""
+        after = "…" if len(quote["context_after"]) == CONTEXT_CHARS else ""
+        shown = (
+            f"{before}{v(quote['context_before'])}>>> {v(quote['quote'])} <<<"
+            f"{v(quote['context_after'])}{after}"
+        )
+        lines.extend(f"    {line}".rstrip() for line in shown.splitlines())
+    if not receipt["quotes"]:
+        lines.append("No quotes.")
     return "\n".join(lines)
 
 
