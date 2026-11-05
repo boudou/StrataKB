@@ -191,6 +191,20 @@ class LearningStore:
                 row["results"] = json.loads(row["results"])
         return rows
 
+    async def get_interaction_results(self, interaction_id: str) -> list[dict] | None:
+        """The stored results of one interaction, in order; None if it is unknown."""
+        rows = await self._fetch(
+            "SELECT results FROM strata_learning.interaction_events WHERE id = $1",
+            interaction_id,
+        )
+        if not rows:
+            return None
+        results = rows[0]["results"]
+        # asyncpg returns JSONB as text
+        if isinstance(results, str):
+            results = json.loads(results)
+        return results or []
+
     # ── Feedback ──────────────────────────────────────────────
 
     async def store_feedback(

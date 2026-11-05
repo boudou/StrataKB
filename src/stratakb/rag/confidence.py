@@ -87,3 +87,20 @@ def score_confidence(scores: list[float], *, basis: str) -> dict:
     if level == "low":
         result["warning"] = _LOW_CONFIDENCE_WARNING if scores else _NO_RESULTS_WARNING
     return result
+
+
+def answer_status(confidence: dict, passage_count: int) -> str:
+    """found, partly_found or not_found, judged on the best passage's score.
+
+    The best passage clearing the high threshold is found, the medium one
+    partly found; anything below, or no passage at all, is not found.
+    """
+    if passage_count == 0:
+        return "not_found"
+    thresholds = _BASIS_THRESHOLDS[confidence["basis"]]
+    top_score = confidence["top_score"]
+    if top_score >= thresholds.high_score:
+        return "found"
+    if top_score >= thresholds.medium_score:
+        return "partly_found"
+    return "not_found"

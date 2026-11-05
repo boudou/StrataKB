@@ -454,8 +454,11 @@ async def test_applies_missing_07_older_chunks_keep_null_offsets(db_url, restore
         DELETE FROM strata_vectors.chunks WHERE layer_name = 'test_mig_documents';
         ALTER TABLE strata_vectors.chunks
             DROP COLUMN document_id, DROP COLUMN char_start, DROP COLUMN char_end;
+        DROP TABLE strata_core.receipt_documents;
+        DROP TABLE strata_core.receipts;
+        DROP TABLE strata_vectors.document_sections;
         DROP TABLE strata_vectors.documents;
-        DELETE FROM strata_core.schema_migrations WHERE version = 7;
+        DELETE FROM strata_core.schema_migrations WHERE version IN (7, 9, 10);
         INSERT INTO strata_vectors.chunks (layer_name, content, source_file)
         VALUES ('test_mig_documents', 'Older chunk', 'old.md');
         """,
@@ -481,6 +484,63 @@ async def test_applies_missing_07_older_chunks_keep_null_offsets(db_url, restore
             db_url,
             "DELETE FROM strata_vectors.chunks WHERE layer_name = 'test_mig_documents'",
         )
+
+
+async def test_applies_missing_09_older_chunks_keep_null_clause_path(db_url, restore_schema):
+    await _owner_execute(
+        db_url,
+        """
+        DELETE FROM strata_vectors.chunks WHERE layer_name = 'test_mig_structure';
+        ALTER TABLE strata_vectors.chunks DROP COLUMN clause_path;
+        DROP TABLE strata_vectors.document_sections;
+        DELETE FROM strata_core.schema_migrations WHERE version = 9;
+        INSERT INTO strata_vectors.chunks (layer_name, content, source_file)
+        VALUES ('test_mig_structure', 'Older chunk', 'old.md');
+        """,
+    )
+    try:
+        await migrations.ensure_schema(db_url)
+
+        conn = await asyncpg.connect(db_url)
+        try:
+            assert await conn.fetchval(
+                "SELECT to_regclass('strata_vectors.document_sections') IS NOT NULL"
+            )
+            clause_path = await conn.fetchval(
+                "SELECT clause_path FROM strata_vectors.chunks "
+                "WHERE layer_name = 'test_mig_structure'"
+            )
+        finally:
+            await conn.close()
+        assert clause_path is None
+        assert await _recorded(db_url) == ALL_VERSIONS
+    finally:
+        await _owner_execute(
+            db_url,
+            "DELETE FROM strata_vectors.chunks WHERE layer_name = 'test_mig_structure'",
+        )
+
+
+async def test_applies_missing_10_receipts(db_url, restore_schema):
+    await _owner_execute(
+        db_url,
+        """
+        DROP TABLE strata_core.receipt_documents;
+        DROP TABLE strata_core.receipts;
+        DELETE FROM strata_core.schema_migrations WHERE version = 10;
+        """,
+    )
+    await migrations.ensure_schema(db_url)
+
+    conn = await asyncpg.connect(db_url)
+    try:
+        assert await conn.fetchval(
+            "SELECT to_regclass('strata_core.receipts') IS NOT NULL "
+            "AND to_regclass('strata_core.receipt_documents') IS NOT NULL"
+        )
+    finally:
+        await conn.close()
+    assert await _recorded(db_url) == ALL_VERSIONS
 
 
 async def test_concurrent_calls(db_url, restore_schema):
@@ -619,7 +679,13 @@ async def _readonly_privileges(db_url: str) -> dict:
 def _assert_closed(privileges: dict) -> None:
     tables = privileges["tables"]
     assert {t for t, readable in tables.items() if readable} == set(_READABLE)
-    for t in ("strata_core.audit_log", "strata_core.users", "strata_core.schema_migrations"):
+    for t in (
+        "strata_core.audit_log",
+        "strata_core.users",
+        "strata_core.schema_migrations",
+        "strata_core.receipts",
+        "strata_core.receipt_documents",
+    ):
         assert tables[t] is False
     learning = [t for t in tables if t.startswith("strata_learning.")]
     assert learning

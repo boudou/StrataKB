@@ -23,6 +23,8 @@ logger = structlog.get_logger()
 
 _OPENAI_DEFAULT_URL = "https://api.openai.com/v1"
 _ANTHROPIC_DEFAULT_URL = "https://api.anthropic.com"
+# Sent to an OpenAI-compatible endpoint configured without a key
+PLACEHOLDER_API_KEY = "unused"
 
 
 @dataclass(frozen=True)
@@ -116,11 +118,17 @@ def openai_compatible_client(api_key: str, base_url: str, **options):
     organization or project the SDK reads OPENAI_ORG_ID and OPENAI_PROJECT_ID
     and sends them as headers; Omit() drops both, so neither reaches the
     configured endpoint.
+
+    An empty key means a keyless server (a default Ollama, llama.cpp or
+    vLLM). The SDK refuses an empty key and will not drop the Authorization
+    header from client defaults, so the request carries the placeholder
+    PLACEHOLDER_API_KEY, which a keyless server ignores, and never
+    OPENAI_API_KEY or OPENAI_ADMIN_KEY from the environment.
     """
     import openai
 
     return openai.AsyncOpenAI(
-        api_key=api_key,
+        api_key=api_key or PLACEHOLDER_API_KEY,
         base_url=base_url,
         default_headers={"OpenAI-Organization": openai.Omit(), "OpenAI-Project": openai.Omit()},
         **options,

@@ -18,6 +18,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from stratakb.config import Settings
+from stratakb.core.egress import PLACEHOLDER_API_KEY
 
 BASE_URL = "http://127.0.0.1:11434/v1"
 
@@ -62,7 +63,7 @@ class TestCustomEndpoint:
             api_key="sk-openai",
         )
         headers = client_kwargs.pop("default_headers")
-        assert client_kwargs == {"api_key": "", "base_url": BASE_URL}
+        assert client_kwargs == {"api_key": PLACEHOLDER_API_KEY, "base_url": BASE_URL}
         # Dropped: the SDK would fill them from OPENAI_ORG_ID and OPENAI_PROJECT_ID
         assert set(headers) == {"OpenAI-Organization", "OpenAI-Project"}
         assert create_kwargs == {
@@ -92,8 +93,7 @@ class TestCustomEndpoint:
             ),
             api_key="sk-openai",
         )
-        assert client_kwargs["api_key"] == ""
-        assert client_kwargs["api_key"] is not None
+        assert client_kwargs["api_key"] == PLACEHOLDER_API_KEY
 
     @pytest.mark.asyncio
     async def test_openai_default_model_and_dimensions(self):

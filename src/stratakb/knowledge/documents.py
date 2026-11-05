@@ -18,6 +18,7 @@ import asyncpg
 import structlog
 
 from stratakb.knowledge.parsers.pdf_parser import ParsedDocument
+from stratakb.knowledge.structure import Section
 
 logger = structlog.get_logger()
 
@@ -133,6 +134,34 @@ async def store_document_version(
     return document_id, version
 
 
+async def store_sections(
+    conn: asyncpg.Connection, document_id: int, sections: Sequence[Section]
+) -> None:
+    """Store a document version's structure map, unless it already has one.
+
+    A reused version keeps the sections stored with it (its text, and so its
+    map, is the same); a version stored before the map existed gets one.
+    """
+    if not sections:
+        return
+    if await conn.fetchval(
+        "SELECT EXISTS (SELECT 1 FROM strata_vectors.document_sections WHERE document_id = $1)",
+        document_id,
+    ):
+        return
+    await conn.executemany(
+        """
+        INSERT INTO strata_vectors.document_sections
+            (document_id, label, title, path, depth, char_start, char_end)
+        VALUES ($1, $2, $3, $4, $5, $6, $7)
+        """,
+        [
+            (document_id, s.label, s.title, s.path, s.depth, s.char_start, s.char_end)
+            for s in sections
+        ],
+    )
+
+
 def _version_lock_key(layer_id: str, source_root: str, relative_path: str) -> int:
     """One file's advisory lock key: signed 32 bits, the same in every process."""
     identity = f"{layer_id}\x00{source_root}\x00{relative_path}".encode()
@@ -146,7 +175,7 @@ async def prune_documents(
     source_root: str | None = None,
     relative_paths: Sequence[str] | None = None,
 ) -> int:
-    """Delete documents that no chunk references; return the count.
+    """Delete documents that no chunk and no receipt references; return the count.
 
     Without source_root and relative_paths the whole layer is swept; with
     them, only those files' versions. Pass both or neither.
@@ -165,10 +194,35 @@ async def prune_documents(
           AND NOT EXISTS (
               SELECT 1 FROM strata_vectors.chunks c WHERE c.document_id = d.id
           )
+          AND NOT EXISTS (
+              SELECT 1 FROM strata_core.receipt_documents r WHERE r.document_id = d.id
+          )
         """,
         *args,
     )
     return int(result.split()[-1])
+
+
+async def fetch_cited_documents(
+    conn: asyncpg.Connection, ends: dict[int, int]
+) -> dict[int, dict]:
+    """Path, page map and text up to the given end of each cited document.
+
+    ends maps a document id to the furthest char_end cited in it; only the
+    text before it is read, which is all locate() needs.
+    """
+    if not ends:
+        return {}
+    rows = await conn.fetch(
+        """
+        SELECT d.id, d.relative_path, d.page_map, left(d.text, x.max_end) AS text
+        FROM strata_vectors.documents d
+        JOIN unnest($1::bigint[], $2::int[]) AS x(id, max_end) ON x.id = d.id
+        """,
+        list(ends),
+        list(ends.values()),
+    )
+    return {row["id"]: dict(row) for row in rows}
 
 
 def locate(

@@ -24,6 +24,7 @@ import pytest
 from structlog.testing import capture_logs
 
 from stratakb.config import Settings
+from stratakb.core.egress import PLACEHOLDER_API_KEY
 from stratakb.knowledge import embedding_checks
 from stratakb.knowledge.embedding_checks import (
     check_vector_column,
@@ -253,10 +254,10 @@ async def test_client_gets_embedding_key_only(monkeypatch):
     assert kwargs["max_retries"] == 0
 
 
-async def test_client_gets_empty_key_without_embedding_key(monkeypatch):
+async def test_client_gets_placeholder_key_without_embedding_key(monkeypatch):
     monkeypatch.setenv("OPENAI_API_KEY", "sk-env-openai")
     client_cls, _ = await _run(_settings(openai_api_key="sk-openai"), ["nomic-embed-text"])
-    assert client_cls.call_args.kwargs["api_key"] == ""
+    assert client_cls.call_args.kwargs["api_key"] == PLACEHOLDER_API_KEY
 
 
 async def test_default_model_is_checked_by_resolved_name():

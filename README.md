@@ -128,7 +128,7 @@ flowchart LR
     z -->|"yes"| t["No text:<br/>skip or remove"]
     z -->|"no"| p["Parse<br/>per format"]
     p -->|"no text"| t
-    p --> c["Chunk<br/>(the file's own text)"] --> x["Add context for the embedding only<br/>[layer > file > headings or Page N]"] --> e["Embed"] --> v[("Store the document text<br/>(new version if it changed)<br/>and that file's chunks")]
+    p --> sm["Structure map<br/>(headings, numbered clauses)"] --> c["Chunk inside each section<br/>(the file's own text)"] --> x["Add context for the embedding only<br/>[layer > file > headings or Page N]"] --> e["Embed"] --> v[("Store the document text<br/>(new version if it changed)<br/>and that file's chunks")]
     p -.->|"scanned-looking PDF,<br/>CSV over 10,000 rows"| fl["Stored, reported<br/>as flagged"]
     h -->|"can't read"| fe["Failed, keeps earlier chunks<br/>(read_error, parse_error)"]
     p -->|"parser rejects"| fe
@@ -136,7 +136,7 @@ flowchart LR
 
 Ingesting a folder again is a sync: unchanged files are skipped, changed files are replaced, new files are added, and files deleted from that folder are removed. Other folders in the same layer are left alone. Files whose names look like secrets (`.env`, `client_secret.json`, `id_rsa`, `*.pem`) are skipped without being opened, and one ingested earlier is removed. Empty files are reported as no text rather than as failures. A PDF that looks scanned (fewer than half its pages have text, or under 200 characters per page on average) is stored for the text it has and reported as flagged. A CSV file over 10,000 rows is stored for its first 10,000 rows and reported as flagged (`truncated`); the log says how many rows were left out. A CSV row with fewer fields than the header is stored with the values it has; one with more keeps the extra values, labelled by position (`Column 4`). A column with an empty header is labelled by position too (`Column 2`), and a header name used twice gets a number on its second use (`Name (2)`), so no value is lost. A file that cannot be read (locked, or no permission) or that its parser rejects is reported as failed and keeps its earlier chunks; the rest of the run carries on.
 
-Every file gets an outcome, and most outcomes a reason. `stratakb add --json` lists both for every file; `strata_ingest_documents` returns the counts, and each failed file in `errors` with its reason. `stratakb add` also reports the reasons of its own file selection (such as `code` or `ignored_by_gitignore`) for files it never reads.
+Every file gets an outcome, and most outcomes a reason. `stratakb add --json` lists both for every file; `strata_ingest_documents` returns the counts, and each failed file in `errors` with its reason and a short message. Errors returned and kept in the run history name a file by its path relative to the ingested folder, not its absolute path. `stratakb add` also reports the reasons of its own file selection (such as `code` or `ignored_by_gitignore`) for files it never reads.
 
 | Outcome | Reasons |
 |---|---|
@@ -148,15 +148,28 @@ Every file gets an outcome, and most outcomes a reason. `stratakb add --json` li
 
 Each stored chunk is the document's own text as its parser extracted it (for Markdown and plain text, the file's characters; for PDF, HTML and other formats, the extracted text): search results quote that text exactly, and a Markdown or HTML section holds its own heading once. Where the chunk sits (`[layer > file > headings]` for Markdown and HTML, `[layer > file > Page N]` otherwise) is added only to the text that is embedded, so semantic search keeps that context; the heading path is also in the chunk's metadata as `section_path`. In Markdown, the front matter (a leading `---` block of `key: value` lines) is never part of the text, `#` lines inside code fences (```` ``` ```` or `~~~`) are not headings, so a shell comment does not split a code block, and headings may be indented up to three spaces or underlined with `===` / `---`. An HTML page's first `<title>` outside an inline `<svg>` is not part of the text: it is the section path of text that sits under no heading (the whole page, when it has no headings), while an SVG's `<title>` stays in the text. Keyword search matches the chunk text, not layer or file names. Chunks stored by earlier versions keep their bracketed prefix until their file is ingested again.
 
-Each file's extracted text is stored once as a document, and every chunk records where in that text it sits (a character range, from which the page and the line range follow), so a passage can be located and checked against its source. Lines count from the start of the page for PDFs and from the start of the document for other formats. When a file's text changes, the next ingest stores it as a new version; versions that no chunk uses any more are removed. Chunks ingested before this was added have no position until their file is ingested again.
+Each file's extracted text is stored once as a document, and every chunk records where in that text it sits (a character range, from which the page and the line range follow), so a passage can be located and checked against its source. Lines count from the start of the page for PDFs and from the start of the document for other formats. When a file's text changes, the next ingest stores it as a new version; versions that no chunk and no receipt uses any more are removed. Chunks ingested before this was added have no position until their file changes or the layer is rebuilt (`replace_all=True`).
+
+Chunks follow the document's structure. Each document gets a structure map: its headings and numbered clauses, each with a path such as `7 Termination > 7.2 Termination for cause` and the range of the text it covers, found without any configuration. The map recognises Markdown, reStructuredText and AsciiDoc headings (and so the headings the other parsers write, such as one per XSD type), numbered headings (`4.3.2`, `7.`, `7(2)(b)`) and keyword headings (`Article 12`, `Section 3`, `Annex II`). A numbered line counts as a clause only when it continues the numbering (`7.3` or `8` after `7.2`) and follows a blank line, a heading or the end of a sentence, so a numbered list inside a clause, or a wrapped line that starts with `30 days` or `Article 6`, is not one. Table-of-contents entries are skipped, so the body's clauses keep their numbers. A chunk never crosses a section boundary (or a PDF page): a short section is one chunk, and a section longer than `chunk_size` is split, with every piece keeping the section's path. The path of the innermost section is stored with each chunk (`clause_path`); text before the first heading has none. A document with no detectable structure is split by size alone, as before. Chunks ingested before this was added have no clause path until their file changes or the layer is rebuilt (`replace_all=True`).
+
+```mermaid
+flowchart LR
+    t["Document text"] --> d{"Headings or<br/>numbered clauses?"}
+    d -->|"yes"| m["Structure map:<br/>path and range per section"] --> s["Cut at every section start;<br/>split long sections by size"] --> c["Chunks with<br/>clause_path"]
+    d -->|"no"| z["Split by size"] --> c2["Chunks without<br/>clause_path"]
+```
 
 **Ask**
 
 ```mermaid
 flowchart LR
     q["Question"] --> r["Route to layers"] --> rw["Rewrite<br/>(optional)"] --> h["Hybrid search per query<br/>cache, HNSW + full-text, RRF"]
-    h --> d["Deduplicate"] --> rr["Cross-encoder<br/>rerank"] --> o["Chunks, sources,<br/>confidence"]
-    o --> a["Your MCP client<br/>writes the answer"]
+    h --> d["Merge the searches<br/>by rank (RRF)"] --> rr["Cross-encoder<br/>rerank"] --> b["Keep the best passages<br/>that fit ANSWER_TOKEN_BUDGET"]
+    b --> c["Cite each passage<br/>file, page, lines, headings"] --> o{"Best passage<br/>scores"}
+    o -->|"high"| f["found"]
+    o -->|"medium"| pf["partly_found<br/>+ next step"]
+    o -->|"low or none"| nf["not_found<br/>+ next step"]
+    f & pf & nf --> a["Your MCP client<br/>writes the answer"]
 ```
 
 **Learn**
@@ -257,11 +270,12 @@ Then ask from your client, for example *"How long should a line of Python be?"*.
 
 | Tool | Role | What it does |
 | --- | --- | --- |
-| `strata_ask` | viewer | Rewrites a question, searches in parallel, reranks, returns context with citations and a confidence level |
+| `strata_ask` | viewer | Rewrites a question, searches in parallel, reranks, and returns found, partly found or not found with the best passages, each with its file, page, lines and headings ([what it returns](#what-strata_ask-returns)) |
 | `strata_search` | viewer | Hybrid search for exact terms and identifiers, with optional layer and metadata filters, and a confidence level |
 | `strata_list_knowledge_layers` | viewer | Lists layers with document and chunk counts |
 | `strata_get_layer_status` | viewer | One layer's configuration and ingestion history |
-| `strata_feedback` | viewer | Rates a result as helpful or not, per answer or per chunk |
+| `strata_get_receipt` | viewer | Opens a receipt (`rcpt_…`, also the resource `strata://receipts/{receipt_id}`): the stored quotes of an answer, each in its surrounding document text, flagged when its source changed since. Open to whoever asked and to anyone who may read every cited layer. Receipts are issued by `strata_verify` and extractive answers, which are not built yet ([roadmap](#roadmap)) |
+| `strata_feedback` | viewer | Rates a result as helpful or not, per answer or per passage (`S1`) or chunk |
 | `strata_learning_stats` | viewer | What the learning system has recorded and learned |
 | `strata_whoami` | viewer | Your identity and role |
 | `strata_admin_health` | viewer | Database, pgvector and schema status, the local-only switch, the providers that receive data, whether the SQL tools are on, and the embedding model and vector column checks |
@@ -289,6 +303,39 @@ The `stratakb add` command has no role check: whoever can reach the database wit
 
 Each `strata_apply_preset` run writes one audit entry with the layer, whether it was created, updated or already up to date, the names of the settings that changed (never their values) and the number of documents and chunks ingested. A refused run writes none.
 
+### What `strata_ask` returns
+
+By default the answer is short: a status, the mode and the passages, each with its own citation, so the client can quote and cite without matching ids to a sources list.
+
+```json
+{
+  "status": "found",
+  "mode": "grounded",
+  "passages": [
+    {
+      "id": "S1",
+      "ref": "d42:1830-1905",
+      "text": "7.2 Either party may end this agreement\nwith ninety days' written notice.",
+      "citation": {
+        "file": "contracts/acme-msa.md",
+        "page": null,
+        "lines": "30-31",
+        "clause_path": "Master agreement > 7 Termination",
+        "layer": "contracts"
+      }
+    }
+  ],
+  "interaction_id": "…"
+}
+```
+
+- `status` is `found` when the best passage scores high, `partly_found` when it scores medium, and `not_found` when it scores low or nothing came back. The last two add a `next_step`, such as adding a folder with `stratakb add` when no layer covers the question. The thresholds are the provisional ones of [Confidence](#glossary).
+- `mode` is `grounded`: the client writes the answer from the passages and cites them by id.
+- The passages come best first and fill a budget of about 1,500 tokens (`ANSWER_TOKEN_BUDGET`); the first passage always comes back, and `top_k` (default 10) only bounds the search before that.
+- Each passage's `text` is the stored document's own text. `ref` names its span in the stored document (`d<document id>:<start>-<end>`), or the chunk (`c<chunk id>`) for a chunk ingested before documents were stored. The citation has the file's path relative to the ingested folder, the page (PDFs; `page_end` too when the passage spans pages), the line range (from the page's start for PDFs) and the clause path from the structure map (for a chunk without one, such as one stored before the map existed or text before the first heading, the parser's heading path when it has one). A chunk ingested before documents were stored is cited by its file name, without lines.
+- `interaction_id` goes to `strata_feedback`, which takes passage ids: `{"S1": "useful", "S2": "wrong"}`.
+- `response_format: "detailed"` returns everything as well: `confidence`, the query variants (`queries_used`), `retrieved_chunks` with their ids, scores and metadata, `sources`, with `status` `ok` and the found, partly found or not found in `answer_status`.
+
 ## Configuration
 
 Settings come from four sources, each overriding the one before: the defaults below, the user-level `config.env`, the file named by `STRATAKB_CONFIG`, then environment variables. The user-level file is `%APPDATA%\stratakb\config.env` on Windows, and `$XDG_CONFIG_HOME/stratakb/config.env`, else `~/.config/stratakb/config.env`, elsewhere. Copy `.env.example` there to start.
@@ -310,12 +357,12 @@ flowchart LR
 | `EMBEDDING_MODEL` | `all-mpnet-base-v2` | Embedding model; the `openai` backend uses `text-embedding-3-large` unless set |
 | `EMBEDDING_DIMENSIONS` | `768` | Must match the model and the `vector(…)` column; vectors of another length are refused, and `strata_admin_health` reports a column of another size |
 | `EMBEDDING_BASE_URL` | | `openai` backend: an OpenAI-compatible server, ending in `/v1` (for example `http://127.0.0.1:11434/v1`); empty means OpenAI |
-| `EMBEDDING_API_KEY` | | Key for `EMBEDDING_BASE_URL`, only if the server asks for one |
+| `EMBEDDING_API_KEY` | | Key for `EMBEDDING_BASE_URL`, only if the server asks for one; a local server usually needs none (requests then carry the placeholder `unused`) |
 | `OPENAI_API_KEY` | | Needed for the `openai` backend without `EMBEDDING_BASE_URL`; never sent to that server |
 | `QUERY_REWRITE_PROVIDER` | `anthropic` | Who rewrites questions in `strata_ask`: `anthropic`, or `openai_compatible` (the endpoint in `QUERY_REWRITE_BASE_URL`) |
 | `ANTHROPIC_API_KEY` | | Turns on query rewriting with the `anthropic` provider |
 | `QUERY_REWRITE_BASE_URL` | | `openai_compatible` provider: an OpenAI-compatible chat endpoint, ending in `/v1` (for example `http://127.0.0.1:11434/v1`) |
-| `QUERY_REWRITE_API_KEY` | | Key for `QUERY_REWRITE_BASE_URL`, only if the endpoint asks for one; `OPENAI_API_KEY` is never sent there |
+| `QUERY_REWRITE_API_KEY` | | Key for `QUERY_REWRITE_BASE_URL`, only if the endpoint asks for one; a local endpoint usually needs none (requests then carry the placeholder `unused`); `OPENAI_API_KEY` is never sent there |
 | `QUERY_REWRITE_MODEL` | `claude-haiku-5-5` | Model used for query rewriting; must be set for `openai_compatible` |
 | `HYBRID_SEARCH_ENABLED` | `true` | Vector plus full-text search |
 | `HYBRID_SEMANTIC_WEIGHT`, `HYBRID_KEYWORD_WEIGHT` | `0.7`, `0.3` | RRF weights |
@@ -325,6 +372,7 @@ flowchart LR
 | `RERANKING_ENABLED` | `true` | Cross-encoder reranking in `strata_ask` |
 | `RERANKING_MODEL` | `cross-encoder/ms-marco-MiniLM-L-6-v2` | Reranker |
 | `RERANKING_CANDIDATE_MULTIPLIER` | `3` | `strata_ask` reranks `top_k` times this many candidates |
+| `ANSWER_TOKEN_BUDGET` | `1500` | How much text `strata_ask` returns: the best passages that fit this many tokens (about four characters each); the first passage always comes back |
 | `CACHE_ENABLED`, `CACHE_TTL_SECONDS` | `true`, `600` | Query result cache, cleared per layer on ingestion |
 | `CACHE_MAXSIZE` | `500` | Query results kept in the cache |
 | `LEARNING_ENABLED` | `true` | Record interactions and learn from them |
@@ -372,7 +420,7 @@ The server answers its client at once and, with the default `local` backend, loa
 
 ### Embeddings from a model server
 
-Instead of the in-process model, StrataKB can embed through any server that speaks the OpenAI embeddings API, such as Ollama, LM Studio or vLLM. Your documents and questions then go to that server and nowhere else; no OpenAI key is needed. With `STRATA_LOCAL_ONLY=true` only a server on this machine (`127.0.0.1`, `::1`, `localhost`) is allowed. For a local Ollama:
+Instead of the in-process model, StrataKB can embed through any server that speaks the OpenAI embeddings API, such as Ollama, LM Studio or vLLM. Your documents and questions then go to that server and nowhere else; no OpenAI key is needed, and a local server such as a default Ollama, llama.cpp or vLLM needs no key at all: leave `EMBEDDING_API_KEY` empty and requests carry the placeholder key `unused`, which a keyless server ignores. With `STRATA_LOCAL_ONLY=true` only a server on this machine (`127.0.0.1`, `::1`, `localhost`) is allowed. For a local Ollama:
 
 ```bash
 ollama pull nomic-embed-text   # 768 dimensions, matches the default column
@@ -391,7 +439,7 @@ Once at startup, in the background, the server asks the server in `EMBEDDING_BAS
 
 ### Query rewriting through a model server
 
-`strata_ask` can also rewrite questions through any endpoint that speaks the OpenAI chat API, such as Ollama, LM Studio, vLLM, Azure OpenAI or Groq, instead of Anthropic. Your questions and the layer descriptions then go to that endpoint; no Anthropic key is needed. With `STRATA_LOCAL_ONLY=true` only an endpoint on this machine (`127.0.0.1`, `::1`, `localhost`) is allowed. For a local Ollama:
+`strata_ask` can also rewrite questions through any endpoint that speaks the OpenAI chat API, such as Ollama, LM Studio, vLLM, Azure OpenAI or Groq, instead of Anthropic. Your questions and the layer descriptions then go to that endpoint; no Anthropic key is needed, and a local endpoint needs no key at all: leave `QUERY_REWRITE_API_KEY` empty and requests carry the placeholder key `unused`. With `STRATA_LOCAL_ONLY=true` only an endpoint on this machine (`127.0.0.1`, `::1`, `localhost`) is allowed. For a local Ollama:
 
 ```bash
 ollama pull llama3.2
@@ -441,14 +489,14 @@ With `STRATA_LOCAL_ONLY=true` the server refuses to start while any blocked path
 
 `strata_admin_health` always lists the switch (`local_only`) and the active outbound providers (`outbound`: provider, purpose, what it sends, destination host and the setting that turns it on), whether the switch is on or not. It never shows keys, credentials, paths or ports.
 
-With `EMBEDDING_BASE_URL` set (and `EMBEDDING_BACKEND` not `local`), the server also asks that server for its model list once at startup. The request carries `EMBEDDING_API_KEY` and nothing about your documents, and with `STRATA_LOCAL_ONLY=true` it is only sent to a server on this machine.
+With `EMBEDDING_BASE_URL` set (and `EMBEDDING_BACKEND` not `local`), the server also asks that server for its model list once at startup. The request carries `EMBEDDING_API_KEY` (or the placeholder `unused` when it is empty) and nothing about your documents, and with `STRATA_LOCAL_ONLY=true` it is only sent to a server on this machine.
 
 StrataKB cannot control what your MCP client's language model does with the retrieved text. If the client uses a cloud model, the retrieved text goes to that provider. Teams that need the whole path to stay on the machine should embed through an OpenAI-compatible server on this machine (see [Embeddings from a model server](#embeddings-from-a-model-server)), rewrite questions through one too if they want rewriting (see [Query rewriting through a model server](#query-rewriting-through-a-model-server)), and use a client with a local model.
 
 ## Glossary
 
 - **Chunk**: a passage of a document, cut along its headings or structure. Search returns chunks, each with its file and section.
-- **Confidence**: `high`, `medium` or `low`, returned with every `strata_ask` and `strata_search` result; a low one comes with a warning. It is judged on the reranker's relevance probability (0 to 1) or, with reranking off, on each chunk's `similarity` (how similar the question and the chunk are by meaning); the result says which (`basis`: `rerank` or `similarity`). Each `strata_ask` chunk carries `score` (its merged rank, best 1.0), `similarity`, `rerank_score` (null with reranking off), `source_file` and `section`, and each source's `relevance_score` is the score confidence was judged on. `strata_search` results carry each chunk's `similarity` (with hybrid search on, the default, its `score` is the fused rank, where the best result is always 1.0), and `strata_search` judges its confidence on that similarity (`basis` `similarity`), never on the fused `score`; a chunk without an embedding counts as similarity 0. The learning loop stores the confidence the tool returned, and each stored result keeps its `similarity`. The thresholds are provisional until the evaluation suite measures them.
+- **Confidence**: `high`, `medium` or `low`, returned with every `strata_search` result and with `strata_ask` in `response_format: "detailed"`; a low one comes with a warning. `strata_ask`'s `found`, `partly_found` or `not_found` is read from the best passage's score on the same thresholds. It is judged on the reranker's relevance probability (0 to 1) or, with reranking off, on each chunk's `similarity` (how similar the question and the chunk are by meaning); the result says which (`basis`: `rerank` or `similarity`). Each detailed `strata_ask` chunk carries `score` (its merged rank, best 1.0), `similarity`, `rerank_score` (null with reranking off), `source_file` and `section`, and each source's `relevance_score` is the score confidence was judged on. `strata_search` results carry each chunk's `similarity` (with hybrid search on, the default, its `score` is the fused rank, where the best result is always 1.0), and `strata_search` judges its confidence on that similarity (`basis` `similarity`), never on the fused `score`; a chunk without an embedding counts as similarity 0. The learning loop stores the confidence the tool returned, and each stored result keeps its `similarity`. The thresholds are provisional until the evaluation suite measures them.
 - **Embedding**: a list of numbers that stands for a chunk's meaning, so similar meanings get similar numbers. The embedding model (`all-mpnet-base-v2` by default) makes them; the vector column stores them (`EMBEDDING_DIMENSIONS`, 768 by default).
 - **HNSW**: the pgvector index that finds similar embeddings quickly; `HNSW_EF_SEARCH` trades recall for speed.
 - **Hybrid search**: a search by meaning (embeddings) and a search by words (PostgreSQL full-text search), merged into one list with RRF.
@@ -458,7 +506,7 @@ StrataKB cannot control what your MCP client's language model does with the retr
 - **Reranking**: in `strata_ask`, a second model (a cross-encoder, `RERANKING_MODEL`) reads the question with each candidate chunk and puts the best first.
 - **Routing patterns**: a layer's regular expressions. When a question names no layers, those whose patterns match are searched first.
 - **RRF** (Reciprocal Rank Fusion): how hybrid search merges its two lists by rank, weighted by `HYBRID_SEMANTIC_WEIGHT` and `HYBRID_KEYWORD_WEIGHT`, with the constant `HYBRID_RRF_K`. The best full-text matches keep `HYBRID_KEYWORD_SLOTS` places in the results, because a chunk found only by words would otherwise rank below every chunk found by meaning. `strata_ask` merges the results of its searches (one per rewritten query) the same way, by rank with `HYBRID_RRF_K`: a chunk several searches find comes first, and ties go to the more similar chunk.
-- **top_k**: how many chunks a tool returns: 5 by default for `strata_search`, 10 for `strata_ask`.
+- **top_k**: how many chunks a tool returns: 5 by default for `strata_search`; for `strata_ask` (10 by default) how many each search returns before `ANSWER_TOKEN_BUDGET` trims them.
 
 ## Project structure
 
@@ -471,9 +519,9 @@ src/stratakb/
   mcp_server.py       MCP server: admin and user tools
   core/               Database pool, roles, audit log, logging, schema migrations, local database in Docker
     sql/              Schema, applied in version order by the server: 01_init, 02_learning, then the 04–12 upgrades
-  knowledge/          Layers, presets, ingestion pipeline, parsers, embeddings, vector store
+  knowledge/          Layers, presets, ingestion pipeline, structure map, parsers, embeddings, vector store
     add_folder.py     Turns one folder into one layer and keeps it in sync
-  rag/                Retriever (hybrid + RRF), reranker, cache, routing, query rewriter, tools
+  rag/                Retriever (hybrid + RRF), reranker, cache, routing, query rewriter, cited passages, receipts, tools
   learning/           Interaction tracking, signals, synonyms, promotion, feedback tools
   database_access/    Read-only SQL and introspection tools
 tests/                pytest suite

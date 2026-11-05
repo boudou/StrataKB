@@ -149,7 +149,9 @@ async def test_ask_explicit_layers_are_never_broadened(tools, monkeypatch):
     search = AsyncMock(return_value=[_result("weak", "chosen", similarity=0.1)])
     monkeypatch.setattr("stratakb.rag.retriever.search_chunks", search)
 
-    response = await registered["strata_ask"]("question", layers=["chosen"], top_k=2)
+    response = await registered["strata_ask"](
+        "question", layers=["chosen"], top_k=2, response_format="detailed"
+    )
 
     assert response["status"] == "ok"
     assert "routing_fallback" not in response
@@ -187,7 +189,7 @@ async def test_ask_falls_back_after_deduplicating_rewritten_queries(tools, monke
     search_mock = AsyncMock(side_effect=search)
     monkeypatch.setattr("stratakb.rag.retriever.search_chunks", search_mock)
 
-    response = await registered["strata_ask"]("question", top_k=2)
+    response = await registered["strata_ask"]("question", top_k=2, response_format="detailed")
 
     assert response["routing_fallback"]["reason"] == "insufficient_results"
     assert [c["chunk_id"] for c in response["retrieved_chunks"]] == ["first", "second"]
@@ -222,7 +224,7 @@ async def test_ask_uses_reranked_confidence_for_fallback(tools, monkeypatch):
         return [{**chunk, "rerank_score": score} for chunk in chunks]
 
     monkeypatch.setattr("stratakb.rag.reranker.rerank_results", rerank)
-    response = await registered["strata_ask"]("question", top_k=2)
+    response = await registered["strata_ask"]("question", top_k=2, response_format="detailed")
 
     assert response["routing_fallback"]["reason"] == "low_confidence"
     assert response["confidence"]["level"] == "medium"

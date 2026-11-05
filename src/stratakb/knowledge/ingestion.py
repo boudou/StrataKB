@@ -1,14 +1,15 @@
 """Document ingestion pipeline orchestrator.
 
 Pipeline: discover files (or take a given file list) → skip secret-looking
-names → skip unchanged → skip empty → parse → chunk → embed → store per file
-→ remove gone (or unlisted) files → record run → recount layer stats.
+names → skip unchanged → skip empty → parse → map structure → chunk along it
+→ embed → store per file → remove gone (or unlisted) files → record run → recount layer stats.
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
+from bisect import bisect_right
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -25,6 +26,7 @@ from stratakb.knowledge.documents import (
     page_starts,
     prune_documents,
     store_document_version,
+    store_sections,
 )
 from stratakb.knowledge.embeddings import embed_texts
 from stratakb.knowledge.layers import (
@@ -36,6 +38,11 @@ from stratakb.knowledge.layers import (
 from stratakb.knowledge.parsers.pdf_parser import ParsedDocument
 from stratakb.knowledge.parsers.registry import FORMATS, Format
 from stratakb.knowledge.policy import is_secret_name
+from stratakb.knowledge.structure import (
+    Section,
+    chunk_spans,
+    detect_sections,
+)
 from stratakb.knowledge.vector_store import ChunkRecord, chunk_embed_text, insert_chunks
 
 if TYPE_CHECKING:
@@ -49,6 +56,9 @@ EMBED_BATCH_SIZE = 100
 
 # A PDF averaging fewer characters per page than this probably holds scanned images
 _SCANNED_MIN_CHARS_PER_PAGE = 200
+
+# The longest error message recorded for one file
+_ERROR_MAX_CHARS = 300
 
 Outcome = Literal["added", "updated", "unchanged", "removed", "skipped", "flagged", "failed"]
 Reason = Literal[
@@ -148,12 +158,13 @@ async def _store_file(
     document_text: str,
     page_map: list[list[int]] | None = None,
     text_origin: str = "text",
+    sections: Sequence[Section] = (),
 ) -> None:
     """Replace one file's row, document version and chunks in a single transaction.
 
     The text is stored as the file's current document version (reused when
-    unchanged); this file's versions no chunk references any more are pruned
-    afterwards.
+    unchanged), with its structure map (sections); this file's versions no
+    chunk references any more are pruned afterwards.
     """
     pool = await get_pool(database_url)
     async with pool.acquire() as conn:
@@ -188,6 +199,7 @@ async def _store_file(
                 page_map=page_map,
                 text_origin=text_origin,
             )
+            await store_sections(conn, document_id, sections)
             for chunk in chunks:
                 chunk.file_id = file_id
                 chunk.document_id = document_id
@@ -444,9 +456,10 @@ async def ingest_documents(
             result.files.append(FileOutcome(relative_path, "removed", reason))
             result.files_removed += 1
 
-        def fail(relative_path: str, error: str, reason: Reason) -> None:
+        def fail(relative_path: str, file_path: Path, error: str, reason: Reason) -> None:
             result.files.append(FileOutcome(relative_path, "failed", reason))
             result.docs_failed += 1
+            error = _file_error(error, file_path=file_path, relative_path=relative_path, root=root)
             result.errors.append({"file": relative_path, "error": error, "reason": reason})
 
         # Step 4: Parse, chunk, embed and store each new or changed file
@@ -473,7 +486,7 @@ async def ingest_documents(
                     "file_read_failed", layer=layer_name, file=relative_path,
                     error_type=type(e).__name__,
                 )
-                fail(relative_path, str(e), "read_error")
+                fail(relative_path, file_path, str(e), "read_error")
                 continue
             content_hash = carried_hash or hashlib.sha256(data).hexdigest()
 
@@ -495,18 +508,21 @@ async def ingest_documents(
                     "file_parse_raised", layer=layer_name, file=relative_path,
                     error_type=type(e).__name__,
                 )
-                fail(relative_path, str(e), "parse_error")
+                fail(relative_path, file_path, str(e), "parse_error")
                 continue
             if parsed.error:
-                fail(relative_path, parsed.error, "parse_error")
+                fail(relative_path, file_path, parsed.error, "parse_error")
                 continue
             parsed.source_file = relative_path
 
+            document_text, page_map = build_document_text(parsed)
+            sections = detect_sections(document_text)
             doc_chunks = _chunk_document(
                 parsed,
                 layer_name=layer_name,
                 chunk_size=chunk_size,
                 chunk_overlap=chunk_overlap,
+                sections=sections,
             )
             if not doc_chunks:
                 await drop(relative_path, previous, "no_text")
@@ -521,12 +537,12 @@ async def ingest_documents(
                 )
             except Exception as e:
                 logger.warning(
-                    "file_ingestion_failed", layer=layer_name, file=relative_path, error=str(e)
+                    "file_ingestion_failed", layer=layer_name, file=relative_path,
+                    error_type=type(e).__name__,
                 )
-                fail(relative_path, str(e), "embed_error")
+                fail(relative_path, file_path, str(e), "embed_error")
                 continue
 
-            document_text, page_map = build_document_text(parsed)
             try:
                 await _store_file(
                     database_url,
@@ -538,15 +554,17 @@ async def ingest_documents(
                     chunks=doc_chunks,
                     document_text=document_text,
                     page_map=page_map,
+                    sections=sections,
                 )
             except (asyncpg.PostgresConnectionError, asyncpg.InterfaceError, OSError):
                 # A lost database is an error for the whole run, not one failed file
                 raise
             except Exception as e:
                 logger.warning(
-                    "file_ingestion_failed", layer=layer_name, file=relative_path, error=str(e)
+                    "file_ingestion_failed", layer=layer_name, file=relative_path,
+                    error_type=type(e).__name__,
                 )
-                fail(relative_path, str(e), "embed_error")
+                fail(relative_path, file_path, str(e), "embed_error")
                 continue
 
             flag = _flag_reason(fmt, parsed)
@@ -629,6 +647,24 @@ def _discover_files(source: Path) -> list[Path]:
     return sorted(files)
 
 
+def _file_error(message: str, *, file_path: Path, relative_path: str, root: Path) -> str:
+    """An error message for one file, safe to return and store: the absolute
+    path (which can hold the user's name) replaced by the relative one, the
+    root by ".", and the text cut to _ERROR_MAX_CHARS."""
+    replacements = []
+    for absolute, relative in ((file_path, relative_path), (root, ".")):
+        if str(absolute) == absolute.anchor:
+            continue  # a bare "/" or "C:\" would rewrite every slash
+        for form in {str(absolute), absolute.as_posix()}:
+            # OSError and repr() show a Windows path with doubled backslashes
+            replacements += [(form.replace("\\", "\\\\"), relative), (form, relative)]
+    for form, relative in replacements:
+        message = message.replace(form, relative)
+    if len(message) > _ERROR_MAX_CHARS:
+        message = message[: _ERROR_MAX_CHARS - 3] + "..."
+    return message
+
+
 def _parse_file(file_path: Path) -> ParsedDocument:
     """Parse a file using the appropriate parser based on extension."""
     ext = file_path.suffix.lower()
@@ -686,69 +722,62 @@ def _chunk_document(
     layer_name: str,
     chunk_size: int,
     chunk_overlap: int,
+    sections: list[Section] | None = None,
 ) -> list[ChunkRecord]:
-    """Split a parsed document into chunks using LangChain text splitter.
+    """Split a parsed document into chunks along its structure map.
+
+    sections is the document text's structure map (structure.detect_sections,
+    detected here when None). The text is cut at every section and page
+    start, and a chunk carries the clause_path of the section it lies in.
+    Without sections, each page is split by size alone.
 
     Each chunk gets char_start and char_end into the document text (see
-    documents.build_document_text), or None when its text is not found.
+    documents.build_document_text).
     """
-    from langchain_text_splitters import RecursiveCharacterTextSplitter
-
-    splitter = RecursiveCharacterTextSplitter(
-        chunk_size=chunk_size,
-        chunk_overlap=chunk_overlap,
-        length_function=len,
-        separators=["\n\n", "\n", ". ", " ", ""],
-    )
-
     # Derive doc_type from file extension
     ext = Path(doc.source_file).suffix.lower()
     fmt = FORMATS.get(ext)
     doc_type = fmt.doc_type if fmt is not None else ext.lstrip(".") or "unknown"
 
-    chunks: list[ChunkRecord] = []
+    text = build_document_text(doc)[0]
+    starts = page_starts(doc)
+    if sections is None:
+        sections = detect_sections(text)
 
-    for page, page_start in zip(doc.pages, page_starts(doc), strict=True):
-        page_chunks = splitter.split_text(page.text)
+    def record(page, content: str, char_start: int | None, clause_path: str | None):
         metadata: dict = {
             "page": page.page_number,
             "total_pages": doc.total_pages,
         }
         if page.section_path:
             metadata["section_path"] = list(page.section_path)
-        # Overlapping chunks repeat text, and a page can repeat itself: a chunk
-        # starts after the previous one's start and at most chunk_overlap
-        # characters before its end, so search from there
-        prev_start, prev_end = -1, 0
-        for chunk_text in page_chunks:
-            pos = page.text.find(chunk_text, max(prev_start + 1, prev_end - chunk_overlap))
-            if pos < 0:
-                pos = page.text.find(chunk_text, prev_start + 1)
-            if pos < 0:
-                logger.warning(
-                    "chunk_offsets_not_found", file=doc.source_file, page=page.page_number
-                )
-                char_start = char_end = None
-            else:
-                prev_start, prev_end = pos, pos + len(chunk_text)
-                char_start = page_start + pos
-                char_end = char_start + len(chunk_text)
-            # content is the page's own text; the context prefix is only embedded
-            chunks.append(
-                ChunkRecord(
-                    content=chunk_text,
-                    embedding=[],  # Filled later
-                    layer_name=layer_name,
-                    metadata=dict(metadata),
-                    source_file=doc.source_file,
-                    source_section=f"page_{page.page_number}",
-                    doc_type=doc_type,
-                    char_start=char_start,
-                    char_end=char_end,
-                )
-            )
+        # content is the page's own text; the context prefix is only embedded
+        return ChunkRecord(
+            content=content,
+            embedding=[],  # Filled later
+            layer_name=layer_name,
+            metadata=metadata,
+            source_file=doc.source_file,
+            source_section=f"page_{page.page_number}",
+            doc_type=doc_type,
+            char_start=char_start,
+            char_end=char_start + len(content) if char_start is not None else None,
+            clause_path=clause_path,
+        )
 
-    return chunks
+    # Without sections, the cuts are the page starts alone: each page split by size
+    return [
+        # The page an offset lies in: page starts are cuts, so a chunk is in one page
+        record(
+            doc.pages[bisect_right(starts, char_start) - 1],
+            text[char_start:char_end],
+            char_start,
+            path or None,
+        )
+        for char_start, char_end, path in chunk_spans(
+            sections, text, chunk_size, chunk_overlap, boundaries=starts
+        )
+    ]
 
 
 async def _record_run(

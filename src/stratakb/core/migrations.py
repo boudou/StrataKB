@@ -248,6 +248,29 @@ MIGRATIONS: list[Migration] = [
     ),
     Migration(8, "08_readonly_documents.sql", _readonly_later_grants_present()),
     Migration(
+        9,
+        "09_structure.sql",
+        """
+        SELECT to_regclass('strata_vectors.document_sections') IS NOT NULL
+            AND EXISTS (
+                SELECT 1 FROM information_schema.columns
+                WHERE table_schema = 'strata_vectors'
+                  AND table_name = 'chunks'
+                  AND column_name = 'clause_path'
+            )
+        """,
+    ),
+    Migration(
+        10,
+        "10_receipts.sql",
+        _tables_present(
+            (
+                ("strata_core", "receipts"),
+                ("strata_core", "receipt_documents"),
+            )
+        ),
+    ),
+    Migration(
         12,
         "12_answer_mode.sql",
         """

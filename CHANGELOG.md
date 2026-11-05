@@ -46,6 +46,9 @@ Notable changes to StrataKB. The format follows [Keep a Changelog](https://keepa
 - `strata_feedback` and `strata_reset_learning` write audit entries: feedback names the user, the interaction, whether it was helpful and which extra signals were given (never their text); a reset names its scope, one layer or all.
 - The `strata_apply_preset` audit entry names the layer settings that changed.
 - `stratakb add` refuses up front, with exit 2 and reason `local_only`, when `STRATA_LOCAL_ONLY` is set and the embedding settings would send text off the machine, and names the setting; before, it ran and every file failed with `embed_error`.
+- Clause-aware chunking: each stored document gets a structure map (migration `09_structure.sql`, table `strata_vectors.document_sections`) of its Markdown, reStructuredText and AsciiDoc headings, numbered headings (`4.3.2`, `7.`, `7(2)(b)`) and keyword headings (`Article 12`, `Section 3`, `Annex II`), found without configuration. A chunk never crosses a section or a PDF page, every piece of a long section keeps the section's path, and each chunk stores it as `clause_path`. Numbered lists inside a clause, dates, amounts and table-of-contents entries are not taken for headings. Existing chunks get a clause path when their file is ingested again.
+- Receipts (migration `10_receipts.sql`): a stored record of the quotes behind an answer, with the document version, hash and up to 300 characters of context around each quote, opened with `strata_get_receipt` or the resource `strata://receipts/{receipt_id}`. A receipt shows `v1 -> v2` when its source has changed since and keeps its quote when the source was deleted; document versions a receipt cites are not pruned. The question is always PII-scrubbed. Issuing and opening are audited (`receipt_issue`, `receipt_open`, refusals included) with the receipt id and counts only. Receipts are not readable through the read-only role, and `export-layer` does not carry them. Nothing issues receipts yet: `strata_verify` and extractive answers will.
+- `ANSWER_TOKEN_BUDGET` (default 1500): how many tokens of passages `strata_ask` returns, best first; the first passage always comes back. `top_k` only bounds the search.
 
 ### Changed
 
@@ -77,6 +80,7 @@ Notable changes to StrataKB. The format follows [Keep a Changelog](https://keepa
 - HTML: the page title is the first `<title>` outside an inline SVG, and SVG titles stay in the text.
 - The SQL tools role check at startup runs one query with a 5 s timeout and removes the tools if it fails or stalls.
 - The egress report counts an `openai_compatible` query rewrite as outbound only when `QUERY_REWRITE_MODEL` is set, since without a model no rewrite is sent. Model ids in the health report are capped at 20 ids of 100 characters.
+- `strata_ask` returns a short answer by default: `status` (`found`, `partly_found` or `not_found`, with a `next_step` for the last two), `mode` (`grounded`) and passages `S1`, `S2`, … each with its exact text, a `ref` to its span of the stored document and its own citation (relative path, page, line range, clause path, layer). The previous shape, with scores, query variants and chunk ids, needs `response_format: "detailed"`, where `status` stays `ok` and the new status is `answer_status`. `strata_feedback` accepts passage ids (`{"S1": "useful"}`) next to chunk ids.
 
 ### Fixed
 
@@ -108,6 +112,7 @@ Notable changes to StrataKB. The format follows [Keep a Changelog](https://keepa
 - A chunk without an embedding no longer makes vector search fail; it is left out of the similarity ranking and can still be found by keyword.
 - Two concurrent stores of the same file no longer fail on the version number.
 - Requests to a custom OpenAI-compatible endpoint (`EMBEDDING_BASE_URL`, `QUERY_REWRITE_BASE_URL`) no longer carry the `OpenAI-Organization` and `OpenAI-Project` headers the SDK takes from `OPENAI_ORG_ID` and `OPENAI_PROJECT_ID`.
+- A keyless OpenAI-compatible endpoint (a default Ollama, llama.cpp or vLLM on localhost) works for embeddings and query rewriting: with no key configured the client sends the placeholder `unused` instead of failing on a missing key, and never falls back to `OPENAI_API_KEY`.
 
 ### Security
 
@@ -116,3 +121,4 @@ Notable changes to StrataKB. The format follows [Keep a Changelog](https://keepa
 - The `strata_readonly` role may read only `knowledge_layers`, `ingestion_runs`, `ingested_files`, `chunks` and `documents` (migration `08_readonly_documents.sql`), not the audit log, users or the learning schema. Migration `06_readonly_grants.sql` narrows existing installs at startup.
 - Locked dependencies upgraded to patched releases for all 124 open advisories (among them certifi, PyJWT, AnyIO, pypdf, transformers, urllib3, cryptography, starlette and python-multipart). Some transitive packages move a major version: filelock 4, cryptography 50, soupsieve 4 and huggingface-hub 2.
 - File listing through git passes `core.fsmonitor=false`, so a crafted `.git/config` in an added folder cannot run a command.
+- Ingest errors returned to the caller and stored in `ingestion_runs.error_log` name the file by its path relative to the ingested folder, never the absolute path (which can hold the user's name), and are cut to 300 characters. The embed and store failure logs record the error type only, not the exception text.
