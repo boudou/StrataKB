@@ -108,46 +108,45 @@ def register_learning_tools(mcp: FastMCP, database_url: str) -> None:
                 ),
             }
 
+        # The audit summary names only the extras that were stored. The
+        # suggested query and layer are caller free text: name them only
+        extras = []
+
         # Store layer correction if provided
-        if correct_layer:
-            await store.store_feedback(
-                interaction_id=interaction_id,
-                signal_type="explicit",
-                signal_name="correct_layer",
-                signal_value=-0.3,
-                metadata={"correct_layer": correct_layer},
-            )
+        if correct_layer and await store.store_feedback(
+            interaction_id=interaction_id,
+            signal_type="explicit",
+            signal_name="correct_layer",
+            signal_value=-0.3,
+            metadata={"correct_layer": correct_layer},
+        ):
+            extras.append("correct_layer")
 
         # Store better query if provided
-        if better_query:
-            await store.store_feedback(
-                interaction_id=interaction_id,
-                signal_type="explicit",
-                signal_name="better_query",
-                signal_value=-0.2,
-                metadata={"better_query": better_query},
-            )
+        if better_query and await store.store_feedback(
+            interaction_id=interaction_id,
+            signal_type="explicit",
+            signal_name="better_query",
+            signal_value=-0.2,
+            metadata={"better_query": better_query},
+        ):
+            extras.append("better_query")
 
         # Store chunk-level feedback
         if chunk_feedback:
+            rated = 0
             for chunk_id, rating in chunk_feedback.items():
                 value = {"useful": 0.7, "wrong": -1.0, "outdated": -0.5}.get(rating, 0)
-                await store.store_feedback(
+                if await store.store_feedback(
                     interaction_id=interaction_id,
                     signal_type="explicit",
                     signal_name=f"chunk_{rating}",
                     signal_value=value,
                     metadata={"chunk_id": chunk_id},
-                )
-
-        # The suggested query and layer are caller free text: name them only
-        extras = []
-        if correct_layer:
-            extras.append("correct_layer")
-        if better_query:
-            extras.append("better_query")
-        if chunk_feedback:
-            extras.append(f"{len(chunk_feedback)} chunk ratings")
+                ):
+                    rated += 1
+            if rated:
+                extras.append(f"{rated} chunk ratings")
         summary = "Rated helpful" if helpful else "Rated not helpful"
         if extras:
             summary += ", with " + ", ".join(extras)
@@ -196,9 +195,15 @@ def register_learning_tools(mcp: FastMCP, database_url: str) -> None:
         Interaction history is preserved unless doing a global reset.
 
         Args:
-            layer: Reset only this layer's learned data. Omit for global reset.
+            layer: Reset only this layer's learned data. Omit for global reset;
+                an empty layer is refused.
             confirm: Must be true to proceed. Safety check.
         """
+        if layer is not None and not layer.strip():
+            return {
+                "status": "error",
+                "error": "layer is empty. Name a layer, or omit layer for a global reset.",
+            }
         if not confirm:
             return {
                 "status": "error",
@@ -209,6 +214,13 @@ def register_learning_tools(mcp: FastMCP, database_url: str) -> None:
 
         store = LearningStore(database_url)
         result = await store.reset(layer=layer)
+        # A reset that failed in the database deleted nothing: report, don't audit
+        if result is None:
+            return {
+                "status": "error",
+                "error": "Reset failed in the database; nothing was deleted. "
+                "Check the server log and retry.",
+            }
         user_id, _ = get_current_user()
         await write_audit_log(
             database_url,

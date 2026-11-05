@@ -486,26 +486,41 @@ class LearningStore:
             return f"{query} ({', '.join(expansions)})"
         return query
 
-    async def reset(self, layer: str | None = None) -> dict:
-        """Reset learning data. If layer specified, only that layer."""
+    async def reset(self, layer: str | None = None) -> dict | None:
+        """Reset learning data. If layer is given (even ""), only that layer.
+
+        Runs as one transaction: returns None if it fails, and then nothing
+        was deleted.
+        """
         _rewrite_cache.clear()
         _synonym_cache.clear()
-        if layer:
-            await self._execute(
-                "DELETE FROM strata_learning.learned_rewrites WHERE $1 = ANY(layers)", layer
-            )
-            await self._execute(
-                "DELETE FROM strata_learning.query_synonyms WHERE layer = $1", layer
-            )
-            await self._execute(
-                "DELETE FROM strata_learning.layer_affinity_scores WHERE layer_name = $1", layer
-            )
+        try:
+            pool = await get_pool(self.database_url)
+            async with pool.acquire() as conn, conn.transaction():
+                if layer is not None:
+                    await conn.execute(
+                        "DELETE FROM strata_learning.learned_rewrites WHERE $1 = ANY(layers)",
+                        layer,
+                    )
+                    await conn.execute(
+                        "DELETE FROM strata_learning.query_synonyms WHERE layer = $1", layer
+                    )
+                    await conn.execute(
+                        "DELETE FROM strata_learning.layer_affinity_scores WHERE layer_name = $1",
+                        layer,
+                    )
+                else:
+                    await conn.execute(
+                        "TRUNCATE strata_learning.feedback_signals,"
+                        " strata_learning.interaction_events,"
+                        " strata_learning.query_sessions,"
+                        " strata_learning.learned_rewrites,"
+                        " strata_learning.query_synonyms,"
+                        " strata_learning.layer_affinity_scores CASCADE"
+                    )
+        except Exception as e:
+            logger.debug("learning_store_reset_failed", error=str(e))
+            return None
+        if layer is not None:
             return {"reset": "layer", "layer": layer}
-        else:
-            for table in [
-                "feedback_signals", "interaction_events",
-                "query_sessions", "learned_rewrites",
-                "query_synonyms", "layer_affinity_scores",
-            ]:
-                await self._execute(f"TRUNCATE strata_learning.{table} CASCADE")
-            return {"reset": "all"}
+        return {"reset": "all"}
