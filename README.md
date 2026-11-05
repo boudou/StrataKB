@@ -319,19 +319,21 @@ flowchart LR
 | `STRATA_LOCAL_ONLY` | `false` | Refuse to start while any provider would send content off this machine, and load models from local files only; see [Where your data goes](#where-your-data-goes) |
 | `LOG_LEVEL` | `INFO` | Structured JSON logs on stderr |
 
-To change the embedding model, update `EMBEDDING_BACKEND`, `EMBEDDING_MODEL` and `EMBEDDING_DIMENSIONS` (and `EMBEDDING_BASE_URL` for a model server), then re-embed every layer at once with `vector_store.re_embed_all_layers()`. It re-embeds the stored chunk text without re-parsing files and resizes the vector column once when the dimensions change; if anything fails, every layer and the column stay as they were. It works in two phases. First it reads the chunks a batch at a time, embeds them and keeps the new vectors aside, while searches and ingests carry on as usual. Then one transaction locks the chunks table, resizes the column if needed, writes the new vectors and embeds any chunk added in the meantime. Ingests wait for that transaction, and searches wait too when it resizes the column. The model runs under the lock only for the chunks added during the first phase, usually none, but writing the vectors and rebuilding the index still takes longer the more chunks there are, so plan a resize of a large knowledge base for a quiet moment.
+To change the embedding model, update `EMBEDDING_BACKEND`, `EMBEDDING_MODEL` and `EMBEDDING_DIMENSIONS` (and `EMBEDDING_BASE_URL` for a model server), then re-embed every layer at once with `vector_store.re_embed_all_layers()`. It re-embeds the stored chunk text without re-parsing files and resizes the vector column once when the dimensions change; if anything fails, every layer and the column stay as they were. It works in two phases. First it reads the chunks a batch at a time, embeds them and keeps the new vectors aside, while searches and ingests carry on as usual. When more than one batch of chunks was added in the meantime, it embeds those too, still without a lock (up to three extra passes). Then one transaction locks the chunks table, resizes the column if needed, writes the new vectors and embeds the few chunks added since. Ingests wait for that transaction, and searches wait too when it resizes the column. The model runs under the lock for at most about one batch of chunks, usually none, but writing the vectors and rebuilding the index still takes longer the more chunks there are, so plan a resize of a large knowledge base for a quiet moment. Each statement of that transaction may take up to 10 minutes (`locked_timeout=600`, in seconds); one that takes longer rolls everything back, and the error says so. Pass a larger `locked_timeout` for a very large knowledge base.
 
 ```mermaid
 flowchart LR
     A["Phase 1: read a batch of chunks"] --> B["Embed it with the new model"]
     B --> C["Keep the vectors aside"]
     C -->|more chunks| A
-    C -->|all done| D["Phase 2: lock the chunks table"]
+    C -->|all done| N{"More than a batch added meanwhile?"}
+    N -->|"yes, up to 3 passes"| A
+    N -->|no| D["Phase 2: lock the chunks table"]
     D --> E{"Dimensions changed?"}
     E -->|yes| F["Resize the vector column"]
     E -->|no| G["Write the new vectors"]
     F --> G
-    G --> H["Embed chunks added during phase 1"]
+    G --> H["Embed the few chunks added since"]
     H --> I["Commit"]
 ```
 
@@ -339,7 +341,7 @@ flowchart LR
 uv run python -c "import asyncio; from stratakb.config import get_settings; from stratakb.knowledge.vector_store import re_embed_all_layers; print(asyncio.run(re_embed_all_layers(get_settings().database_url)))"
 ```
 
-Every layer shares the one vector column, so `vector_store.re_embed_layer()` re-embeds a single layer at the column's current size only, and refuses any other size.
+Every layer shares the one vector column, so `vector_store.re_embed_layer()` re-embeds a single layer at the column's current size only, and refuses any other size. When `re_embed_all_layers()` resizes the column while `re_embed_layer()` is running, the single-layer run stops before its next write and says which size to set.
 
 ### Database and models
 
