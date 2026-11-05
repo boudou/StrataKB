@@ -154,6 +154,7 @@ def register_rag_tools(
                         "section": r.source_section,
                         "doc_type": r.doc_type,
                         "metadata": r.metadata,
+                        "similarity": r.similarity,
                     }
                     for r in results
                 ],

@@ -268,3 +268,15 @@ async def test_hybrid_search_keeps_cosine_similarity_separate_from_rrf_rank():
     assert results[0].score == 1.0
     assert results[0].similarity == 0.2
     assert conn.fetch.await_args_list[1].args[2] == "[1,0]"
+
+
+@pytest.mark.asyncio
+async def test_search_results_carry_similarity(tools, monkeypatch):
+    registered, _, _ = tools
+    search = AsyncMock(return_value=[_result("guide", "docs", score=1.0, similarity=0.42)])
+    monkeypatch.setattr("stratakb.rag.retriever.search_chunks", search)
+
+    response = await registered["strata_search"]("accounting guide", top_k=1)
+
+    assert response["results"][0]["score"] == 1.0
+    assert response["results"][0]["similarity"] == 0.42

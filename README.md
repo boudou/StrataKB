@@ -390,7 +390,7 @@ StrataKB cannot control what your MCP client's language model does with the retr
 ## Glossary
 
 - **Chunk**: a passage of a document, cut along its headings or structure. Search returns chunks, each with its file and section.
-- **Confidence**: `high`, `medium` or `low`, returned with every `strata_ask` result; a low one comes with a warning. It is judged on the reranker's relevance probability (0 to 1) or, with reranking off, on how similar the question and each chunk are by meaning; the result says which (`basis`: `rerank` or `similarity`). The thresholds are provisional until the evaluation suite measures them.
+- **Confidence**: `high`, `medium` or `low`, returned with every `strata_ask` result; a low one comes with a warning. It is judged on the reranker's relevance probability (0 to 1) or, with reranking off, on how similar the question and each chunk are by meaning; the result says which (`basis`: `rerank` or `similarity`). `strata_search` results carry each chunk's `similarity` (its `score` is the hybrid rank, where the best result is always 1.0), and the learning loop judges a search's confidence on that similarity. The thresholds are provisional until the evaluation suite measures them.
 - **Embedding**: a list of numbers that stands for a chunk's meaning, so similar meanings get similar numbers. The embedding model (`all-mpnet-base-v2` by default) makes them; the vector column stores them (`EMBEDDING_DIMENSIONS`, 768 by default).
 - **HNSW**: the pgvector index that finds similar embeddings quickly; `HNSW_EF_SEARCH` trades recall for speed.
 - **Hybrid search**: a search by meaning (embeddings) and a search by words (PostgreSQL full-text search), merged into one list with RRF.

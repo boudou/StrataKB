@@ -15,6 +15,7 @@ from stratakb.config import get_settings
 from stratakb.learning.pii import scrub_query
 from stratakb.learning.signals import detect_reformulation, detect_layer_switch, detect_follow_up
 from stratakb.learning.store import LearningStore
+from stratakb.rag.confidence import score_confidence
 
 logger = structlog.get_logger()
 
@@ -82,7 +83,12 @@ class Tracker:
             return result
 
         chunks = result.get("results", [])
-        top_score = max((c.get("score", 0) for c in chunks), default=0)
+        # Judged on cosine similarity, never on the fused hybrid score: that
+        # one is divided by the top score, so the best result is always 1.0.
+        confidence = score_confidence(
+            [c["similarity"] for c in chunks if c.get("similarity") is not None],
+            basis="similarity",
+        )
 
         detected = result.get("auto_detected_layers")
         await self._record_safely(
@@ -93,8 +99,8 @@ class Tracker:
             layers_detected=detected,
             rewritten_queries=None,
             chunks=chunks,
-            confidence_level=None,
-            confidence_score=top_score,
+            confidence_level=confidence["level"],
+            confidence_score=confidence["top_score"],
             response_time_ms=elapsed_ms,
         )
 
