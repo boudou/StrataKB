@@ -1,0 +1,51 @@
+name: Docs
+
+on:
+  pull_request:
+    paths: ["**.md", ".github/workflows/docs.yml"]
+  push:
+    branches: [main]
+    paths: ["**.md", ".github/workflows/docs.yml"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: docs-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  # Renders every Mermaid block: GitHub shows a block it cannot parse as an error box
+  mermaid:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+      - name: Render the Mermaid diagrams
+        run: |
+          echo '{"args": ["--no-sandbox"]}' > "$RUNNER_TEMP/puppeteer.json"
+          mkdir -p "$RUNNER_TEMP/mermaid"
+          status=0
+          for f in $(git grep -l '```mermaid' -- '*.md'); do
+            echo "::group::$f"
+            if ! npx -y @mermaid-js/mermaid-cli@12.2.0 -p "$RUNNER_TEMP/puppeteer.json" \
+                -i "$f" -o "$RUNNER_TEMP/mermaid/$(echo "$f" | tr / _)"; then
+              echo "::error file=$f::a Mermaid diagram in this file does not parse"
+              status=1
+            fi
+            echo "::endgroup::"
+          done
+          exit $status
+
+  # Relative links and #anchors between the repository's own files. External
+  # links are checked weekly (links.yml), so a slow site never blocks a pull request.
+  links:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: lycheeverse/lychee-action@v2
+        with:
+          args: --offline --include-fragments --no-progress --root-dir "${{ github.workspace }}" './**/*.md'
+          fail: true

@@ -39,6 +39,7 @@ Notable changes to StrataKB. The format follows [Keep a Changelog](https://keepa
 - `strata_apply_preset` reports the layer settings that changed (`layer_changes`), and its dry run the settings that would change (`layer_check`).
 - `strata_search` returns a `confidence` (level, top score, relevant sources, basis `similarity`), in the same shape as `strata_ask`; the learning tracker stores that value instead of judging the search again.
 - `vector_store.re_embed_all_layers()` takes `locked_timeout` (default 600 s per statement) for the locked phase, which before ran under the pool's 30 s limit.
+- More CI checks: an end-to-end job with the real embedding and reranking models, a stdio smoke test, ruff and LF line endings on changed files, a repository-rules check (`scripts/check_repo_rules.py`), dependency review, Mermaid and offline link checks on Markdown changes, and a weekly external-link check of the repository and the wiki. The test database now starts empty and is built by the server's own migrations. See "What CI checks" in CONTRIBUTING.md.
 
 ### Changed
 
