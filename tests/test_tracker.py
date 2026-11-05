@@ -230,7 +230,34 @@ async def test_layer_switch_compares_with_previous_auto_detection():
 
 
 @pytest.mark.asyncio
-async def test_track_search_stores_similarity_confidence_not_fused_score():
+async def test_track_search_stores_the_confidence_the_tool_returned():
+    with patch("stratakb.learning.tracker.get_settings", return_value=_enabled_settings()):
+        from stratakb.learning.tracker import Tracker
+
+        store = _mock_store()
+        tracker = Tracker(store)
+
+        # The similarities alone would score high: the tracker must not rescore.
+        search = AsyncMock(return_value={
+            "status": "ok",
+            "confidence": {
+                "level": "medium", "top_score": 0.5,
+                "relevant_sources": 1, "basis": "similarity",
+            },
+            "results": [
+                {"chunk_id": f"c{i}", "score": 1.0 - i * 0.1, "similarity": 0.9}
+                for i in range(3)
+            ],
+        })
+        await tracker.track_search(search, "SEPA reject codes", ["sepa"], 5, None)
+
+    kwargs = store.store_interaction.call_args.kwargs
+    assert kwargs["confidence_level"] == "medium"
+    assert kwargs["confidence_score"] == 0.5
+
+
+@pytest.mark.asyncio
+async def test_track_search_stores_result_similarity():
     with patch("stratakb.learning.tracker.get_settings", return_value=_enabled_settings()):
         from stratakb.learning.tracker import Tracker
 
@@ -238,30 +265,13 @@ async def test_track_search_stores_similarity_confidence_not_fused_score():
         tracker = Tracker(store)
 
         search = AsyncMock(return_value={"status": "ok", "results": [
-            {"chunk_id": "c1", "score": 1.0, "similarity": 0.3},
-            {"chunk_id": "c2", "score": 0.4, "similarity": 0.2},
+            {"chunk_id": "c1", "content": "text", "score": 1.0, "similarity": 0.3,
+             "layer": "sepa", "source_file": "rules.md"},
         ]})
         await tracker.track_search(search, "SEPA reject codes", ["sepa"], 5, None)
 
     kwargs = store.store_interaction.call_args.kwargs
-    assert kwargs["confidence_score"] == 0.3
-    assert kwargs["confidence_level"] == "low"
-
-
-@pytest.mark.asyncio
-async def test_track_search_stores_the_similarity_level():
-    with patch("stratakb.learning.tracker.get_settings", return_value=_enabled_settings()):
-        from stratakb.learning.tracker import Tracker
-
-        store = _mock_store()
-        tracker = Tracker(store)
-
-        search = AsyncMock(return_value={"status": "ok", "results": [
-            {"chunk_id": f"c{i}", "score": 1.0 - i * 0.1, "similarity": 0.7}
-            for i in range(3)
-        ] + [{"chunk_id": "c9", "score": 0.1, "similarity": None}]})
-        await tracker.track_search(search, "SEPA reject codes", ["sepa"], 5, None)
-
-    kwargs = store.store_interaction.call_args.kwargs
-    assert kwargs["confidence_level"] == "high"
-    assert kwargs["confidence_score"] == 0.7
+    assert kwargs["results"][0] == {
+        "chunk_id": "c1", "score": 1.0, "similarity": 0.3,
+        "layer": "sepa", "source_file": "rules.md",
+    }

@@ -121,6 +121,20 @@ def _basis_score(chunk: dict[str, Any], basis: str) -> float:
     return chunk["similarity"] if chunk["similarity"] is not None else 0.0
 
 
+def _search_confidence(results: list[SearchResult]) -> dict[str, Any]:
+    """Judge strata_search results on cosine similarity, never the fused score.
+
+    The fused score is divided by the top score, so the best result is
+    always 1.0. A result without an embedding counts as similarity 0.0.
+    """
+    from stratakb.rag.confidence import score_confidence
+
+    return score_confidence(
+        [r.similarity if r.similarity is not None else 0.0 for r in results],
+        basis="similarity",
+    )
+
+
 def register_rag_tools(
     mcp: FastMCP, database_url: str, openai_api_key: str = ""
 ) -> None:
@@ -147,7 +161,6 @@ def register_rag_tools(
         """Run strata_search; the tool below documents the arguments."""
         from stratakb.config import get_settings
         from stratakb.knowledge.embeddings import embedding_key_error
-        from stratakb.rag.confidence import score_confidence
         from stratakb.rag.retriever import search_chunks
 
         _settings = get_settings()
@@ -180,12 +193,9 @@ def register_rag_tools(
                 metadata_filter=metadata_filter,
             )
 
+            confidence = _search_confidence(results)
             fallback_reason = None
             if detected_layers:
-                confidence = score_confidence(
-                    [r.similarity for r in results if r.similarity is not None],
-                    basis="similarity",
-                )
                 fallback_reason = _routing_fallback_reason(len(results), top_k, confidence)
                 if fallback_reason:
                     results = await search_chunks(
@@ -193,6 +203,7 @@ def register_rag_tools(
                         layers=None, top_k=top_k, metadata_filter=metadata_filter,
                     )
                     layers = None
+                    confidence = _search_confidence(results)
 
             user_id, _ = get_current_user()
             await write_audit_log(
@@ -212,6 +223,7 @@ def register_rag_tools(
             response = {
                 "status": "ok",
                 "query": query,
+                "confidence": confidence,
                 "results": [
                     {
                         "chunk_id": r.chunk_id,
@@ -253,8 +265,9 @@ def register_rag_tools(
         Runs hybrid search (vector similarity plus full-text) across the
         ingested knowledge layers and returns the most relevant chunks with
         their source file and section. Use strata_list_knowledge_layers to see
-        which layers exist. The response carries an interaction_id to pass to
-        strata_feedback.
+        which layers exist. The response carries a confidence level (high,
+        medium or low) judged on the results' similarity, with a warning when
+        low, and an interaction_id to pass to strata_feedback.
 
         Args:
             query: Natural language search query, or exact terms and identifiers.

@@ -280,3 +280,63 @@ async def test_search_results_carry_similarity(tools, monkeypatch):
 
     assert response["results"][0]["score"] == 1.0
     assert response["results"][0]["similarity"] == 0.42
+
+
+@pytest.mark.asyncio
+async def test_search_returns_similarity_confidence(tools, monkeypatch):
+    registered, _, _ = tools
+    search = AsyncMock(return_value=[
+        _result(name, "docs", score=score, similarity=0.7)
+        for name, score in (("a", 1.0), ("b", 0.9), ("c", 0.8))
+    ])
+    monkeypatch.setattr("stratakb.rag.retriever.search_chunks", search)
+
+    response = await registered["strata_search"]("accounting guide", top_k=3)
+
+    assert response["confidence"] == {
+        "level": "high", "top_score": 0.7, "relevant_sources": 3, "basis": "similarity",
+    }
+
+
+@pytest.mark.asyncio
+async def test_search_confidence_judged_on_fallback_results(tools, monkeypatch):
+    registered, _, detect = tools
+    detect.return_value = ["routed"]
+    search = AsyncMock(
+        side_effect=[
+            [
+                _result("weak1", "routed", similarity=0.2),
+                _result("weak2", "routed", similarity=0.1),
+            ],
+            [
+                _result("strong", "other", similarity=0.9),
+                _result("weak1", "routed", similarity=0.2),
+            ],
+        ]
+    )
+    monkeypatch.setattr("stratakb.rag.retriever.search_chunks", search)
+
+    response = await registered["strata_search"]("question", top_k=2)
+
+    assert response["routing_fallback"]["reason"] == "low_confidence"
+    assert response["confidence"]["level"] == "medium"
+    assert response["confidence"]["top_score"] == 0.9
+    assert "warning" not in response["confidence"]
+
+
+@pytest.mark.asyncio
+async def test_search_confidence_counts_missing_similarity_as_zero(tools, monkeypatch):
+    registered, _, _ = tools
+    search = AsyncMock(return_value=[_result("guide", "docs", similarity=None)])
+    monkeypatch.setattr("stratakb.rag.retriever.search_chunks", search)
+
+    response = await registered["strata_search"]("accounting guide", top_k=1)
+
+    assert response["confidence"]["level"] == "low"
+    assert response["confidence"]["top_score"] == 0.0
+    assert response["confidence"]["warning"].startswith("Low confidence results")
+
+    search.return_value = []
+    response = await registered["strata_search"]("accounting guide", top_k=1)
+
+    assert response["confidence"]["warning"].startswith("No results found")

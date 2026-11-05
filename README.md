@@ -245,7 +245,7 @@ Then ask from your client, for example *"How long should a line of Python be?"*.
 | Tool | Role | What it does |
 | --- | --- | --- |
 | `strata_ask` | viewer | Rewrites a question, searches in parallel, reranks, returns context with citations and a confidence level |
-| `strata_search` | viewer | Hybrid search for exact terms and identifiers, with optional layer and metadata filters |
+| `strata_search` | viewer | Hybrid search for exact terms and identifiers, with optional layer and metadata filters, and a confidence level |
 | `strata_list_knowledge_layers` | viewer | Lists layers with document and chunk counts |
 | `strata_get_layer_status` | viewer | One layer's configuration and ingestion history |
 | `strata_feedback` | viewer | Rates a result as helpful or not, per answer or per chunk |
@@ -431,7 +431,7 @@ StrataKB cannot control what your MCP client's language model does with the retr
 ## Glossary
 
 - **Chunk**: a passage of a document, cut along its headings or structure. Search returns chunks, each with its file and section.
-- **Confidence**: `high`, `medium` or `low`, returned with every `strata_ask` result; a low one comes with a warning. It is judged on the reranker's relevance probability (0 to 1) or, with reranking off, on each chunk's `similarity` (how similar the question and the chunk are by meaning); the result says which (`basis`: `rerank` or `similarity`). Each `strata_ask` chunk carries `score` (its merged rank, best 1.0), `similarity`, `rerank_score` (null with reranking off), `source_file` and `section`, and each source's `relevance_score` is the score confidence was judged on. `strata_search` results carry each chunk's `similarity` (with hybrid search on, the default, its `score` is the fused rank, where the best result is always 1.0), and the learning loop judges a search's confidence on that similarity. The thresholds are provisional until the evaluation suite measures them.
+- **Confidence**: `high`, `medium` or `low`, returned with every `strata_ask` and `strata_search` result; a low one comes with a warning. It is judged on the reranker's relevance probability (0 to 1) or, with reranking off, on each chunk's `similarity` (how similar the question and the chunk are by meaning); the result says which (`basis`: `rerank` or `similarity`). Each `strata_ask` chunk carries `score` (its merged rank, best 1.0), `similarity`, `rerank_score` (null with reranking off), `source_file` and `section`, and each source's `relevance_score` is the score confidence was judged on. `strata_search` results carry each chunk's `similarity` (with hybrid search on, the default, its `score` is the fused rank, where the best result is always 1.0), and `strata_search` judges its confidence on that similarity (`basis` `similarity`), never on the fused `score`; a chunk without an embedding counts as similarity 0. The learning loop stores the confidence the tool returned, and each stored result keeps its `similarity`. The thresholds are provisional until the evaluation suite measures them.
 - **Embedding**: a list of numbers that stands for a chunk's meaning, so similar meanings get similar numbers. The embedding model (`all-mpnet-base-v2` by default) makes them; the vector column stores them (`EMBEDDING_DIMENSIONS`, 768 by default).
 - **HNSW**: the pgvector index that finds similar embeddings quickly; `HNSW_EF_SEARCH` trades recall for speed.
 - **Hybrid search**: a search by meaning (embeddings) and a search by words (PostgreSQL full-text search), merged into one list with RRF.
