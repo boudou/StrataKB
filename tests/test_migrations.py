@@ -7,6 +7,8 @@ on the same database.
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import re
 import time
 from unittest.mock import patch
 from urllib.parse import urlsplit, urlunsplit
@@ -61,6 +63,7 @@ async def _recorded(db_url: str) -> set[int]:
     return {row["version"] for row in rows}
 
 
+@contextlib.contextmanager
 def _with_extra(version: int, name: str, sql: str):
     """Patch MIGRATIONS with one extra, never-present migration whose file is sql."""
     real_load = migrations._load_sql
@@ -68,28 +71,97 @@ def _with_extra(version: int, name: str, sql: str):
     def load(file_name: str) -> str:
         return sql if file_name == name else real_load(file_name)
 
-    return (
-        patch.object(
-            migrations, "MIGRATIONS", [*migrations.MIGRATIONS, (version, name, "SELECT false")]
-        ),
+    extra = migrations.Migration(version, name, "SELECT false")
+    with (
+        patch.object(migrations, "MIGRATIONS", [*migrations.MIGRATIONS, extra]),
         patch.object(migrations, "_load_sql", side_effect=load),
+    ):
+        yield
+
+
+def test_schema_migrations_ddl_matches_05():
+    sql = migrations._load_sql("05_add_folder.sql")
+    found = re.search(
+        r"CREATE TABLE IF NOT EXISTS strata_core\.schema_migrations \(.*?\);", sql, re.S
     )
+    assert found
+    in_05 = found.group(0).removesuffix(";")
+    assert " ".join(in_05.split()) == " ".join(migrations._SCHEMA_MIGRATIONS_DDL.split())
+
+
+async def _schema_snapshot(db_url: str) -> dict:
+    """Columns, indexes, constraints, recorded versions and read-only privileges."""
+    conn = await asyncpg.connect(db_url)
+    try:
+        columns = await conn.fetch(
+            """
+            SELECT table_schema, table_name, column_name, data_type, is_nullable,
+                   column_default
+            FROM information_schema.columns
+            WHERE table_schema IN ('strata_core', 'strata_vectors', 'strata_learning')
+            ORDER BY 1, 2, 3
+            """
+        )
+        indexes = await conn.fetch(
+            """
+            SELECT schemaname, indexname, indexdef FROM pg_indexes
+            WHERE schemaname IN ('strata_core', 'strata_vectors', 'strata_learning')
+            ORDER BY 1, 2
+            """
+        )
+        constraints = await conn.fetch(
+            """
+            SELECT c.conrelid::regclass::text AS rel, c.conname,
+                   pg_get_constraintdef(c.oid) AS def
+            FROM pg_constraint c
+            JOIN pg_class t ON t.oid = c.conrelid
+            JOIN pg_namespace n ON n.oid = t.relnamespace
+            WHERE n.nspname IN ('strata_core', 'strata_vectors', 'strata_learning')
+            ORDER BY 1, 2
+            """
+        )
+        versions = await conn.fetch(
+            "SELECT version, name FROM strata_core.schema_migrations ORDER BY version"
+        )
+        has_role = await conn.fetchval(
+            "SELECT 1 FROM pg_roles WHERE rolname = 'strata_readonly'"
+        )
+    finally:
+        await conn.close()
+    return {
+        "columns": [tuple(row) for row in columns],
+        "indexes": [tuple(row) for row in indexes],
+        "constraints": [tuple(row) for row in constraints],
+        "versions": [tuple(row) for row in versions],
+        "privileges": await _readonly_privileges(db_url) if has_role else None,
+    }
 
 
 async def test_sql_files_apply_twice(db_url):
-    for name in (
-        "01_init.sql",
-        "02_learning.sql",
-        "04_ingested_files.sql",
-        "05_add_folder.sql",
-        "06_readonly_grants.sql",
-        "07_documents.sql",
-        "12_answer_mode.sql",
-    ):
-        sql = migrations._load_sql(name)
-        await _owner_execute(db_url, sql)
-        await _owner_execute(db_url, sql)
-    assert {4, 5, 6} <= await _recorded(db_url)
+    await migrations.ensure_schema(db_url)
+    for m in migrations.MIGRATIONS:
+        await _owner_execute(db_url, migrations._load_sql(m.file))
+    first = await _schema_snapshot(db_url)
+    for m in migrations.MIGRATIONS:
+        await _owner_execute(db_url, migrations._load_sql(m.file))
+    assert await _schema_snapshot(db_url) == first
+    assert first["columns"]
+    assert {row[0] for row in first["columns"]} == {
+        "strata_core",
+        "strata_vectors",
+        "strata_learning",
+    }
+    assert await _recorded(db_url) == {1, 2, 4, 5, 6, 7, 12}
+
+
+async def test_presence_true_on_current_schema(db_url):
+    await migrations.ensure_schema(db_url)
+    conn = await asyncpg.connect(db_url)
+    try:
+        for m in migrations.MIGRATIONS:
+            assert await conn.fetchval(m.presence) is True, m.file
+    finally:
+        await conn.close()
 
 
 @pytest.fixture
@@ -302,16 +374,27 @@ async def test_concurrent_calls(db_url):
 
 
 async def test_broken_file_raises_naming_it(db_url):
-    extra_migrations, extra_load = _with_extra(9001, "90_broken.sql", "SELEC 1")
     with (
-        extra_migrations,
-        extra_load,
+        _with_extra(9001, "90_broken.sql", "SELEC 1"),
         pytest.raises(migrations.MigrationError, match="90_broken.sql") as exc,
     ):
         await migrations.ensure_schema(db_url)
     assert "psql -f" in str(exc.value)
     assert db_url not in migrations._checked
     assert 9001 not in await _recorded(db_url)
+
+
+async def test_still_missing_file_has_generic_message(db_url):
+    with (
+        _with_extra(9003, "93_noop.sql", "SELECT 1"),
+        pytest.raises(migrations.MigrationError, match="93_noop.sql") as exc,
+    ):
+        await migrations.ensure_schema(db_url)
+    message = str(exc.value)
+    assert "ran without an error" in message
+    assert "only the owner of the tables" not in message.lower()
+    assert db_url not in migrations._checked
+    assert 9003 not in await _recorded(db_url)
 
 
 async def test_bad_password_passes_through(db_url):
@@ -341,12 +424,8 @@ async def test_non_owner_schema_present(db_url, readonly_url):
 async def test_non_owner_schema_missing(db_url, readonly_url):
     await migrations.ensure_schema(db_url)
     migrations._checked.clear()
-    extra_migrations, extra_load = _with_extra(
-        9002, "92_probe.sql", "CREATE TABLE strata_core.migration_probe (id INT)"
-    )
     with (
-        extra_migrations,
-        extra_load,
+        _with_extra(9002, "92_probe.sql", "CREATE TABLE strata_core.migration_probe (id INT)"),
         pytest.raises(migrations.MigrationError, match="may not update it") as exc,
     ):
         await migrations.ensure_schema(readonly_url)
@@ -373,7 +452,7 @@ DELETE FROM strata_core.schema_migrations WHERE version = 6;
 
 
 def _presence_query(version: int) -> str:
-    return next(query for v, _, query in migrations.MIGRATIONS if v == version)
+    return next(m.presence for m in migrations.MIGRATIONS if m.version == version)
 
 
 @pytest.fixture
@@ -626,8 +705,11 @@ async def test_unrevokable_06_is_refused(db_url, readonly_role, probe_url):
     )
     try:
         migrations._checked.clear()
-        with pytest.raises(migrations.MigrationError, match="06_readonly_grants.sql"):
+        with pytest.raises(migrations.MigrationError, match="06_readonly_grants.sql") as exc:
             await migrations.ensure_schema(probe_url)
+        # The re-check after the file, not the older out-of-date branch
+        assert "ran without an error" in str(exc.value)
+        assert "may not update it" not in str(exc.value)
         assert probe_url not in migrations._checked
         assert 6 not in await _recorded(db_url)
         conn = await asyncpg.connect(db_url)
@@ -649,11 +731,104 @@ async def test_readonly_presence_without_ingested_files(db_url, readonly_role):
         tx = conn.transaction()
         await tx.start()
         try:
+            # Without its grant the renamed table is not readable, so the
+            # missing strata_core.ingested_files is the only reason for false
             await conn.execute(
-                "ALTER TABLE strata_core.ingested_files RENAME TO ingested_files_probe"
+                "ALTER TABLE strata_core.ingested_files RENAME TO ingested_files_probe;"
+                "REVOKE ALL ON strata_core.ingested_files_probe FROM strata_readonly"
             )
             assert await conn.fetchval(_presence_query(6)) is False
         finally:
             await tx.rollback()
+    finally:
+        await conn.close()
+
+
+async def test_public_grant_is_named(db_url, readonly_role):
+    await migrations.ensure_schema(db_url)
+    await _owner_execute(
+        db_url,
+        """
+        GRANT SELECT ON strata_core.audit_log TO PUBLIC;
+        DELETE FROM strata_core.schema_migrations WHERE version = 6;
+        """,
+    )
+    try:
+        migrations._checked.clear()
+        with pytest.raises(migrations.MigrationError, match="06_readonly_grants.sql") as exc:
+            await migrations.ensure_schema(db_url)
+        message = str(exc.value)
+        assert "PUBLIC" in message
+        assert "pg_read_all_data" in message
+        assert "only the owner of the tables" in message.lower()
+    finally:
+        await _owner_execute(db_url, "REVOKE SELECT ON strata_core.audit_log FROM PUBLIC")
+        migrations._checked.clear()
+        await migrations.ensure_schema(db_url)
+    assert 6 in await _recorded(db_url)
+
+
+async def test_readonly_presence_ignores_sequence_default_acl(db_url, readonly_role):
+    await migrations.ensure_schema(db_url)
+    conn = await asyncpg.connect(db_url)
+    try:
+        await conn.execute(
+            "ALTER DEFAULT PRIVILEGES IN SCHEMA strata_core "
+            "GRANT SELECT ON SEQUENCES TO strata_readonly"
+        )
+        # 06 revokes default privileges on tables only, so only those count
+        assert await conn.fetchval(_presence_query(6)) is True
+        await conn.execute(
+            "ALTER DEFAULT PRIVILEGES IN SCHEMA strata_core "
+            "GRANT SELECT ON TABLES TO strata_readonly"
+        )
+        assert await conn.fetchval(_presence_query(6)) is False
+    finally:
+        await conn.execute(
+            "ALTER DEFAULT PRIVILEGES IN SCHEMA strata_core "
+            "REVOKE SELECT ON SEQUENCES FROM strata_readonly;"
+            "ALTER DEFAULT PRIVILEGES IN SCHEMA strata_core "
+            "REVOKE SELECT ON TABLES FROM strata_readonly"
+        )
+        await conn.close()
+
+
+async def test_schema_migrations_lock_names_the_table(db_url):
+    await migrations.ensure_schema(db_url)
+    # The table stage reads schema_migrations on every run
+    migrations._checked.clear()
+    holder = await asyncpg.connect(db_url)
+    tx = holder.transaction()
+    try:
+        await tx.start()
+        await holder.execute(
+            "LOCK TABLE strata_core.schema_migrations IN ACCESS EXCLUSIVE MODE"
+        )
+        with (
+            patch.object(migrations, "_TIMEOUT_S", 1),
+            pytest.raises(
+                migrations.MigrationError, match="strata_core.schema_migrations"
+            ) as exc,
+        ):
+            await migrations.ensure_schema(db_url)
+        assert "while reading" not in str(exc.value)
+        assert db_url not in migrations._checked
+    finally:
+        await tx.rollback()
+        await holder.close()
+        migrations._checked.clear()
+
+
+async def test_repairs_01_only(fresh_url):
+    await _owner_execute(fresh_url, migrations._load_sql("01_init.sql"))
+
+    await migrations.ensure_schema(fresh_url)
+
+    assert await _recorded(fresh_url) == {1, 2, 4, 5, 6, 7, 12}
+    conn = await asyncpg.connect(fresh_url)
+    try:
+        assert await conn.fetchval(
+            "SELECT to_regclass('strata_learning.query_sessions') IS NOT NULL"
+        )
     finally:
         await conn.close()
