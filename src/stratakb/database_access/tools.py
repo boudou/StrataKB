@@ -5,6 +5,7 @@ Provides read-only SQL execution, schema introspection, and vector stats.
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import re
 
@@ -28,16 +29,24 @@ _SERVER_ACCESS_ROLES = (
     "pg_write_server_files",
 )
 
-# Whether session_user or current_user is, or is a member of, a superuser
-# role. 'MEMBER' covers direct and indirect membership, including INHERIT
-# FALSE; a superuser is a member of every role, so it also returns true.
-_SUPERUSER_QUERY = (
-    "SELECT bool_or(rolsuper) FROM pg_roles "
+# One row: whether session_user or current_user is, or is a member of, a
+# superuser role, and which server-access roles either of them is a member
+# of. 'MEMBER' covers direct and indirect membership, including INHERIT
+# FALSE; a superuser is a member of every role, so it is caught too.
+_ROLE_CHECK_QUERY = (
+    "SELECT bool_or(rolsuper) AS superuser, "
+    "array_agg(rolname ORDER BY rolname) "
+    "FILTER (WHERE rolname = ANY($1::text[])) AS members "
+    "FROM pg_roles "
     "WHERE pg_has_role(session_user, oid, 'MEMBER') "
     "OR pg_has_role(current_user, oid, 'MEMBER')"
 )
 
-# Seconds to wait for the read-only database at startup
+# The free-form SQL tools. They run only as the role behind
+# readonly_database_url, never as the owner role behind database_url.
+_SQL_TOOLS = ("strata_db_query", "strata_db_explain")
+
+# Seconds the whole role check at startup may take
 _CHECK_TIMEOUT = 5
 
 # Whether the SQL tools are on, and why not (read by strata_admin_health)
@@ -108,14 +117,21 @@ def sql_tools_status() -> dict[str, str]:
     return dict(_sql_tools)
 
 
+def _set_sql_tools_status(status: str, reason: str | None = None) -> None:
+    """Record whether the SQL tools are on and, when off, why."""
+    _sql_tools.clear()
+    _sql_tools["status"] = status
+    if reason is not None:
+        _sql_tools["reason"] = reason
+
+
 def _disable_sql_tools(mcp: FastMCP, reason: str) -> None:
     """Remove the SQL tools that are still registered and record why."""
     for name in _SQL_TOOLS:
         # Not registered: no URL, or removed by an earlier check
         with contextlib.suppress(ToolError):
             mcp.remove_tool(name)
-    _sql_tools.clear()
-    _sql_tools.update(status="disabled", reason=reason)
+    _set_sql_tools_status("disabled", reason)
     logger.warning("sql_tools_disabled", reason=reason)
 
 
@@ -127,42 +143,42 @@ async def _unsafe_role_reason(query_database_url: str) -> str | None:
     role it belongs to with set_config('role', ...), even in a read-only
     transaction, and rolsuper is not inherited.
     """
-    conn = await asyncpg.connect(query_database_url, timeout=_CHECK_TIMEOUT)
+    conn = await asyncpg.connect(query_database_url)
     try:
-        superuser = await conn.fetchval(_SUPERUSER_QUERY)
-        if superuser:
-            return "the READONLY_DATABASE_URL role is a superuser or a member of a superuser role"
-        members = await conn.fetchval(
-            "SELECT array_agg(rolname ORDER BY rolname) FROM pg_roles "
-            "WHERE rolname = ANY($1::text[]) "
-            "AND (pg_has_role(session_user, oid, 'MEMBER') "
-            "OR pg_has_role(current_user, oid, 'MEMBER'))",
-            list(_SERVER_ACCESS_ROLES),
-        )
-        if members:
-            return "the READONLY_DATABASE_URL role is a member of " + ", ".join(members)
-        return None
-    finally:
-        await conn.close()
+        row = await conn.fetchrow(_ROLE_CHECK_QUERY, list(_SERVER_ACCESS_ROLES))
+    except BaseException:
+        # Drop the socket: a graceful close first cancels the stalled query
+        # over a new connection, which has no deadline
+        conn.terminate()
+        raise
+    await conn.close()
+    if row["superuser"]:
+        return "the READONLY_DATABASE_URL role is a superuser or a member of a superuser role"
+    if row["members"]:
+        return "the READONLY_DATABASE_URL role is a member of " + ", ".join(row["members"])
+    return None
 
 
 async def secure_sql_tools(mcp: FastMCP, query_database_url: str) -> None:
     """Remove the SQL tools unless the read-only role is safe to run SQL as.
 
     Refuses a superuser, a member of a server-access role, and a role that
-    cannot be checked (fail closed). Never raises; the URL is never logged.
+    cannot be checked (fail closed), including one whose check does not
+    finish within _CHECK_TIMEOUT seconds. Never raises; the URL is never
+    logged.
     """
     if not query_database_url:
         return
     try:
-        reason = await _unsafe_role_reason(query_database_url)
+        reason = await asyncio.wait_for(
+            _unsafe_role_reason(query_database_url), _CHECK_TIMEOUT
+        )
     except Exception as e:
         reason = f"could not check the READONLY_DATABASE_URL role: {type(e).__name__}"
     if reason:
         _disable_sql_tools(mcp, reason)
         return
-    _sql_tools.clear()
-    _sql_tools.update(status="enabled")
+    _set_sql_tools_status("enabled")
     logger.info("sql_tools_enabled")
 
 
@@ -419,14 +435,8 @@ def register_database_tools(mcp: FastMCP, database_url: str, query_database_url:
         _register_sql_tools(mcp, database_url, query_database_url)
     else:
         reason = "READONLY_DATABASE_URL is not set"
-        _sql_tools.clear()
-        _sql_tools.update(status="disabled", reason=reason)
+        _set_sql_tools_status("disabled", reason)
         logger.info("sql_tools_disabled", reason=reason)
-
-
-# The free-form SQL tools. They run only as the role behind
-# readonly_database_url, never as the owner role behind database_url.
-_SQL_TOOLS = ("strata_db_query", "strata_db_explain")
 
 
 def _register_sql_tools(mcp: FastMCP, database_url: str, query_database_url: str) -> None:
@@ -434,8 +444,7 @@ def _register_sql_tools(mcp: FastMCP, database_url: str, query_database_url: str
 
     `database_url` serves only the audit log.
     """
-    _sql_tools.clear()
-    _sql_tools.update(status="enabled")
+    _set_sql_tools_status("enabled")
 
     @mcp.tool()
     @require_role("operator")
