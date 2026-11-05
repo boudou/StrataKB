@@ -57,6 +57,8 @@ Notable changes to StrataKB. The format follows [Keep a Changelog](https://keepa
 - A schema update waits at most 30 seconds for a lock another process holds, then stops and names the lock.
 - Applying a preset again updates the layer's `display_name`, `description`, `metadata_schema`, `chunk_config`, `routing_patterns` and `answer_mode` from the YAML before the chunks are rebuilt; before, they were set only when the layer was created. A layer with the same name made another way (`stratakb add`, `strata_create_knowledge_layer`, another preset) is refused and left unchanged instead of being cleared; a layer from before origins were recorded is taken over by the preset. A preset without `answer_mode` leaves an existing layer's mode alone, and a `metadata_schema` that is not a mapping is refused when the preset loads.
 - The default `DATABASE_URL` uses `127.0.0.1` instead of `localhost`, which can resolve to `::1` and fail with Docker in WSL.
+- `vector_store.re_embed_all_layers()` and `re_embed_layer()` read the chunks a batch at a time and embed them before taking the table lock; the lock covers only the resize, the writes and any chunk added in the meantime. Before, they loaded every chunk into memory and held the lock while the model ran.
+- Schema update messages say which migration a re-check failed for; the one for 06 names access from a `PUBLIC` grant or a role such as `pg_read_all_data`, which 06 does not revoke. A lock timeout while creating `strata_core.schema_migrations` names that table.
 
 ### Fixed
 
@@ -76,6 +78,8 @@ Notable changes to StrataKB. The format follows [Keep a Changelog](https://keepa
 - A half-built schema (`01_init.sql` applied without `02_learning.sql`) is repaired instead of failing the update. A user without `USAGE` on the StrataKB schemas is told which privilege is missing, instead of being sent to a schema file. Migration 06 is no longer recorded when the database user could not revoke the grants it removes.
 - `strata_search` interactions store a confidence judged on the query/chunk similarity, with its level. Before, they stored the top fused score, which is always 1.0, and no level, so the learning loop never learned from searches. `strata_search` results now carry each chunk's `similarity`.
 - A CSV file over 10,000 rows was cut short without a message. It is now stored for its first 10,000 rows and reported as flagged (`truncated`), and the log says how many rows were left out.
+- A CSV row with fewer fields than the header failed the whole file. It is now stored with the values it has, and a row with more fields keeps the extra values, labelled by position (`Column 4`).
+- `stratakb db up` and `db down` print one line and exit 3 on an unexpected error instead of a stack trace, and recognize Docker Desktop's "Ports are not available" message as a port in use.
 - `stratakb add --max-file-size inf` crashed; it is now a usage error (exit 2), like `0`, a negative value or `nan`, and the command refuses them before it connects to the database.
 
 ### Security
