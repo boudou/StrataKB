@@ -40,6 +40,9 @@ Notable changes to StrataKB. The format follows [Keep a Changelog](https://keepa
 - `strata_search` returns a `confidence` (level, top score, relevant sources, basis `similarity`), in the same shape as `strata_ask`; the learning tracker stores that value instead of judging the search again.
 - `vector_store.re_embed_all_layers()` takes `locked_timeout` (default 600 s per statement) for the locked phase, which before ran under the pool's 30 s limit.
 - More CI checks: an end-to-end job with the real embedding and reranking models, a stdio smoke test, ruff and LF line endings on changed files, a repository-rules check (`scripts/check_repo_rules.py`), dependency review, Mermaid and offline link checks on Markdown changes, and a weekly external-link check of the repository and the wiki. The test database now starts empty and is built by the server's own migrations. See "What CI checks" in CONTRIBUTING.md.
+- Ingestion reports a file that cannot be read (locked, no permission) as failed with reason `read_error`, instead of `parse_error`; every failed file in `errors` carries its reason.
+- `strata_apply_preset` with `dry_run=true` reports `would_claim` for a layer with no recorded origin that already matches the preset.
+- Markdown: setext headings (`===`, `---` underlines) and ATX headings indented by up to three spaces.
 
 ### Changed
 
@@ -65,6 +68,10 @@ Notable changes to StrataKB. The format follows [Keep a Changelog](https://keepa
 - `strata_ask` merges the results of its rewritten queries by rank (Reciprocal Rank Fusion) instead of dividing each query's scores by its own top score, so chunks no longer tie at 1.0. Every chunk has the same keys (`rerank_score`, `source_file` and `section` included), and a source's `relevance_score` is the score confidence was judged on.
 - Chunks added while a re-embed runs are staged again without the lock (up to three passes), so few are left to embed under it. `re_embed_layer()` stops with an error when another process resized the column meanwhile.
 - `load_preset` rejects a blank `display_name`.
+- `strata_ask` merges the results of its rewritten queries by chunk, not by the first 200 characters of the text, so two different chunks that start the same way both reach the answer.
+- Storing a file prunes only that file's old document versions, not the whole layer's.
+- Markdown front matter is cut off by one rule, only when its lines look like YAML; a leading `---` break followed by text is kept as text. A byte-order mark no longer hides front matter.
+- HTML: the page title is the first `<title>` outside an inline SVG, and SVG titles stay in the text.
 
 ### Fixed
 
@@ -92,6 +99,9 @@ Notable changes to StrataKB. The format follows [Keep a Changelog](https://keepa
 - Applying a preset to a layer with no origin claims it in the same guarded update that writes its settings; an origin another process wrote in between is no longer overwritten, and a failed write no longer leaves the layer half-updated.
 - A failed cleanup of the re-embed staging table no longer hides the error that caused it.
 - When a schema update's read-only grants (06) are not in place although the connecting user owns the schema, the message names the likely cause instead of asking to run as the owner.
+- Concurrent or cancelled first calls no longer create extra database connection pools or leave a half-made one open.
+- A chunk without an embedding no longer makes vector search fail; it is left out of the similarity ranking and can still be found by keyword.
+- Two concurrent stores of the same file no longer fail on the version number.
 
 ### Security
 
