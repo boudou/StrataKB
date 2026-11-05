@@ -107,8 +107,8 @@ jobs:
           git -C examples/peps/source sparse-checkout set --no-cone $PEPS
       - run: uv run pytest tests/test_e2e_real_model.py -v
 
-  # Ruff and line endings on the files a pull request changes. The rest of the
-  # tree has older ruff findings that are fixed separately.
+  # Ruff on the lines a pull request changes, and line endings on its files.
+  # The rest of the tree has older ruff findings that are fixed separately.
   lint:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
@@ -119,11 +119,8 @@ jobs:
         with:
           fetch-depth: 0
       - uses: astral-sh/setup-uv@v10.3.3
-      - name: Ruff on changed Python files
-        run: |
-          mapfile -t files < <(git diff --name-only --diff-filter=ACMR "$BASE"...HEAD -- '*.py')
-          if [ ${#files[@]} -eq 0 ]; then echo "No Python files changed"; exit 0; fi
-          uvx ruff@0.17.3 check --no-cache "${files[@]}"
+      - name: Ruff on changed lines
+        run: python3 scripts/ruff_changed_lines.py "$BASE" uvx ruff@0.17.3
       - name: LF line endings in changed files
         run: |
           mapfile -t files < <(git diff --name-only --diff-filter=ACMR "$BASE"...HEAD)

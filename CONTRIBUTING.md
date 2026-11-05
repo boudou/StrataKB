@@ -45,7 +45,7 @@ python scripts/check_repo_rules.py origin/main
 flowchart LR
     PR[Pull request] --> T[test: full suite]
     PR --> E[e2e: real models]
-    PR --> L[lint: ruff and LF on changed files]
+    PR --> L[lint: ruff on changed lines, LF]
     PR --> R[repo-rules]
     PR --> D[dependency-review]
     PR -->|Markdown changed| M[docs: Mermaid and links]
@@ -54,7 +54,7 @@ flowchart LR
 
 - **test:** `uv run pytest` against an empty Postgres that the server's migrations build, as on a new install. It includes a stdio smoke test that starts `python -m stratakb` and checks that stdout carries only JSON-RPC.
 - **e2e:** embeds eight PEPs with the real embedding and reranking models and asks `strata_search` and `strata_ask` about them. Locally: `STRATA_E2E=1 uv run pytest tests/test_e2e_real_model.py` with the PEPs fetched (see `examples/README.md`) and the database up. The first run downloads the models.
-- **lint:** `ruff check` on the Python files you changed, and LF line endings on every file you changed.
+- **lint:** `ruff check` findings on the lines you changed (older findings elsewhere in a file do not fail it; `python scripts/ruff_changed_lines.py origin/main` runs the same check locally), and LF line endings on every file you changed.
 - **dependency-review:** fails when a pull request adds or bumps a dependency with a known high-severity vulnerability.
 - **docs:** renders every Mermaid diagram (`npx @mermaid-js/mermaid-cli -i README.md -o out.md`) and checks relative links and anchors between the repository's files ([lychee](https://lychee.cli.rs/) with `--offline --include-fragments`).
 - **links (weekly):** external links in the repository and the wiki. It only reports.
