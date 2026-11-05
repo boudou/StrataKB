@@ -266,3 +266,59 @@ async def test_hybrid_results_carry_cosine_similarity(monkeypatch, vacuumed_chun
     finally:
         async with pool.acquire() as conn:
             await conn.execute("DELETE FROM strata_vectors.chunks WHERE layer_name = $1", layer)
+
+
+# ==========================================
+# Chunks without an embedding
+# ==========================================
+
+
+def test_semantic_leg_skips_chunks_without_embedding():
+    """Only the semantic CTE leaves out NULL embeddings; the full-text CTE keeps them."""
+    sql, _ = _build_hybrid_sql("[0.1,0.2]", "settlement", ["sepa"], top_k=3)
+    semantic, fulltext = sql.split("fulltext AS (", 1)
+    assert "embedding IS NOT NULL" in semantic.split("semantic AS (", 1)[1]
+    assert "embedding IS NOT NULL" not in fulltext
+
+
+@pytest.mark.asyncio
+async def test_hybrid_still_finds_chunk_without_embedding(monkeypatch, vacuumed_chunks):
+    """A chunk with a NULL embedding is still returned through the keyword leg."""
+    from stratakb.config import get_settings
+    from stratakb.core.database import get_pool
+    from stratakb.rag.retriever import search_chunks
+
+    settings = get_settings()
+    pool = await get_pool(settings.database_url)
+    layer = f"nullemb_{uuid.uuid4().hex[:8]}"
+    query = [0.1] * settings.embedding_dimensions
+    vector = "[" + ",".join(str(x) for x in query) + "]"
+    insert = """
+        INSERT INTO strata_vectors.chunks (layer_name, content, embedding, source_file)
+        VALUES ($1, $2, $3::vector, $4) RETURNING id
+    """
+    monkeypatch.setattr("stratakb.rag.retriever._get_cache", lambda: None)
+    try:
+        async with pool.acquire() as conn:
+            for i in range(3):
+                await conn.execute(
+                    insert, layer, f"Note {i} on payment fees and reporting.", vector, f"n_{i}",
+                )
+            ac04 = str(await conn.fetchval(
+                insert, layer, "Reason code AC04 means the account is closed.", None, "ac04",
+            ))
+
+        with patch(
+            "stratakb.rag.retriever.embed_texts",
+            new_callable=AsyncMock,
+            return_value=[query],
+        ):
+            results = await search_chunks(
+                settings.database_url, None, "AC04", layers=[layer], top_k=5
+            )
+
+        found = next(r for r in results if r.chunk_id == ac04)
+        assert found.similarity is None
+    finally:
+        async with pool.acquire() as conn:
+            await conn.execute("DELETE FROM strata_vectors.chunks WHERE layer_name = $1", layer)

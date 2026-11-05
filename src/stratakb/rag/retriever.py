@@ -139,7 +139,8 @@ async def search_chunks(
             cache.put(query, layers, top_k, results, metadata_filter)
         return results
 
-    conditions: list[str] = []
+    # A chunk without an embedding has no cosine distance: leave it out
+    conditions: list[str] = ["embedding IS NOT NULL"]
     params: list[object] = [query_vector, top_k]
     param_idx = 3  # $1 = embedding, $2 = top_k
 
@@ -155,9 +156,7 @@ async def search_chunks(
             params.append(value)
             param_idx += 1
 
-    where_clause = ""
-    if conditions:
-        where_clause = "WHERE " + " AND ".join(conditions)
+    where_clause = "WHERE " + " AND ".join(conditions)
 
     sql = f"""
         SELECT
@@ -323,7 +322,8 @@ def _build_hybrid_sql(
             params.append(value)
             param_idx += 1
 
-    where = "WHERE " + " AND ".join(conditions) if conditions else ""
+    # Only the semantic leg skips chunks without an embedding; keyword search still finds them
+    where = "WHERE " + " AND ".join(["embedding IS NOT NULL", *conditions])
 
     params.append(query_text)
     if _WEBSEARCH_SYNTAX.search(query_text):

@@ -234,6 +234,34 @@ class TestSearchChunksUnit:
             assert "metadata->>'doc_type'" in sql
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("filters", [
+        {},
+        {"layers": ["sepa"]},
+        {"layers": ["sepa"], "metadata_filter": {"doc_type": "yaml"}},
+    ])
+    async def test_vector_sql_skips_chunks_without_embedding(self, filters):
+        """A chunk without an embedding has no cosine distance: the vector query leaves it out."""
+        from stratakb.rag.retriever import search_chunks
+
+        mock_pool, mock_conn = _mock_pool_and_conn()
+
+        with patch(
+            "stratakb.rag.retriever.embed_texts",
+            new_callable=AsyncMock,
+            return_value=[[0.01] * 768],
+        ), patch(
+            "stratakb.rag.retriever.get_pool",
+            new_callable=AsyncMock,
+            return_value=mock_pool,
+        ), patch(
+            "stratakb.config.get_settings",
+            return_value=_mock_settings(),
+        ):
+            await search_chunks("postgresql://test", "sk-test", "test query", **filters)
+            sql = mock_conn.fetch.call_args[0][0]
+            assert "WHERE embedding IS NOT NULL" in sql
+
+    @pytest.mark.asyncio
     async def test_results_parsed_correctly(self):
         """Results from DB should be parsed into SearchResult objects."""
         from stratakb.rag.retriever import search_chunks
@@ -657,3 +685,56 @@ class TestVectorSearchIntegration:
                 await delete_layer(db_url, name=layer_name)
             except LayerNotFoundError:
                 pass
+
+    @pytest.mark.asyncio
+    async def test_vector_search_skips_null_embedding(self, db_url, monkeypatch):
+        """A chunk with a NULL embedding is left out of a vector-only search, not a crash."""
+        import uuid
+
+        from stratakb.config import get_settings
+        from stratakb.core.database import get_pool
+        from stratakb.rag import retriever
+        from stratakb.rag.retriever import search_chunks
+
+        settings = get_settings()
+        vector_only = settings.model_copy(update={"hybrid_search_enabled": False})
+        monkeypatch.setattr("stratakb.config.get_settings", lambda: vector_only)
+        monkeypatch.setattr("stratakb.rag.retriever._get_cache", lambda: None)
+
+        async def _fetch_without_index(pool, settings, sql, params):
+            # The HNSW index never returns a NULL vector; a sequential scan does
+            timeout = retriever._SEARCH_TIMEOUT
+            async with pool.acquire() as conn, conn.transaction():
+                await conn.execute(f"SET LOCAL hnsw.ef_search = {settings.hnsw_ef_search}")
+                await conn.execute(f"SET LOCAL statement_timeout = '{timeout}s'")
+                await conn.execute("SET LOCAL enable_indexscan = off")
+                return await conn.fetch(sql, *params)
+
+        monkeypatch.setattr("stratakb.rag.retriever._search_fetch", _fetch_without_index)
+
+        pool = await get_pool(db_url)
+        layer = f"nullemb_{uuid.uuid4().hex[:8]}"
+        query = [0.1] * settings.embedding_dimensions
+        vector = "[" + ",".join(str(x) for x in query) + "]"
+        insert = """
+            INSERT INTO strata_vectors.chunks (layer_name, content, embedding, source_file)
+            VALUES ($1, $2, $3::vector, $4)
+        """
+        try:
+            async with pool.acquire() as conn:
+                await conn.execute(insert, layer, "First embedded note.", vector, "a")
+                await conn.execute(insert, layer, "Second embedded note.", vector, "b")
+                await conn.execute(insert, layer, "A note without an embedding.", None, "c")
+
+            with patch(
+                "stratakb.rag.retriever.embed_texts",
+                new_callable=AsyncMock,
+                return_value=[query],
+            ):
+                results = await search_chunks(db_url, None, "note", layers=[layer], top_k=5)
+
+            assert sorted(r.source_file for r in results) == ["a", "b"]
+            assert all(r.similarity is not None for r in results)
+        finally:
+            async with pool.acquire() as conn:
+                await conn.execute("DELETE FROM strata_vectors.chunks WHERE layer_name = $1", layer)
