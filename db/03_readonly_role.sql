@@ -3,10 +3,10 @@
 -- read-only transaction; this role also keeps them away from superuser-only
 -- functions such as pg_read_file().
 --
--- The role may SELECT from four tables only: strata_core.knowledge_layers,
--- strata_core.ingestion_runs, strata_core.ingested_files and
--- strata_vectors.chunks. Not the audit log, users or anything in
--- strata_learning. A table added later is not readable until granted by name.
+-- The role may SELECT from five tables only: strata_core.knowledge_layers,
+-- strata_core.ingestion_runs, strata_core.ingested_files,
+-- strata_vectors.chunks and strata_vectors.documents. Not the audit log, users
+-- or anything in strata_learning. A table added later is not readable until granted by name.
 --
 -- The password comes from the READONLY_DB_PASSWORD environment variable (psql 15+):
 --   READONLY_DB_PASSWORD=... psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f db/03_readonly_role.sql
@@ -23,12 +23,17 @@ GRANT USAGE ON SCHEMA strata_core, strata_vectors TO strata_readonly;
 GRANT SELECT ON strata_core.knowledge_layers, strata_core.ingestion_runs, strata_vectors.chunks
     TO strata_readonly;
 
--- 04_ingested_files.sql runs after this file on a fresh Docker volume only;
--- the server's migration 06 (06_readonly_grants.sql) grants it then. In CI the
--- server's migrations run first, so the block below grants it
+-- 04_ingested_files.sql and 07_documents.sql run after this file on a fresh
+-- Docker volume only; the server's migrations 06 (06_readonly_grants.sql) and
+-- 08 (08_readonly_documents.sql) grant them then. In CI and after
+-- `stratakb db up` the server's migrations run first, so the block below
+-- grants them
 DO $$
 BEGIN
     IF to_regclass('strata_core.ingested_files') IS NOT NULL THEN
         GRANT SELECT ON strata_core.ingested_files TO strata_readonly;
+    END IF;
+    IF to_regclass('strata_vectors.documents') IS NOT NULL THEN
+        GRANT SELECT ON strata_vectors.documents TO strata_readonly;
     END IF;
 END $$;

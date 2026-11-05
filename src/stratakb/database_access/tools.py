@@ -456,8 +456,9 @@ def _register_sql_tools(mcp: FastMCP, database_url: str, query_database_url: str
         """Execute a read-only SQL query against the StrataKB database.
 
         Runs SELECT queries against strata_core.knowledge_layers,
-        strata_core.ingestion_runs, strata_core.ingested_files and
-        strata_vectors.chunks (the audit log, users and learning tables are not
+        strata_core.ingestion_runs, strata_core.ingested_files,
+        strata_vectors.chunks and strata_vectors.documents (each document's
+        extracted text; the audit log, users and learning tables are not
         readable), in a read-only transaction that is rolled back afterwards.
         Write operations (INSERT, UPDATE, DELETE, DROP, etc.) are blocked.
         Returns at most 1000 rows. Use fully qualified table names

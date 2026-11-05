@@ -29,14 +29,17 @@ _MIGRATION_LOCK_KEY = 0x5354524154414B42
 _TIMEOUT_S = 30
 
 # The StrataKB schemas, and the tables strata_readonly may read (as granted
-# by 06_readonly_grants.sql and db/03_readonly_role.sql)
+# by 06_readonly_grants.sql, 08_readonly_documents.sql and db/03_readonly_role.sql)
 _STRATA_SCHEMAS = ("strata_core", "strata_vectors", "strata_learning")
 _READONLY_TABLES = (
     ("strata_core", "knowledge_layers"),
     ("strata_core", "ingestion_runs"),
     ("strata_core", "ingested_files"),
     ("strata_vectors", "chunks"),
+    ("strata_vectors", "documents"),
 )
+# The readable tables a migration after 06 creates; 08 grants them
+_READONLY_TABLES_AFTER_06 = (("strata_vectors", "documents"),)
 _STRATA_SCHEMA_LIST = ", ".join(f"'{schema}'" for schema in _STRATA_SCHEMAS)
 # The schemas strata_readonly gets USAGE on, which are also the ones the
 # presence queries resolve with to_regclass
@@ -89,7 +92,9 @@ def _readonly_grants_present() -> str:
     can exist where the schemas don't yet: has_schema_privilege would raise,
     hence the CASE guard over every schema the query names. has_table_privilege
     returns NULL for a missing table, so each check keeps its own COALESCE.
-    Default privileges count on tables only, the kind 06 revokes.
+    Default privileges count on tables only, the kind 06 revokes. The tables
+    a later migration creates are allowed but not required: 06 runs before
+    they exist, and 08's query checks them.
     """
     guard = "\n            OR ".join(
         f"to_regnamespace('{schema}') IS NULL" for schema in _STRATA_SCHEMAS
@@ -98,6 +103,7 @@ def _readonly_grants_present() -> str:
         f"COALESCE(has_table_privilege(\n"
         f"                    r.oid, to_regclass('{schema}.{table}'), 'SELECT'), false)"
         for schema, table in _READONLY_TABLES
+        if (schema, table) not in _READONLY_TABLES_AFTER_06
     )
     usage = "\n                AND ".join(
         ("" if schema in _READABLE_SCHEMAS else "NOT ")
@@ -129,6 +135,26 @@ def _readonly_grants_present() -> str:
             FROM pg_roles r WHERE r.rolname = 'strata_readonly'
         ), true)
         END
+        """
+
+
+def _readonly_later_grants_present() -> str:
+    """Query that is true when strata_readonly can read the tables 08 grants.
+
+    True when the role does not exist. False while a table is missing, so 08
+    is not recorded before 07 has created it: presence is read before any file
+    runs. Stray grants are 06's check, not this one.
+    """
+    readable = "\n            AND ".join(
+        f"COALESCE(has_table_privilege(\n"
+        f"                r.oid, to_regclass('{schema}.{table}'), 'SELECT'), false)"
+        for schema, table in _READONLY_TABLES_AFTER_06
+    )
+    return f"""
+        SELECT COALESCE((
+            SELECT {readable}
+            FROM pg_roles r WHERE r.rolname = 'strata_readonly'
+        ), true)
         """
 
 
@@ -220,6 +246,7 @@ MIGRATIONS: list[Migration] = [
             )
         """,
     ),
+    Migration(8, "08_readonly_documents.sql", _readonly_later_grants_present()),
     Migration(
         12,
         "12_answer_mode.sql",

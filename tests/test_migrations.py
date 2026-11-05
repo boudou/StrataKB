@@ -138,6 +138,9 @@ def test_readonly_lists_agree():
     assert in_03 == in_module
     assert set(_READABLE) == in_module
     assert in_readme == in_module
+    assert _granted(migrations._load_sql("08_readonly_documents.sql"), "SELECT") == {
+        f"{schema}.{table}" for schema, table in migrations._READONLY_TABLES_AFTER_06
+    }
 
     schemas = {schema for schema, _ in pairs}
     assert set(migrations._READABLE_SCHEMAS) == schemas
@@ -551,6 +554,7 @@ _READABLE = (
     "strata_core.ingestion_runs",
     "strata_core.ingested_files",
     "strata_vectors.chunks",
+    "strata_vectors.documents",
 )
 
 # The grants db/03_readonly_role.sql made before 06
@@ -652,7 +656,11 @@ async def test_readonly_role_select(db_url, readonly_role):
                 async with conn.transaction():
                     await conn.execute("SET LOCAL ROLE strata_readonly")
                     await conn.fetch(f"SELECT 1 FROM {table} LIMIT 1")
-        for table in ("strata_vectors.chunks", "strata_core.knowledge_layers"):
+        for table in (
+            "strata_vectors.chunks",
+            "strata_vectors.documents",
+            "strata_core.knowledge_layers",
+        ):
             async with conn.transaction():
                 await conn.execute("SET LOCAL ROLE strata_readonly")
                 await conn.fetch(f"SELECT 1 FROM {table} LIMIT 1")
@@ -856,6 +864,72 @@ async def test_readonly_presence_without_ingested_files(db_url, readonly_role):
             assert await conn.fetchval(_presence_query(6)) is False
         finally:
             await tx.rollback()
+    finally:
+        await conn.close()
+
+
+async def _documents_readable(db_url: str) -> bool:
+    conn = await asyncpg.connect(db_url)
+    try:
+        return await conn.fetchval(
+            "SELECT has_table_privilege('strata_readonly', 'strata_vectors.documents', 'SELECT')"
+        )
+    finally:
+        await conn.close()
+
+
+async def test_readonly_presence_06_does_not_require_documents(db_url, readonly_role):
+    await migrations.ensure_schema(db_url)
+    conn = await asyncpg.connect(db_url)
+    try:
+        tx = conn.transaction()
+        await tx.start()
+        try:
+            # As on a new database when 06 runs: 07 has not created the table yet
+            await conn.execute(
+                "ALTER TABLE strata_vectors.documents RENAME TO documents_probe;"
+                "REVOKE ALL ON strata_vectors.documents_probe FROM strata_readonly"
+            )
+            assert await conn.fetchval(_presence_query(6)) is True
+            assert await conn.fetchval(_presence_query(8)) is False
+        finally:
+            await tx.rollback()
+    finally:
+        await conn.close()
+
+
+async def test_applies_missing_08_grants_documents(db_url, readonly_role, restore_schema):
+    await migrations.ensure_schema(db_url)
+    await _owner_execute(
+        db_url,
+        """
+        REVOKE SELECT ON strata_vectors.documents FROM strata_readonly;
+        DELETE FROM strata_core.schema_migrations WHERE version = 8;
+        """,
+    )
+    conn = await asyncpg.connect(db_url)
+    try:
+        assert await conn.fetchval(_presence_query(8)) is False
+    finally:
+        await conn.close()
+
+    migrations._checked.clear()
+    await migrations.ensure_schema(db_url)
+
+    assert await _documents_readable(db_url)
+    assert 8 in await _recorded(db_url)
+    _assert_closed(await _readonly_privileges(db_url))
+
+
+async def test_rerun_06_keeps_documents_grant(db_url, readonly_role):
+    await migrations.ensure_schema(db_url)
+    await _owner_execute(db_url, migrations._load_sql("06_readonly_grants.sql"))
+
+    assert await _documents_readable(db_url)
+    conn = await asyncpg.connect(db_url)
+    try:
+        assert await conn.fetchval(_presence_query(6)) is True
+        assert await conn.fetchval(_presence_query(8)) is True
     finally:
         await conn.close()
 
