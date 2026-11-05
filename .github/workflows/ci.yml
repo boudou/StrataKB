@@ -92,6 +92,15 @@ jobs:
         with:
           path: ~/.cache/huggingface
           key: hf-${{ runner.os }}-all-mpnet-base-v2-ms-marco-MiniLM-L-6-v2
+      # The server loads models offline first; fetch them here so the tests
+      # find them in the cache.
+      - name: Download the models
+        env:
+          HF_HUB_OFFLINE: "0"
+        run: >-
+          uv run python -c "from huggingface_hub import snapshot_download;
+          snapshot_download('sentence-transformers/all-mpnet-base-v2');
+          snapshot_download('cross-encoder/ms-marco-MiniLM-L-6-v2')"
       - name: Fetch a few PEPs
         run: |
           git clone --depth 1 --filter=blob:none --sparse https://github.com/python/peps.git examples/peps/source
