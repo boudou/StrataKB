@@ -18,3 +18,17 @@ def test_mcp_server_imports():
 
     assert mcp is not None
     assert mcp.name == "StrataKB"
+
+
+def test_settings_readers_use_the_live_settings():
+    """Modules that bind get_settings at import hold the real one, not a test's patch."""
+    import stratakb.config
+    import stratakb.learning.tracker
+    import stratakb.mcp_server
+
+    assert stratakb.mcp_server.get_settings is stratakb.config.get_settings
+    assert stratakb.learning.tracker.get_settings is stratakb.config.get_settings
+    assert (
+        stratakb.mcp_server.settings.database_url
+        == stratakb.config.get_settings().database_url
+    )
