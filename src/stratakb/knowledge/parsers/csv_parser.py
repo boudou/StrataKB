@@ -117,9 +117,16 @@ def _row_to_text(row: dict, headers: list[str], source: str) -> str:
     if title:
         lines.append(f"# {title}")
 
+    # A short row has None for its missing fields: treat them as empty cells
     for header in headers:
-        value = row.get(header, "").strip()
+        value = (row.get(header) or "").strip()
         if value:
             lines.append(f"**{header}:** {value}")
+
+    # A long row has its extra values under the None key: label them by position
+    for position, extra in enumerate(row.get(None) or [], start=len(headers) + 1):
+        value = (extra or "").strip()
+        if value:
+            lines.append(f"**Column {position}:** {value}")
 
     return "\n".join(lines)

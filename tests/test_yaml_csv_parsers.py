@@ -286,6 +286,35 @@ class TestCSVParser:
         assert truncated[0]["rows_read"] == MAX_ROWS
         assert truncated[0]["rows_left_out"] == 5
 
+    def test_short_row_keeps_its_values(self, tmp_path):
+        from stratakb.knowledge.parsers.csv_parser import parse_csv
+
+        path = tmp_path / "short.csv"
+        path.write_text("a,b,c\n1,2\n3,4,5\n", encoding="utf-8")
+        result = parse_csv(path)
+        assert result.error is None
+        assert result.total_pages == 2
+        first = result.pages[0].text
+        assert "**a:** 1" in first
+        assert "**b:** 2" in first
+        assert "**c:**" not in first
+        assert "**c:** 5" in result.pages[1].text
+
+    def test_long_row_keeps_extra_values(self, tmp_path):
+        from stratakb.knowledge.parsers.csv_parser import parse_csv
+
+        path = tmp_path / "long.csv"
+        path.write_text("a,b\n1,2,3,4\n5,6\n", encoding="utf-8")
+        result = parse_csv(path)
+        assert result.error is None
+        assert result.total_pages == 2
+        first = result.pages[0].text
+        assert "**a:** 1" in first
+        assert "**b:** 2" in first
+        assert "**Column 3:** 3" in first
+        assert "**Column 4:** 4" in first
+        assert "Column" not in result.pages[1].text
+
     def test_nonexistent_csv(self):
         from stratakb.knowledge.parsers.csv_parser import parse_csv
 
