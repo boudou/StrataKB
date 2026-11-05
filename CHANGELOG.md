@@ -37,6 +37,8 @@ Notable changes to StrataKB. The format follows [Keep a Changelog](https://keepa
 - `vector_store.re_embed_all_layers()` re-embeds every layer in one transaction and resizes the shared vector column once when the dimensions change.
 - Layers have an `answer_mode`, `grounded` (default) or `extractive` (migration `12_answer_mode.sql`). Presets set it with an `answer_mode` key, and layer listings show it. The server records the mode but does not act on it yet.
 - `strata_apply_preset` reports the layer settings that changed (`layer_changes`), and its dry run the settings that would change (`layer_check`).
+- `strata_search` returns a `confidence` (level, top score, relevant sources, basis `similarity`), in the same shape as `strata_ask`; the learning tracker stores that value instead of judging the search again.
+- `vector_store.re_embed_all_layers()` takes `locked_timeout` (default 600 s per statement) for the locked phase, which before ran under the pool's 30 s limit.
 
 ### Changed
 
@@ -59,6 +61,9 @@ Notable changes to StrataKB. The format follows [Keep a Changelog](https://keepa
 - The default `DATABASE_URL` uses `127.0.0.1` instead of `localhost`, which can resolve to `::1` and fail with Docker in WSL.
 - `vector_store.re_embed_all_layers()` and `re_embed_layer()` read the chunks a batch at a time and embed them before taking the table lock; the lock covers only the resize, the writes and any chunk added in the meantime. Before, they loaded every chunk into memory and held the lock while the model ran.
 - Schema update messages say which migration a re-check failed for; the one for 06 names access from a `PUBLIC` grant or a role such as `pg_read_all_data`, which 06 does not revoke. A lock timeout while creating `strata_core.schema_migrations` names that table.
+- `strata_ask` merges the results of its rewritten queries by rank (Reciprocal Rank Fusion) instead of dividing each query's scores by its own top score, so chunks no longer tie at 1.0. Every chunk has the same keys (`rerank_score`, `source_file` and `section` included), and a source's `relevance_score` is the score confidence was judged on.
+- Chunks added while a re-embed runs are staged again without the lock (up to three passes), so few are left to embed under it. `re_embed_layer()` stops with an error when another process resized the column meanwhile.
+- `load_preset` rejects a blank `display_name`.
 
 ### Fixed
 
@@ -81,6 +86,11 @@ Notable changes to StrataKB. The format follows [Keep a Changelog](https://keepa
 - A CSV row with fewer fields than the header failed the whole file. It is now stored with the values it has, and a row with more fields keeps the extra values, labelled by position (`Column 4`).
 - `stratakb db up` and `db down` print one line and exit 3 on an unexpected error instead of a stack trace, and recognize Docker Desktop's "Ports are not available" message as a port in use.
 - `stratakb add --max-file-size inf` crashed; it is now a usage error (exit 2), like `0`, a negative value or `nan`, and the command refuses them before it connects to the database.
+- CSV columns with an empty header name are labelled `Column N`, and a repeated name gets a suffix (`Name (2)`). Before, the empty one gave a line with no label and the earlier of two same-named columns was lost. Header names are trimmed.
+- Markdown headings inside fenced code blocks no longer split a section, and an HTML page's `<title>` is used for the section path but no longer repeated in the text.
+- Applying a preset to a layer with no origin claims it in the same guarded update that writes its settings; an origin another process wrote in between is no longer overwritten, and a failed write no longer leaves the layer half-updated.
+- A failed cleanup of the re-embed staging table no longer hides the error that caused it.
+- When a schema update's read-only grants (06) are not in place although the connecting user owns the schema, the message names the likely cause instead of asking to run as the owner.
 
 ### Security
 
