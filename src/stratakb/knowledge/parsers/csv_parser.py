@@ -21,6 +21,9 @@ logger = structlog.get_logger()
 # and ingestion reports the file as flagged ("truncated")
 MAX_ROWS = 10_000
 
+# Common naming columns: the first one with a value is the chunk title
+_TITLE_COLUMNS = ("Title", "Name", "Term", "Code", "Operation")
+
 
 def parse_csv(file_path: str | Path) -> ParsedDocument:
     """Parse a CSV file into searchable text chunks.
@@ -71,10 +74,11 @@ def parse_csv(file_path: str | Path) -> ParsedDocument:
         return ParsedDocument(source_file=source, pages=[], total_pages=0)
 
     labels = _column_labels(headers)
+    title_columns = _title_columns(labels)
     pages: list[ParsedPage] = []
 
     for page_num, row in enumerate(rows, start=1):
-        text = _row_to_text(row, labels)
+        text = _row_to_text(row, labels, title_columns)
         if text.strip():
             pages.append(ParsedPage(
                 text=text,
@@ -99,6 +103,11 @@ def parse_csv(file_path: str | Path) -> ParsedDocument:
     )
 
 
+def _position_label(position: int) -> str:
+    """Label a column that has no header name by its 1-based position."""
+    return f"Column {position}"
+
+
 def _column_labels(headers: list[str]) -> list[str]:
     """Label each column by its header name.
 
@@ -110,33 +119,33 @@ def _column_labels(headers: list[str]) -> list[str]:
     for position, header in enumerate(headers, start=1):
         name = header.strip()
         if not name:
-            labels.append(f"Column {position}")
+            labels.append(_position_label(position))
             continue
         seen[name] = seen.get(name, 0) + 1
         labels.append(name if seen[name] == 1 else f"{name} ({seen[name]})")
     return labels
 
 
-def _row_to_text(values: list[str], labels: list[str]) -> str:
-    """Convert a CSV row into structured text with column labels."""
+def _title_columns(labels: list[str]) -> list[int]:
+    """Return the indexes of the naming columns, in _TITLE_COLUMNS order.
+
+    A name used twice counts at its first use only ("Name (2)" is never a title column).
+    """
+    return [labels.index(name) for name in _TITLE_COLUMNS if name in labels]
+
+
+def _row_to_text(values: list[str], labels: list[str], title_columns: list[int]) -> str:
+    """Convert a CSV row into structured text with column labels.
+
+    title_columns is _title_columns(labels): the row's title is its first
+    non-empty value among them.
+    """
     lines = []
 
-    # Use the first common naming column as the chunk title
-    title_candidates = [
-        "Title",
-        "Name",
-        "Term",
-        "Code",
-        "Operation",
-    ]
-    title = ""
-    for col in title_candidates:
-        if col in labels:
-            index = labels.index(col)
-            if index < len(values) and values[index].strip():
-                title = values[index].strip()
-                break
-
+    title = next(
+        (values[i].strip() for i in title_columns if i < len(values) and values[i].strip()),
+        "",
+    )
     if title:
         lines.append(f"# {title}")
 
@@ -145,7 +154,7 @@ def _row_to_text(values: list[str], labels: list[str]) -> str:
     for position, raw in enumerate(values, start=1):
         value = raw.strip()
         if value:
-            label = labels[position - 1] if position <= len(labels) else f"Column {position}"
+            label = labels[position - 1] if position <= len(labels) else _position_label(position)
             lines.append(f"**{label}:** {value}")
 
     return "\n".join(lines)

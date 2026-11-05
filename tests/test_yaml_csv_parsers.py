@@ -359,6 +359,22 @@ class TestCSVParser:
         assert "**Name:** x" in text
         assert "**Name (2):** y" in text
 
+    def test_title_falls_back_per_row(self, tmp_path):
+        from stratakb.knowledge.parsers.csv_parser import parse_csv
+
+        path = tmp_path / "fallback.csv"
+        path.write_text("Title,Name,Code\n,,C1\nT,,C2\n", encoding="utf-8")
+        result = parse_csv(path)
+        assert result.pages[0].text.startswith("# C1\n")
+        assert result.pages[1].text.startswith("# T\n")
+
+    def test_title_columns_once_per_header(self):
+        from stratakb.knowledge.parsers.csv_parser import _title_columns
+
+        assert _title_columns(["Code", "Name"]) == [1, 0]
+        assert _title_columns(["Name", "Name (2)", "Other"]) == [0]
+        assert _title_columns(["Other"]) == []
+
     def test_header_whitespace_stripped(self, tmp_path):
         from stratakb.knowledge.parsers.csv_parser import parse_csv
 

@@ -388,6 +388,68 @@ class TestMarkdownParser:
         assert [p.section_path for p in result.pages] == [["A"], ["A", "B"]]
         assert "plain line" in result.pages[0].text
 
+    def test_frontmatter_left_out_without_headings(self, tmp_path):
+        result = self._parse(tmp_path, "---\ntitle: x\n---\nJust text.\n")
+        assert [p.text for p in result.pages] == ["Just text."]
+
+    def test_frontmatter_only_file_has_no_pages(self, tmp_path):
+        result = self._parse(tmp_path, "---\ntitle: x\n---\n")
+        assert result.pages == []
+        assert result.total_pages == 0
+
+    def test_thematic_break_then_text_is_not_frontmatter(self, tmp_path):
+        source = "---\n# Intro\ntext\n\n---\n\n## Next\nmore\n"
+        result = self._parse(tmp_path, source)
+        assert [(p.section_path, p.text) for p in result.pages] == [
+            ([], "---"),
+            (["Intro"], "# Intro\ntext\n\n---"),
+            (["Intro", "Next"], "## Next\nmore"),
+        ]
+
+    def test_frontmatter_may_start_with_comment(self, tmp_path):
+        source = "---\n# comment\ntitle: x\n---\n\n# Real\n\ntext\n"
+        result = self._parse(tmp_path, source)
+        assert [p.section_path for p in result.pages] == [["Real"]]
+        assert result.pages[0].text == "# Real\n\ntext"
+
+    def test_key_then_prose_is_not_frontmatter(self, tmp_path):
+        result = self._parse(tmp_path, "---\nNote: x\nprose\n---\n")
+        all_text = "\n".join(p.text for p in result.pages)
+        assert "Note: x" in all_text
+        assert "prose" in all_text
+
+    def test_setext_headings(self, tmp_path):
+        source = "Title\n=====\n\nintro\n\nPart\n----\n\nbody\n"
+        result = self._parse(tmp_path, source)
+        assert [p.section_path for p in result.pages] == [["Title"], ["Title", "Part"]]
+        assert result.pages[0].text.startswith("Title\n=====")
+        assert "intro" in result.pages[0].text
+        assert result.pages[1].text.startswith("Part\n----")
+
+    @pytest.mark.parametrize("source", [
+        "# A\n\ntext\n\n---\n\nmore\n",
+        "# A\n\n- item\n---\n",
+        "# A\n\n```\nCode\n---\n```\n",
+        "# A\n\n> quote\n---\n",
+    ])
+    def test_underline_after_blank_list_or_fence_is_not_heading(self, tmp_path, source):
+        result = self._parse(tmp_path, source)
+        assert [p.section_path for p in result.pages] == [["A"]]
+
+    def test_atx_heading_indented_up_to_three_spaces(self, tmp_path):
+        result = self._parse(tmp_path, "   # A\n\ntext\n\n    # code\n")
+        assert [p.section_path for p in result.pages] == [["A"]]
+        assert "    # code" in result.pages[0].text
+
+    def test_frontmatter_after_byte_order_mark(self, tmp_path):
+        from stratakb.knowledge.parsers.markdown_parser import parse_markdown
+
+        path = tmp_path / "bom.md"
+        path.write_text("---\ntitle: x\n---\nJust text.\n", encoding="utf-8-sig")
+        result = parse_markdown(path)
+        assert result.error is None
+        assert [p.text for p in result.pages] == ["Just text."]
+
 
 class TestMarkdownErrors:
     def test_nonexistent_file(self):
@@ -569,6 +631,52 @@ class TestHTMLParser:
         result = parse_html(path)
         assert [p.text for p in result.pages] == ["Intro", "# Main\n\nx"]
         assert [p.section_path for p in result.pages] == [["Guide"], ["Main"]]
+
+    @staticmethod
+    def _parse(tmp_path, source: str):
+        from stratakb.knowledge.parsers.html_parser import parse_html
+
+        path = tmp_path / "page.html"
+        path.write_text(source, encoding="utf-8")
+        result = parse_html(path)
+        assert result.error is None
+        return result
+
+    def test_svg_title_in_body_is_text(self, tmp_path):
+        result = self._parse(
+            tmp_path,
+            "<html><head><title>Page</title></head><body><h1>A</h1><p>x</p>"
+            "<svg><title>Sales chart</title></svg></body></html>",
+        )
+        assert result.total_pages == 1
+        assert "Sales chart" in result.pages[0].text
+        assert "Page" not in result.pages[0].text
+        assert result.pages[0].section_path == ["A"]
+
+    def test_svg_title_is_not_page_title(self, tmp_path):
+        result = self._parse(
+            tmp_path,
+            "<html><body><p>Intro</p><svg><title>Logo</title></svg><h1>A</h1><p>x</p></body></html>",
+        )
+        assert result.pages[0].section_path == []
+        assert "Logo" in result.pages[0].text
+        assert "Intro" in result.pages[0].text
+        assert result.pages[1].section_path == ["A"]
+
+    def test_svg_title_is_not_glued_to_neighbours(self, tmp_path):
+        result = self._parse(tmp_path, "<p>x<svg><title>Chart</title></svg>y</p>")
+        assert result.pages[0].text == "x\nChart\ny"
+
+    def test_title_without_head_element(self, tmp_path):
+        result = self._parse(tmp_path, "<!doctype html><title>Doc</title><p>text</p>")
+        assert [(p.section_path, p.text) for p in result.pages] == [(["Doc"], "text")]
+
+    def test_unclosed_title_gives_one_untitled_page(self, tmp_path):
+        result = self._parse(
+            tmp_path, "<html><head><title>Broken</head><body><p>text</p></body></html>"
+        )
+        assert result.total_pages == 1
+        assert result.pages[0].section_path == []
 
 
 class TestHTMLErrors:
