@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from decimal import Decimal
 
 import pytest
@@ -98,6 +99,15 @@ class TestCheck:
     def test_quote_with_omission(self):
         assert _flag_texts('"A fee of EUR 1,000.00 ... is reported in pacs.002" [S2]') == []
 
+    def test_quote_of_fragments_flagged(self):
+        # Single-word fragments around an omission prove nothing
+        assert _flag_texts('"A ... applies ... 5%" [S2]') == ["A ... applies ... 5%"]
+
+    def test_quote_part_inside_a_word_flagged(self):
+        # "EUR 1" stops inside "1,000.00", "ee of" starts inside "fee of"
+        assert _flag_texts('"A fee of EUR 1" [S2]') == ["A fee of EUR 1"]
+        assert _flag_texts('"ee of EUR 1,000.00 applies" [S2]') == ["ee of EUR 1,000.00 applies"]
+
     def test_quote_across_line_break_and_curly_marks(self):
         draft = "“Reject reason AC01 is reported in pacs.002” [S2]"
         assert _flag_texts(draft) == []
@@ -162,6 +172,17 @@ class TestCheck:
         assert len(result.flags) == MAX_FLAGS
         assert result.flags_unlisted == result.facts_checked - MAX_FLAGS
         assert not result.verified
+
+    @pytest.mark.parametrize(
+        "unit",
+        ["one ", "twenty one ", "two and ", "three-", "five (5 ", "one" + " " * 40],
+    )
+    def test_long_run_of_number_words_is_fast(self, unit):
+        # An unbounded run of number words backtracked quadratically (20 s at 22k chars)
+        draft = (unit * (MAX_DRAFT_CHARS // len(unit) + 1))[:MAX_DRAFT_CHARS] + "("
+        started = time.perf_counter()
+        extract_facts(draft)
+        assert time.perf_counter() - started < 2.0
 
     def test_repeated_fact_checked_once(self):
         result = check("It is 30 days [S1], 30 days, thirty days [S1].", PASSAGES)

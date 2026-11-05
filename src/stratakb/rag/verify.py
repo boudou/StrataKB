@@ -82,18 +82,42 @@ def _cited_ids(marker: str) -> list[str]:
     return ids
 
 
+# Each part of a quote with an omission must hold at least this many words, so
+# fragments such as "a ... e" cannot pass as a quote
+_MIN_PART_WORDS = 2
+
+
+def _find_part(part: str, text: str, pos: int) -> re.Match[str] | None:
+    """The first match of part in text from pos, not starting or ending inside a word.
+
+    A part ending in a digit must not stop inside a number ("1" of "1,000.00").
+    """
+    head = r"(?<!\w)" if part[:1].isalnum() or part[:1] == "_" else ""
+    tail = r"(?!\w)" if part[-1:].isalnum() or part[-1:] == "_" else ""
+    if part[-1:].isdigit():
+        tail = r"(?!\w|[.,]\d)"
+    return re.compile(head + re.escape(part) + tail).search(text, pos)
+
+
 def _quote_found(quote: str, text: str) -> bool:
-    """Whether every part of the quote ("..." marks an omission) is in text, in order."""
+    """Whether every part of the quote ("..." marks an omission) is in text, in order.
+
+    Parts match whole words only, and with an omission each part needs
+    _MIN_PART_WORDS words.
+    """
     parts = [p.strip() for p in quote.split("...") if p.strip()]
+    if len(parts) > 1 and any(len(p.split()) < _MIN_PART_WORDS for p in parts):
+        return False
     pos = 0
     for part in parts:
-        i = text.find(part, pos)
-        if i < 0:
+        m = _find_part(part, text, pos)
+        if m is None:
             # Punctuation inside the closing quote mark need not be the source's
-            i = text.find(part.rstrip(".,;:!?"), pos)
-            if i < 0:
+            trimmed = part.rstrip(".,;:!?")
+            m = _find_part(trimmed, text, pos) if trimmed else None
+            if m is None:
                 return False
-        pos = i + len(part)
+        pos = m.end()
     return bool(parts)
 
 
@@ -111,7 +135,9 @@ _SMALL = {
 }
 _SCALES = {"hundred": 100, "thousand": 1_000, "million": 1_000_000}
 _WORD = "(?:" + "|".join(sorted([*_SMALL, *_SCALES], key=len, reverse=True)) + ")"
-_WORDS = rf"(?<![\w-]){_WORD}(?:(?:\s+and\s+|\s+|-){_WORD})*(?![\w])"
+# At most 12 words in one number ("nine hundred and ninety nine thousand ..."):
+# an unbounded run backtracks quadratically on a long run of number words
+_WORDS = rf"(?<![\w-]){_WORD}(?:(?:\s+and\s+|\s+|-){_WORD}){{0,11}}(?![\w])"
 _DIGITS = r"(?<![\w.,])(?:\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d+(?:\.\d+)?)(?:st|nd|rd|th)?(?![\w])"
 # A number in digits, in words, or both ("thirty (30)", "30 (thirty)")
 _NUMBER = (
