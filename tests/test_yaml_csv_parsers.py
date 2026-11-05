@@ -7,7 +7,7 @@ Tests cover:
 - CSV parsing of a reason code list
 - Error handling for bad files
 - Metadata fields (service_domain, operation_type, api_version)
-- Integration with ingestion pipeline (SUPPORTED_PARSERS)
+- Integration with ingestion pipeline (FORMATS)
 """
 
 from __future__ import annotations
@@ -457,16 +457,16 @@ class TestCSVParser:
 
 
 class TestPipelineIntegration:
-    def test_yaml_registered_in_supported_parsers(self):
-        from stratakb.knowledge.ingestion import SUPPORTED_PARSERS
+    def test_yaml_registered_in_formats(self):
+        from stratakb.knowledge.parsers.registry import FORMATS
 
-        assert ".yaml" in SUPPORTED_PARSERS
-        assert ".yml" in SUPPORTED_PARSERS
+        assert ".yaml" in FORMATS
+        assert ".yml" in FORMATS
 
-    def test_csv_registered_in_supported_parsers(self):
-        from stratakb.knowledge.ingestion import SUPPORTED_PARSERS
+    def test_csv_registered_in_formats(self):
+        from stratakb.knowledge.parsers.registry import FORMATS
 
-        assert ".csv" in SUPPORTED_PARSERS
+        assert ".csv" in FORMATS
 
     def test_discover_yaml_files(self):
         from stratakb.knowledge.ingestion import _discover_files

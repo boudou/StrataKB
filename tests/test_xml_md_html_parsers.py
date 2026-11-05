@@ -6,7 +6,7 @@ Tests cover:
 - Markdown splitting by heading hierarchy (H1/H2/H3)
 - HTML parsing with tag stripping and section chunking
 - Error handling for bad files
-- Integration with ingestion pipeline (SUPPORTED_PARSERS)
+- Integration with ingestion pipeline (FORMATS)
 """
 
 from __future__ import annotations
@@ -729,23 +729,23 @@ class TestHTMLErrors:
 
 
 class TestPipelineIntegration:
-    def test_xml_registered_in_supported_parsers(self):
-        from stratakb.knowledge.ingestion import SUPPORTED_PARSERS
+    def test_xml_registered_in_formats(self):
+        from stratakb.knowledge.parsers.registry import FORMATS
 
-        assert ".xml" in SUPPORTED_PARSERS
-        assert ".xsd" in SUPPORTED_PARSERS
+        assert ".xml" in FORMATS
+        assert ".xsd" in FORMATS
 
-    def test_markdown_registered_in_supported_parsers(self):
-        from stratakb.knowledge.ingestion import SUPPORTED_PARSERS
+    def test_markdown_registered_in_formats(self):
+        from stratakb.knowledge.parsers.registry import FORMATS
 
-        assert ".md" in SUPPORTED_PARSERS
-        assert ".markdown" in SUPPORTED_PARSERS
+        assert ".md" in FORMATS
+        assert ".markdown" in FORMATS
 
-    def test_html_registered_in_supported_parsers(self):
-        from stratakb.knowledge.ingestion import SUPPORTED_PARSERS
+    def test_html_registered_in_formats(self):
+        from stratakb.knowledge.parsers.registry import FORMATS
 
-        assert ".html" in SUPPORTED_PARSERS
-        assert ".htm" in SUPPORTED_PARSERS
+        assert ".html" in FORMATS
+        assert ".htm" in FORMATS
 
     def test_parse_file_dispatches_xsd(self):
         from stratakb.knowledge.ingestion import _parse_file

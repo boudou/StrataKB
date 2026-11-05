@@ -13,7 +13,7 @@ from fnmatch import fnmatchcase
 from pathlib import PurePosixPath
 from typing import TYPE_CHECKING
 
-from stratakb.knowledge.parsers.registry import SUPPORTED_PARSERS
+from stratakb.knowledge.parsers.registry import FORMATS
 
 if TYPE_CHECKING:
     from stratakb.knowledge.selection import FileEntry
@@ -114,7 +114,7 @@ def evaluate(entry: FileEntry, max_file_size_bytes: int) -> Verdict:
     ext = PurePosixPath(name).suffix
     if ext in CODE_EXTENSIONS:
         return Verdict(False, "code")
-    if ext not in SUPPORTED_PARSERS:
+    if ext not in FORMATS:
         return Verdict(False, "unsupported")
     if entry.size > max_file_size_bytes:
         return Verdict(False, "too_large")

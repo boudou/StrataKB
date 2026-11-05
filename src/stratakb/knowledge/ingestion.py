@@ -34,7 +34,7 @@ from stratakb.knowledge.layers import (
     get_layer_status,
 )
 from stratakb.knowledge.parsers.pdf_parser import ParsedDocument
-from stratakb.knowledge.parsers.registry import SUPPORTED_PARSERS
+from stratakb.knowledge.parsers.registry import FORMATS
 from stratakb.knowledge.policy import is_secret_name
 from stratakb.knowledge.vector_store import ChunkRecord, chunk_embed_text, insert_chunks
 
@@ -44,9 +44,6 @@ if TYPE_CHECKING:
 logger = structlog.get_logger()
 
 EMBED_BATCH_SIZE = 100
-
-# Formats read as bytes by their parser: never decoded to check for empty text
-_BINARY_FORMATS = {".pdf", ".docx"}
 
 # A PDF averaging fewer characters per page than this probably holds scanned images
 _SCANNED_MIN_CHARS_PER_PAGE = 200
@@ -433,8 +430,10 @@ async def ingest_documents(
                 result.files.append(FileOutcome(relative_path, "unchanged"))
                 continue
 
+            # A listed file may have an unknown extension: _parse_file rejects it
+            fmt = FORMATS.get(file_path.suffix.lower())
             if not data or (
-                file_path.suffix.lower() not in _BINARY_FORMATS
+                (fmt is None or not fmt.binary)
                 and not data.decode("utf-8-sig", errors="replace").strip()
             ):
                 await drop(relative_path, previous, "no_text")
@@ -507,7 +506,7 @@ async def ingest_documents(
             else:
                 result.files_updated += 1
                 outcome = FileOutcome(relative_path, "updated")
-            if file_path.suffix.lower() == ".pdf" and _probably_scanned(parsed):
+            if fmt is not None and fmt.scanned_check and _probably_scanned(parsed):
                 result.files_flagged += 1
                 outcome = FileOutcome(relative_path, "flagged", "probably_scanned")
             elif parsed.rows_left_out:
@@ -578,30 +577,28 @@ def _discover_files(source: Path) -> list[Path]:
     """Find all supported files in a path (file or directory)."""
     if source.is_file():
         ext = source.suffix.lower()
-        if ext in SUPPORTED_PARSERS and SUPPORTED_PARSERS[ext] is not None:
-            return [source]
-        return []
+        return [source] if ext in FORMATS else []
 
     files = []
-    for ext, parser in SUPPORTED_PARSERS.items():
-        if parser is not None:  # skip extensions mapped to None (e.g. .fpr)
-            files.extend(source.rglob(f"*{ext}"))
+    for ext in FORMATS:
+        files.extend(source.rglob(f"*{ext}"))
     return sorted(files)
 
 
 def _parse_file(file_path: Path) -> ParsedDocument:
     """Parse a file using the appropriate parser based on extension."""
     ext = file_path.suffix.lower()
-    parser = SUPPORTED_PARSERS.get(ext)
-    if parser is None:
+    fmt = FORMATS.get(ext)
+    if fmt is None:
         return ParsedDocument(source_file=file_path.name, error=f"Unsupported format: {ext}")
-    return parser(file_path)
+    return fmt.parser(file_path)
 
 
 def _probably_scanned(doc: ParsedDocument) -> bool:
-    """Whether a parsed PDF looks scanned: under half its pages have text, or
-    too few characters per page on average. The PDF parser keeps only pages
-    with text, so len(doc.pages) counts those."""
+    """Whether a parsed document looks scanned: under half its pages have
+    text, or too few characters per page on average. Called only for formats
+    whose FORMATS row sets scanned_check; the PDF parser keeps only pages with
+    text, so len(doc.pages) counts those."""
     if doc.total_pages <= 0 or not doc.pages:
         return False
     return (
@@ -633,8 +630,8 @@ def _chunk_document(
 
     # Derive doc_type from file extension
     ext = Path(doc.source_file).suffix.lower()
-    doc_type_map = {".pdf": "pdf", ".docx": "docx", ".yaml": "yaml", ".yml": "yaml", ".csv": "csv", ".xml": "xml", ".xsd": "xsd", ".json": "json", ".md": "markdown", ".markdown": "markdown", ".html": "html", ".htm": "html", ".txt": "text", ".rst": "rst", ".adoc": "adoc"}
-    doc_type = doc_type_map.get(ext, ext.lstrip(".") or "unknown")
+    fmt = FORMATS.get(ext)
+    doc_type = fmt.doc_type if fmt is not None else ext.lstrip(".") or "unknown"
 
     chunks: list[ChunkRecord] = []
 
