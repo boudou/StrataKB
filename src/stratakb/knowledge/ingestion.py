@@ -55,8 +55,8 @@ class FileOutcome:
     or "failed".
     reason: why a file was removed ("deleted", "not_selected" when a file list
     left out a file that still exists, "secret", "no_text"), skipped
-    ("secret", "no_text"), flagged ("probably_scanned": stored, and counted
-    as added or updated) or failed ("parse_error", "embed_error"); None
+    ("secret", "no_text"), flagged ("probably_scanned", "truncated": stored,
+    and counted as added or updated) or failed ("parse_error", "embed_error"); None
     otherwise.
     """
 
@@ -79,7 +79,8 @@ class IngestionResult:
     files_unchanged: int = 0
     files_removed: int = 0
     files_skipped: int = 0  # secret-looking names and files without text, not tracked
-    files_flagged: int = 0  # PDFs that look scanned; also counted as added or updated
+    # PDFs that look scanned and CSVs cut at the row limit; also counted as added or updated
+    files_flagged: int = 0
     # True when chunks from before per-file tracking were dropped and the layer rebuilt
     rebuilt_legacy: bool = False
     errors: list[dict] = field(default_factory=list)
@@ -229,7 +230,8 @@ async def ingest_documents(
     never read: it is skipped, or removed when it was tracked. A file without
     text (0 bytes, whitespace only, or a parse that yields nothing) is not a
     failure: it is skipped, or removed when it was tracked. A PDF that looks
-    scanned (see _probably_scanned) is stored for the text it has and flagged.
+    scanned (see _probably_scanned) is stored for the text it has and flagged;
+    so is a CSV cut at the parser's row limit (stored for the rows read).
     Every file gets a FileOutcome in result.files.
 
     With files, source_path is the root folder and the list is the full
@@ -503,6 +505,9 @@ async def ingest_documents(
             if file_path.suffix.lower() == ".pdf" and _probably_scanned(parsed):
                 result.files_flagged += 1
                 outcome = FileOutcome(relative_path, "flagged", "probably_scanned")
+            elif parsed.rows_left_out:
+                result.files_flagged += 1
+                outcome = FileOutcome(relative_path, "flagged", "truncated")
             result.files.append(outcome)
             result.docs_processed += 1
             result.chunks_created += len(doc_chunks)

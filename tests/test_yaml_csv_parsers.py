@@ -206,6 +206,13 @@ class TestYAMLErrors:
 # ==========================================
 
 
+def _write_rows(path: Path, count: int) -> Path:
+    """Write a CSV with a header and count data rows."""
+    lines = ["Code,Name"] + [f"C{i},Name {i}" for i in range(count)]
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return path
+
+
 class TestCSVParser:
     def test_parse_code_list(self):
         from stratakb.knowledge.parsers.csv_parser import parse_csv
@@ -238,6 +245,46 @@ class TestCSVParser:
         # Title should be from the "Name" column
         first_page = result.pages[0]
         assert first_page.text.startswith("# IncorrectAccountNumber")
+
+    def test_small_csv_not_truncated(self):
+        from structlog.testing import capture_logs
+
+        from stratakb.knowledge.parsers.csv_parser import parse_csv
+
+        with capture_logs() as logs:
+            result = parse_csv(TEST_CSV)
+        assert result.rows_left_out == 0
+        assert not [e for e in logs if e["event"] == "csv_truncated"]
+
+    def test_exactly_max_rows_not_truncated(self, tmp_path):
+        from structlog.testing import capture_logs
+
+        from stratakb.knowledge.parsers.csv_parser import MAX_ROWS, parse_csv
+
+        path = _write_rows(tmp_path / "limit.csv", MAX_ROWS)
+        with capture_logs() as logs:
+            result = parse_csv(path)
+        assert result.error is None
+        assert result.total_pages == MAX_ROWS
+        assert result.rows_left_out == 0
+        assert not [e for e in logs if e["event"] == "csv_truncated"]
+
+    def test_rows_past_max_counted_and_logged(self, tmp_path):
+        from structlog.testing import capture_logs
+
+        from stratakb.knowledge.parsers.csv_parser import MAX_ROWS, parse_csv
+
+        path = _write_rows(tmp_path / "big.csv", MAX_ROWS + 5)
+        with capture_logs() as logs:
+            result = parse_csv(path)
+        assert result.error is None
+        assert result.total_pages == MAX_ROWS
+        assert result.rows_left_out == 5
+        truncated = [e for e in logs if e["event"] == "csv_truncated"]
+        assert len(truncated) == 1
+        assert truncated[0]["log_level"] == "warning"
+        assert truncated[0]["rows_read"] == MAX_ROWS
+        assert truncated[0]["rows_left_out"] == 5
 
     def test_nonexistent_csv(self):
         from stratakb.knowledge.parsers.csv_parser import parse_csv

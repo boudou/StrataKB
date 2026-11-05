@@ -7,6 +7,7 @@ its column header.
 from __future__ import annotations
 
 import csv
+import itertools
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -16,7 +17,8 @@ from stratakb.knowledge.parsers.pdf_parser import ParsedDocument, ParsedPage
 
 logger = structlog.get_logger()
 
-# Maximum rows to parse (safety limit)
+# Maximum rows to parse (safety limit); rows past it are counted, not read,
+# and ingestion reports the file as flagged ("truncated")
 MAX_ROWS = 10_000
 
 
@@ -24,6 +26,7 @@ def parse_csv(file_path: str | Path) -> ParsedDocument:
     """Parse a CSV file into searchable text chunks.
 
     Each row becomes a page, formatted with the column headers as labels.
+    Rows past MAX_ROWS are not read; their count is in rows_left_out.
 
     Args:
         file_path: Path to the CSV file.
@@ -47,14 +50,20 @@ def parse_csv(file_path: str | Path) -> ParsedDocument:
                 return ParsedDocument(source_file=source, pages=[], total_pages=0)
 
             headers = list(reader.fieldnames)
-            rows = []
-            for i, row in enumerate(reader):
-                if i >= MAX_ROWS:
-                    break
-                rows.append(row)
+            rows = list(itertools.islice(reader, MAX_ROWS))
+            # Count the rest without keeping it
+            rows_left_out = sum(1 for _ in reader)
 
     except Exception as e:
         return ParsedDocument(source_file=source, error=f"CSV parse error: {e}")
+
+    if rows_left_out:
+        logger.warning(
+            "csv_truncated",
+            file=source,
+            rows_read=len(rows),
+            rows_left_out=rows_left_out,
+        )
 
     if not rows:
         return ParsedDocument(source_file=source, pages=[], total_pages=0)
@@ -75,6 +84,7 @@ def parse_csv(file_path: str | Path) -> ParsedDocument:
         file=source,
         columns=len(headers),
         rows=len(rows),
+        rows_left_out=rows_left_out,
         pages=len(pages),
     )
 
@@ -82,6 +92,7 @@ def parse_csv(file_path: str | Path) -> ParsedDocument:
         source_file=source,
         pages=pages,
         total_pages=len(pages),
+        rows_left_out=rows_left_out,
     )
 
 

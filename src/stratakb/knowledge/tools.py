@@ -203,7 +203,8 @@ def register_knowledge_tools(
         files_skipped counts the skipped files. A PDF that looks scanned
         (under half its pages have text, or under 200 characters per page on
         average) is stored for the text it has and counted in files_flagged;
-        it also counts as added or updated.
+        it also counts as added or updated. A CSV over 10,000 rows is stored
+        for its first 10,000 rows and also counted in files_flagged.
 
         Unchanged means the same file content (SHA-256). A change to the
         layer's chunk_config or to the embedding model is not detected: use

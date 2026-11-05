@@ -523,6 +523,60 @@ class TestScannedPdf:
         assert third.files_unchanged == 1
 
 
+def _csv(rows: list[str]) -> str:
+    return "Code,Name\n" + "".join(f"{r},Name of {r}\n" for r in rows)
+
+
+class TestTruncatedCsv:
+    """A CSV over the parser's row limit (patched to 2) is stored and flagged."""
+
+    async def _ingest_capped(self, db_url, layer, root: Path):
+        with patch("stratakb.knowledge.parsers.csv_parser.MAX_ROWS", 2):
+            result, _ = await _ingest(db_url, layer, root)
+        return result
+
+    async def test_over_limit_flagged_and_stored(self, db_url, layer, tmp_path):
+        _write(tmp_path / "codes.csv", _csv(["A1", "A2", "A3"]))
+        _write(tmp_path / "a.md", "# Alpha\n\nAlpha content.\n")
+
+        result = await self._ingest_capped(db_url, layer, tmp_path)
+
+        outcomes = _outcomes(result)
+        assert outcomes["codes.csv"] == ("flagged", "truncated")
+        assert outcomes["a.md"] == ("added", None)
+        assert result.files_flagged == 1
+        assert result.files_added == 2
+        assert result.status == "completed"
+        files = {f["relative_path"]: f for f in await _files(db_url, layer)}
+        assert files["codes.csv"]["chunk_count"] == 2
+
+    async def test_at_limit_not_flagged(self, db_url, layer, tmp_path):
+        _write(tmp_path / "codes.csv", _csv(["A1", "A2"]))
+
+        result = await self._ingest_capped(db_url, layer, tmp_path)
+
+        assert _outcomes(result)["codes.csv"] == ("added", None)
+        assert result.files_flagged == 0
+        assert result.files_added == 1
+
+    async def test_flagged_update_and_unchanged_rerun(self, db_url, layer, tmp_path):
+        codes = tmp_path / "codes.csv"
+        _write(codes, _csv(["A1", "A2", "A3"]))
+        first = await self._ingest_capped(db_url, layer, tmp_path)
+        assert _outcomes(first)["codes.csv"] == ("flagged", "truncated")
+
+        _write(codes, _csv(["B1", "B2", "B3", "B4"]))
+        second = await self._ingest_capped(db_url, layer, tmp_path)
+        assert _outcomes(second)["codes.csv"] == ("flagged", "truncated")
+        assert second.files_updated == 1
+        assert second.files_flagged == 1
+
+        third = await self._ingest_capped(db_url, layer, tmp_path)
+        assert _outcomes(third)["codes.csv"] == ("unchanged", None)
+        assert third.files_flagged == 0
+        assert third.files_unchanged == 1
+
+
 async def test_tool_returns_files_skipped():
     from stratakb.knowledge.ingestion import IngestionResult
     from stratakb.mcp_server import mcp
