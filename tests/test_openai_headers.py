@@ -3,9 +3,11 @@
 Tests cover:
 - Query rewriting, embeddings and the model check never send OPENAI_ORG_ID
   or OPENAI_PROJECT_ID to QUERY_REWRITE_BASE_URL or EMBEDDING_BASE_URL
-- They do send the endpoint's own key
-- With no key configured, the client still builds and sends only the
-  placeholder key, never OPENAI_API_KEY or OPENAI_ADMIN_KEY from the environment
+- They do send the endpoint's own key, even with OPENAI_ADMIN_KEY set
+- With no key configured, the client still builds, holds no OPENAI_ADMIN_KEY,
+  and its requests carry no Authorization header: not OPENAI_API_KEY,
+  OPENAI_ADMIN_KEY or an Authorization line in OPENAI_CUSTOM_HEADERS
+- A 401 from a keyless rewrite endpoint logs a hint naming QUERY_REWRITE_API_KEY
 - Embeddings sent to OpenAI itself keep the SDK's organization and project
 
 The real SDK client runs over a mock transport; nothing leaves the machine.
@@ -37,6 +39,7 @@ def _sdk_env(monkeypatch):
         "OPENAI_API_KEY",
         "OPENAI_ADMIN_KEY",
         "OPENAI_BASE_URL",
+        "OPENAI_CUSTOM_HEADERS",
         "ANTHROPIC_BASE_URL",
         "QUERY_REWRITE_MODEL",
     ):
@@ -99,11 +102,18 @@ def _reply(request: httpx2.Request) -> httpx2.Response:
 class _Recorder:
     """Builds real SDK clients over a mock transport and keeps each request's headers."""
 
-    def __init__(self):
+    def __init__(self, status: int = 200):
         self.headers: list[httpx2.Headers] = []
+        self.status = status
 
     def _handle(self, request: httpx2.Request) -> httpx2.Response:
         self.headers.append(request.headers)
+        if self.status != 200:
+            return httpx2.Response(
+                self.status,
+                content=json.dumps({"error": {"message": "unauthorized"}}),
+                headers={"content-type": "application/json"},
+            )
         return _reply(request)
 
     def __call__(self, **kwargs):
@@ -126,9 +136,10 @@ def _assert_no_sdk_env_headers(rec: _Recorder) -> None:
         assert headers["authorization"] == "Bearer endpoint-key"
 
 
-async def test_rewrite_endpoint_gets_no_org_or_project(recorder):
+async def test_rewrite_endpoint_gets_no_org_or_project(recorder, monkeypatch):
     from stratakb.rag.query_rewriter import rewrite_query
 
+    monkeypatch.setenv("OPENAI_ADMIN_KEY", "sk-admin-env")
     settings = _settings(
         query_rewrite_provider="openai_compatible",
         query_rewrite_base_url=BASE_URL,
@@ -141,18 +152,20 @@ async def test_rewrite_endpoint_gets_no_org_or_project(recorder):
     _assert_no_sdk_env_headers(recorder)
 
 
-async def test_embedding_endpoint_gets_no_org_or_project(recorder):
+async def test_embedding_endpoint_gets_no_org_or_project(recorder, monkeypatch):
     from stratakb.knowledge.embeddings import embed_texts
 
+    monkeypatch.setenv("OPENAI_ADMIN_KEY", "sk-admin-env")
     with patch("stratakb.config.get_settings", return_value=_embedding_settings()):
         vectors = await embed_texts(["x"])
     assert len(vectors) == 1
     _assert_no_sdk_env_headers(recorder)
 
 
-async def test_model_check_gets_no_org_or_project(recorder):
+async def test_model_check_gets_no_org_or_project(recorder, monkeypatch):
     from stratakb.knowledge.embedding_checks import check_embedding_model
 
+    monkeypatch.setenv("OPENAI_ADMIN_KEY", "sk-admin-env")
     result = await check_embedding_model(_embedding_settings())
     assert result["status"] == "ok"
     _assert_no_sdk_env_headers(recorder)
@@ -171,43 +184,58 @@ async def test_openai_itself_keeps_org_and_project(recorder):
         assert headers["authorization"] == "Bearer sk-test"
 
 
-def test_keyless_client_builds_without_openai_api_key():
+def test_keyless_client_builds_without_openai_api_key(monkeypatch):
     from stratakb.core.egress import openai_compatible_client
 
+    monkeypatch.setenv("OPENAI_ADMIN_KEY", "sk-admin-env")
     client = openai_compatible_client("", BASE_URL)
     assert client.api_key == PLACEHOLDER_API_KEY
+    assert client.admin_api_key == ""
     assert str(client.base_url).startswith(BASE_URL)
+
+
+_ENV_SECRETS = ("sk-env", "sk-admin-env", "sk-custom-env")
+
+
+@pytest.fixture
+def env_credentials(monkeypatch):
+    """Put a credential in every environment variable the SDK reads one from."""
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-env")
+    monkeypatch.setenv("OPENAI_ADMIN_KEY", "sk-admin-env")
+    monkeypatch.setenv("OPENAI_CUSTOM_HEADERS", "Authorization: Bearer sk-custom-env")
 
 
 def _assert_keyless(rec: _Recorder) -> None:
     assert rec.headers, "no request was sent"
     for headers in rec.headers:
-        assert headers["authorization"] == f"Bearer {PLACEHOLDER_API_KEY}"
+        assert "authorization" not in headers
         assert "openai-organization" not in headers
         assert "openai-project" not in headers
+        for value in headers.values():
+            assert not any(secret in value for secret in _ENV_SECRETS)
 
 
-async def test_keyless_rewrite_endpoint_gets_no_key(recorder, monkeypatch):
-    from stratakb.rag.query_rewriter import rewrite_query
-
-    monkeypatch.setenv("OPENAI_ADMIN_KEY", "sk-admin-env")
-    settings = _settings(
+def _keyless_rewrite_settings() -> Settings:
+    return _settings(
         query_rewrite_provider="openai_compatible",
         query_rewrite_base_url=BASE_URL,
         query_rewrite_model="llama3.2",
         query_rewrite_api_key="",
     )
-    with patch("stratakb.config.get_settings", return_value=settings):
+
+
+async def test_keyless_rewrite_sends_no_authorization(recorder, env_credentials):
+    from stratakb.rag.query_rewriter import rewrite_query
+
+    with patch("stratakb.config.get_settings", return_value=_keyless_rewrite_settings()):
         result = await rewrite_query("q")
     assert result == ["a", "b"]
     _assert_keyless(recorder)
 
 
-async def test_keyless_embedding_endpoint_gets_no_key(recorder, monkeypatch):
+async def test_keyless_embedding_sends_no_authorization(recorder, env_credentials):
     from stratakb.knowledge.embeddings import embed_texts
 
-    monkeypatch.setenv("OPENAI_API_KEY", "sk-env")
-    monkeypatch.setenv("OPENAI_ADMIN_KEY", "sk-admin-env")
     settings = _embedding_settings(embedding_api_key="")
     with patch("stratakb.config.get_settings", return_value=settings):
         vectors = await embed_texts(["x"])
@@ -215,10 +243,29 @@ async def test_keyless_embedding_endpoint_gets_no_key(recorder, monkeypatch):
     _assert_keyless(recorder)
 
 
-async def test_keyless_model_check_reaches_endpoint(recorder, monkeypatch):
+async def test_keyless_model_check_sends_no_authorization(recorder, env_credentials):
     from stratakb.knowledge.embedding_checks import check_embedding_model
 
-    monkeypatch.setenv("OPENAI_API_KEY", "sk-env")
     result = await check_embedding_model(_embedding_settings(embedding_api_key=""))
     assert result["status"] == "ok"
     _assert_keyless(recorder)
+
+
+async def test_rewrite_401_without_key_names_the_setting():
+    from structlog.testing import capture_logs
+
+    from stratakb.rag.query_rewriter import rewrite_query
+
+    rec = _Recorder(status=401)
+    with (
+        patch("openai.AsyncOpenAI", side_effect=rec),
+        patch("stratakb.config.get_settings", return_value=_keyless_rewrite_settings()),
+        capture_logs() as logs,
+    ):
+        result = await rewrite_query("q")
+    assert result == ["q"]
+    _assert_keyless(rec)
+    failed = [e for e in logs if e["event"] == "query_rewrite_failed"]
+    assert len(failed) == 1
+    assert "QUERY_REWRITE_API_KEY" in failed[0]["hint"]
+    assert "not set" in failed[0]["hint"]

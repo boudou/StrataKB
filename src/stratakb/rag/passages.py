@@ -5,16 +5,30 @@ numbered S1, S2, ... in it, so S<n> is the n-th retrieved chunk the
 learning loop records. Each passage carries a ref that names the exact span
 of the stored document text it holds, and a citation a developer can open:
 the file's relative path, the page, the line range and the clause path.
+The budget counts each passage's id, ref and citation with its text, and an
+answer holds at most MAX_PASSAGES passages, all of which the learning loop
+stores, so feedback by passage id resolves for every one.
 """
 
 from __future__ import annotations
 
+import json
 import math
+import re
+from dataclasses import dataclass
 from typing import Any
 
 from stratakb.knowledge.documents import locate
 
 RESPONSE_FORMATS = ("concise", "detailed")
+
+# The most passages an answer returns, and results the learning loop stores
+MAX_PASSAGES = 50
+# The tokens a passage costs in the response beyond its own indent-2 JSON: the
+# deeper indentation inside the response's passages list and the page, lines
+# and page_end a stored document adds (measured on FastMCP's indent-2 JSON
+# with six-digit spans and three-digit pages: about 81 characters)
+RESPONSE_SLACK_TOKENS = 21
 
 _NEXT_STEPS = {
     "not_found": (
@@ -28,21 +42,63 @@ _NEXT_STEPS = {
 }
 
 
+def ask_chunk(
+    *,
+    chunk_id: str | None,
+    content: str,
+    score: float,
+    similarity: float | None,
+    layer: str,
+    source_file: str,
+    section: str | None,
+    doc_type: str | None,
+    metadata: dict[str, Any],
+    document_id: int | None,
+    char_start: int | None,
+    char_end: int | None,
+    clause_path: str | None,
+) -> dict[str, Any]:
+    """The one shape of a strata_ask chunk; the reranker fills rerank_score."""
+    return {
+        "chunk_id": chunk_id,
+        "content": content,
+        "score": score,
+        "similarity": similarity,
+        "rerank_score": None,
+        "layer": layer,
+        "source_file": source_file,
+        "section": section,
+        "doc_type": doc_type,
+        "metadata": metadata,
+        "document_id": document_id,
+        "char_start": char_start,
+        "char_end": char_end,
+        "clause_path": clause_path,
+    }
+
+
 def estimate_tokens(text: str) -> int:
     """A rough token count: about four characters per token."""
     return math.ceil(len(text) / 4)
 
 
-def pack_passages(chunks: list[dict[str, Any]], budget: int) -> list[dict[str, Any]]:
-    """The leading chunks, in order, whose text fits the token budget.
+def passage_cost(chunk: dict[str, Any]) -> int:
+    """The tokens a chunk costs as a passage: its id, ref, text and citation as JSON."""
+    passage = json.dumps(build_passages([chunk], {})[0], indent=2, ensure_ascii=False)
+    return estimate_tokens(passage) + RESPONSE_SLACK_TOKENS
 
-    Packing stops before the chunk that would pass the budget; the first
-    chunk is always kept, however long.
+
+def pack_passages(chunks: list[dict[str, Any]], budget: int) -> list[dict[str, Any]]:
+    """The leading chunks, in order, whose passages fit the token budget.
+
+    Each passage costs its text plus its id, ref and citation (passage_cost).
+    Packing stops before the chunk that would pass the budget, and after
+    MAX_PASSAGES passages; the first chunk is always kept, however long.
     """
     kept: list[dict[str, Any]] = []
     used = 0
-    for chunk in chunks:
-        cost = estimate_tokens(chunk["content"])
+    for chunk in chunks[:MAX_PASSAGES]:
+        cost = passage_cost(chunk)
         if kept and used + cost > budget:
             break
         kept.append(chunk)
@@ -55,6 +111,35 @@ def passage_ref(chunk: dict[str, Any]) -> str:
     if chunk.get("document_id") is not None and chunk.get("char_start") is not None:
         return f"d{chunk['document_id']}:{chunk['char_start']}-{chunk['char_end']}"
     return f"c{chunk['chunk_id']}"
+
+
+@dataclass(frozen=True)
+class DocumentRef:
+    """A span of a stored document's text: d<document_id>:<char_start>-<char_end>."""
+
+    document_id: int
+    char_start: int
+    char_end: int
+
+
+@dataclass(frozen=True)
+class ChunkRef:
+    """A stored chunk named by its id: c<chunk_id>."""
+
+    chunk_id: str
+
+
+_DOCUMENT_REF = re.compile(r"d(\d{1,18}):(\d{1,9})-(\d{1,9})")
+_CHUNK_REF = re.compile(r"c([0-9a-fA-F]{8}-(?:[0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12})")
+
+
+def parse_ref(ref: str) -> DocumentRef | ChunkRef | None:
+    """The span or chunk a ref written by passage_ref names; None when malformed."""
+    if m := _DOCUMENT_REF.fullmatch(ref):
+        return DocumentRef(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+    if m := _CHUNK_REF.fullmatch(ref):
+        return ChunkRef(m.group(1).lower())
+    return None
 
 
 def _clause_path(chunk: dict[str, Any], metadata: dict[str, Any]) -> str | None:

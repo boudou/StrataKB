@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import sys
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 from uuid import uuid4
@@ -185,3 +186,114 @@ class TestErrorsWithoutAbsolutePaths:
             ("a.md", "RuntimeError"), ("b.md", "RuntimeError"),
         ]
         assert marker not in repr(logs)
+
+
+class TestLogsWithoutExceptionText:
+    """No database needed: the parsers and embed_texts are called directly."""
+
+    def test_corrupt_docx_logs_no_path(self, tmp_path):
+        from structlog.testing import capture_logs
+
+        from stratakb.knowledge.parsers.docx_parser import parse_docx
+
+        file_path = tmp_path / "broken.docx"
+        file_path.write_bytes(b"not a zip")
+        with capture_logs() as logs:
+            doc = parse_docx(file_path)
+
+        assert doc.error
+        events = [e for e in logs if e["event"] == "docx_parse_error"]
+        assert len(events) == 1
+        assert events[0]["error_type"] == "PackageNotFoundError"
+        assert "error" not in events[0]
+        assert str(tmp_path) not in repr(logs)
+
+    def test_corrupt_pdf_logs_no_path(self, tmp_path):
+        from structlog.testing import capture_logs
+
+        from stratakb.knowledge.parsers.pdf_parser import parse_pdf
+
+        file_path = tmp_path / "broken.pdf"
+        file_path.write_bytes(b"%PDF-1.4 garbage")
+        with (
+            capture_logs() as logs,
+            patch("pypdf.PdfReader", side_effect=ValueError(f"cannot open {file_path}")),
+        ):
+            doc = parse_pdf(file_path)
+
+        assert str(file_path) in doc.error
+        events = [e for e in logs if e["event"] == "pdf_parse_error"]
+        assert len(events) == 1
+        assert events[0]["error_type"] == "ValueError"
+        assert "error" not in events[0]
+        assert str(tmp_path) not in repr(logs)
+
+    async def test_embedding_api_error_logs_type_only(self):
+        from structlog.testing import capture_logs
+
+        from stratakb.knowledge.embeddings import embed_texts
+        from tests.test_embedding_provider import _fake_client, _settings
+
+        marker = "distinctive-91c2-provider-text"
+        client = _fake_client()
+        client.embeddings.create = AsyncMock(side_effect=RuntimeError(marker))
+        with (
+            capture_logs() as logs,
+            patch("stratakb.config.get_settings", return_value=_settings()),
+            patch("openai.AsyncOpenAI", return_value=client),
+            pytest.raises(RuntimeError),
+        ):
+            await embed_texts(["x"], api_key="sk-test")
+
+        events = [e for e in logs if e["event"] == "openai_embedding_api_error"]
+        assert len(events) == 1
+        assert events[0]["error_type"] == "RuntimeError"
+        assert "error" not in events[0]
+        assert marker not in repr(logs)
+
+
+class TestFileErrorBoundaries:
+    ROOT = Path("/data/docs")
+    FILE = Path("/data/docs/a.md")
+
+    def _redact(self, message: str) -> str:
+        from stratakb.knowledge.ingestion import _file_error
+
+        return _file_error(message, file_path=self.FILE, relative_path="a.md", root=self.ROOT)
+
+    @pytest.mark.parametrize(
+        "message", ["see /data/docs2/x", "see /data/docs.bak/x", "see /mnt/data/docs/x"]
+    )
+    def test_longer_names_stay(self, message):
+        with patch("stratakb.knowledge.ingestion._case_insensitive_fs", return_value=False):
+            assert self._redact(message) == message
+
+    @pytest.mark.parametrize(
+        ("message", "expected"),
+        [
+            ("open /data/docs/b.md failed", "open ./b.md failed"),
+            ("open /data/docs/a.md failed", "open a.md failed"),
+            ("bad path '/data/docs'", "bad path '.'"),
+            ("(under /data/docs)", "(under .)"),
+            ("nothing at /data/docs.", "nothing at .."),
+        ],
+    )
+    def test_path_at_a_boundary_is_replaced(self, message, expected):
+        with patch("stratakb.knowledge.ingestion._case_insensitive_fs", return_value=False):
+            assert self._redact(message) == expected
+
+    def test_other_case_is_replaced_on_a_case_insensitive_fs(self):
+        with patch("stratakb.knowledge.ingestion._case_insensitive_fs", return_value=True):
+            assert self._redact("open /DATA/Docs/a.md failed") == "open a.md failed"
+
+    def test_other_case_stays_on_a_case_sensitive_fs(self):
+        with patch("stratakb.knowledge.ingestion._case_insensitive_fs", return_value=False):
+            assert self._redact("open /DATA/Docs/a.md failed") == "open /DATA/Docs/a.md failed"
+
+    @pytest.mark.skipif(
+        sys.platform not in ("win32", "linux"), reason="case sensitivity varies by volume"
+    )
+    def test_case_insensitive_fs_on_this_platform(self, tmp_path):
+        from stratakb.knowledge.ingestion import _case_insensitive_fs
+
+        assert _case_insensitive_fs(tmp_path) is (sys.platform == "win32")

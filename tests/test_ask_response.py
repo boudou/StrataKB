@@ -14,7 +14,19 @@ from uuid import uuid4
 
 import pytest
 
-from stratakb.rag.passages import build_passages, cite, pack_passages, passage_ref
+from stratakb.rag.passages import (
+    MAX_PASSAGES,
+    RESPONSE_SLACK_TOKENS,
+    ChunkRef,
+    DocumentRef,
+    build_passages,
+    cite,
+    estimate_tokens,
+    pack_passages,
+    parse_ref,
+    passage_cost,
+    passage_ref,
+)
 from stratakb.rag.retriever import SearchResult
 
 DOC_TEXT = (
@@ -137,21 +149,47 @@ async def _delete_interaction(db_url: str, interaction_id: str) -> None:
 
 class TestPacking:
     def test_budget_packs_passages(self):
-        chunks = [{"content": "x" * 1000} for _ in range(10)]
+        chunks = [{"chunk_id": f"c{i}", "content": "x" * 1000} for i in range(10)]
 
-        # 1,000 characters are about 250 tokens
-        assert len(pack_passages(chunks, 500)) == 2
-        assert len(pack_passages(chunks, 1500)) == 6
-        assert pack_passages(chunks, 1500) == chunks[:6]
+        # 1,000 characters are about 250 tokens, plus the passage's JSON
+        cost = passage_cost(chunks[0])
+        assert cost > 250 + RESPONSE_SLACK_TOKENS
+        assert len(pack_passages(chunks, 500)) == 500 // cost == 1
+        assert len(pack_passages(chunks, 1500)) == 1500 // cost == 4
+        assert pack_passages(chunks, 1500) == chunks[:4]
+
+    def test_cost_counts_citation(self):
+        bare = {"chunk_id": "a", "content": ""}
+        cited = {
+            "chunk_id": "a", "content": "", "layer": "rules",
+            "source_file": "rules/sepa-credit-transfer/rulebook-2025-chapter-4.md",
+            "clause_path": "4 Business requirements > 4.2 Credit transfer datasets",
+        }
+
+        assert passage_cost(bare) > RESPONSE_SLACK_TOKENS
+        assert passage_cost(cited) > passage_cost(bare)
+        # The cost is the passage's own JSON plus the response slack
+        passage = json.dumps(build_passages([cited], {})[0], indent=2, ensure_ascii=False)
+        assert passage_cost(cited) == estimate_tokens(passage) + RESPONSE_SLACK_TOKENS
+
+    def test_at_most_max_passages(self):
+        chunks = [{"chunk_id": f"c{i}", "content": "x"} for i in range(60)]
+
+        assert pack_passages(chunks, 100_000) == chunks[:MAX_PASSAGES]
+        assert MAX_PASSAGES == 50
 
     def test_first_passage_always_kept(self):
-        chunks = [{"content": "x" * 10_000}, {"content": "short"}]
+        chunks = [{"chunk_id": "a", "content": "x" * 10_000}, {"chunk_id": "b", "content": "short"}]
 
         assert pack_passages(chunks, 100) == chunks[:1]
         assert pack_passages([], 100) == []
 
     def test_packing_stops_at_the_first_passage_over_budget(self):
-        chunks = [{"content": "a" * 400}, {"content": "b" * 4000}, {"content": "c" * 4}]
+        chunks = [
+            {"chunk_id": "a", "content": "a" * 400},
+            {"chunk_id": "b", "content": "b" * 4000},
+            {"chunk_id": "c", "content": "c" * 4},
+        ]
 
         assert pack_passages(chunks, 200) == chunks[:1]
 
@@ -162,6 +200,15 @@ class TestRefAndCitation:
             == "d7:30-41"
         assert passage_ref({"chunk_id": "abc", "document_id": None, "char_start": None}) == "cabc"
         assert passage_ref({"chunk_id": "abc"}) == "cabc"
+
+    def test_parse_ref_reads_what_passage_ref_writes(self):
+        chunk_id = str(uuid4())
+        document = {"chunk_id": chunk_id, "document_id": 7, "char_start": 30, "char_end": 41}
+        assert parse_ref(passage_ref(document)) == DocumentRef(7, 30, 41)
+        assert parse_ref(passage_ref({"chunk_id": chunk_id})) == ChunkRef(chunk_id)
+        assert parse_ref(passage_ref({"chunk_id": chunk_id.upper()})) == ChunkRef(chunk_id)
+        for malformed in ("d7:30", "cabc", "x7:1-2", "d7:1-2 ", ""):
+            assert parse_ref(malformed) is None
 
     def test_pdf_citation_has_page_and_lines_on_the_page(self):
         text = "page one\nline two\n\nfirst\nsecond\nthird"
@@ -255,7 +302,12 @@ class TestAskResponse:
         await _delete_interaction(settings.database_url, response["interaction_id"])
 
     async def test_budget_trims_the_response(self, server, settings):
-        settings.answer_token_budget = 500
+        # Each passage costs 250 tokens of text plus its id, ref and citation
+        cost = passage_cost({
+            "chunk_id": "c0", "content": "x" * 1000, "source_file": "c0.md",
+            "layer": "docs", "metadata": {"section_path": ["Master agreement", "7 Termination"]},
+        })
+        settings.answer_token_budget = 2 * cost + cost // 2
         results = [_result(f"c{i}", "docs", content="x" * 1000) for i in range(10)]
 
         response = await _ask(server, results, layers=["docs"], response_format="detailed")
@@ -343,6 +395,105 @@ class TestAskResponse:
             assert "S9" in unknown["error"]
         finally:
             await _delete_interaction(settings.database_url, interaction_id)
+
+    async def test_feedback_on_passage_25(self, server, settings):
+        from stratakb.core.database import get_pool
+
+        settings.answer_token_budget = 10_000
+        results = [_result(f"chunk-{i}", "docs") for i in range(25)]
+        response = await _ask(server, results, layers=["docs"], top_k=25)
+        interaction_id = response["interaction_id"]
+
+        try:
+            assert [p["id"] for p in response["passages"]][-1] == "S25"
+            feedback = _payload(await server.call_tool("strata_feedback", {
+                "interaction_id": interaction_id,
+                "helpful": True,
+                "chunk_feedback": {"S25": "useful"},
+            }))
+            assert feedback["status"] == "ok"
+
+            pool = await get_pool(settings.database_url)
+            rows = await pool.fetch(
+                "SELECT signal_name, metadata FROM strata_learning.feedback_signals "
+                "WHERE interaction_id = $1 AND signal_name LIKE 'chunk_%'",
+                interaction_id,
+            )
+            rated = {json.loads(r["metadata"])["chunk_id"]: r["signal_name"] for r in rows}
+            assert rated == {"chunk-24": "chunk_useful"}
+        finally:
+            await _delete_interaction(settings.database_url, interaction_id)
+
+    async def test_feedback_stops_at_max_passages(self, server, settings):
+        settings.answer_token_budget = 100_000
+        results = [_result(f"chunk-{i}", "docs", content="x") for i in range(60)]
+        response = await _ask(server, results, layers=["docs"], top_k=60)
+        interaction_id = response["interaction_id"]
+
+        try:
+            assert len(response["passages"]) == MAX_PASSAGES
+            last = _payload(await server.call_tool("strata_feedback", {
+                "interaction_id": interaction_id,
+                "helpful": True,
+                "chunk_feedback": {f"S{MAX_PASSAGES}": "useful"},
+            }))
+            assert last["status"] == "ok"
+            beyond = _payload(await server.call_tool("strata_feedback", {
+                "interaction_id": interaction_id,
+                "helpful": True,
+                "chunk_feedback": {f"S{MAX_PASSAGES + 1}": "useful"},
+            }))
+            assert beyond["status"] == "error"
+            assert f"S{MAX_PASSAGES + 1}" in beyond["error"]
+        finally:
+            await _delete_interaction(settings.database_url, interaction_id)
+
+    async def test_high_confidence_survives_packing(self, server, settings):
+        settings.answer_token_budget = 250
+        results = [
+            _result("c0", "docs", content="x" * 1000),
+            _result("c1", "docs"),
+            _result("c2", "docs"),
+        ]
+
+        with patch(
+            "stratakb.learning.tracker.Tracker._record_safely", AsyncMock()
+        ) as record:
+            response = await _ask(server, results, layers=["docs"], response_format="detailed")
+
+        assert len(response["passages"]) == 1
+        assert response["confidence"]["level"] == "high"
+        assert response["confidence"]["relevant_sources"] == 3
+        assert response["answer_status"] == "found"
+        assert record.await_args.kwargs["confidence_level"] == "high"
+
+    async def test_status_judged_on_returned_passages(self, server, settings):
+        settings.answer_token_budget = 250
+        results = [
+            _result("weak", "docs", similarity=0.3, content="x" * 1000),
+            _result("strong", "docs", similarity=0.9),
+        ]
+
+        response = await _ask(server, results, layers=["docs"], response_format="detailed")
+
+        assert [p["id"] for p in response["passages"]] == ["S1"]
+        assert response["answer_status"] == "not_found"
+        assert response["next_step"]
+        assert response["confidence"]["top_score"] == 0.9
+        await _delete_interaction(settings.database_url, response["interaction_id"])
+
+    async def test_budget_counts_citations(self, server, settings):
+        import pydantic_core
+
+        results = [_result(f"c{i}", "docs", content=f"tiny {i}") for i in range(30)]
+
+        response = await _ask(server, results, layers=["docs"], top_k=30)
+
+        serialized = pydantic_core.to_json(response, indent=2).decode()
+        # 100 tokens cover status, mode, next_step and interaction_id
+        assert estimate_tokens(serialized) <= settings.answer_token_budget + 100
+        assert 1 < len(response["passages"]) < 30
+        await _delete_interaction(settings.database_url, response["interaction_id"])
 
     async def test_feedback_by_passage_id_unknown_interaction(self, server):
         feedback = _payload(await server.call_tool("strata_feedback", {

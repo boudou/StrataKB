@@ -4,6 +4,8 @@ Tests cover:
 - The model match rule: <model> or <model>:latest, exact
 - A missing model degrades strata_admin_health; a listed one does not
 - A server that cannot list its models is unchecked, not degraded
+- A 401 adds a detail naming EMBEDDING_API_KEY (not set, or refused),
+  never the key itself; other errors add none
 - The check is skipped for the local backend, without EMBEDDING_BASE_URL,
   and for a remote URL with STRATA_LOCAL_ONLY on
 - The client gets EMBEDDING_API_KEY only, never OPENAI_API_KEY
@@ -207,6 +209,55 @@ async def test_listing_failure_is_unchecked():
     assert "APIConnectionError" in model["reason"]
     assert result["overall"] == "ok"
     assert any(e["event"] == "embedding_model_unchecked" for e in logs)
+
+
+_REMOTE_URL = "http://models.example.com/v1"
+
+
+def _unauthorized() -> Exception:
+    import httpx2
+    import openai
+
+    response = httpx2.Response(401, request=httpx2.Request("GET", _REMOTE_URL + "/models"))
+    return openai.AuthenticationError("Unauthorized", response=response, body=None)
+
+
+async def test_401_without_key_names_embedding_api_key():
+    settings = _settings(embedding_base_url=_REMOTE_URL, embedding_api_key="")
+    await _run(settings, [], error=_unauthorized())
+    result = await _health(settings)
+
+    model = result["embedding"]["model"]
+    assert model["status"] == "unchecked"
+    assert "EMBEDDING_API_KEY" in model["detail"]
+    assert "not set" in model["detail"]
+    assert result["overall"] == "ok"
+
+
+async def test_401_with_key_says_the_key_was_refused():
+    import json
+
+    settings = _settings(embedding_base_url=_REMOTE_URL, embedding_api_key="sk-endpoint-secret")
+    with capture_logs() as logs:
+        await _run(settings, [], error=_unauthorized())
+        result = await _health(settings)
+
+    model = result["embedding"]["model"]
+    assert model["status"] == "unchecked"
+    assert "EMBEDDING_API_KEY" in model["detail"]
+    assert "not set" not in model["detail"]
+    assert result["overall"] == "ok"
+    assert "sk-endpoint-secret" not in json.dumps(result)
+    assert "sk-endpoint-secret" not in repr(logs)
+
+
+async def test_other_errors_carry_no_key_detail():
+    import httpx
+    import openai
+
+    error = openai.APIConnectionError(request=httpx.Request("GET", _REMOTE_URL + "/models"))
+    await _run(_settings(embedding_base_url=_REMOTE_URL, embedding_api_key=""), [], error=error)
+    assert "detail" not in embedding_checks_status()["model"]
 
 
 async def test_skipped_without_base_url():

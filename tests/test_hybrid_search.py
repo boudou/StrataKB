@@ -8,10 +8,12 @@ from structlog.testing import capture_logs
 
 from stratakb.rag.retriever import (
     _build_hybrid_sql,
+    _filter_conditions,
     _fuse_rrf,
     _hybrid_search,
     _reserve_keyword_slots,
     _search_fetch,
+    _supports_iterative_scan,
     fuse_rrf,
 )
 
@@ -193,6 +195,72 @@ async def test_search_fetch_sets_search_settings_in_one_transaction():
     conn.transaction.assert_called_once()
     assert conn.fetch.call_args.args == ("SELECT 1", 7)
     assert rows == ["row"]
+
+
+@pytest.mark.asyncio
+async def test_search_fetch_turns_on_iterative_scan_on_pgvector_08():
+    conn = AsyncMock()
+    conn.fetch.return_value = []
+    conn.fetchval.return_value = "0.8.0"
+
+    await _search_fetch(_mock_pool(conn), SimpleNamespace(hnsw_ef_search=40), "SELECT 1", [])
+
+    statements = [c.args[0] for c in conn.execute.call_args_list]
+    assert statements == [
+        "SET LOCAL hnsw.ef_search = 40",
+        "SET LOCAL statement_timeout = '10s'",
+        "SET LOCAL hnsw.iterative_scan = relaxed_order",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_search_fetch_skips_iterative_scan_on_old_pgvector_and_warns_once(monkeypatch):
+    monkeypatch.setattr("stratakb.rag.retriever._iterative_scan_warned", False)
+    conn = AsyncMock()
+    conn.fetch.return_value = []
+    conn.fetchval.return_value = "0.7.4"
+    settings = SimpleNamespace(hnsw_ef_search=40)
+
+    with capture_logs() as logs:
+        await _search_fetch(_mock_pool(conn), settings, "SELECT 1", [])
+        await _search_fetch(_mock_pool(conn), settings, "SELECT 1", [])
+
+    statements = [c.args[0] for c in conn.execute.call_args_list]
+    assert not any("iterative_scan" in s for s in statements)
+    assert len(statements) == 4
+    warned = [e for e in logs if e["event"] == "hnsw_iterative_scan_unavailable"]
+    assert len(warned) == 1
+    assert warned[0]["pgvector_version"] == "0.7.4"
+
+
+@pytest.mark.parametrize("version", ["0.8.0", "0.8.7", "1.0.0"])
+def test_supports_iterative_scan_from_08(version):
+    assert _supports_iterative_scan(version)
+
+
+@pytest.mark.parametrize("version", ["0.7.4", "0.5", None, MagicMock()])
+def test_supports_iterative_scan_rejects_older_or_unknown(version):
+    assert not _supports_iterative_scan(version)
+
+
+def test_filter_conditions_numbers_from_start_idx():
+    assert _filter_conditions(["a", "b"], {"doc_type": "x"}, 3) == (
+        ["layer_name IN ($3, $4)", "metadata->>'doc_type' = $5"],
+        ["a", "b", "x"],
+    )
+
+
+def test_hybrid_sql_tsquery_follows_filter_params():
+    sql, params = _build_hybrid_sql("[0.1]", "settlement", ["sepa"], 5, {"doc_type": "rule"})
+
+    assert "plainto_tsquery('english', $5)" in sql
+    assert params == ["[0.1]", 15, "sepa", "rule", "settlement"]
+
+
+def test_hybrid_sql_ranks_semantic_leg_with_a_real_sort():
+    sql, _ = _build_hybrid_sql("[0.1]", "settlement", None, 5)
+
+    assert "ORDER BY distance + 0, id" in sql
 
 
 @pytest.mark.asyncio

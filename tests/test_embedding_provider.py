@@ -62,10 +62,20 @@ class TestCustomEndpoint:
             _settings(embedding_base_url=BASE_URL, embedding_model="nomic-embed-text"),
             api_key="sk-openai",
         )
+        import openai
+
         headers = client_kwargs.pop("default_headers")
-        assert client_kwargs == {"api_key": PLACEHOLDER_API_KEY, "base_url": BASE_URL}
+        assert client_kwargs == {
+            "api_key": PLACEHOLDER_API_KEY,
+            "admin_api_key": "",
+            "base_url": BASE_URL,
+        }
         # Dropped: the SDK would fill them from OPENAI_ORG_ID and OPENAI_PROJECT_ID
         assert set(headers) == {"OpenAI-Organization", "OpenAI-Project"}
+        # No key: the request drops the Authorization header (Omit has no __eq__)
+        extra_headers = create_kwargs.pop("extra_headers")
+        assert set(extra_headers) == {"Authorization"}
+        assert isinstance(extra_headers["Authorization"], openai.Omit)
         assert create_kwargs == {
             "input": ["x"],
             "model": "nomic-embed-text",
@@ -73,7 +83,7 @@ class TestCustomEndpoint:
         }
         assert len(vectors[0]) == 768
 
-        client_kwargs, _, _ = await _embed(
+        client_kwargs, create_kwargs, _ = await _embed(
             _settings(
                 embedding_base_url=BASE_URL,
                 embedding_model="nomic-embed-text",
@@ -82,6 +92,7 @@ class TestCustomEndpoint:
             api_key="sk-openai",
         )
         assert client_kwargs["api_key"] == "k"
+        assert "extra_headers" not in create_kwargs
 
     @pytest.mark.asyncio
     async def test_custom_endpoint_never_receives_openai_key(self):

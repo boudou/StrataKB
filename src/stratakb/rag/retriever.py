@@ -149,23 +149,11 @@ async def search_chunks(
         return results
 
     # A chunk without an embedding has no cosine distance: leave it out
-    conditions: list[str] = ["embedding IS NOT NULL"]
-    params: list[object] = [query_vector, top_k]
-    param_idx = 3  # $1 = embedding, $2 = top_k
+    # ($1 = embedding, $2 = top_k)
+    conditions, filter_params = _filter_conditions(layers, metadata_filter, 3)
+    params: list[object] = [query_vector, top_k, *filter_params]
 
-    if layers:
-        placeholders = ", ".join(f"${param_idx + i}" for i in range(len(layers)))
-        conditions.append(f"layer_name IN ({placeholders})")
-        params.extend(layers)
-        param_idx += len(layers)
-
-    if metadata_filter:
-        for key, value in metadata_filter.items():
-            conditions.append(f"metadata->>'{_sanitize_key(key)}' = ${param_idx}")
-            params.append(value)
-            param_idx += 1
-
-    where_clause = "WHERE " + " AND ".join(conditions)
+    where_clause = "WHERE " + " AND ".join(["embedding IS NOT NULL", *conditions])
 
     sql = f"""
         SELECT
@@ -190,6 +178,8 @@ async def search_chunks(
     pool = await get_pool(database_url)
     rows = await _search_fetch(pool, settings, sql, params)
     results = [_row_to_result(row, row["score"], row["score"]) for row in rows]
+    # An iterative index scan in relaxed order can return rows slightly out of order
+    results.sort(key=lambda r: r.score, reverse=True)
 
     if cache:
         cache.put(query, layers, top_k, results, metadata_filter)
@@ -206,11 +196,68 @@ async def search_chunks(
     return results
 
 
+def _filter_conditions(
+    layers: list[str] | None,
+    metadata_filter: dict[str, str] | None,
+    start_idx: int,
+) -> tuple[list[str], list]:
+    """Build the layer and metadata WHERE conditions shared by both search paths.
+
+    Placeholders are numbered from $start_idx; the params follow in that order.
+    """
+    conditions: list[str] = []
+    params: list = []
+    idx = start_idx
+    if layers:
+        placeholders = ", ".join(f"${idx + i}" for i in range(len(layers)))
+        conditions.append(f"layer_name IN ({placeholders})")
+        params.extend(layers)
+        idx += len(layers)
+    if metadata_filter:
+        for key, value in metadata_filter.items():
+            conditions.append(f"metadata->>'{_sanitize_key(key)}' = ${idx}")
+            params.append(value)
+            idx += 1
+    return conditions, params
+
+
+def _supports_iterative_scan(extversion: object) -> bool:
+    """True when the pgvector extension version is 0.8 or later."""
+    if not isinstance(extversion, str):
+        return False
+    match = re.match(r"(\d+)\.(\d+)", extversion)
+    if not match:
+        return False
+    return (int(match.group(1)), int(match.group(2))) >= (0, 8)
+
+
+# Set once the missing iterative-scan support has been logged in this process
+_iterative_scan_warned = False
+
+
 async def _search_fetch(pool, settings, sql: str, params: list) -> list:
-    """Run one search query in a transaction with the search settings."""
+    """Run one search query in a transaction with the search settings.
+
+    Without iterative index scans (pgvector 0.8+) the HNSW index returns at
+    most hnsw.ef_search rows, and a filter applied afterwards can leave fewer
+    than the LIMIT asks for.
+    """
+    global _iterative_scan_warned
     async with pool.acquire() as conn, conn.transaction():
         await conn.execute(f"SET LOCAL hnsw.ef_search = {settings.hnsw_ef_search}")
         await conn.execute(f"SET LOCAL statement_timeout = '{_SEARCH_TIMEOUT}s'")
+        version = await conn.fetchval(
+            "SELECT extversion FROM pg_extension WHERE extname = 'vector'"
+        )
+        # "hnsw" is a reserved prefix once pgvector loads: never send an unknown setting
+        if _supports_iterative_scan(version):
+            await conn.execute("SET LOCAL hnsw.iterative_scan = relaxed_order")
+        elif not _iterative_scan_warned:
+            _iterative_scan_warned = True
+            logger.warning(
+                "hnsw_iterative_scan_unavailable",
+                pgvector_version=version if isinstance(version, str) else None,
+            )
         return await conn.fetch(sql, *params)
 
 
@@ -357,21 +404,9 @@ def _build_hybrid_sql(
     Returns (sql, params) tuple.
     """
     over_retrieve = top_k * 3
-    conditions: list[str] = []
-    params: list = [query_vector, over_retrieve]
-    param_idx = 3
-
-    if layers:
-        placeholders = ", ".join(f"${param_idx + i}" for i in range(len(layers)))
-        conditions.append(f"layer_name IN ({placeholders})")
-        params.extend(layers)
-        param_idx += len(layers)
-
-    if metadata_filter:
-        for key, value in metadata_filter.items():
-            conditions.append(f"metadata->>'{_sanitize_key(key)}' = ${param_idx}")
-            params.append(value)
-            param_idx += 1
+    conditions, filter_params = _filter_conditions(layers, metadata_filter, 3)
+    params: list = [query_vector, over_retrieve, *filter_params]
+    param_idx = 3 + len(filter_params)
 
     # Only the semantic leg skips chunks without an embedding; keyword search still finds them
     where = "WHERE " + " AND ".join(["embedding IS NOT NULL", *conditions])
@@ -386,12 +421,14 @@ def _build_hybrid_sql(
 
     ft_where = f"WHERE tsv @@ q AND {' AND '.join(conditions)}" if conditions else "WHERE tsv @@ q"
 
+    # The index scan may return rows in relaxed order; "distance + 0" makes the
+    # ranking a real sort instead of reusing the index order
     sql = f"""
         WITH semantic AS (
-            SELECT id, ROW_NUMBER() OVER (ORDER BY embedding <=> $1::vector) AS rank
+            SELECT id, embedding <=> $1::vector AS distance
             FROM strata_vectors.chunks
             {where}
-            ORDER BY embedding <=> $1::vector
+            ORDER BY distance
             LIMIT $2
         ),
         fulltext AS (
@@ -401,7 +438,8 @@ def _build_hybrid_sql(
             ORDER BY rank
             LIMIT $2
         )
-        SELECT 'semantic' AS source, id, rank FROM semantic
+        SELECT 'semantic' AS source, id, ROW_NUMBER() OVER (ORDER BY distance + 0, id) AS rank
+        FROM semantic
         UNION ALL
         SELECT 'fulltext' AS source, id, rank FROM fulltext
     """

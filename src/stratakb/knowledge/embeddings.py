@@ -245,12 +245,10 @@ async def _embed_openai(
     """Embed texts using the OpenAI API or an OpenAI-compatible server."""
     from openai import AsyncOpenAI
 
-    from stratakb.core.egress import openai_compatible_client
+    from stratakb.core.egress import keyless_request_options, openai_compatible_client
 
-    # Always pass a string key: with None the SDK would read OPENAI_API_KEY
-    # from the environment and send it to the custom server. base_url=None
-    # keeps the SDK default (OpenAI, or OPENAI_BASE_URL), where the SDK's
-    # OPENAI_ORG_ID and OPENAI_PROJECT_ID headers belong.
+    # base_url=None keeps the SDK default (OpenAI, or OPENAI_BASE_URL), where
+    # the SDK's OPENAI_ORG_ID and OPENAI_PROJECT_ID headers belong.
     if base_url:
         client = openai_compatible_client(api_key, base_url)
     else:
@@ -263,6 +261,7 @@ async def _embed_openai(
     # The SDK asks for base64 by default, which not every server implements
     if base_url:
         create_kwargs["encoding_format"] = "float"
+        create_kwargs.update(keyless_request_options(api_key))
     all_embeddings: list[list[float]] = []
 
     for i in range(0, len(texts), MAX_BATCH_SIZE):
@@ -285,7 +284,7 @@ async def _embed_openai(
                 "openai_embedding_api_error",
                 batch_start=i,
                 batch_size=len(batch),
-                error=str(e),
+                error_type=type(e).__name__,
             )
             raise RuntimeError(f"Embedding API error: {e}") from e
 

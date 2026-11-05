@@ -19,7 +19,12 @@ import structlog
 
 from stratakb.config import Settings
 from stratakb.core.database import get_pool
-from stratakb.core.egress import embedding_provider, openai_compatible_client
+from stratakb.core.egress import (
+    embedding_provider,
+    keyless_request_options,
+    openai_compatible_client,
+    unauthorized_detail,
+)
 from stratakb.knowledge.embeddings import resolve_embedding_model
 
 logger = structlog.get_logger()
@@ -93,24 +98,27 @@ async def check_embedding_model(settings: Settings) -> dict:
 
     model = resolve_embedding_model(settings.embedding_backend, settings.embedding_model)
 
-    # Always pass a string key: with None the SDK would read OPENAI_API_KEY
-    # from the environment and send it to the custom server.
+    key = settings.embedding_api_key
     client = openai_compatible_client(
-        settings.embedding_api_key,
+        key,
         settings.embedding_base_url,
         timeout=_TIMEOUT_SECONDS,
         max_retries=0,
     )
     try:
-        ids = {m.id async for m in client.models.list()}
+        ids = {m.id async for m in client.models.list(**keyless_request_options(key))}
     except Exception as e:
         # Only the class name: an SDK error text can echo the request URL
         logger.warning("embedding_model_unchecked", error=type(e).__name__)
-        return {
+        result = {
             "status": "unchecked",
             "model": model,
             "reason": f"could not list the server's models: {type(e).__name__}",
         }
+        detail = unauthorized_detail(e, key, "EMBEDDING_API_KEY")
+        if detail is not None:
+            result["detail"] = detail
+        return result
     finally:
         await client.close()
 
