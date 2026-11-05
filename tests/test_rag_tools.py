@@ -153,7 +153,7 @@ class TestConfidenceScoring:
     def test_high_confidence(self):
         from stratakb.rag.confidence import score_confidence
 
-        result = score_confidence([0.92, 0.85, 0.81, 0.75])
+        result = score_confidence([0.92, 0.85, 0.81, 0.75], basis="similarity")
         assert result["level"] == "high"
         assert result["top_score"] == 0.92
         assert result["relevant_sources"] >= 3
@@ -161,13 +161,13 @@ class TestConfidenceScoring:
     def test_medium_confidence(self):
         from stratakb.rag.confidence import score_confidence
 
-        result = score_confidence([0.72, 0.65])
+        result = score_confidence([0.72, 0.65], basis="similarity")
         assert result["level"] == "medium"
 
     def test_low_confidence(self):
         from stratakb.rag.confidence import score_confidence
 
-        result = score_confidence([0.40, 0.30])
+        result = score_confidence([0.40, 0.30], basis="similarity")
         assert result["level"] == "low"
         assert result["basis"] == "similarity"
         assert "warning" in result
@@ -178,7 +178,7 @@ class TestConfidenceScoring:
         scores = [0.7, 0.65, 0.6]
         assert score_confidence(scores, basis="rerank")["level"] == "medium"
         assert score_confidence(scores, basis="rerank")["basis"] == "rerank"
-        assert score_confidence(scores)["level"] == "high"
+        assert score_confidence(scores, basis="similarity")["level"] == "high"
 
     def test_unknown_basis_raises(self):
         from stratakb.rag.confidence import score_confidence
@@ -190,28 +190,35 @@ class TestConfidenceScoring:
         from stratakb.rag.confidence import score_confidence
 
         assert score_confidence([], basis="rerank")["basis"] == "rerank"
-        assert score_confidence([])["basis"] == "similarity"
+        assert score_confidence([], basis="similarity")["basis"] == "similarity"
 
     def test_no_results(self):
         from stratakb.rag.confidence import score_confidence
 
-        result = score_confidence([])
+        result = score_confidence([], basis="similarity")
         assert result["level"] == "low"
         assert "warning" in result
         assert result["relevant_sources"] == 0
 
-    def test_custom_thresholds(self):
+    def test_basis_is_required(self):
         from stratakb.rag.confidence import ConfidenceThresholds, score_confidence
 
-        thresholds = ConfidenceThresholds(high_score=0.9, medium_score=0.7)
-        result = score_confidence([0.85, 0.82, 0.80], thresholds=thresholds)
-        assert result["level"] == "medium"  # top_score < 0.9
+        with pytest.raises(TypeError):
+            score_confidence([0.9])
+        with pytest.raises(TypeError):
+            ConfidenceThresholds()
+
+    def test_thresholds_cannot_be_passed(self):
+        from stratakb.rag.confidence import score_confidence
+
+        with pytest.raises(TypeError):
+            score_confidence([0.9], basis="similarity", thresholds=None)
 
     def test_single_high_result(self):
         from stratakb.rag.confidence import score_confidence
 
         # Only 1 relevant source — not enough for "high" (needs 3+)
-        result = score_confidence([0.95])
+        result = score_confidence([0.95], basis="similarity")
         assert result["level"] == "medium"
 
 
@@ -627,6 +634,115 @@ class TestAskConfidence:
         assert confidence["basis"] == "rerank"
         assert all(0 < s["relevance_score"] < 1 for s in result["sources"])
         assert [c["similarity"] for c in result["retrieved_chunks"]] == [0.2, 0.15, 0.1]
+
+
+_ASK_CHUNK_KEYS = [
+    "chunk_id", "content", "score", "similarity", "rerank_score",
+    "layer", "source_file", "section", "doc_type", "metadata",
+]
+
+
+def _result(name, score, similarity):
+    from stratakb.rag.retriever import SearchResult
+
+    return SearchResult(
+        chunk_id=name, content=f"{name} text", score=score, layer_name="docs",
+        source_file=f"{name}.md", source_section="", doc_type="", similarity=similarity,
+    )
+
+
+async def _ask_with(by_query, *, reranking=False, logits=None):
+    """Run strata_ask with the rewriter giving these queries and each query these results."""
+    settings = _rewrite_settings(learning_enabled=False, reranking_enabled=reranking)
+    ask = _capture_ask(settings)
+
+    async def search(_db, _key, query, *, layers, top_k):
+        return by_query[query]
+
+    with (
+        patch("stratakb.config.get_settings", return_value=settings),
+        patch(
+            "stratakb.rag.query_rewriter.rewrite_query",
+            AsyncMock(return_value=list(by_query)),
+        ),
+        patch("stratakb.rag.retriever.search_chunks", AsyncMock(side_effect=search)),
+        patch("stratakb.rag.tools.write_audit_log", AsyncMock()),
+        patch("stratakb.rag.reranker._get_reranker", return_value=_LogitModel(logits or [])),
+    ):
+        return await ask(question="q", layers=["docs"])
+
+
+class TestAskOrdering:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("swapped", [False, True])
+    async def test_ask_orders_top_chunks_of_two_queries_by_similarity(
+        self, no_sdk_env, swapped
+    ):
+        by_query = {"one": [_result("a", 1.0, 0.5)], "two": [_result("b", 1.0, 0.8)]}
+        if swapped:
+            by_query = dict(reversed(list(by_query.items())))
+        result = await _ask_with(by_query)
+
+        assert [c["chunk_id"] for c in result["retrieved_chunks"]] == ["b", "a"]
+
+    @pytest.mark.asyncio
+    async def test_ask_ranks_chunk_found_by_several_queries_first(self, no_sdk_env):
+        by_query = {
+            "one": [_result("a", 1.0, 0.9), _result("both", 0.9, 0.4)],
+            "two": [_result("b", 1.0, 0.9), _result("both", 0.9, 0.4)],
+        }
+        result = await _ask_with(by_query)
+
+        chunks = result["retrieved_chunks"]
+        assert chunks[0]["chunk_id"] == "both"
+        assert chunks[0]["score"] == 1.0
+        assert all(c["score"] < 1.0 for c in chunks[1:])
+
+    @pytest.mark.asyncio
+    async def test_ask_single_query_keeps_search_order(self, no_sdk_env):
+        """A chunk kept for its exact terms keeps its place despite a lower similarity."""
+        by_query = {
+            "q": [_result("a", 1.0, 0.3), _result("b", 0.8, 0.9), _result("c", 0.5, 0.6)],
+        }
+        result = await _ask_with(by_query)
+
+        assert [c["chunk_id"] for c in result["retrieved_chunks"]] == ["a", "b", "c"]
+
+    @pytest.mark.asyncio
+    async def test_ask_chunk_keys_match_with_and_without_reranking(self, no_sdk_env):
+        by_query = {"q": [_result("a", 1.0, 0.5), _result("b", 0.8, 0.4)]}
+        plain = await _ask_with(by_query)
+        reranked = await _ask_with(by_query, reranking=True, logits=[0.5, 1.0])
+
+        for chunk in plain["retrieved_chunks"] + reranked["retrieved_chunks"]:
+            assert list(chunk) == _ASK_CHUNK_KEYS
+        assert all(c["rerank_score"] is None for c in plain["retrieved_chunks"])
+        assert all(0 < c["rerank_score"] < 1 for c in reranked["retrieved_chunks"])
+        assert plain["retrieved_chunks"][0]["score"] == 1.0
+        assert [c["chunk_id"] for c in reranked["retrieved_chunks"]] == ["b", "a"]
+
+    @pytest.mark.asyncio
+    async def test_ask_source_relevance_uses_confidence_basis(self, no_sdk_env):
+        by_query = {"q": [_result("a", 1.0, 0.5), _result("b", 0.8, 0.4)]}
+        for reranking, field in ((False, "similarity"), (True, "rerank_score")):
+            result = await _ask_with(by_query, reranking=reranking, logits=[0.5, 1.0])
+
+            chunks = {c["source_file"]: c for c in result["retrieved_chunks"]}
+            assert result["sources"]
+            for source in result["sources"]:
+                assert source["relevance_score"] == chunks[source["file"]][field]
+
+    @pytest.mark.asyncio
+    async def test_ask_does_not_mutate_search_results(self, no_sdk_env):
+        """The search cache shares its result objects, so the ask must not rescore them."""
+        by_query = {
+            "one": [_result("a", 0.7, 0.5), _result("b", 0.3, 0.4)],
+            "two": [_result("b", 0.6, 0.6)],
+        }
+        before = {q: [r.score for r in rs] for q, rs in by_query.items()}
+        await _ask_with(by_query)
+
+        assert {q: [r.score for r in rs] for q, rs in by_query.items()} == before
 
 
 # ==========================================

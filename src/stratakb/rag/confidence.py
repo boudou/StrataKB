@@ -13,10 +13,10 @@ from dataclasses import dataclass
 
 @dataclass
 class ConfidenceThresholds:
-    """Configurable thresholds for confidence scoring."""
+    """Thresholds for one score scale; the score cut-offs have no default."""
 
-    high_score: float = 0.8
-    medium_score: float = 0.6
+    high_score: float
+    medium_score: float
     high_min_sources: int = 3
     medium_min_sources: int = 1
 
@@ -34,19 +34,14 @@ _BASIS_THRESHOLDS = {
 }
 
 
-def score_confidence(
-    scores: list[float],
-    *,
-    basis: str = "similarity",
-    thresholds: ConfidenceThresholds | None = None,
-) -> dict:
+def score_confidence(scores: list[float], *, basis: str) -> dict:
     """Compute confidence level from search result scores.
 
     Args:
         scores: Scores of the search results, all on the scale named by basis.
         basis: "similarity" (query/chunk cosine similarity) or "rerank"
-            (cross-encoder relevance probability, 0-1). Picks the thresholds.
-        thresholds: Optional custom thresholds, overriding the basis default.
+            (cross-encoder relevance probability, 0-1). Required: it picks the
+            thresholds, and the result reports it.
 
     Returns:
         Dict with level (high/medium/low), top_score, relevant_sources count,
@@ -57,41 +52,32 @@ def score_confidence(
     """
     if basis not in _BASIS_THRESHOLDS:
         raise ValueError(f"Unknown confidence basis: {basis!r}")
-    if not thresholds:
-        thresholds = _BASIS_THRESHOLDS[basis]
+    thresholds = _BASIS_THRESHOLDS[basis]
 
     if not scores:
-        return {
-            "level": "low",
-            "top_score": 0.0,
-            "relevant_sources": 0,
-            "basis": basis,
-            "warning": "No results found. Try broadening your search or using different terms.",
-        }
-
-    top_score = max(scores)
-    # Count sources above medium threshold as "relevant"
-    relevant = sum(1 for s in scores if s >= thresholds.medium_score)
-
-    if top_score >= thresholds.high_score and relevant >= thresholds.high_min_sources:
-        return {
-            "level": "high",
-            "top_score": round(top_score, 4),
-            "relevant_sources": relevant,
-            "basis": basis,
-        }
-    elif top_score >= thresholds.medium_score and relevant >= thresholds.medium_min_sources:
-        return {
-            "level": "medium",
-            "top_score": round(top_score, 4),
-            "relevant_sources": relevant,
-            "basis": basis,
-        }
+        level, top_score, relevant = "low", 0.0, 0
+        warning = "No results found. Try broadening your search or using different terms."
     else:
-        return {
-            "level": "low",
-            "top_score": round(top_score, 4),
-            "relevant_sources": relevant,
-            "basis": basis,
-            "warning": "Low confidence results. Consider verifying with authoritative sources or refining your query.",
-        }
+        top_score = max(scores)
+        # Count sources above medium threshold as "relevant"
+        relevant = sum(1 for s in scores if s >= thresholds.medium_score)
+        if top_score >= thresholds.high_score and relevant >= thresholds.high_min_sources:
+            level = "high"
+        elif top_score >= thresholds.medium_score and relevant >= thresholds.medium_min_sources:
+            level = "medium"
+        else:
+            level = "low"
+        warning = (
+            "Low confidence results. Consider verifying with authoritative sources"
+            " or refining your query."
+        )
+
+    result = {
+        "level": level,
+        "top_score": round(top_score, 4),
+        "relevant_sources": relevant,
+        "basis": basis,
+    }
+    if level == "low":
+        result["warning"] = warning
+    return result
