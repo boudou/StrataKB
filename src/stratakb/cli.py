@@ -267,11 +267,6 @@ def _connection_errors() -> tuple[type[BaseException], ...]:
     )
 
 
-def _first_line(text: str) -> str:
-    lines = text.strip().splitlines()
-    return lines[0] if lines else "no message"
-
-
 def _run_db(args: argparse.Namespace) -> int:
     from stratakb.config import config_files, get_settings, user_config_file
     from stratakb.core import local_db
@@ -296,7 +291,10 @@ def _run_db(args: argparse.Namespace) -> int:
         _err(f"Can't reach the database in {local_db.CONTAINER} ({type(e).__name__}).")
         return EXIT_DATABASE
     except Exception as e:
-        _err(f"stratakb db {args.db_command} failed ({type(e).__name__}): {_first_line(str(e))}")
+        _err(
+            f"stratakb db {args.db_command} failed ({type(e).__name__}): "
+            f"{local_db.first_line(str(e))}"
+        )
         return EXIT_DATABASE
 
     state = _UP_TEXT[result.state]

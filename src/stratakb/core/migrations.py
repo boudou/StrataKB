@@ -44,18 +44,20 @@ class Migration:
     """A numbered SQL file and the query that is true once its objects exist.
 
     not_in_place is added to the error when the file runs but leaves its
-    presence query false.
+    presence query false. not_in_place_as_owner, when set, replaces it (and
+    the advice to apply the file as the owner) when the connecting user
+    already has the owner's privileges.
     """
 
     version: int
     file: str
     presence: str
     not_in_place: str = ""
+    not_in_place_as_owner: str = ""
 
 
 # The presence queries below are built once at import from the constants in
-# this module, never from input. A pair must not repeat: count(*) would never
-# reach len(tables).
+# this module, never from input.
 
 
 def _pair_list(tables: tuple[tuple[str, str], ...]) -> str:
@@ -63,7 +65,10 @@ def _pair_list(tables: tuple[tuple[str, str], ...]) -> str:
 
 
 def _tables_present(tables: tuple[tuple[str, str], ...]) -> str:
-    """Query that is true when every (schema, table) exists, read from pg_catalog."""
+    """Query that is true when every (schema, table) exists, read from pg_catalog.
+
+    A pair must not repeat: count(*) would never reach len(tables).
+    """
     return f"""
         SELECT count(*) = {len(tables)} FROM pg_catalog.pg_class c
         JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
@@ -91,14 +96,18 @@ def _readonly_grants_present() -> str:
         f"                    r.oid, to_regclass('{schema}.{table}'), 'SELECT'), false)"
         for schema, table in _READONLY_TABLES
     )
+    readable_schemas = {schema for schema, _ in _READONLY_TABLES}
+    usage = "\n                AND ".join(
+        ("" if schema in readable_schemas else "NOT ")
+        + f"has_schema_privilege(r.oid, '{schema}', 'USAGE')"
+        for schema in _STRATA_SCHEMAS
+    )
     return f"""
         SELECT CASE
         WHEN {guard} THEN false
         ELSE COALESCE((
             SELECT {readable}
-                AND has_schema_privilege(r.oid, 'strata_core', 'USAGE')
-                AND has_schema_privilege(r.oid, 'strata_vectors', 'USAGE')
-                AND NOT has_schema_privilege(r.oid, 'strata_learning', 'USAGE')
+                AND {usage}
                 AND NOT EXISTS (
                     SELECT 1 FROM pg_class c
                     JOIN pg_namespace n ON n.oid = c.relnamespace
@@ -189,6 +198,12 @@ MIGRATIONS: list[Migration] = [
             "06 does not remove access that strata_readonly gets from a PUBLIC grant "
             "or from a role it belongs to (such as pg_read_all_data): revoke that by hand."
         ),
+        not_in_place_as_owner=(
+            "The user in DATABASE_URL owns the StrataKB tables, so the cause is access "
+            "06 does not remove: strata_readonly still gets it from a PUBLIC grant or "
+            "from a role it belongs to (such as pg_read_all_data). Revoke that by hand, "
+            "then start StrataKB again."
+        ),
     ),
     Migration(
         7,
@@ -230,6 +245,25 @@ CREATE TABLE IF NOT EXISTS strata_core.schema_migrations (
 # fails with ReadOnlySQLTransactionError before any privilege check.
 _REFUSED = (asyncpg.InsufficientPrivilegeError, asyncpg.ReadOnlySQLTransactionError)
 
+# True when current_user has the privileges of the owner of every StrataKB
+# schema, every table-like relation in them and every role that set default
+# privileges there (a superuser always has). Reads pg_catalog only.
+_STRATA_SCHEMA_LIST = ", ".join(f"'{schema}'" for schema in _STRATA_SCHEMAS)
+_OWNS_STRATA_OBJECTS = f"""
+    SELECT COALESCE(bool_and(pg_has_role(current_user, o.owner, 'USAGE')), false) FROM (
+        SELECT n.nspowner AS owner FROM pg_catalog.pg_namespace n
+        WHERE n.nspname IN ({_STRATA_SCHEMA_LIST})
+        UNION ALL
+        SELECT c.relowner FROM pg_catalog.pg_class c
+        JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname IN ({_STRATA_SCHEMA_LIST}) AND c.relkind IN ('r', 'p', 'v', 'm', 'f')
+        UNION ALL
+        SELECT d.defaclrole FROM pg_catalog.pg_default_acl d
+        JOIN pg_catalog.pg_namespace n ON n.oid = d.defaclnamespace
+        WHERE n.nspname IN ({_STRATA_SCHEMA_LIST})
+    ) o
+    """
+
 # Database URLs whose schema is known to be current in this process
 _checked: set[str] = set()
 
@@ -241,10 +275,73 @@ class MigrationError(Exception):
 class _Stage(enum.Enum):
     """Where ensure_schema is, for its error messages."""
 
-    LOCK = "lock"  # taking the advisory lock
-    READ = "read"  # running the presence queries
-    TABLE = "table"  # creating or reading strata_core.schema_migrations
-    FILE = "file"  # applying or recording a migration
+    LOCK = enum.auto()  # taking the advisory lock
+    READ = enum.auto()  # running the presence queries
+    TABLE = enum.auto()  # creating or reading strata_core.schema_migrations
+    FILE = enum.auto()  # applying or recording a migration
+
+
+@dataclass(frozen=True)
+class _StageErrors:
+    """The messages for one stage of ensure_schema, by what went wrong.
+
+    Placeholders: {timeout}, {error} (the exception), {file} and {fix}
+    (_owner_fix(file)). str.format does not re-read substituted values,
+    so braces in an error text or a path are safe.
+    """
+
+    lock: str  # asyncpg.LockNotAvailableError
+    refused: str  # _REFUSED
+    failed: str  # any other asyncpg.PostgresError
+
+
+# Presence queries only read, so a refusal there is a missing USAGE
+_USAGE_REFUSED = (
+    "Could not read the database schema: {error}. The user in DATABASE_URL "
+    "needs USAGE on the strata_core and strata_vectors schemas; connect "
+    "as the database owner or grant it."
+)
+_MAY_NOT_UPDATE = "The database schema is out of date and this user may not update it. {fix}"
+_READ_FAILED = "Could not read the database schema: {error}."
+
+_STAGE_ERRORS: dict[_Stage, _StageErrors] = {
+    _Stage.LOCK: _StageErrors(
+        lock=(
+            "Timed out after {timeout} s waiting for the schema update lock: "
+            "another StrataKB process is updating this database's schema. "
+            "Try again when it has finished."
+        ),
+        refused=_USAGE_REFUSED,
+        failed=_READ_FAILED,
+    ),
+    _Stage.READ: _StageErrors(
+        lock=(
+            "Timed out after {timeout} s waiting for a lock while reading the "
+            "database schema. Try again when other sessions have finished."
+        ),
+        refused=_USAGE_REFUSED,
+        failed=_READ_FAILED,
+    ),
+    _Stage.TABLE: _StageErrors(
+        lock=(
+            "Timed out after {timeout} s waiting for a lock on "
+            "strata_core.schema_migrations: another session is using it (a long "
+            "query or an open transaction). Try again when it has finished."
+        ),
+        refused=_MAY_NOT_UPDATE,
+        failed="Creating strata_core.schema_migrations failed: {error}. {fix}",
+    ),
+    _Stage.FILE: _StageErrors(
+        lock=(
+            "Timed out after {timeout} s waiting for a table lock while "
+            "applying {file}: another session is using a table this file "
+            "changes (a long query or an open transaction). Try again when it "
+            "has finished, or {fix}"
+        ),
+        refused=_MAY_NOT_UPDATE,
+        failed="Schema migration {file} failed: {error}. {fix}",
+    ),
+}
 
 
 def _load_sql(file_name: str) -> str:
@@ -253,6 +350,20 @@ def _load_sql(file_name: str) -> str:
 
 def _owner_fix(file_name: str) -> str:
     return f"Apply {SQL_DIR / file_name} as the database owner (psql -f)."
+
+
+def _error_for(stage: _Stage, exc: asyncpg.PostgresError, current: str) -> MigrationError:
+    """The MigrationError for exc raised at stage, with current as the file to fix."""
+    errors = _STAGE_ERRORS[stage]
+    if isinstance(exc, asyncpg.LockNotAvailableError):
+        template = errors.lock
+    elif isinstance(exc, _REFUSED):
+        template = errors.refused
+    else:
+        template = errors.failed
+    return MigrationError(
+        template.format(timeout=_TIMEOUT_S, error=exc, file=current, fix=_owner_fix(current))
+    )
 
 
 async def ensure_schema(database_url: str) -> None:
@@ -287,6 +398,7 @@ async def ensure_schema(database_url: str) -> None:
                     present[m.version] = bool(await conn.fetchval(m.presence))
 
                 stage = _Stage.TABLE
+                current = "01_init.sql"  # creates strata_core
                 # DDL only for what is missing: CREATE ... IF NOT EXISTS checks the
                 # CREATE privilege first, and strata_readonly may run no DDL at all.
                 # The advisory lock keeps other StrataKB processes from racing.
@@ -318,6 +430,13 @@ async def ensure_schema(database_url: str) -> None:
                         # A file can run without effect (REVOKE and GRANT only
                         # warn when this user may not change a privilege)
                         if not await conn.fetchval(m.presence):
+                            if m.not_in_place_as_owner and await conn.fetchval(
+                                _OWNS_STRATA_OBJECTS
+                            ):
+                                raise MigrationError(
+                                    f"{m.file} ran without an error, but its changes are "
+                                    f"not in place. {m.not_in_place_as_owner}"
+                                )
                             detail = f" {m.not_in_place}" if m.not_in_place else ""
                             raise MigrationError(
                                 f"{m.file} ran without an error, but its changes are not "
@@ -331,62 +450,22 @@ async def ensure_schema(database_url: str) -> None:
                         m.file,
                     )
         except asyncpg.LockNotAvailableError as e:
-            if stage is _Stage.LOCK:
-                raise MigrationError(
-                    f"Timed out after {_TIMEOUT_S} s waiting for the schema update lock: "
-                    "another StrataKB process is updating this database's schema. "
-                    "Try again when it has finished."
-                ) from e
-            if stage is _Stage.TABLE:
-                raise MigrationError(
-                    f"Timed out after {_TIMEOUT_S} s waiting for a lock on "
-                    "strata_core.schema_migrations: another session is using it (a long "
-                    "query or an open transaction). Try again when it has finished."
-                ) from e
-            if stage is _Stage.FILE:
-                raise MigrationError(
-                    f"Timed out after {_TIMEOUT_S} s waiting for a table lock while "
-                    f"applying {current}: another session is using a table this file "
-                    "changes (a long query or an open transaction). Try again when it "
-                    f"has finished, or {_owner_fix(current)}"
-                ) from e
-            raise MigrationError(
-                f"Timed out after {_TIMEOUT_S} s waiting for a lock while reading the "
-                "database schema. Try again when other sessions have finished."
-            ) from e
+            raise _error_for(stage, e, current) from e
         except _REFUSED as e:
-            # The transaction has rolled back
-            if stage in (_Stage.LOCK, _Stage.READ):
-                # Presence queries only read, so this is a missing USAGE
-                raise MigrationError(
-                    f"Could not read the database schema: {e}. The user in DATABASE_URL "
-                    "needs USAGE on the strata_core and strata_vectors schemas; connect "
-                    "as the database owner or grant it."
-                ) from e
-            # Every presence query has run, before any write
-            if all(present.values()):
-                logger.warning(
-                    "migration_not_recorded",
-                    versions=[m.version for m in migrations if m.version not in recorded],
-                )
-                _checked.add(database_url)
-                return
-            first_missing = next(m.file for m in migrations if not present[m.version])
-            raise MigrationError(
-                "The database schema is out of date and this user may not update it. "
-                + _owner_fix(first_missing)
-            ) from e
+            # The transaction has rolled back. In TABLE and FILE every presence
+            # query has run, before any write.
+            if stage in (_Stage.TABLE, _Stage.FILE):
+                if all(present.values()):
+                    logger.warning(
+                        "migration_not_recorded",
+                        versions=[m.version for m in migrations if m.version not in recorded],
+                    )
+                    _checked.add(database_url)
+                    return
+                current = next(m.file for m in migrations if not present[m.version])
+            raise _error_for(stage, e, current) from e
         except asyncpg.PostgresError as e:
-            if stage in (_Stage.LOCK, _Stage.READ):
-                raise MigrationError(f"Could not read the database schema: {e}.") from e
-            if stage is _Stage.TABLE:
-                raise MigrationError(
-                    f"Creating strata_core.schema_migrations failed: {e}. "
-                    + _owner_fix("01_init.sql")
-                ) from e
-            raise MigrationError(
-                f"Schema migration {current} failed: {e}. {_owner_fix(current)}"
-            ) from e
+            raise _error_for(stage, e, current) from e
     finally:
         await conn.close()
 

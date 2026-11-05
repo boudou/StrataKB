@@ -10,6 +10,7 @@ import asyncio
 import contextlib
 import re
 import time
+from pathlib import Path
 from unittest.mock import patch
 from urllib.parse import urlsplit, urlunsplit
 
@@ -87,6 +88,76 @@ def test_schema_migrations_ddl_matches_05():
     assert found
     in_05 = found.group(0).removesuffix(";")
     assert " ".join(in_05.split()) == " ".join(migrations._SCHEMA_MIGRATIONS_DDL.split())
+
+
+_REPO = Path(__file__).parents[1]
+
+
+def _granted(sql: str, privilege: str) -> set[str]:
+    """Every name in the GRANT <privilege> ON ... TO strata_readonly statements."""
+    sql = "\n".join(line for line in sql.splitlines() if not line.lstrip().startswith("--"))
+    names: set[str] = set()
+    pattern = rf"GRANT {privilege} ON (?:SCHEMA )?(.+?) TO strata_readonly"
+    for found in re.finditer(pattern, sql, re.S):
+        names.update(name.strip() for name in found.group(1).split(","))
+    return names
+
+
+def test_readonly_lists_agree():
+    pairs = migrations._READONLY_TABLES
+    assert len(set(pairs)) == len(pairs)
+    in_module = {f"{schema}.{table}" for schema, table in pairs}
+
+    in_06 = _granted(migrations._load_sql("06_readonly_grants.sql"), "SELECT")
+    db_03 = (_REPO / "db" / "03_readonly_role.sql").read_text(encoding="utf-8")
+    in_03 = _granted(db_03, "SELECT")
+    readme = (_REPO / "README.md").read_text(encoding="utf-8")
+    sentence = re.search(r"The `strata_readonly` role can read(.*?)It cannot read", readme, re.S)
+    assert sentence
+    in_readme = set(re.findall(r"`(strata_\w+\.\w+)`", sentence.group(1)))
+
+    assert in_06 == in_module
+    assert in_03 == in_module
+    assert set(_READABLE) == in_module
+    assert in_readme == in_module
+
+    schemas = {schema for schema, _ in pairs}
+    assert _granted(migrations._load_sql("06_readonly_grants.sql"), "USAGE") == schemas
+    assert _granted(db_03, "USAGE") == schemas
+
+
+def test_stage_errors_cover_every_stage():
+    assert set(migrations._STAGE_ERRORS) == set(migrations._Stage)
+    for stage in migrations._Stage:
+        assert isinstance(stage.value, int)
+        errors = migrations._STAGE_ERRORS[stage]
+        assert errors.lock and errors.refused and errors.failed
+
+
+def test_error_for_picks_the_family():
+    file_lock = migrations._error_for(
+        migrations._Stage.FILE, asyncpg.LockNotAvailableError("x"), "07_documents.sql"
+    )
+    assert "table lock" in str(file_lock)
+    assert "07_documents.sql" in str(file_lock)
+
+    read_refused = migrations._error_for(
+        migrations._Stage.READ, asyncpg.InsufficientPrivilegeError("x"), ""
+    )
+    assert "USAGE" in str(read_refused)
+
+    # Not an InsufficientPrivilegeError, but refused all the same
+    table_refused = migrations._error_for(
+        migrations._Stage.TABLE, asyncpg.ReadOnlySQLTransactionError("x"), "05_add_folder.sql"
+    )
+    assert "may not update it" in str(table_refused)
+    assert "05_add_folder.sql" in str(table_refused)
+
+    failed = migrations._error_for(
+        migrations._Stage.FILE, asyncpg.PostgresError("bad {x}"), "07_documents.sql"
+    )
+    assert "bad {x}" in str(failed)
+    assert "Schema migration 07_documents.sql failed" in str(failed)
 
 
 async def _schema_snapshot(db_url: str) -> dict:
@@ -710,6 +781,9 @@ async def test_unrevokable_06_is_refused(db_url, readonly_role, probe_url):
         # The re-check after the file, not the older out-of-date branch
         assert "ran without an error" in str(exc.value)
         assert "may not update it" not in str(exc.value)
+        # The probe role owns nothing, so the owner advice applies
+        assert "only the owner of the tables" in str(exc.value).lower()
+        assert "psql -f" in str(exc.value)
         assert probe_url not in migrations._checked
         assert 6 not in await _recorded(db_url)
         conn = await asyncpg.connect(db_url)
@@ -758,9 +832,11 @@ async def test_public_grant_is_named(db_url, readonly_role):
         with pytest.raises(migrations.MigrationError, match="06_readonly_grants.sql") as exc:
             await migrations.ensure_schema(db_url)
         message = str(exc.value)
+        # The docker user owns the tables, so the owner advice would mislead
         assert "PUBLIC" in message
         assert "pg_read_all_data" in message
-        assert "only the owner of the tables" in message.lower()
+        assert "only the owner of the tables" not in message.lower()
+        assert "psql -f" not in message
     finally:
         await _owner_execute(db_url, "REVOKE SELECT ON strata_core.audit_log FROM PUBLIC")
         migrations._checked.clear()

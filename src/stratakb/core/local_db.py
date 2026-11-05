@@ -91,7 +91,7 @@ async def _docker(*args: str, timeout: float | None = None) -> tuple[int, str, s
     )
 
 
-def _first_line(text: str) -> str:
+def first_line(text: str) -> str:
     lines = text.strip().splitlines()
     return lines[0] if lines else "no message"
 
@@ -114,16 +114,16 @@ async def _status() -> str | None:
         return out
     if "no such container" in err.lower():
         return None
-    raise LocalDbError(f"docker container inspect {CONTAINER} failed: {_first_line(err)}")
+    raise LocalDbError(f"docker container inspect {CONTAINER} failed: {first_line(err)}")
 
 
 async def _host_port() -> int:
     """The host port of a running container; docker prints none for a stopped one."""
     code, out, err = await _docker("port", CONTAINER, "5432/tcp")
     if code != 0:
-        raise LocalDbError(f"docker port {CONTAINER} failed: {_first_line(err)}")
+        raise LocalDbError(f"docker port {CONTAINER} failed: {first_line(err)}")
     try:
-        return int(_first_line(out).rsplit(":", 1)[-1])
+        return int(first_line(out).rsplit(":", 1)[-1])
     except ValueError:
         raise LocalDbError(f"docker port {CONTAINER} printed no port.") from None
 
@@ -205,14 +205,14 @@ async def up(port: int = LOCAL_DB_PORT, notify: Callable[[str], None] | None = N
             await _docker("rm", CONTAINER)
             if _port_in_use(err):
                 raise LocalDbError(_port_message(port))
-            raise LocalDbError(f"docker run failed: {_first_line(err)}")
+            raise LocalDbError(f"docker run failed: {first_line(err)}")
         state = "created"
     elif status in ("running", "restarting"):
         state = "running"
     elif status == "paused":
         code, _, err = await _docker("unpause", CONTAINER)
         if code != 0:
-            raise LocalDbError(f"docker unpause {CONTAINER} failed: {_first_line(err)}")
+            raise LocalDbError(f"docker unpause {CONTAINER} failed: {first_line(err)}")
         state = "started"
     else:
         say(f"Starting the container {CONTAINER}…")
@@ -223,7 +223,7 @@ async def up(port: int = LOCAL_DB_PORT, notify: Callable[[str], None] | None = N
                     f"{_port_message(port)} docker rm {CONTAINER} lets "
                     f"stratakb db up --port recreate it, with the data kept in {VOLUME}."
                 )
-            raise LocalDbError(f"docker start {CONTAINER} failed: {_first_line(err)}")
+            raise LocalDbError(f"docker start {CONTAINER} failed: {first_line(err)}")
         state = "started"
 
     actual = await _host_port()
@@ -252,6 +252,6 @@ async def down() -> DownOutcome:
     if status in ("running", "restarting", "paused"):
         code, _, err = await _docker("stop", CONTAINER)
         if code != 0:
-            raise LocalDbError(f"docker stop {CONTAINER} failed: {_first_line(err)}")
+            raise LocalDbError(f"docker stop {CONTAINER} failed: {first_line(err)}")
         return "stopped"
     return "not_running"
