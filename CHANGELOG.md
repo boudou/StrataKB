@@ -30,6 +30,10 @@ Notable changes to StrataKB. The format follows [Keep a Changelog](https://keepa
 - At startup the server checks, in the background, that the embedding server lists the configured model and that the vector column matches `EMBEDDING_DIMENSIONS`; `strata_admin_health` reports both under `embedding`.
 - Ingestion flags PDFs that look scanned (`files_flagged`, reason `probably_scanned`).
 - Numbered schema migrations, recorded in `strata_core.schema_migrations`. The server and `stratakb add` build an empty database from the schema files shipped in the package, and bring an existing one up to date.
+- A routed search (no layers given) that returns fewer results than asked for, or only low-confidence ones, runs again across all layers. `strata_search` and `strata_ask` report `routing_fallback` with the reason (`insufficient_results` or `low_confidence`); layers you name are never broadened. Results carry the query/chunk cosine `similarity` next to the fused rank score.
+- `HYBRID_KEYWORD_SLOTS` (default 1): hybrid search keeps places for the best full-text matches, so an exact term or identifier the embedding misses (a reason code, a message name) still reaches the results. The `hybrid_search_complete` log reports `keyword_only_results`.
+- Each ingested document's extracted text is stored once per version in the new `strata_vectors.documents` table (migration `07_documents.sql`), and every chunk records where it sits in that text (`char_start`, `char_end`). A document's version goes up only when its text changes; old versions are removed once no chunk uses them. Chunks ingested before this change have no offsets and stay searchable. Backups made with `scripts/backup_restore.py` do not include the stored text yet.
+- Layers have an `answer_mode`, `grounded` (default) or `extractive` (migration `12_answer_mode.sql`). Presets set it with an `answer_mode` key, and layer listings show it. The server records the mode but does not act on it yet.
 
 ### Changed
 
@@ -43,6 +47,10 @@ Notable changes to StrataKB. The format follows [Keep a Changelog](https://keepa
 - The base schema files `01_init.sql` and `02_learning.sql` moved from `db/` to `src/stratakb/core/sql/`; `db/` keeps only `03_readonly_role.sql`. Pointed at an empty database, the server now creates the StrataKB schemas and the `vector` and `pg_trgm` extensions there instead of failing.
 - The README opens with a four-step Quick start in plain words, followed by the reference and a Glossary.
 - `stratakb add` and the server share one config source and one entry point; `python -m stratakb` runs the same command.
+- A chunk's stored content is now the document's own text. The `[layer > file > section]` prefix is added only to the text that is embedded, so it no longer shows in results and keyword search no longer matches layer or file names. Markdown and HTML sections no longer repeat their parent headings; the heading chain is in the chunk's `section_path` metadata. Chunks ingested before this change keep their prefix until the layer is ingested again.
+- `strata_search` no longer turns words in the question into metadata filters.
+- `strata_ask` confidence is judged on a meaningful scale: the reranker's relevance probability (0 to 1, the reranker now applies a sigmoid) or, with reranking off, the query/chunk cosine similarity. Before, hybrid scores were divided by the top score, so almost any answer came back `high`. The result reports the `basis` (`rerank` or `similarity`). The thresholds are provisional. Confidence stored for earlier interactions is on the old scale.
+- Both search queries run with a 10 s statement timeout.
 
 ### Fixed
 
