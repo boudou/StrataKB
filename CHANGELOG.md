@@ -43,6 +43,9 @@ Notable changes to StrataKB. The format follows [Keep a Changelog](https://keepa
 - Ingestion reports a file that cannot be read (locked, no permission) as failed with reason `read_error`, instead of `parse_error`; every failed file in `errors` carries its reason.
 - `strata_apply_preset` with `dry_run=true` reports `would_claim` for a layer with no recorded origin that already matches the preset.
 - Markdown: setext headings (`===`, `---` underlines) and ATX headings indented by up to three spaces.
+- `strata_feedback` and `strata_reset_learning` write audit entries: feedback names the user, the interaction, whether it was helpful and which extra signals were given (never their text); a reset names its scope, one layer or all.
+- The `strata_apply_preset` audit entry names the layer settings that changed.
+- `stratakb add` refuses up front, with exit 2 and reason `local_only`, when `STRATA_LOCAL_ONLY` is set and the embedding settings would send text off the machine, and names the setting; before, it ran and every file failed with `embed_error`.
 
 ### Changed
 
@@ -72,6 +75,8 @@ Notable changes to StrataKB. The format follows [Keep a Changelog](https://keepa
 - Storing a file prunes only that file's old document versions, not the whole layer's.
 - Markdown front matter is cut off by one rule, only when its lines look like YAML; a leading `---` break followed by text is kept as text. A byte-order mark no longer hides front matter.
 - HTML: the page title is the first `<title>` outside an inline SVG, and SVG titles stay in the text.
+- The SQL tools role check at startup runs one query with a 5 s timeout and removes the tools if it fails or stalls.
+- The egress report counts an `openai_compatible` query rewrite as outbound only when `QUERY_REWRITE_MODEL` is set, since without a model no rewrite is sent. Model ids in the health report are capped at 20 ids of 100 characters.
 
 ### Fixed
 
@@ -102,11 +107,12 @@ Notable changes to StrataKB. The format follows [Keep a Changelog](https://keepa
 - Concurrent or cancelled first calls no longer create extra database connection pools or leave a half-made one open.
 - A chunk without an embedding no longer makes vector search fail; it is left out of the similarity ranking and can still be found by keyword.
 - Two concurrent stores of the same file no longer fail on the version number.
+- Requests to a custom OpenAI-compatible endpoint (`EMBEDDING_BASE_URL`, `QUERY_REWRITE_BASE_URL`) no longer carry the `OpenAI-Organization` and `OpenAI-Project` headers the SDK takes from `OPENAI_ORG_ID` and `OPENAI_PROJECT_ID`.
 
 ### Security
 
 - `strata_db_query` and `strata_db_explain` run each statement in a read-only transaction that is always rolled back, so `SELECT … INTO`, writing functions and `set_config()` no longer take effect. The statement timeout is now transaction-local instead of sticking to the pooled connection, and rows are fetched through a cursor up to the 1,000-row cap instead of in full.
 - The SQL tools are registered only when `READONLY_DATABASE_URL` is set, and are removed at startup when that role is a superuser, a member of one, or holds a server-file or signal role. They no longer fall back to the owner role.
-- The `strata_readonly` role may read only `knowledge_layers`, `ingestion_runs`, `ingested_files` and `chunks`, not the audit log, users or the learning schema. Migration `06_readonly_grants.sql` narrows existing installs at startup.
+- The `strata_readonly` role may read only `knowledge_layers`, `ingestion_runs`, `ingested_files`, `chunks` and `documents` (migration `08_readonly_documents.sql`), not the audit log, users or the learning schema. Migration `06_readonly_grants.sql` narrows existing installs at startup.
 - Locked dependencies upgraded to patched releases for all 124 open advisories (among them certifi, PyJWT, AnyIO, pypdf, transformers, urllib3, cryptography, starlette and python-multipart). Some transitive packages move a major version: filelock 4, cryptography 50, soupsieve 4 and huggingface-hub 2.
 - File listing through git passes `core.fsmonitor=false`, so a crafted `.git/config` in an added folder cannot run a command.
