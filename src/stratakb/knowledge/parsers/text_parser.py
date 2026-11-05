@@ -14,8 +14,6 @@ from stratakb.knowledge.parsers.pdf_parser import ParsedDocument, ParsedPage
 
 logger = structlog.get_logger()
 
-_TEXT_EXTENSIONS = (".txt", ".rst", ".adoc")
-
 
 def parse_text(file_path: str | Path) -> ParsedDocument:
     """Parse a plain-text file into a single page.
@@ -35,8 +33,11 @@ def parse_text(file_path: str | Path) -> ParsedDocument:
     if not file_path.exists():
         return ParsedDocument(source_file=source, error=f"File not found: {file_path}")
 
+    # Imported here: the registry imports this module
+    from stratakb.knowledge.parsers.registry import extensions_for
+
     ext = file_path.suffix.lower()
-    if ext not in _TEXT_EXTENSIONS:
+    if ext not in extensions_for(parse_text):
         return ParsedDocument(source_file=source, error=f"Not a text file: {file_path}")
 
     try:

@@ -13,32 +13,60 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 import asyncpg
 import structlog
 
 from stratakb.core.database import get_pool
 from stratakb.core.migrations import ensure_schema
+from stratakb.knowledge.documents import (
+    build_document_text,
+    page_starts,
+    prune_documents,
+    store_document_version,
+)
 from stratakb.knowledge.embeddings import embed_texts
-from stratakb.knowledge.layers import LayerNotFoundError, get_layer_status
+from stratakb.knowledge.layers import (
+    DEFAULT_CHUNK_OVERLAP,
+    DEFAULT_CHUNK_SIZE,
+    LayerNotFoundError,
+    get_layer_status,
+)
 from stratakb.knowledge.parsers.pdf_parser import ParsedDocument
-from stratakb.knowledge.parsers.registry import SUPPORTED_PARSERS
+from stratakb.knowledge.parsers.registry import FORMATS, Format
 from stratakb.knowledge.policy import is_secret_name
-from stratakb.knowledge.vector_store import ChunkRecord, insert_chunks
+from stratakb.knowledge.vector_store import ChunkRecord, chunk_embed_text, insert_chunks
 
 if TYPE_CHECKING:
+    from uuid import UUID
+
     from stratakb.knowledge.selection import FileEntry
 
 logger = structlog.get_logger()
 
 EMBED_BATCH_SIZE = 100
 
-# Formats read as bytes by their parser: never decoded to check for empty text
-_BINARY_FORMATS = {".pdf", ".docx"}
-
 # A PDF averaging fewer characters per page than this probably holds scanned images
 _SCANNED_MIN_CHARS_PER_PAGE = 200
+
+Outcome = Literal["added", "updated", "unchanged", "removed", "skipped", "flagged", "failed"]
+Reason = Literal[
+    "deleted", "not_selected", "secret", "no_text",
+    "probably_scanned", "truncated",
+    "read_error", "parse_error", "embed_error",
+]
+
+# The reasons each outcome may carry; None: no reason
+REASONS: dict[str, frozenset[str | None]] = {
+    "added": frozenset({None}),
+    "updated": frozenset({None}),
+    "unchanged": frozenset({None}),
+    "removed": frozenset({"deleted", "not_selected", "secret", "no_text"}),
+    "skipped": frozenset({"secret", "no_text"}),
+    "flagged": frozenset({"probably_scanned", "truncated"}),
+    "failed": frozenset({"read_error", "parse_error", "embed_error"}),
+}
 
 
 @dataclass(frozen=True)
@@ -49,14 +77,21 @@ class FileOutcome:
     or "failed".
     reason: why a file was removed ("deleted", "not_selected" when a file list
     left out a file that still exists, "secret", "no_text"), skipped
-    ("secret", "no_text"), flagged ("probably_scanned": stored, and counted
-    as added or updated) or failed ("parse_error", "embed_error"); None
-    otherwise.
+    ("secret", "no_text"), flagged ("probably_scanned", "truncated": stored,
+    and counted as added or updated) or failed ("read_error" when it could not
+    be read, "parse_error", "embed_error"); None otherwise. REASONS holds the
+    allowed pairs; any other pair raises ValueError.
     """
 
     relative_path: str
-    outcome: str
-    reason: str | None = None
+    outcome: Outcome
+    reason: Reason | None = None
+
+    def __post_init__(self) -> None:
+        if self.reason not in REASONS.get(self.outcome, frozenset()):
+            raise ValueError(
+                f"Not an ingest outcome and reason: {self.outcome!r}, {self.reason!r}"
+            )
 
 
 @dataclass
@@ -73,7 +108,8 @@ class IngestionResult:
     files_unchanged: int = 0
     files_removed: int = 0
     files_skipped: int = 0  # secret-looking names and files without text, not tracked
-    files_flagged: int = 0  # PDFs that look scanned; also counted as added or updated
+    # PDFs that look scanned and CSVs cut at the row limit; also counted as added or updated
+    files_flagged: int = 0
     # True when chunks from before per-file tracking were dropped and the layer rebuilt
     rebuilt_legacy: bool = False
     errors: list[dict] = field(default_factory=list)
@@ -91,7 +127,7 @@ async def _embed_chunks(
     for i in range(0, len(chunks), EMBED_BATCH_SIZE):
         batch = chunks[i:i + EMBED_BATCH_SIZE]
         embeddings = await embed_texts(
-            [c.content for c in batch],
+            [chunk_embed_text(c.layer_name, c.source_file, c.metadata, c.content) for c in batch],
             api_key=api_key,
             model=embedding_model,
             dimensions=embedding_dimensions,
@@ -109,8 +145,16 @@ async def _store_file(
     content_hash: str,
     size_bytes: int,
     chunks: list[ChunkRecord],
+    document_text: str,
+    page_map: list[list[int]] | None = None,
+    text_origin: str = "text",
 ) -> None:
-    """Replace one file's row and chunks in a single transaction."""
+    """Replace one file's row, document version and chunks in a single transaction.
+
+    The text is stored as the file's current document version (reused when
+    unchanged); this file's versions no chunk references any more are pruned
+    afterwards.
+    """
     pool = await get_pool(database_url)
     async with pool.acquire() as conn:
         async with conn.transaction():
@@ -134,34 +178,83 @@ async def _store_file(
                 len(chunks),
             )
             await conn.execute("DELETE FROM strata_vectors.chunks WHERE file_id = $1", file_id)
+            document_id, _ = await store_document_version(
+                conn,
+                layer_id=layer_id,
+                file_id=file_id,
+                source_root=source_root,
+                relative_path=relative_path,
+                text=document_text,
+                page_map=page_map,
+                text_origin=text_origin,
+            )
             for chunk in chunks:
                 chunk.file_id = file_id
+                chunk.document_id = document_id
+                # Checked here so a stored span always holds the chunk's text
+                if chunk.char_start is not None and (
+                    document_text[chunk.char_start:chunk.char_end] != chunk.content
+                ):
+                    logger.warning(
+                        "chunk_offsets_mismatch", file=relative_path, char_start=chunk.char_start
+                    )
+                    chunk.char_start = chunk.char_end = None
             await insert_chunks(database_url, chunks, conn=conn)
+            # Only after the insert: until then the current version is unreferenced
+            await prune_documents(
+                conn, layer_id, source_root=source_root, relative_paths=[relative_path]
+            )
+
+
+async def _remove_files(
+    pool: asyncpg.Pool,
+    *,
+    layer_id: str,
+    source_root: str,
+    files: Sequence[tuple[str, UUID]],
+) -> None:
+    """Remove tracked files, given as (relative path, ingested_files id), in one transaction.
+
+    Deleting the rows cascades to their chunks and unlinks their documents,
+    so their versions are pruned afterwards.
+    """
+    async with pool.acquire() as conn, conn.transaction():
+        await conn.execute(
+            "DELETE FROM strata_core.ingested_files WHERE id = ANY($1::uuid[])",
+            [file_id for _, file_id in files],
+        )
+        await prune_documents(
+            conn, layer_id, source_root=source_root, relative_paths=[path for path, _ in files]
+        )
 
 
 async def clear_layer(database_url: str, layer_name: str) -> None:
-    """Delete every chunk and ingested_files row of a layer."""
+    """Delete every chunk and ingested_files row of a layer, and its unreferenced documents."""
     await ensure_schema(database_url)
     pool = await get_pool(database_url)
+    files = 0
     async with pool.acquire() as conn:
         async with conn.transaction():
+            layer_id = await conn.fetchval(
+                "SELECT id FROM strata_core.knowledge_layers WHERE name = $1", layer_name
+            )
+            # By name: this also removes legacy chunks that have no file row
             chunks = await conn.execute(
                 "DELETE FROM strata_vectors.chunks WHERE layer_name = $1", layer_name
             )
-            files = await conn.execute(
-                """
-                DELETE FROM strata_core.ingested_files
-                WHERE layer_id = (SELECT id FROM strata_core.knowledge_layers WHERE name = $1)
-                """,
-                layer_name,
-            )
+            if layer_id is not None:
+                deleted = await conn.execute(
+                    "DELETE FROM strata_core.ingested_files WHERE layer_id = $1", layer_id
+                )
+                files = int(deleted.split()[-1])
+                await prune_documents(conn, layer_id)
     # After the commit: the recount runs on another connection
     await _update_layer_stats(database_url, layer_name)
     logger.info(
         "layer_cleared",
         layer=layer_name,
         chunks=int(chunks.split()[-1]),
-        files=int(files.split()[-1]),
+        files=files,
     )
 
 
@@ -183,14 +276,16 @@ async def ingest_documents(
     single file's parent folder). A re-run skips files whose SHA-256 is
     unchanged, replaces changed files, adds new ones and, for a folder, removes
     files ingested from that same folder that no longer exist. A file that
-    fails to parse keeps its previous chunks. Each file's chunks are replaced
-    in one transaction.
+    cannot be read or fails to parse keeps its previous chunks, and its entry
+    in result.errors carries the reason. Each file's chunks are replaced in
+    one transaction.
 
     A file whose name looks like a secret (see policy.is_secret_name) is
     never read: it is skipped, or removed when it was tracked. A file without
     text (0 bytes, whitespace only, or a parse that yields nothing) is not a
     failure: it is skipped, or removed when it was tracked. A PDF that looks
-    scanned (see _probably_scanned) is stored for the text it has and flagged.
+    scanned (see _probably_scanned) is stored for the text it has and flagged;
+    so is a CSV cut at the parser's row limit (stored for the rows read).
     Every file gets a FileOutcome in result.files.
 
     With files, source_path is the root folder and the list is the full
@@ -264,9 +359,9 @@ async def ingest_documents(
         return result
 
     layer_id = layer["id"]
-    chunk_config = layer.get("chunk_config", {})
-    chunk_size = chunk_config.get("chunk_size", 1000) if isinstance(chunk_config, dict) else 1000
-    chunk_overlap = chunk_config.get("chunk_overlap", 200) if isinstance(chunk_config, dict) else 200
+    chunk_config = layer["chunk_config"]
+    chunk_size = chunk_config.get("chunk_size", DEFAULT_CHUNK_SIZE)
+    chunk_overlap = chunk_config.get("chunk_overlap", DEFAULT_CHUNK_OVERLAP)
 
     # Step 2: Discover files
     source = Path(source_path)
@@ -330,27 +425,29 @@ async def ingest_documents(
         # the tracked one is known to be unchanged
         total = sum(
             1 for rel, _, carried in work
-            if not is_secret_name(rel)
-            and (carried is None or rel not in tracked or tracked[rel]["content_hash"] != carried)
+            if not is_secret_name(rel) and not _matches_tracked(carried, tracked.get(rel))
         )
         done = 0
 
-        async def drop(relative_path: str, previous, reason: str) -> None:
+        async def drop(relative_path: str, previous, reason: Reason) -> None:
             """Skip a file, or remove it (row and chunks) when it was tracked."""
             if previous is None:
                 result.files.append(FileOutcome(relative_path, "skipped", reason))
                 result.files_skipped += 1
                 return
-            await pool.execute(
-                "DELETE FROM strata_core.ingested_files WHERE id = $1", previous["id"]
+            await _remove_files(
+                pool,
+                layer_id=layer_id,
+                source_root=source_root,
+                files=[(relative_path, previous["id"])],
             )
             result.files.append(FileOutcome(relative_path, "removed", reason))
             result.files_removed += 1
 
-        def fail(relative_path: str, error: str, reason: str) -> None:
+        def fail(relative_path: str, error: str, reason: Reason) -> None:
             result.files.append(FileOutcome(relative_path, "failed", reason))
             result.docs_failed += 1
-            result.errors.append({"file": relative_path, "error": error})
+            result.errors.append({"file": relative_path, "error": error, "reason": reason})
 
         # Step 4: Parse, chunk, embed and store each new or changed file
         seen: set[str] = set()
@@ -364,11 +461,7 @@ async def ingest_documents(
                 continue
 
             # A carried hash equal to the tracked one: unchanged, never opened
-            if (
-                carried_hash is not None
-                and previous is not None
-                and previous["content_hash"] == carried_hash
-            ):
+            if _matches_tracked(carried_hash, previous):
                 result.files_unchanged += 1
                 result.files.append(FileOutcome(relative_path, "unchanged"))
                 continue
@@ -376,19 +469,22 @@ async def ingest_documents(
             try:
                 data = file_path.read_bytes()
             except OSError as e:
-                fail(relative_path, str(e), "parse_error")
+                logger.warning(
+                    "file_read_failed", layer=layer_name, file=relative_path,
+                    error_type=type(e).__name__,
+                )
+                fail(relative_path, str(e), "read_error")
                 continue
             content_hash = carried_hash or hashlib.sha256(data).hexdigest()
 
-            if previous is not None and previous["content_hash"] == content_hash:
+            if _matches_tracked(content_hash, previous):
                 result.files_unchanged += 1
                 result.files.append(FileOutcome(relative_path, "unchanged"))
                 continue
 
-            if not data or (
-                file_path.suffix.lower() not in _BINARY_FORMATS
-                and not data.decode("utf-8-sig", errors="replace").strip()
-            ):
+            # A listed file may have an unknown extension: _parse_file rejects it
+            fmt = FORMATS.get(file_path.suffix.lower())
+            if _has_no_text(fmt, data):
                 await drop(relative_path, previous, "no_text")
                 continue
 
@@ -430,6 +526,7 @@ async def ingest_documents(
                 fail(relative_path, str(e), "embed_error")
                 continue
 
+            document_text, page_map = build_document_text(parsed)
             try:
                 await _store_file(
                     database_url,
@@ -439,6 +536,8 @@ async def ingest_documents(
                     content_hash=content_hash,
                     size_bytes=len(data),
                     chunks=doc_chunks,
+                    document_text=document_text,
+                    page_map=page_map,
                 )
             except (asyncpg.PostgresConnectionError, asyncpg.InterfaceError, OSError):
                 # A lost database is an error for the whole run, not one failed file
@@ -450,15 +549,16 @@ async def ingest_documents(
                 fail(relative_path, str(e), "embed_error")
                 continue
 
+            flag = _flag_reason(fmt, parsed)
             if previous is None:
                 result.files_added += 1
-                outcome = FileOutcome(relative_path, "added")
             else:
                 result.files_updated += 1
-                outcome = FileOutcome(relative_path, "updated")
-            if file_path.suffix.lower() == ".pdf" and _probably_scanned(parsed):
+            if flag is not None:
                 result.files_flagged += 1
-                outcome = FileOutcome(relative_path, "flagged", "probably_scanned")
+                outcome = FileOutcome(relative_path, "flagged", flag)
+            else:
+                outcome = FileOutcome(relative_path, "added" if previous is None else "updated")
             result.files.append(outcome)
             result.docs_processed += 1
             result.chunks_created += len(doc_chunks)
@@ -474,9 +574,8 @@ async def ingest_documents(
                 if path not in seen and (files is not None or not (root / path).exists())
             ]
             if gone:
-                await pool.execute(
-                    "DELETE FROM strata_core.ingested_files WHERE id = ANY($1::uuid[])",
-                    [file_id for _, file_id in gone],
+                await _remove_files(
+                    pool, layer_id=layer_id, source_root=source_root, files=gone
                 )
                 result.files.extend(
                     FileOutcome(
@@ -522,30 +621,28 @@ def _discover_files(source: Path) -> list[Path]:
     """Find all supported files in a path (file or directory)."""
     if source.is_file():
         ext = source.suffix.lower()
-        if ext in SUPPORTED_PARSERS and SUPPORTED_PARSERS[ext] is not None:
-            return [source]
-        return []
+        return [source] if ext in FORMATS else []
 
     files = []
-    for ext, parser in SUPPORTED_PARSERS.items():
-        if parser is not None:  # skip extensions mapped to None (e.g. .fpr)
-            files.extend(source.rglob(f"*{ext}"))
+    for ext in FORMATS:
+        files.extend(source.rglob(f"*{ext}"))
     return sorted(files)
 
 
 def _parse_file(file_path: Path) -> ParsedDocument:
     """Parse a file using the appropriate parser based on extension."""
     ext = file_path.suffix.lower()
-    parser = SUPPORTED_PARSERS.get(ext)
-    if parser is None:
+    fmt = FORMATS.get(ext)
+    if fmt is None:
         return ParsedDocument(source_file=file_path.name, error=f"Unsupported format: {ext}")
-    return parser(file_path)
+    return fmt.parser(file_path)
 
 
 def _probably_scanned(doc: ParsedDocument) -> bool:
-    """Whether a parsed PDF looks scanned: under half its pages have text, or
-    too few characters per page on average. The PDF parser keeps only pages
-    with text, so len(doc.pages) counts those."""
+    """Whether a parsed document looks scanned: under half its pages have
+    text, or too few characters per page on average. Called only for formats
+    whose FORMATS row sets scanned_check; the PDF parser keeps only pages with
+    text, so len(doc.pages) counts those."""
     if doc.total_pages <= 0 or not doc.pages:
         return False
     return (
@@ -554,26 +651,33 @@ def _probably_scanned(doc: ParsedDocument) -> bool:
     )
 
 
-def _build_context_prefix(
-    layer_name: str,
-    source_file: str,
-    page_number: int | None = None,
-    section: str | None = None,
-) -> str:
-    """Build a context prefix for a chunk to improve embedding quality.
+def _matches_tracked(content_hash: str | None, previous) -> bool:
+    """Whether a file's hash equals the hash tracked for it (so it is unchanged)."""
+    return (
+        content_hash is not None
+        and previous is not None
+        and previous["content_hash"] == content_hash
+    )
 
-    Prepends [layer > filename > page/section] to give the embedding model
-    contextual information about where this chunk comes from.
-    """
-    file_stem = Path(source_file).stem if source_file else "unknown"
 
-    parts = [layer_name, file_stem]
-    if section:
-        parts.append(section)
-    elif page_number is not None:
-        parts.append(f"Page {page_number}")
+def _has_no_text(fmt: Format | None, data: bytes) -> bool:
+    """Whether a file's bytes hold no text: 0 bytes, or a text format (or an
+    unknown one) that decodes to whitespace only. A binary format's bytes are
+    left to its parser."""
+    return not data or (
+        (fmt is None or not fmt.binary)
+        and not data.decode("utf-8-sig", errors="replace").strip()
+    )
 
-    return f"[{' > '.join(parts)}]\n"
+
+def _flag_reason(fmt: Format | None, parsed: ParsedDocument) -> Reason | None:
+    """Why a stored file is flagged: it looks scanned, or its parser cut rows
+    at a limit; None when it is not flagged."""
+    if fmt is not None and fmt.scanned_check and _probably_scanned(parsed):
+        return "probably_scanned"
+    if parsed.rows_left_out:
+        return "truncated"
+    return None
 
 
 def _chunk_document(
@@ -583,7 +687,11 @@ def _chunk_document(
     chunk_size: int,
     chunk_overlap: int,
 ) -> list[ChunkRecord]:
-    """Split a parsed document into chunks using LangChain text splitter."""
+    """Split a parsed document into chunks using LangChain text splitter.
+
+    Each chunk gets char_start and char_end into the document text (see
+    documents.build_document_text), or None when its text is not found.
+    """
     from langchain_text_splitters import RecursiveCharacterTextSplitter
 
     splitter = RecursiveCharacterTextSplitter(
@@ -595,31 +703,48 @@ def _chunk_document(
 
     # Derive doc_type from file extension
     ext = Path(doc.source_file).suffix.lower()
-    doc_type_map = {".pdf": "pdf", ".docx": "docx", ".yaml": "yaml", ".yml": "yaml", ".csv": "csv", ".xml": "xml", ".xsd": "xsd", ".json": "json", ".md": "markdown", ".markdown": "markdown", ".html": "html", ".htm": "html", ".txt": "text", ".rst": "rst", ".adoc": "adoc"}
-    doc_type = doc_type_map.get(ext, ext.lstrip(".") or "unknown")
+    fmt = FORMATS.get(ext)
+    doc_type = fmt.doc_type if fmt is not None else ext.lstrip(".") or "unknown"
 
     chunks: list[ChunkRecord] = []
 
-    for page in doc.pages:
+    for page, page_start in zip(doc.pages, page_starts(doc), strict=True):
         page_chunks = splitter.split_text(page.text)
+        metadata: dict = {
+            "page": page.page_number,
+            "total_pages": doc.total_pages,
+        }
+        if page.section_path:
+            metadata["section_path"] = list(page.section_path)
+        # Overlapping chunks repeat text, and a page can repeat itself: a chunk
+        # starts after the previous one's start and at most chunk_overlap
+        # characters before its end, so search from there
+        prev_start, prev_end = -1, 0
         for chunk_text in page_chunks:
-            prefix = _build_context_prefix(
-                layer_name=layer_name,
-                source_file=doc.source_file,
-                page_number=page.page_number,
-            )
+            pos = page.text.find(chunk_text, max(prev_start + 1, prev_end - chunk_overlap))
+            if pos < 0:
+                pos = page.text.find(chunk_text, prev_start + 1)
+            if pos < 0:
+                logger.warning(
+                    "chunk_offsets_not_found", file=doc.source_file, page=page.page_number
+                )
+                char_start = char_end = None
+            else:
+                prev_start, prev_end = pos, pos + len(chunk_text)
+                char_start = page_start + pos
+                char_end = char_start + len(chunk_text)
+            # content is the page's own text; the context prefix is only embedded
             chunks.append(
                 ChunkRecord(
-                    content=prefix + chunk_text,
+                    content=chunk_text,
                     embedding=[],  # Filled later
                     layer_name=layer_name,
-                    metadata={
-                        "page": page.page_number,
-                        "total_pages": doc.total_pages,
-                    },
+                    metadata=dict(metadata),
                     source_file=doc.source_file,
                     source_section=f"page_{page.page_number}",
                     doc_type=doc_type,
+                    char_start=char_start,
+                    char_end=char_end,
                 )
             )
 

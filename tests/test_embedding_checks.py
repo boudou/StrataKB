@@ -109,7 +109,8 @@ async def _health(settings: Settings) -> dict:
             AsyncMock(return_value={"status": "ok"}),
         ),
     ):
-        return await mcp_server.strata_admin_health()
+        server = mcp_server.build_server(settings)
+        return await server._tool_manager.get_tool("strata_admin_health").fn()
 
 
 # ==========================================
@@ -163,6 +164,31 @@ async def test_available_is_sorted_and_capped():
     await _run(_settings(), ids)
     available = embedding_checks_status()["model"]["available"]
     assert available == sorted(ids)[:20]
+
+
+async def test_long_id_is_cut():
+    await _run(_settings(), ["x" * 10_000])
+    available = embedding_checks_status()["model"]["available"]
+    assert len(available) == 1
+    assert len(available[0]) <= 100
+    assert available[0].endswith("…")
+
+
+async def test_unprintable_characters_are_dropped():
+    await _run(_settings(), ["bad\nmo\x1bdel‮"])
+    assert embedding_checks_status()["model"]["available"] == ["badmodel"]
+
+
+async def test_non_string_ids_are_skipped():
+    await _run(_settings(), [None, 5, "llama3.2"])
+    model = embedding_checks_status()["model"]
+    assert model["status"] == "missing"
+    assert model["available"] == ["llama3.2"]
+
+
+async def test_ids_that_clean_alike_appear_once():
+    await _run(_settings(), ["llama3.2", "llama3.2\n"])
+    assert embedding_checks_status()["model"]["available"] == ["llama3.2"]
 
 
 async def test_listing_failure_is_unchecked():
@@ -258,6 +284,8 @@ async def test_column_mismatch_degrades_health():
     assert column["setting_dimensions"] == 768
     for text in ("1024", "768", "EMBEDDING_DIMENSIONS"):
         assert text in column["detail"]
+    assert "re_embed_all_layers" in column["detail"]
+    assert "re_embed_layer()" not in column["detail"]
     assert result["overall"] == "degraded"
     assert any(e["event"] == "vector_column_mismatch" for e in logs)
 

@@ -1,4 +1,4 @@
-"""Create a knowledge layer from a preset file and ingest its sources.
+"""Create or update a knowledge layer from a preset file and ingest its sources.
 
 Same as the strata_apply_preset MCP tool, for ingestions too long to run
 inside a tool call.
@@ -45,12 +45,14 @@ async def _apply(preset_path: Path, docs_root: Path | None, dry_run: bool) -> di
 
     try:
         layer = await create_preset_layer(settings.database_url, preset)
+        if layer["status"] == "refused":
+            return {"layer": "refused", "error": layer["message"]}
         ingestion = await ingest_preset(
             settings.database_url, settings.openai_api_key, preset, docs_root
         )
     finally:
         await close_pool()
-    return {"layer": layer["status"], "ingestion": ingestion}
+    return {"layer": layer["status"], "layer_changes": layer["changes"], "ingestion": ingestion}
 
 
 def main() -> None:
@@ -70,6 +72,8 @@ def main() -> None:
     result = asyncio.run(_apply(args.preset, args.docs_root, args.dry_run))
     json.dump(result, sys.stdout, indent=2, default=str)
     print()
+    if result.get("layer") == "refused":
+        sys.exit(1)
 
 
 if __name__ == "__main__":

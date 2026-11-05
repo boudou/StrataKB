@@ -25,24 +25,37 @@ def _get_reranker(model_name: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"):
             return _reranker
         from sentence_transformers import CrossEncoder
 
-        from stratakb.config import get_settings
+        from stratakb.knowledge.embeddings import load_cached_first
 
         logger.info("loading_reranker_model", model=model_name)
-        if get_settings().strata_local_only:
-            try:
-                _reranker = CrossEncoder(model_name, local_files_only=True)
-            except Exception as e:
-                raise RuntimeError(
-                    f"STRATA_LOCAL_ONLY is on and the reranking model {model_name} is "
-                    f"not installed on this machine, so it cannot be downloaded. On a "
-                    f"machine that may download, run `uv run hf download {model_name}`, "
-                    f"set RERANKING_MODEL to a folder that holds the model, or set "
-                    f"RERANKING_ENABLED=false."
-                ) from e
-        else:
-            _reranker = CrossEncoder(model_name)
+        _reranker = load_cached_first(
+            CrossEncoder,
+            model_name,
+            f"STRATA_LOCAL_ONLY is on and the reranking model {model_name} is "
+            f"not installed on this machine, so it cannot be downloaded. On a "
+            f"machine that may download, run `uv run hf download {model_name}`, "
+            f"set RERANKING_MODEL to a folder that holds the model, or set "
+            f"RERANKING_ENABLED=false.",
+        )
         logger.info("reranker_model_loaded", model=model_name)
     return _reranker
+
+
+def score_pairs(
+    query: str,
+    texts: list[str],
+    model_name: str = "cross-encoder/ms-marco-MiniLM-L-6-v2",
+) -> list[float]:
+    """Score each text against the query as a relevance probability (0-1).
+
+    The sigmoid is set at predict time, so it replaces the model's own default
+    activation: the result is one sigmoid over the logits for any model.
+    """
+    from torch import nn
+
+    reranker = _get_reranker(model_name)
+    scores = reranker.predict([(query, t) for t in texts], activation_fn=nn.Sigmoid())
+    return [float(s) for s in scores]
 
 
 def rerank_results(
@@ -60,14 +73,13 @@ def rerank_results(
         model_name: Cross-encoder model to use.
 
     Returns:
-        Top-k chunks sorted by cross-encoder relevance score.
+        Top-k chunks sorted by cross-encoder relevance, each with a
+        "rerank_score": the relevance probability (0-1).
     """
     if not chunks:
         return []
 
-    reranker = _get_reranker(model_name)
-    pairs = [(query, c["content"]) for c in chunks]
-    scores = reranker.predict(pairs)
+    scores = score_pairs(query, [c["content"] for c in chunks], model_name)
 
     # Pair chunks with new scores and sort
     scored = list(zip(chunks, scores))

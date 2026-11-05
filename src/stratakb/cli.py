@@ -3,6 +3,8 @@
     stratakb                  start the MCP server on stdio (as before)
     stratakb serve            the same
     stratakb add <path> ...   turn a folder into a layer, or sync it
+    stratakb db up            start a local database in Docker, creating it on first use
+    stratakb db down          stop it; its data stays
 
 Each subcommand is a subparser and a handler; a new one adds both and
 nothing else. The command owns the terminal (prompts, progress, the report
@@ -17,6 +19,8 @@ import argparse
 import asyncio
 import contextlib
 import json
+import math
+import os
 import sys
 from collections.abc import Sequence
 from pathlib import Path
@@ -25,6 +29,7 @@ from typing import TYPE_CHECKING, Any
 import structlog
 
 if TYPE_CHECKING:
+    from stratakb.core.local_db import DownOutcome, UpState
     from stratakb.knowledge.add_folder import Plan, Report
 
 logger = structlog.get_logger()
@@ -54,6 +59,8 @@ class _ArgumentParser(argparse.ArgumentParser):
 
 
 def _parser() -> _ArgumentParser:
+    from stratakb.config import LOCAL_DB_PORT
+
     parser = _ArgumentParser(
         prog="stratakb",
         description="StrataKB: a layered knowledge base for MCP clients. "
@@ -75,7 +82,7 @@ def _parser() -> _ArgumentParser:
     add.add_argument("--description", help="layer description (default: from the README)")
     add.add_argument(
         "--max-file-size",
-        type=float,
+        type=_size_mb,
         default=50.0,
         metavar="MB",
         help="skip files larger than this many megabytes (default: 50)",
@@ -89,7 +96,44 @@ def _parser() -> _ArgumentParser:
         "--yes", action="store_true", help="go ahead with a large run without asking"
     )
     add.add_argument("--json", action="store_true", help="print the report as JSON")
+
+    db = commands.add_parser(
+        "db",
+        help="start or stop a local database in Docker",
+        description="Start or stop a local PostgreSQL database in a Docker "
+        "container, bound to 127.0.0.1. Its data stays in a Docker volume.",
+    )
+    db_commands = db.add_subparsers(dest="db_command", metavar="<command>", required=True)
+    up = db_commands.add_parser("up", help="start the local database, creating it on first use")
+    up.add_argument(
+        "--port",
+        type=_port,
+        default=LOCAL_DB_PORT,
+        help="host port on 127.0.0.1 when the container is created (default: %(default)s)",
+    )
+    db_commands.add_parser("down", help="stop the local database; its data stays")
     return parser
+
+
+def _size_mb(text: str) -> float:
+    try:
+        size = float(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"not a number: {text}") from None
+    # float() also accepts inf and nan; neither is a size
+    if not (math.isfinite(size) and size > 0):
+        raise argparse.ArgumentTypeError(f"not a finite number above 0: {text}")
+    return size
+
+
+def _port(text: str) -> int:
+    try:
+        port = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"not a port number: {text}") from None
+    if not 1 <= port <= 65535:
+        raise argparse.ArgumentTypeError(f"not a port number (1-65535): {text}")
+    return port
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -100,13 +144,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     except _UsageError as e:
         return _usage_error(str(e), argv)
 
+    if args.command == "db":
+        return _run_db(args)
     if args.command == "add":
         return _run_add(args)
     return _serve()
 
 
 def _serve() -> int:
-    # Lazy: the server module reads settings and configures logging on import
+    # Lazy: the server module imports every tool module, which db and add do not need
     from stratakb.mcp_server import main as serve_main
 
     serve_main()
@@ -199,6 +245,92 @@ class _Progress:
             sys.stderr.flush()
 
 
+# ── db ───────────────────────────────────────────────────
+
+_UP_TEXT: dict[UpState, str] = {
+    "created": "created",
+    "started": "started",
+    "running": "already running",
+}
+
+
+def _connection_errors() -> tuple[type[BaseException], ...]:
+    """The errors that mean the database can't be reached."""
+    import asyncpg
+
+    return (
+        OSError,
+        asyncpg.PostgresConnectionError,
+        asyncpg.InvalidAuthorizationSpecificationError,
+        asyncpg.InvalidCatalogNameError,
+        asyncpg.InterfaceError,
+    )
+
+
+def _run_db(args: argparse.Namespace) -> int:
+    from stratakb.config import config_files, get_settings, user_config_file
+    from stratakb.core import local_db
+    from stratakb.core.logging import configure_logging
+    from stratakb.core.migrations import MigrationError
+
+    configure_logging("WARNING")
+    _use_utf8_output()
+
+    try:
+        if args.db_command == "down":
+            _out(_down_text(asyncio.run(local_db.down())))
+            return EXIT_OK
+        result = asyncio.run(local_db.up(args.port, notify=_err))
+    except KeyboardInterrupt:
+        _err("Interrupted.")
+        return EXIT_INTERRUPTED
+    except (local_db.LocalDbError, MigrationError) as e:
+        _err(str(e))
+        return EXIT_DATABASE
+    except _connection_errors() as e:
+        _err(f"Can't reach the database in {local_db.CONTAINER} ({type(e).__name__}).")
+        return EXIT_DATABASE
+    except Exception as e:
+        _err(
+            f"stratakb db {args.db_command} failed ({type(e).__name__}): "
+            f"{local_db.first_line(str(e))}"
+        )
+        return EXIT_DATABASE
+
+    state = _UP_TEXT[result.state]
+    _out(
+        f"Database ready at 127.0.0.1:{result.port} "
+        f"(container {local_db.CONTAINER}, {state})."
+    )
+    if local_db.points_here(get_settings().database_url, result.port):
+        _out("Nothing to configure: DATABASE_URL already points here.")
+        return EXIT_OK
+    _out(f"DATABASE_URL={result.url}")
+    if any(key.upper() == "DATABASE_URL" for key in os.environ):
+        _out(
+            "Your environment sets DATABASE_URL to another database; "
+            "set it to the line above to use this one."
+        )
+    else:
+        files = config_files()
+        target = files[-1] if files else user_config_file()
+        _out(f"Put this line in {target} to use this database.")
+    return EXIT_OK
+
+
+def _down_text(outcome: DownOutcome) -> str:
+    from stratakb.core.local_db import CONTAINER, VOLUME
+
+    if outcome == "stopped":
+        return (
+            f"Stopped {CONTAINER}. Its data stays in the Docker volume {VOLUME}; "
+            "stratakb db up starts it again."
+        )
+    if outcome == "not_running":
+        return f"{CONTAINER} is not running."
+    return f"There is no {CONTAINER} container; nothing to stop."
+
+
 # ── add ──────────────────────────────────────────────────
 
 
@@ -227,9 +359,19 @@ def _run_add(args: argparse.Namespace) -> int:
     settings = get_settings()
     if settings.strata_local_only:
         # Before add_folder imports huggingface_hub, which reads these once
-        from stratakb.core.egress import keep_hugging_face_offline
+        from stratakb.core.egress import (
+            embedding_provider,
+            keep_hugging_face_offline,
+            refusal_line,
+        )
 
         keep_hugging_face_offline()
+        # Only the embedding side: add never rewrites queries, so an Anthropic
+        # key or a remote rewrite endpoint does not stop it
+        if provider := embedding_provider(settings):
+            from stratakb.knowledge.add_folder import refused
+
+            return _finish(refused("local_only", refusal_line(provider), root=root), args)
 
     try:
         report = asyncio.run(_add(args, settings))
@@ -254,8 +396,6 @@ def _finish(report: Report, args: argparse.Namespace) -> int:
 
 async def _add(args: argparse.Namespace, settings: Any) -> Report:
     """Plan, confirm and apply one add; every failure becomes a refusal report."""
-    import asyncpg
-
     from stratakb.core.database import close_pool
     from stratakb.core.migrations import MigrationError, ensure_schema
     from stratakb.knowledge import add_folder
@@ -306,13 +446,7 @@ async def _add(args: argparse.Namespace, settings: Any) -> Report:
         finally:
             if progress is not None:
                 progress.finish()
-    except (
-        OSError,
-        asyncpg.PostgresConnectionError,
-        asyncpg.InvalidAuthorizationSpecificationError,
-        asyncpg.InvalidCatalogNameError,
-        asyncpg.InterfaceError,
-    ) as e:
+    except _connection_errors() as e:
         return refuse("db_unreachable", _unreachable_message(target, e), EXIT_DATABASE)
     except MigrationError as e:
         return refuse("schema", str(e), EXIT_DATABASE)
@@ -383,11 +517,12 @@ def _model_notice(plan: Plan, settings: Any) -> None:
 
 def _unreachable_message(target: str, error: BaseException) -> str:
     from stratakb.config import config_files
+    from stratakb.core.local_db import START_HINT
 
     files = ", ".join(str(path) for path in config_files()) or "none"
     return (
         f"Can't reach the database at {target} ({type(error).__name__}). "
-        f"Config files read: {files}. Set DATABASE_URL or STRATAKB_CONFIG."
+        f"Config files read: {files}. Set DATABASE_URL or STRATAKB_CONFIG. {START_HINT}"
     )
 
 

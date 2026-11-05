@@ -17,6 +17,7 @@ import asyncio
 import dataclasses
 import getpass
 import hashlib
+import math
 import os
 import re
 import sys
@@ -24,13 +25,13 @@ from collections import Counter
 from collections.abc import Callable, Collection
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, get_args
 from urllib.parse import urlsplit
 from uuid import uuid4
 
 from stratakb.core.audit import write_audit_log
 from stratakb.core.database import get_pool
-from stratakb.knowledge.ingestion import ingest_documents
+from stratakb.knowledge.ingestion import Outcome, ingest_documents
 from stratakb.knowledge.layers import (
     MAX_OWNER_LENGTH,
     NAME_PATTERN,
@@ -57,7 +58,7 @@ LARGE_RUN_BYTES = 500_000_000
 # ... and so does removing at least this many files, when that is more than half
 LARGE_REMOVAL_MIN = 10
 
-OUTCOME_KEYS = ("added", "updated", "unchanged", "removed", "skipped", "flagged", "failed")
+OUTCOME_KEYS = get_args(Outcome)
 
 # The keys of the JSON report, in order: a stable interface
 REPORT_KEYS = (
@@ -443,8 +444,10 @@ async def plan(database_url: str, path: str | os.PathLike, options: Options) -> 
             f"Invalid layer name '{options.name}'. Must be 3-100 chars, "
             "lowercase alphanumeric with underscores, starting with a letter.",
         )
-    if not options.max_file_size_mb > 0:
-        return _refuse(result, "usage_error", "--max-file-size must be a positive number.")
+    if not (math.isfinite(options.max_file_size_mb) and options.max_file_size_mb > 0):
+        return _refuse(
+            result, "usage_error", "--max-file-size must be a finite number above 0."
+        )
     max_bytes = int(options.max_file_size_mb * 1_000_000)
 
     # 2. Broad paths

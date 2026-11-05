@@ -2,8 +2,10 @@
 
 A preset names the layer, its chunking and routing patterns, and the folders
 (source groups) to ingest, relative to a documents root. Applying a preset
-creates the layer if needed, clears its chunks and ingests every group, so a
-whole documentation domain can be set up, or rebuilt, in one call.
+creates the layer, or brings an existing layer made by this preset up to the
+preset's settings, then clears its chunks and ingests every group, so a whole
+documentation domain can be set up, or rebuilt, in one call. A layer with the
+same name made another way is refused and left alone.
 
 Example (see examples/ for complete presets):
 
@@ -12,6 +14,7 @@ Example (see examples/ for complete presets):
     description: SEPA rulebooks, implementation guidelines and reason codes.
     chunk_config: {chunk_size: 1500, chunk_overlap: 200}
     routing_patterns: ['\\bsepa\\b', '\\bsct\\s*inst\\b']
+    answer_mode: grounded    # or extractive; grounded for a new layer when left out
     sources:
       - name: rulebooks
         path: rulebooks
@@ -29,14 +32,21 @@ import yaml
 
 from stratakb.knowledge.ingestion import _chunk_document, _discover_files, _parse_file
 from stratakb.knowledge.layers import (
+    DEFAULT_ANSWER_MODE,
     LayerExistsError,
+    LayerNotFoundError,
+    LayerOriginError,
     LayerValidationError,
+    _validate_answer_mode,
     _validate_chunk_config,
+    _validate_display_name,
+    _validate_metadata_schema,
     _validate_name,
     _validate_routing_patterns,
     create_layer,
-    get_layer_status,
-    set_origin,
+    get_layer,
+    may_claim,
+    update_layer,
 )
 from stratakb.knowledge.policy import is_secret_name
 
@@ -63,6 +73,8 @@ class LayerPreset:
     metadata_schema: dict = field(default_factory=dict)
     chunk_config: dict = field(default_factory=dict)
     routing_patterns: list[str] = field(default_factory=list)
+    # None: a new layer gets DEFAULT_ANSWER_MODE, an existing layer keeps its mode
+    answer_mode: str | None = None
     sources: list[SourceGroup] = field(default_factory=list)
     # Directory the source paths are relative to, unless the caller overrides it
     root: Path | None = None
@@ -85,8 +97,13 @@ def load_preset(preset_path: str | Path) -> LayerPreset:
             raise LayerValidationError(f"Preset {path} is missing '{key}'.")
 
     _validate_name(data["name"])
+    display_name = _validate_display_name(data["display_name"])
     chunk_config = _validate_chunk_config(data.get("chunk_config") or {})
     routing_patterns = _validate_routing_patterns(data.get("routing_patterns") or [])
+    answer_mode = data.get("answer_mode")
+    if answer_mode is not None:
+        answer_mode = _validate_answer_mode(answer_mode)
+    metadata_schema = _validate_metadata_schema(data.get("metadata_schema") or {})
 
     sources = []
     for raw in data["sources"]:
@@ -105,11 +122,12 @@ def load_preset(preset_path: str | Path) -> LayerPreset:
 
     return LayerPreset(
         name=data["name"],
-        display_name=data["display_name"],
-        description=data.get("description", ""),
-        metadata_schema=data.get("metadata_schema") or {},
+        display_name=display_name,
+        description=data.get("description") or "",
+        metadata_schema=metadata_schema,
         chunk_config=chunk_config,
         routing_patterns=routing_patterns,
+        answer_mode=answer_mode,
         sources=sources,
         root=root,
     )
@@ -213,13 +231,92 @@ def _parse_source_group(preset: LayerPreset, root: Path, group: SourceGroup) -> 
 # ─── Layer creation and ingestion ────────────────────────────────────
 
 
-async def create_preset_layer(database_url: str, preset: LayerPreset) -> dict:
-    """Create the preset's knowledge layer, or report that it already exists.
+def _preset_settings(preset: LayerPreset) -> dict:
+    """The layer settings a preset sets, in reporting order, as they are stored.
 
-    An existing layer with no recorded origin (made before origins were
-    recorded) is marked as coming from this preset.
+    answer_mode is left out when the preset does not set it.
     """
-    origin = f"preset:{preset.name}"
+    settings = {
+        "display_name": preset.display_name,
+        "description": preset.description or "",
+        "metadata_schema": preset.metadata_schema,
+        "chunk_config": preset.chunk_config,
+        "routing_patterns": preset.routing_patterns,
+    }
+    if preset.answer_mode is not None:
+        settings["answer_mode"] = preset.answer_mode
+    return settings
+
+
+def preset_layer_changes(existing: dict, preset: LayerPreset) -> list[str]:
+    """Names of the settings whose stored value differs from the preset's."""
+    return [
+        key for key, value in _preset_settings(preset).items() if existing.get(key) != value
+    ]
+
+
+def _preset_origin(preset: LayerPreset) -> str:
+    """The origin recorded on a layer made by the preset."""
+    return f"preset:{preset.name}"
+
+
+def _refused(origin: str | None, preset: LayerPreset) -> dict:
+    message = (
+        f"The layer '{preset.name}' was not made by this preset "
+        f"(origin '{origin}'). "
+        "Rename the preset's 'name' or delete that layer."
+    )
+    return {"status": "refused", "changes": [], "message": message}
+
+
+def _layer_decision(existing: dict, preset: LayerPreset) -> dict:
+    """What applying the preset does to its existing layer, as the dry run reports it.
+
+    "would_claim" is a layer with no recorded origin whose settings already
+    match: applying the preset only marks it as made by the preset.
+
+    Returns {"status": "refused", "changes": [], "message": ...} or
+    {"status": "would_update" | "would_claim" | "unchanged", "changes": [setting names]}.
+    """
+    if not may_claim(existing.get("origin"), _preset_origin(preset)):
+        return _refused(existing.get("origin"), preset)
+    changes = preset_layer_changes(existing, preset)
+    if changes:
+        status = "would_update"
+    elif existing.get("origin") is None:
+        status = "would_claim"
+    else:
+        status = "unchanged"
+    return {"status": status, "changes": changes}
+
+
+async def check_preset_layer(database_url: str, preset: LayerPreset) -> dict:
+    """Report, without writing, what applying the preset would do to its layer.
+
+    Returns {"status": "would_create" | "would_update" | "would_claim" | "unchanged"
+    | "refused", "changes": [setting names]}, plus a "message" when refused.
+    """
+    try:
+        existing = await get_layer(database_url, name=preset.name)
+    except LayerNotFoundError:
+        return {"status": "would_create", "changes": []}
+    return _layer_decision(existing, preset)
+
+
+async def create_preset_layer(database_url: str, preset: LayerPreset) -> dict:
+    """Create the preset's knowledge layer, or bring an existing one up to the preset.
+
+    An existing layer made by this preset, or with no recorded origin (made
+    before origins were recorded, then marked as coming from this preset),
+    takes the preset's settings; only those that differ are written, in the
+    same UPDATE as the origin, which only succeeds while no other origin is
+    stored. An existing layer made another way is refused and left unchanged.
+
+    Returns {"status": "created" | "updated" | "exists" | "refused",
+    "changes": [setting names]}, plus "layer" when created and "message"
+    otherwise.
+    """
+    origin = _preset_origin(preset)
     try:
         layer = await create_layer(
             database_url,
@@ -229,14 +326,45 @@ async def create_preset_layer(database_url: str, preset: LayerPreset) -> dict:
             metadata_schema=preset.metadata_schema,
             chunk_config=preset.chunk_config,
             routing_patterns=preset.routing_patterns,
+            answer_mode=preset.answer_mode or DEFAULT_ANSWER_MODE,
             origin=origin,
         )
-        return {"status": "created", "layer": layer}
+        return {"status": "created", "layer": layer, "changes": []}
     except LayerExistsError:
-        existing = await get_layer_status(database_url, name=preset.name)
-        if existing.get("origin") is None:
-            await set_origin(database_url, preset.name, origin)
-        return {"status": "exists", "message": f"Layer '{preset.name}' already exists"}
+        existing = await get_layer(database_url, name=preset.name)
+        decision = _layer_decision(existing, preset)
+        if decision["status"] == "refused":
+            logger.warning(
+                "preset_layer_refused", preset=preset.name, origin=existing.get("origin")
+            )
+            return decision
+
+        changes = decision["changes"]
+        # Already this preset's and up to date: no write (it would bump updated_at)
+        if changes or existing.get("origin") is None:
+            settings = _preset_settings(preset)
+            try:
+                await update_layer(
+                    database_url,
+                    preset.name,
+                    claim_origin=origin,
+                    **{key: settings[key] for key in changes},
+                )
+            except LayerOriginError as e:
+                # Another origin was written after the read above
+                logger.warning("preset_layer_refused", preset=preset.name, origin=e.origin)
+                return _refused(e.origin, preset)
+        if not changes:
+            return {
+                "status": "exists",
+                "changes": [],
+                "message": f"Layer '{preset.name}' already exists",
+            }
+        return {
+            "status": "updated",
+            "changes": changes,
+            "message": f"Layer '{preset.name}' updated: {', '.join(changes)}",
+        }
 
 
 async def ingest_preset(

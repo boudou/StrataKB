@@ -1,9 +1,10 @@
 -- StrataKB read-only role grants, by table name
 -- strata_readonly (the role behind READONLY_DATABASE_URL) may SELECT from the
--- layer, ingestion-run, ingested-file and chunk tables only: not the audit log,
--- users, schema_migrations or anything in strata_learning. Older installs got
--- SELECT on every table plus default privileges for future tables; this file
--- removes them. Idempotent, run after 04: applied by the server on startup
+-- layer, ingestion-run, ingested-file, chunk and document tables only: not the
+-- audit log, users, schema_migrations or anything in strata_learning. On a new
+-- database this file runs before 07 creates the document table, so 08 grants
+-- that one; a later run grants it here too. Older installs got SELECT on every
+-- table plus default privileges for future tables; this file removes them. Idempotent, run after 04: applied by the server on startup
 -- (stratakb.core.migrations) and by psql as the database owner. Does nothing
 -- when the role does not exist.
 
@@ -38,4 +39,8 @@ BEGIN
     GRANT USAGE ON SCHEMA strata_core, strata_vectors TO strata_readonly;
     GRANT SELECT ON strata_core.knowledge_layers, strata_core.ingestion_runs,
         strata_core.ingested_files, strata_vectors.chunks TO strata_readonly;
+    -- A re-run must not drop 08's grant
+    IF to_regclass('strata_vectors.documents') IS NOT NULL THEN
+        GRANT SELECT ON strata_vectors.documents TO strata_readonly;
+    END IF;
 END $$;

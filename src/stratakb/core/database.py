@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 from datetime import datetime
 
 import asyncpg
@@ -11,19 +13,33 @@ logger = structlog.get_logger()
 
 # One pool per URL: the SQL tools may connect as a separate read-only role
 _pools: dict[str, asyncpg.Pool] = {}
+# One lock per URL, so concurrent first calls share a single creation
+_locks: dict[str, asyncio.Lock] = {}
 
 
 async def get_pool(database_url: str) -> asyncpg.Pool:
     """Get or create the connection pool for a database URL."""
     pool = _pools.get(database_url)
-    if pool is None:
+    if pool is not None:
+        return pool
+    async with _locks.setdefault(database_url, asyncio.Lock()):
+        pool = _pools.get(database_url)
+        if pool is not None:
+            return pool
         logger.info("creating_db_pool", url=database_url.split("@")[-1])
-        pool = await asyncpg.create_pool(
+        pool = asyncpg.create_pool(
             database_url,
             min_size=2,
             max_size=20,
             command_timeout=30,
         )
+        try:
+            await pool
+        except BaseException:
+            # Cancelled or failed while connecting: close what was opened
+            with contextlib.suppress(Exception):
+                pool.terminate()
+            raise
         _pools[database_url] = pool
         logger.info("db_pool_created")
     return pool
@@ -44,6 +60,8 @@ async def fetch_layers_stamp(database_url: str) -> tuple[int, datetime | None]:
 
 async def close_pool() -> None:
     """Close all connection pools."""
+    # Locks bind to the event loop they first wait on; start fresh each time
+    _locks.clear()
     while _pools:
         _, pool = _pools.popitem()
         await pool.close()

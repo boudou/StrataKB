@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from dataclasses import dataclass
 
 import structlog
 
@@ -17,6 +18,19 @@ from stratakb.learning.signals import detect_reformulation, detect_layer_switch,
 from stratakb.learning.store import LearningStore
 
 logger = structlog.get_logger()
+
+
+@dataclass(frozen=True)
+class _TrackedTool:
+    """What differs between the tracked tools: name and where the result keeps things."""
+
+    name: str
+    chunks_key: str
+    rewritten_key: str | None = None
+
+
+_ASK = _TrackedTool("strata_ask", "retrieved_chunks", "queries_used")
+_SEARCH = _TrackedTool("strata_search", "results")
 
 
 class Tracker:
@@ -36,31 +50,7 @@ class Tracker:
         top_k: int = 10,
     ) -> dict:
         """Wrap strata_ask with tracking; adds interaction_id to the result."""
-        if not self._settings.learning_enabled:
-            return await original_fn(question, layers, include_sources, top_k)
-
-        start = time.monotonic()
-        result = await original_fn(question, layers, include_sources, top_k)
-        elapsed_ms = int((time.monotonic() - start) * 1000)
-
-        if result.get("status") != "ok":
-            return result
-
-        detected = result.get("auto_detected_layers")
-        await self._record_safely(
-            result,
-            tool_name="strata_ask",
-            query_text=question,
-            layers_searched=layers or detected,
-            layers_detected=detected,
-            rewritten_queries=result.get("queries_used"),
-            chunks=result.get("retrieved_chunks", []),
-            confidence_level=result.get("confidence", {}).get("level"),
-            confidence_score=result.get("confidence", {}).get("top_score"),
-            response_time_ms=elapsed_ms,
-        )
-
-        return result
+        return await self._track(_ASK, original_fn, question, layers, include_sources, top_k)
 
     async def track_search(
         self,
@@ -71,30 +61,39 @@ class Tracker:
         metadata_filter: dict | None = None,
     ) -> dict:
         """Wrap strata_search with tracking; adds interaction_id to the result."""
+        return await self._track(_SEARCH, original_fn, query, layers, top_k, metadata_filter)
+
+    async def _track(
+        self,
+        tool: _TrackedTool,
+        original_fn,
+        query: str,
+        layers: list[str] | None,
+        *args,
+    ) -> dict:
+        """Run a tool with its arguments in order and record the ok result."""
         if not self._settings.learning_enabled:
-            return await original_fn(query, layers, top_k, metadata_filter)
+            return await original_fn(query, layers, *args)
 
         start = time.monotonic()
-        result = await original_fn(query, layers, top_k, metadata_filter)
+        result = await original_fn(query, layers, *args)
         elapsed_ms = int((time.monotonic() - start) * 1000)
 
         if result.get("status") != "ok":
             return result
 
-        chunks = result.get("results", [])
-        top_score = max((c.get("score", 0) for c in chunks), default=0)
-
         detected = result.get("auto_detected_layers")
+        confidence = result.get("confidence", {})
         await self._record_safely(
             result,
-            tool_name="strata_search",
+            tool_name=tool.name,
             query_text=query,
             layers_searched=layers or detected,
             layers_detected=detected,
-            rewritten_queries=None,
-            chunks=chunks,
-            confidence_level=None,
-            confidence_score=top_score,
+            rewritten_queries=result.get(tool.rewritten_key) if tool.rewritten_key else None,
+            chunks=result.get(tool.chunks_key, []),
+            confidence_level=confidence.get("level"),
+            confidence_score=confidence.get("top_score"),
             response_time_ms=elapsed_ms,
         )
 
@@ -153,6 +152,7 @@ class Tracker:
             {
                 "chunk_id": c.get("chunk_id"),
                 "score": c.get("score"),
+                "similarity": c.get("similarity"),
                 "layer": c.get("layer"),
                 "source_file": c.get("source_file"),
             }

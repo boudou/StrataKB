@@ -11,6 +11,7 @@ import json
 import re
 import time
 from datetime import datetime
+from typing import Literal, get_args
 
 import asyncpg
 import structlog
@@ -25,6 +26,12 @@ logger = structlog.get_logger()
 NAME_PATTERN = re.compile(r"^[a-z][a-z0-9_]{1,98}[a-z0-9]$")
 REQUIRED_CHUNK_KEYS = {"chunk_size", "chunk_overlap"}
 VALID_STATUSES = {"active", "inactive", "archived"}
+# Chunk settings a layer gets when its chunk_config leaves them out
+DEFAULT_CHUNK_SIZE = 1000
+DEFAULT_CHUNK_OVERLAP = 200
+# How strata_ask answers for a layer (core/sql/12_answer_mode.sql)
+ANSWER_MODES = ("grounded", "extractive")
+DEFAULT_ANSWER_MODE = "grounded"
 # Column sizes in core/sql/05_add_folder.sql
 MAX_ORIGIN_LENGTH = 100
 MAX_OWNER_LENGTH = 200
@@ -35,8 +42,24 @@ _ROOT_PATH_INDEX = "knowledge_layers_root_path_key"
 _LAYER_COLUMNS = (
     "id, name, display_name, description, metadata_schema, chunk_config, "
     "routing_patterns, status, doc_count, chunk_count, last_ingested, "
-    "created_at, updated_at, origin, owner, root_path"
+    "created_at, updated_at, origin, owner, root_path, answer_mode"
 )
+
+# asyncpg returns jsonb as text (the pool sets no JSON codec): decoded by _decode_jsonb
+_JSONB_COLUMNS = ("metadata_schema", "chunk_config", "routing_patterns")
+
+# The only columns _write_columns puts into SQL
+_LayerColumn = Literal[
+    "display_name",
+    "description",
+    "metadata_schema",
+    "chunk_config",
+    "routing_patterns",
+    "answer_mode",
+    "origin",
+    "root_path",
+]
+_WRITABLE_COLUMNS = frozenset(get_args(_LayerColumn))
 
 # Search tools read routing patterns and descriptions through a short-lived
 # cache. This process's create, delete and setters clear it at once; a layer
@@ -69,6 +92,20 @@ class RootTakenError(LayerError):
     """Another layer already holds this folder."""
 
 
+class LayerOriginError(LayerError):
+    """The layer's origin is not the one a write claims; origin holds the stored one."""
+
+    def __init__(self, message: str, origin: str | None) -> None:
+        super().__init__(message)
+        self.origin = origin
+
+
+def _raise_if_root_taken(e: asyncpg.UniqueViolationError, root_path: object) -> None:
+    """Raise RootTakenError when e is the root_path index's violation."""
+    if e.constraint_name == _ROOT_PATH_INDEX:
+        raise RootTakenError(f"Another layer already holds the folder '{root_path}'.") from e
+
+
 def _validate_name(name: str) -> None:
     """Validate layer name: lowercase, alphanumeric + underscores, 3-100 chars."""
     if not name or not NAME_PATTERN.match(name):
@@ -96,8 +133,8 @@ def _validate_chunk_config(chunk_config: dict) -> dict:
         raise LayerValidationError("chunk_config must be a JSON object.")
     # Apply defaults
     config = {
-        "chunk_size": chunk_config.get("chunk_size", 1000),
-        "chunk_overlap": chunk_config.get("chunk_overlap", 200),
+        "chunk_size": chunk_config.get("chunk_size", DEFAULT_CHUNK_SIZE),
+        "chunk_overlap": chunk_config.get("chunk_overlap", DEFAULT_CHUNK_OVERLAP),
         "splitting_strategy": chunk_config.get("splitting_strategy", "recursive"),
     }
     if not isinstance(config["chunk_size"], int) or config["chunk_size"] < 100:
@@ -109,10 +146,47 @@ def _validate_chunk_config(chunk_config: dict) -> dict:
     return config
 
 
+def _validate_answer_mode(answer_mode: str) -> str:
+    """Validate an answer mode: one of ANSWER_MODES."""
+    if answer_mode not in ANSWER_MODES:
+        raise LayerValidationError(
+            f"Invalid answer_mode '{answer_mode}'. Must be one of: {', '.join(ANSWER_MODES)}."
+        )
+    return answer_mode
+
+
 def _validate_length(field: str, value: str | None, limit: int) -> None:
     """Reject a value longer than its column allows."""
     if value is not None and len(value) > limit:
         raise LayerValidationError(f"{field} must be at most {limit} characters.")
+
+
+def _validate_display_name(display_name: object) -> str:
+    """Validate a display name: a non-blank string. Returns it stripped."""
+    if not isinstance(display_name, str) or not display_name.strip():
+        raise LayerValidationError("display_name is required.")
+    return display_name.strip()
+
+
+def _validate_metadata_schema(metadata_schema: object) -> dict:
+    """Validate a metadata schema: a JSON object."""
+    if not isinstance(metadata_schema, dict):
+        raise LayerValidationError("metadata_schema must be a JSON object.")
+    return metadata_schema
+
+
+def _decode_jsonb(value: object) -> object:
+    """Decode a jsonb value asyncpg returned as text; other values as they are."""
+    return json.loads(value) if isinstance(value, str) else value
+
+
+def _layer_dict(row: asyncpg.Record) -> dict:
+    """Return a layer row as a dict, with its jsonb columns decoded."""
+    layer = dict(row)
+    for column in _JSONB_COLUMNS:
+        if column in layer:
+            layer[column] = _decode_jsonb(layer[column])
+    return layer
 
 
 async def list_layers(database_url: str) -> list[dict]:
@@ -126,7 +200,7 @@ async def list_layers(database_url: str) -> list[dict]:
         ORDER BY name
         """
     )
-    return [dict(r) for r in rows]
+    return [_layer_dict(r) for r in rows]
 
 
 async def create_layer(
@@ -141,6 +215,7 @@ async def create_layer(
     origin: str | None = None,
     owner: str | None = None,
     root_path: str | None = None,
+    answer_mode: str = DEFAULT_ANSWER_MODE,
 ) -> dict:
     """Create a new knowledge layer.
 
@@ -152,16 +227,11 @@ async def create_layer(
     Raises LayerValidationError if inputs are invalid.
     """
     _validate_name(name)
-
-    if not display_name or not display_name.strip():
-        raise LayerValidationError("display_name is required.")
-
-    meta = metadata_schema or {}
-    if not isinstance(meta, dict):
-        raise LayerValidationError("metadata_schema must be a JSON object.")
-
+    display = _validate_display_name(display_name)
+    meta = _validate_metadata_schema(metadata_schema or {})
     chunk_cfg = _validate_chunk_config(chunk_config or {})
     routing = _validate_routing_patterns(routing_patterns or [])
+    mode = _validate_answer_mode(answer_mode)
     _validate_length("origin", origin, MAX_ORIGIN_LENGTH)
     _validate_length("owner", owner, MAX_OWNER_LENGTH)
 
@@ -172,12 +242,12 @@ async def create_layer(
             f"""
             INSERT INTO strata_core.knowledge_layers
                 (name, display_name, description, metadata_schema, chunk_config,
-                 routing_patterns, origin, owner, root_path)
-            VALUES ($1, $2, $3, $4::jsonb, $5::jsonb, $6::jsonb, $7, $8, $9)
+                 routing_patterns, origin, owner, root_path, answer_mode)
+            VALUES ($1, $2, $3, $4::jsonb, $5::jsonb, $6::jsonb, $7, $8, $9, $10)
             RETURNING {_LAYER_COLUMNS}
             """,
             name,
-            display_name.strip(),
+            display,
             description or "",
             _json_str(meta),
             _json_str(chunk_cfg),
@@ -185,17 +255,35 @@ async def create_layer(
             origin,
             owner,
             root_path,
+            mode,
         )
     except asyncpg.UniqueViolationError as e:
-        if e.constraint_name == _ROOT_PATH_INDEX:
-            raise RootTakenError(
-                f"Another layer already holds the folder '{root_path}'."
-            ) from e
+        _raise_if_root_taken(e, root_path)
         raise LayerExistsError(f"Knowledge layer '{name}' already exists.")
 
     _routing_cache.clear()
     logger.info("layer_created", layer=name)
-    return dict(row)
+    return _layer_dict(row)
+
+
+async def get_layer(database_url: str, *, name: str) -> dict:
+    """Return one knowledge layer's row (no ingestion statistics).
+
+    Raises LayerNotFoundError if layer doesn't exist.
+    """
+    await ensure_schema(database_url)
+    pool = await get_pool(database_url)
+    row = await pool.fetchrow(
+        f"""
+        SELECT {_LAYER_COLUMNS}
+        FROM strata_core.knowledge_layers
+        WHERE name = $1
+        """,
+        name,
+    )
+    if row is None:
+        raise LayerNotFoundError(f"Knowledge layer '{name}' not found.")
+    return _layer_dict(row)
 
 
 async def get_layer_status(database_url: str, *, name: str) -> dict:
@@ -211,6 +299,7 @@ async def get_layer_status(database_url: str, *, name: str) -> dict:
                kl.status, kl.doc_count, kl.chunk_count, kl.last_ingested,
                kl.chunk_config, kl.metadata_schema, kl.routing_patterns,
                kl.created_at, kl.updated_at, kl.origin, kl.owner, kl.root_path,
+               kl.answer_mode,
                (SELECT count(*) FROM strata_core.ingestion_runs ir
                 WHERE ir.layer_id = kl.id) AS ingestion_run_count,
                (SELECT max(ir.completed_at) FROM strata_core.ingestion_runs ir
@@ -223,7 +312,7 @@ async def get_layer_status(database_url: str, *, name: str) -> dict:
     )
     if row is None:
         raise LayerNotFoundError(f"Knowledge layer '{name}' not found.")
-    return dict(row)
+    return _layer_dict(row)
 
 
 async def find_layer_by_root(database_url: str, root_path: str) -> dict | None:
@@ -238,7 +327,7 @@ async def find_layer_by_root(database_url: str, root_path: str) -> dict | None:
         """,
         root_path,
     )
-    return dict(row) if row is not None else None
+    return _layer_dict(row) if row is not None else None
 
 
 async def find_overlapping_roots(database_url: str, root_path: str) -> list[dict]:
@@ -262,7 +351,7 @@ async def find_overlapping_roots(database_url: str, root_path: str) -> list[dict
         """,
         root_path,
     )
-    return [dict(r) for r in rows]
+    return [_layer_dict(r) for r in rows]
 
 
 async def layer_holds_folder(database_url: str, layer_name: str, root_path: str) -> bool:
@@ -297,29 +386,88 @@ async def layer_holds_folder(database_url: str, layer_name: str, root_path: str)
     return not row["other_root"] and not row["legacy"]
 
 
-async def _set_column(
-    database_url: str, layer_name: str, column: str, value: str | None
-) -> None:
-    """Set one column of a layer and bump updated_at.
+def may_claim(stored_origin: str | None, claim_origin: str) -> bool:
+    """Who may claim a layer for claim_origin: no origin recorded yet, or the same one.
 
-    column is always a literal from the setters below, never caller input.
+    _write_columns applies the same rule in its SQL guard, so that the check
+    and the write are one statement; a test keeps the two in agreement.
     """
+    return stored_origin is None or stored_origin == claim_origin
+
+
+async def _write_columns(
+    database_url: str,
+    name: str,
+    values: dict[_LayerColumn, object],
+    *,
+    claim_origin: str | None = None,
+) -> dict:
+    """Write the given columns of a layer in one UPDATE and bump updated_at.
+
+    values maps a column to its value; columns in _JSONB_COLUMNS are
+    JSON-encoded and cast to jsonb. With claim_origin, the UPDATE also sets
+    origin to it, and only succeeds while may_claim(stored origin, claim_origin).
+
+    Returns the updated layer record.
+    Raises ValueError if a column is not one of _WRITABLE_COLUMNS, or if values
+    holds origin together with claim_origin.
+    Raises LayerNotFoundError if the layer doesn't exist.
+    Raises LayerOriginError if claim_origin is given and another origin is stored.
+    Raises RootTakenError if another layer already holds the root_path written.
+    """
+    # Checked at run time too: the column names go into the SQL text
+    unknown = [column for column in values if column not in _WRITABLE_COLUMNS]
+    if unknown:
+        raise ValueError(f"Not a writable layer column: {unknown[0]!r}")
+    if claim_origin is not None and "origin" in values:
+        raise ValueError("Pass origin through claim_origin only, not in values.")
+
+    columns = dict(values)
+    if claim_origin is not None:
+        columns["origin"] = claim_origin
+    params: list[object] = [name]
+    assignments = []
+    for column, value in columns.items():
+        if column in _JSONB_COLUMNS:
+            params.append(json.dumps(value))
+            assignments.append(f"{column} = ${len(params)}::jsonb")
+        else:
+            params.append(value)
+            assignments.append(f"{column} = ${len(params)}")
+    guard = ""
+    if claim_origin is not None:
+        params.append(claim_origin)
+        guard = f" AND (origin IS NULL OR origin = ${len(params)})"  # may_claim, in SQL
+
     await ensure_schema(database_url)
     pool = await get_pool(database_url)
-    row = await pool.fetchrow(
-        f"""
-        UPDATE strata_core.knowledge_layers
-        SET {column} = $2, updated_at = NOW()
-        WHERE name = $1
-        RETURNING id
-        """,
-        layer_name,
-        value,
-    )
+    try:
+        row = await pool.fetchrow(
+            f"""
+            UPDATE strata_core.knowledge_layers
+            SET {", ".join(assignments)}, updated_at = NOW()
+            WHERE name = $1{guard}
+            RETURNING {_LAYER_COLUMNS}
+            """,
+            *params,
+        )
+    except asyncpg.UniqueViolationError as e:
+        _raise_if_root_taken(e, columns.get("root_path"))
+        raise
     if row is None:
-        raise LayerNotFoundError(f"Knowledge layer '{layer_name}' not found.")
+        # The guarded write changed nothing: find out why (the layer may be gone by now)
+        stored = await pool.fetchrow(
+            "SELECT origin FROM strata_core.knowledge_layers WHERE name = $1", name
+        )
+        if stored is None or claim_origin is None:
+            raise LayerNotFoundError(f"Knowledge layer '{name}' not found.")
+        raise LayerOriginError(
+            f"Knowledge layer '{name}' has origin '{stored['origin']}', not '{claim_origin}'.",
+            stored["origin"],
+        )
     _routing_cache.clear()
-    logger.info("layer_updated", layer=layer_name, field=column)
+    logger.info("layer_updated", layer=name, fields=list(columns))
+    return _layer_dict(row)
 
 
 async def set_root_path(database_url: str, layer_name: str, root_path: str | None) -> None:
@@ -328,22 +476,25 @@ async def set_root_path(database_url: str, layer_name: str, root_path: str | Non
     Raises LayerNotFoundError if the layer doesn't exist.
     Raises RootTakenError if another layer already holds root_path.
     """
-    try:
-        await _set_column(database_url, layer_name, "root_path", root_path)
-    except asyncpg.UniqueViolationError as e:
-        if e.constraint_name == _ROOT_PATH_INDEX:
-            raise RootTakenError(
-                f"Another layer already holds the folder '{root_path}'."
-            ) from e
-        raise
+    await _write_columns(database_url, layer_name, {"root_path": root_path})
+
+
+def _validate_description(description: object) -> str:
+    """Return description unchanged; raise LayerValidationError if it is not a string."""
+    if not isinstance(description, str):
+        raise LayerValidationError("description must be a string.")
+    return description
 
 
 async def set_description(database_url: str, layer_name: str, description: str) -> None:
     """Set a layer's description.
 
     Raises LayerNotFoundError if the layer doesn't exist.
+    Raises LayerValidationError if description is not a string.
     """
-    await _set_column(database_url, layer_name, "description", description)
+    await _write_columns(
+        database_url, layer_name, {"description": _validate_description(description)}
+    )
 
 
 async def set_origin(database_url: str, layer_name: str, origin: str | None) -> None:
@@ -353,7 +504,61 @@ async def set_origin(database_url: str, layer_name: str, origin: str | None) -> 
     Raises LayerValidationError if origin is longer than its column.
     """
     _validate_length("origin", origin, MAX_ORIGIN_LENGTH)
-    await _set_column(database_url, layer_name, "origin", origin)
+    await _write_columns(database_url, layer_name, {"origin": origin})
+
+
+async def set_layer_answer_mode(database_url: str, layer_name: str, answer_mode: str) -> None:
+    """Set how strata_ask answers for a layer ("grounded" or "extractive").
+
+    Raises LayerNotFoundError if the layer doesn't exist.
+    Raises LayerValidationError if answer_mode is not one of ANSWER_MODES.
+    """
+    _validate_answer_mode(answer_mode)
+    await _write_columns(database_url, layer_name, {"answer_mode": answer_mode})
+
+
+async def update_layer(
+    database_url: str,
+    name: str,
+    *,
+    display_name: str | None = None,
+    description: str | None = None,
+    metadata_schema: dict | None = None,
+    chunk_config: dict | None = None,
+    routing_patterns: list[str] | None = None,
+    answer_mode: str | None = None,
+    claim_origin: str | None = None,
+) -> dict:
+    """Set the given settings of a layer in one UPDATE; None leaves a setting as it is.
+
+    With claim_origin, the same UPDATE sets the layer's origin to it, and only
+    while the stored origin is NULL or already claim_origin.
+
+    Returns the updated layer record (unchanged when nothing is given).
+    Raises LayerNotFoundError if the layer doesn't exist.
+    Raises LayerValidationError if a value is invalid (a non-string description
+    too); nothing is written then.
+    Raises LayerOriginError if another origin is stored; nothing is written then.
+    """
+    values: dict[_LayerColumn, object] = {}
+    if display_name is not None:
+        values["display_name"] = _validate_display_name(display_name)
+    if description is not None:
+        values["description"] = _validate_description(description)
+    if metadata_schema is not None:
+        values["metadata_schema"] = _validate_metadata_schema(metadata_schema)
+    if chunk_config is not None:
+        values["chunk_config"] = _validate_chunk_config(chunk_config)
+    if routing_patterns is not None:
+        values["routing_patterns"] = _validate_routing_patterns(routing_patterns)
+    if answer_mode is not None:
+        values["answer_mode"] = _validate_answer_mode(answer_mode)
+    if claim_origin is not None:
+        _validate_length("origin", claim_origin, MAX_ORIGIN_LENGTH)
+
+    if not values and claim_origin is None:
+        return await get_layer(database_url, name=name)
+    return await _write_columns(database_url, name, values, claim_origin=claim_origin)
 
 
 async def delete_layer(database_url: str, *, name: str) -> dict:
@@ -419,9 +624,7 @@ async def get_layer_routing(database_url: str) -> dict:
     )
     routing: dict = {"patterns": {}, "descriptions": {}}
     for row in rows:
-        patterns = row["routing_patterns"]
-        if isinstance(patterns, str):
-            patterns = json.loads(patterns)
+        patterns = _decode_jsonb(row["routing_patterns"])
         if patterns:
             routing["patterns"][row["name"]] = patterns
         description = row["description"] or ""

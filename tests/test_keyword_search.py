@@ -187,3 +187,80 @@ async def test_fulltext_limit_keeps_best_ranked():
     finally:
         async with pool.acquire() as conn:
             await conn.execute("DELETE FROM strata_vectors.chunks WHERE layer_name = $1", layer)
+
+
+# ==========================================
+# Keyword-only chunks reach hybrid results
+# ==========================================
+
+# Eight chunks sit right on the query vector; one is orthogonal to it and holds the
+# identifier. With top_k=2 the vector leg fills all top_k * 3 rows with the eight.
+_CLOSE_CHUNKS = 8
+
+
+@pytest.mark.asyncio
+async def test_keyword_only_chunk_reaches_results(monkeypatch, vacuumed_chunks):
+    from unittest.mock import AsyncMock, patch
+
+    from stratakb.config import get_settings
+    from stratakb.core.database import get_pool
+    from stratakb.rag.retriever import search_chunks
+
+    settings = get_settings()
+    pool = await get_pool(settings.database_url)
+    layer = f"kwslot_{uuid.uuid4().hex[:8]}"
+    h = settings.embedding_dimensions // 2
+    close = [1.0] * h + [0.0] * (settings.embedding_dimensions - h)
+    orthogonal = [0.0] * h + [1.0] * (settings.embedding_dimensions - h)
+    close_vector = "[" + ",".join(str(x) for x in close) + "]"
+    orthogonal_vector = "[" + ",".join(str(x) for x in orthogonal) + "]"
+    insert = """
+        INSERT INTO strata_vectors.chunks (layer_name, content, embedding, source_file)
+        VALUES ($1, $2, $3::vector, $4) RETURNING id
+    """
+    monkeypatch.setattr("stratakb.rag.retriever._get_cache", lambda: None)
+    try:
+        async with pool.acquire() as conn:
+            close_ids = set()
+            for i in range(_CLOSE_CHUNKS):
+                close_ids.add(str(await conn.fetchval(
+                    insert, layer, f"Note {i} on payment fees and reporting.",
+                    close_vector, f"close_{i}",
+                )))
+            ac04 = str(await conn.fetchval(
+                insert, layer, "Reason code AC04 means the account is closed.",
+                orthogonal_vector, "ac04",
+            ))
+
+        # Precondition: the vector leg is full and misses the keyword chunk
+        sql, params = _build_hybrid_sql(close_vector, "AC04", [layer], top_k=2)
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(sql, *params)
+        semantic = [str(r["id"]) for r in rows if r["source"] == "semantic"]
+        keyword = [str(r["id"]) for r in rows if r["source"] == "fulltext"]
+        assert len(semantic) == 6
+        assert ac04 not in semantic
+        assert keyword == [ac04]
+
+        with patch(
+            "stratakb.rag.retriever.embed_texts",
+            new_callable=AsyncMock,
+            return_value=[close],
+        ):
+            results = await search_chunks(
+                settings.database_url, None, "AC04", layers=[layer], top_k=2
+            )
+            assert len(results) == 2
+            assert results[0].chunk_id in close_ids
+            assert results[1].chunk_id == ac04
+
+            no_slots = settings.model_copy(update={"hybrid_keyword_slots": 0})
+            with patch("stratakb.config.get_settings", return_value=no_slots):
+                results = await search_chunks(
+                    settings.database_url, None, "AC04", layers=[layer], top_k=2
+                )
+            assert len(results) == 2
+            assert ac04 not in {r.chunk_id for r in results}
+    finally:
+        async with pool.acquire() as conn:
+            await conn.execute("DELETE FROM strata_vectors.chunks WHERE layer_name = $1", layer)

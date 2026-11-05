@@ -9,6 +9,19 @@ import pytest
 
 
 @pytest.fixture(scope="session", autouse=True)
+def _import_settings_readers():
+    """Import the module that binds get_settings at import, with no patch active.
+
+    stratakb.learning.tracker does `from stratakb.config import get_settings`.
+    If its first import happened inside a test that patches
+    stratakb.config.get_settings, the patch would stay in it for every later
+    test. Session fixtures are set up before any function fixture, so this
+    import always comes first.
+    """
+    import stratakb.learning.tracker  # noqa: F401
+
+
+@pytest.fixture(scope="session", autouse=True)
 def _migrate_test_db():
     """Bring the test database up to the current schema once per session.
 
@@ -27,6 +40,24 @@ def _migrate_test_db():
         pass
     finally:
         migrations._checked.clear()
+
+
+@pytest.fixture
+async def vacuumed_chunks():
+    """Vacuum the chunks table before a test that ranks through the HNSW index.
+
+    Many tests insert and then delete the same fake embeddings. Until vacuum
+    repairs the HNSW graph, rows added afterwards can be unreachable from its
+    entry point, so an index scan returns fewer rows than the table holds.
+    Autovacuum does this in a running server; a test can run first.
+    """
+    from stratakb.config import get_settings
+
+    conn = await asyncpg.connect(get_settings().database_url)
+    try:
+        await conn.execute("VACUUM strata_vectors.chunks")
+    finally:
+        await conn.close()
 
 
 @pytest.fixture(autouse=True)

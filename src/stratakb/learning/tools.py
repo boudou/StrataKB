@@ -7,7 +7,8 @@ from __future__ import annotations
 
 from mcp.server.fastmcp import FastMCP
 
-from stratakb.core.auth import require_role
+from stratakb.core.audit import write_audit_log
+from stratakb.core.auth import get_current_user, require_role
 from stratakb.core.logging import log_tool_call
 
 
@@ -89,6 +90,27 @@ def register_learning_tools(mcp: FastMCP, database_url: str) -> None:
                     metadata={"chunk_id": chunk_id},
                 )
 
+        # The suggested query and layer are caller free text: name them only
+        extras = []
+        if correct_layer:
+            extras.append("correct_layer")
+        if better_query:
+            extras.append("better_query")
+        if chunk_feedback:
+            extras.append(f"{len(chunk_feedback)} chunk ratings")
+        summary = "Rated helpful" if helpful else "Rated not helpful"
+        if extras:
+            summary += ", with " + ", ".join(extras)
+        user_id, _ = get_current_user()
+        await write_audit_log(
+            database_url,
+            user_id=user_id,
+            action="feedback",
+            tool_name="strata_feedback",
+            parameters={"interaction_id": interaction_id, "helpful": helpful},
+            result_summary=summary,
+        )
+
         return {"status": "ok", "message": "Feedback recorded. Thank you!"}
 
     @mcp.tool()
@@ -137,4 +159,17 @@ def register_learning_tools(mcp: FastMCP, database_url: str) -> None:
 
         store = LearningStore(database_url)
         result = await store.reset(layer=layer)
+        user_id, _ = get_current_user()
+        await write_audit_log(
+            database_url,
+            user_id=user_id,
+            action="reset_learning",
+            tool_name="strata_reset_learning",
+            parameters={"scope": "layer", "layer": layer} if layer else {"scope": "all"},
+            result_summary=(
+                f"Reset learned data for layer '{layer}'"
+                if layer
+                else "Reset all learning data, including interaction history"
+            ),
+        )
         return {"status": "ok", **result}

@@ -21,12 +21,14 @@ import pytest
 
 from stratakb.config import (
     DOTENV_WARNING,
+    LOCAL_DB_PORT,
     config_file_missing,
     config_files,
     dotenv_warning,
     get_settings,
     user_config_file,
 )
+from stratakb.core import local_db
 
 
 @pytest.fixture(autouse=True)
@@ -54,6 +56,20 @@ def _user_file(text: str) -> Path:
 def test_no_config_files_by_default():
     assert config_files() == []
     assert get_settings().strata_role == "viewer"
+
+
+def test_default_database_url_uses_ipv4_loopback(monkeypatch):
+    # localhost resolves to ::1 first on Windows, and Docker in WSL forwards IPv4 only
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    url = get_settings().database_url
+    assert "@127.0.0.1:5433/" in url
+    assert "localhost" not in url
+
+
+def test_default_database_url_is_the_local_database(monkeypatch):
+    # One source for the defaults: stratakb db up's container is the default database
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    assert local_db.points_here(get_settings().database_url, LOCAL_DB_PORT)
 
 
 def test_user_file_is_under_the_user_folder(tmp_path):

@@ -1,6 +1,8 @@
-"""Tests for the stratakb command: dispatch, confirmations, exit codes and rendering.
+"""Tests for the stratakb command: dispatch, confirmations, exit codes and rendering,
+and the db up / db down subcommands.
 
-add_folder.plan and add_folder.apply are patched, so no database is needed.
+add_folder.plan and add_folder.apply are patched, and so are the docker calls,
+so no database and no Docker are needed.
 """
 
 from __future__ import annotations
@@ -8,6 +10,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import typing
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import asyncpg
@@ -15,7 +18,8 @@ import pytest
 import structlog
 
 from stratakb import cli
-from stratakb.config import Settings
+from stratakb.config import Settings, user_config_file
+from stratakb.core import local_db
 from stratakb.core.migrations import MigrationError
 from stratakb.knowledge import add_folder
 from stratakb.knowledge.add_folder import REPORT_KEYS, Plan, Report
@@ -79,8 +83,11 @@ def _report(**overrides) -> Report:
 
 @pytest.fixture(autouse=True)
 def cli_env(monkeypatch, tmp_path):
-    """No config files, no ./.env, no logging changes, no real database or model."""
+    """No config files, no ./.env, no DATABASE_URL in the environment, no logging
+    changes, no real database or model."""
     monkeypatch.delenv("STRATAKB_CONFIG", raising=False)
+    # The suite runs with DATABASE_URL set; db up reports on it
+    monkeypatch.delenv("DATABASE_URL", raising=False)
     monkeypatch.setenv("APPDATA", str(tmp_path / "appdata"))
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
     monkeypatch.chdir(tmp_path)
@@ -134,6 +141,20 @@ def test_serve_starts_the_server():
 def test_usage_error_exits_2(capsys):
     assert cli.main(["add", ROOT, "--max-file-size", "lots"]) == 2
     assert "--max-file-size" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("size", ["inf", "-inf", "nan", "0", "-2"])
+def test_max_file_size_must_be_finite_and_positive(capsys, size):
+    plan_mock = AsyncMock()
+    with patch.object(add_folder, "plan", plan_mock):
+        assert cli.main(["add", ROOT, "--max-file-size", size]) == 2
+        assert "--max-file-size" in capsys.readouterr().err
+
+        assert cli.main(["add", ROOT, "--max-file-size", size, "--json"]) == 2
+        data = json.loads(capsys.readouterr().out)
+    assert data["reason"] == "usage_error"
+    assert data["exit_code"] == 2
+    plan_mock.assert_not_called()
 
 
 def test_usage_error_with_json_prints_a_refusal(capsys):
@@ -198,7 +219,18 @@ def test_exit_3_when_the_database_is_unreachable(cli_env, capsys):
         "Can't reach the database at db.example:5433 (OSError). "
         "Config files read: none. Set DATABASE_URL or STRATAKB_CONFIG."
     ) in captured.err
+    assert captured.err.rstrip().endswith("Run stratakb db up to start a local database.")
     assert "secret_pw" not in captured.err
+
+
+def test_unreachable_json_hint_names_db_up(cli_env, capsys):
+    cli_env["schema"].side_effect = OSError("connection refused")
+    code, _, _ = _run(["add", ROOT, "--json"])
+    assert code == 3
+    captured = capsys.readouterr()
+    # The JSON report carries no hint; --json prints it on stderr
+    assert json.loads(captured.out)["reason"] == "db_unreachable"
+    assert captured.err.rstrip().endswith(local_db.START_HINT)
 
 
 @pytest.mark.parametrize(
@@ -357,6 +389,96 @@ def test_local_only_keeps_hugging_face_offline(cli_env, monkeypatch):
     assert os.environ["TRANSFORMERS_OFFLINE"] == "1"
 
 
+REMOTE_EMBEDDINGS = {"embedding_backend": "openai", "embedding_base_url": "http://gpu-box:11434/v1"}
+
+
+@pytest.fixture
+def hf_flags(monkeypatch):
+    """Put back the offline flags that a local-only add sets."""
+    monkeypatch.setenv("HF_HUB_OFFLINE", "0")
+    monkeypatch.setenv("TRANSFORMERS_OFFLINE", "0")
+
+
+def test_local_only_refuses_a_remote_embedding_url(cli_env, hf_flags, capsys):
+    settings = _settings(strata_local_only=True, **REMOTE_EMBEDDINGS)
+    with patch("stratakb.config.get_settings", return_value=settings):
+        code, plan_mock, apply_mock = _run(["add", ROOT])
+    assert code == 2
+    plan_mock.assert_not_called()
+    apply_mock.assert_not_called()
+    cli_env["schema"].assert_not_awaited()
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "EMBEDDING_BASE_URL" in captured.err
+    assert "STRATA_LOCAL_ONLY" in captured.err
+    assert "gpu-box" in captured.err
+
+
+def test_local_only_refusal_json(hf_flags, capsys):
+    settings = _settings(strata_local_only=True, **REMOTE_EMBEDDINGS)
+    with patch("stratakb.config.get_settings", return_value=settings):
+        code, _, apply_mock = _run(["add", ROOT, "--json"])
+    assert code == 2
+    apply_mock.assert_not_called()
+    data = json.loads(capsys.readouterr().out)
+    assert tuple(data) == REPORT_KEYS
+    assert data["reason"] == "local_only"
+    assert data["exit_code"] == 2
+    assert data["layer"] is None
+    assert not any(data["counts"].values())
+
+
+def test_local_only_refuses_the_openai_default(hf_flags, monkeypatch, capsys):
+    monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+    monkeypatch.delenv("EMBEDDING_BASE_URL", raising=False)
+    settings = _settings(strata_local_only=True, embedding_backend="openai")
+    with patch("stratakb.config.get_settings", return_value=settings):
+        code, _, apply_mock = _run(["add", ROOT])
+    assert code == 2
+    apply_mock.assert_not_called()
+    assert "EMBEDDING_BACKEND" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    "rewrite",
+    [
+        {"anthropic_api_key": "sk-ant-test"},
+        {
+            "query_rewrite_provider": "openai_compatible",
+            "query_rewrite_base_url": "http://gpu-box:11434/v1",
+            "query_rewrite_model": "llama3.2",
+        },
+    ],
+    ids=["anthropic_key", "remote_rewrite"],
+)
+def test_local_only_ignores_query_rewriting(hf_flags, rewrite):
+    settings = _settings(strata_local_only=True, embedding_backend="local", **rewrite)
+    with patch("stratakb.config.get_settings", return_value=settings):
+        code, _, apply_mock = _run(["add", ROOT])
+    assert code == 0
+    apply_mock.assert_awaited_once()
+
+
+def test_local_only_allows_a_loopback_embedding_url(hf_flags):
+    settings = _settings(
+        strata_local_only=True,
+        embedding_backend="openai",
+        embedding_base_url="http://127.0.0.1:11434/v1",
+    )
+    with patch("stratakb.config.get_settings", return_value=settings):
+        code, _, apply_mock = _run(["add", ROOT])
+    assert code == 0
+    apply_mock.assert_awaited_once()
+
+
+def test_remote_embedding_url_runs_when_local_only_is_off():
+    settings = _settings(**REMOTE_EMBEDDINGS)
+    with patch("stratakb.config.get_settings", return_value=settings):
+        code, _, apply_mock = _run(["add", ROOT])
+    assert code == 0
+    apply_mock.assert_awaited_once()
+
+
 def test_add_leaves_offline_flags_when_local_only_is_off(monkeypatch):
     monkeypatch.setenv("HF_HUB_OFFLINE", "0")
     code, _, _ = _run(["add", ROOT])
@@ -423,3 +545,312 @@ def test_text_quiet_rerun():
     text = cli.render_text(_report(created=False, counts=counts, files=[]))
     assert text.startswith("Synced layer docs in the database at db.example:5433")
     assert "  4 unchanged" in text
+
+
+# ── db up / db down ──────────────────────────────────────
+
+CONTAINER_URL = "postgresql://strata:strata_dev_password@127.0.0.1:5433/strata"
+NO_SUCH = (1, "", "Error: No such container: stratakb-db")
+
+
+def _fake_docker(status=NO_SUCH, port="127.0.0.1:5433", **answers):
+    """An AsyncMock for local_db._docker that answers by the first argument.
+
+    status is the answer to `container inspect`: a state string or a tuple.
+    """
+    defaults = {
+        "info": (0, "27.0.1", ""),
+        "container": status if isinstance(status, tuple) else (0, status, ""),
+        "run": (0, "abc123", ""),
+        "start": (0, "stratakb-db", ""),
+        "unpause": (0, "stratakb-db", ""),
+        "stop": (0, "stratakb-db", ""),
+        "port": (0, port, ""),
+        "rm": (0, "stratakb-db", ""),
+    }
+    defaults.update(answers)
+
+    async def answer(*args, timeout=None):
+        return defaults[args[0]]
+
+    return AsyncMock(side_effect=answer)
+
+
+def _db(argv, docker=None, wait_ready=None):
+    docker = docker or _fake_docker()
+    wait_ready = wait_ready or AsyncMock()
+    with (
+        patch.object(local_db, "_docker", docker),
+        patch.object(local_db, "_wait_ready", wait_ready),
+    ):
+        code = cli.main(argv)
+    return code, docker, wait_ready
+
+
+def _verbs(docker) -> list[str]:
+    return [c.args[0] for c in docker.call_args_list]
+
+
+def test_db_up_without_docker_exits_3(capsys):
+    with patch.object(local_db.shutil, "which", return_value=None):
+        code = cli.main(["db", "up"])
+    assert code == 3
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    lines = captured.err.strip().splitlines()
+    assert len(lines) == 1
+    assert "docker is not on PATH" in lines[0]
+    assert "https://docs.docker.com/get-docker/" in lines[0]
+
+
+def test_db_up_docker_not_runnable_exits_3(capsys):
+    with (
+        patch.object(local_db.shutil, "which", return_value="C:/bin/docker.exe"),
+        patch.object(
+            local_db.asyncio,
+            "create_subprocess_exec",
+            AsyncMock(side_effect=PermissionError("blocked")),
+        ),
+    ):
+        code = cli.main(["db", "up"])
+    assert code == 3
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "could not be run (PermissionError)" in captured.err
+
+
+def test_db_up_daemon_down_exits_3(capsys):
+    docker = _fake_docker(info=(1, "", "Cannot connect to the Docker daemon"))
+    code, docker, wait_ready = _db(["db", "up"], docker)
+    assert code == 3
+    assert _verbs(docker) == ["info"]
+    wait_ready.assert_not_called()
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "daemon is not running" in captured.err
+
+
+def test_db_up_creates_the_container(cli_env, capsys):
+    code, docker, wait_ready = _db(["db", "up"])
+    assert code == 0
+    run = next(c.args for c in docker.call_args_list if c.args[0] == "run")
+    assert list(run) == [
+        "run", "-d",
+        "--name", "stratakb-db",
+        "--restart", "unless-stopped",
+        "-e", "POSTGRES_DB=strata",
+        "-e", "POSTGRES_USER=strata",
+        "-e", "POSTGRES_PASSWORD=strata_dev_password",
+        "-p", "127.0.0.1:5433:5432",
+        "-v", "stratakb-data:/var/lib/postgresql/data",
+        "pgvector/pgvector:pg16",
+    ]  # fmt: skip
+    wait_ready.assert_awaited_once_with(CONTAINER_URL)
+    cli_env["schema"].assert_awaited_once_with(CONTAINER_URL)
+    captured = capsys.readouterr()
+    assert "Database ready at 127.0.0.1:5433 (container stratakb-db, created)." in captured.out
+    assert f"DATABASE_URL={CONTAINER_URL}" in captured.out
+    assert f"Put this line in {user_config_file()} to use this database." in captured.out
+    # Progress goes to stderr; the container id docker run prints is never echoed
+    assert "Creating the container stratakb-db" in captured.err
+    assert "abc123" not in captured.out + captured.err
+
+
+def test_db_up_nothing_to_configure(capsys):
+    default_url = Settings(_env_file=None).database_url
+    with patch("stratakb.config.get_settings", return_value=_settings(database_url=default_url)):
+        code, _, _ = _db(["db", "up"])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "Nothing to configure: DATABASE_URL already points here." in out
+    assert "strata_dev_password" not in out
+
+
+def test_db_up_environment_sets_database_url(monkeypatch, capsys):
+    monkeypatch.setenv("DATABASE_URL", DB_URL)
+    code, _, _ = _db(["db", "up"])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert f"DATABASE_URL={CONTAINER_URL}" in out
+    assert "Your environment sets DATABASE_URL to another database" in out
+
+
+def test_db_up_already_running(cli_env, capsys):
+    code, docker, wait_ready = _db(["db", "up"], _fake_docker("running"))
+    assert code == 0
+    assert not {"run", "start", "unpause"} & set(_verbs(docker))
+    wait_ready.assert_awaited_once_with(CONTAINER_URL)
+    cli_env["schema"].assert_awaited_once_with(CONTAINER_URL)
+    assert "(container stratakb-db, already running)." in capsys.readouterr().out
+
+
+def test_db_up_starts_a_stopped_container(capsys):
+    code, docker, _ = _db(["db", "up"], _fake_docker("exited"))
+    assert code == 0
+    verbs = _verbs(docker)
+    assert verbs.count("start") == 1
+    assert "run" not in verbs
+    start = next(c.args for c in docker.call_args_list if c.args[0] == "start")
+    assert start == ("start", "stratakb-db")
+    assert "(container stratakb-db, started)." in capsys.readouterr().out
+
+
+def test_db_up_unpauses(capsys):
+    code, docker, _ = _db(["db", "up"], _fake_docker("paused"))
+    assert code == 0
+    verbs = _verbs(docker)
+    assert verbs.count("unpause") == 1
+    assert "start" not in verbs
+    assert "run" not in verbs
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "docker: Error response from daemon: ... port is already allocated.",
+        "Bind for 127.0.0.1:5433 failed: address already in use",
+        # Docker Desktop on Windows, when a host process holds the port
+        "docker: Error response from daemon: Ports are not available: exposing port "
+        "TCP 127.0.0.1:5433 -> 0.0.0.0:0: listen tcp 127.0.0.1:5433: bind: Only one usage "
+        "of each socket address (protocol/network address/port) is normally permitted.",
+    ],
+)
+def test_db_up_port_in_use(capsys, message):
+    docker = _fake_docker(run=(125, "", message))
+    code, docker, wait_ready = _db(["db", "up"], docker)
+    assert code == 3
+    wait_ready.assert_not_called()
+    rm = [c.args for c in docker.call_args_list if c.args[0] == "rm"]
+    assert rm == [("rm", "stratakb-db")]
+    for call in docker.call_args_list:
+        assert "volume" not in call.args
+        assert not (call.args[0] == "rm" and "-v" in call.args)
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "Port 5433 on 127.0.0.1 is already in use" in captured.err
+    assert "--port" in captured.err
+
+
+def test_db_up_start_port_in_use(capsys):
+    docker = _fake_docker(
+        "exited", start=(1, "", "Bind for 127.0.0.1:5433 failed: address already in use")
+    )
+    code, docker, _ = _db(["db", "up"], docker)
+    assert code == 3
+    assert "rm" not in _verbs(docker)
+    err = capsys.readouterr().err
+    assert "Port 5433 on 127.0.0.1 is already in use" in err
+    assert "docker rm stratakb-db" in err
+
+
+def test_db_up_reports_the_existing_port(capsys):
+    docker = _fake_docker("running", port="127.0.0.1:5433")
+    code, _, wait_ready = _db(["db", "up", "--port", "5440"], docker)
+    assert code == 0
+    wait_ready.assert_awaited_once_with(CONTAINER_URL)
+    captured = capsys.readouterr()
+    assert "Database ready at 127.0.0.1:5433" in captured.out
+    assert "already uses port 5433" in captured.err
+
+
+def test_db_up_readiness_timeout(capsys):
+    with (
+        patch.object(local_db, "_docker", _fake_docker("running")),
+        patch.object(local_db, "_READY_TIMEOUT_S", 0.2),
+        patch.object(local_db.asyncpg, "connect", AsyncMock(side_effect=OSError("reset"))),
+    ):
+        code = cli.main(["db", "up"])
+    assert code == 3
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "did not accept connections within 0.2 s (OSError)" in captured.err
+
+
+def test_db_up_schema_error_exits_3(cli_env, capsys):
+    cli_env["schema"].side_effect = MigrationError("Apply 05_add_folder.sql as the owner.")
+    code, _, _ = _db(["db", "up"], _fake_docker("running"))
+    assert code == 3
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "Apply 05_add_folder.sql as the owner." in captured.err
+
+
+def test_db_up_unexpected_error_exits_3(cli_env, capsys):
+    cli_env["schema"].side_effect = asyncpg.PostgresError("relation x does not exist\nmore")
+    code, _, _ = _db(["db", "up"], _fake_docker("running"))
+    assert code == 3
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "Traceback" not in captured.err
+    # Progress lines come first; the error is the last line, and only its first line
+    last = captured.err.strip().splitlines()[-1]
+    assert last == "stratakb db up failed (PostgresError): relation x does not exist"
+
+
+def test_db_down_unexpected_error_exits_3(capsys):
+    with patch.object(local_db, "down", AsyncMock(side_effect=RuntimeError("boom"))):
+        code = cli.main(["db", "down"])
+    assert code == 3
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "Traceback" not in captured.err
+    assert captured.err.strip().splitlines() == ["stratakb db down failed (RuntimeError): boom"]
+
+
+def test_up_text_covers_every_state():
+    assert set(cli._UP_TEXT) == set(typing.get_args(local_db.UpState))
+
+
+@pytest.mark.parametrize(
+    ("status", "stops", "line"),
+    [
+        ("running", True, "Stopped stratakb-db. Its data stays in the Docker volume stratakb-data"),
+        ("exited", False, "stratakb-db is not running."),
+        (NO_SUCH, False, "There is no stratakb-db container; nothing to stop."),
+    ],
+)
+def test_db_down(capsys, status, stops, line):
+    code, docker, _ = _db(["db", "down"], _fake_docker(status))
+    assert code == 0
+    verbs = _verbs(docker)
+    assert ("stop" in verbs) is stops
+    assert "rm" not in verbs
+    assert all("volume" not in c.args for c in docker.call_args_list)
+    assert line in capsys.readouterr().out
+
+
+def test_db_down_without_docker_exits_3(capsys):
+    with patch.object(local_db.shutil, "which", return_value=None):
+        code = cli.main(["db", "down"])
+    assert code == 3
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "docker is not on PATH" in captured.err
+
+
+def test_db_without_subcommand_exits_2(capsys):
+    assert cli.main(["db"]) == 2
+    assert "usage" in capsys.readouterr().err
+
+
+def test_db_up_bad_port_exits_2(capsys):
+    assert cli.main(["db", "up", "--port", "0"]) == 2
+    assert "not a port number" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    ("url", "expected"),
+    [
+        ("postgresql://strata:strata_dev_password@localhost:5433/strata", True),
+        ("postgresql://strata:strata_dev_password@127.0.0.1:5433/strata", True),
+        ("postgresql://strata:strata_dev_password@[::1]:5433/strata", True),
+        ("postgresql://strata:strata_dev_password@localhost:5434/strata", False),
+        ("postgresql://strata:other@localhost:5433/strata", False),
+        ("postgresql://someone:strata_dev_password@localhost:5433/strata", False),
+        ("postgresql://strata:strata_dev_password@localhost:5433/other", False),
+        ("postgresql://strata:strata_dev_password@db.example:5433/strata", False),
+        ("postgresql://strata:strata_dev_password@localhost:99999/strata", False),
+    ],
+)
+def test_points_here(url, expected):
+    assert local_db.points_here(url, 5433) is expected

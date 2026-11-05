@@ -20,6 +20,8 @@ class ParsedPage:
     text: str
     page_number: int
     source_file: str
+    # Heading chain of a section, outermost first (Markdown and HTML); empty for other formats
+    section_path: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -30,6 +32,8 @@ class ParsedDocument:
     pages: list[ParsedPage] = field(default_factory=list)
     total_pages: int = 0
     error: str | None = None
+    # Rows a row-limited parser (CSV) did not read; 0 for other formats
+    rows_left_out: int = 0
 
 
 def parse_pdf(file_path: str | Path) -> ParsedDocument:

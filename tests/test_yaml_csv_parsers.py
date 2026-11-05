@@ -7,7 +7,7 @@ Tests cover:
 - CSV parsing of a reason code list
 - Error handling for bad files
 - Metadata fields (service_domain, operation_type, api_version)
-- Integration with ingestion pipeline (SUPPORTED_PARSERS)
+- Integration with ingestion pipeline (FORMATS)
 """
 
 from __future__ import annotations
@@ -206,6 +206,13 @@ class TestYAMLErrors:
 # ==========================================
 
 
+def _write_rows(path: Path, count: int) -> Path:
+    """Write a CSV with a header and count data rows."""
+    lines = ["Code,Name"] + [f"C{i},Name {i}" for i in range(count)]
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return path
+
+
 class TestCSVParser:
     def test_parse_code_list(self):
         from stratakb.knowledge.parsers.csv_parser import parse_csv
@@ -238,6 +245,165 @@ class TestCSVParser:
         # Title should be from the "Name" column
         first_page = result.pages[0]
         assert first_page.text.startswith("# IncorrectAccountNumber")
+
+    def test_small_csv_not_truncated(self):
+        from structlog.testing import capture_logs
+
+        from stratakb.knowledge.parsers.csv_parser import parse_csv
+
+        with capture_logs() as logs:
+            result = parse_csv(TEST_CSV)
+        assert result.rows_left_out == 0
+        assert not [e for e in logs if e["event"] == "csv_truncated"]
+
+    def test_exactly_max_rows_not_truncated(self, tmp_path):
+        from structlog.testing import capture_logs
+
+        from stratakb.knowledge.parsers.csv_parser import MAX_ROWS, parse_csv
+
+        path = _write_rows(tmp_path / "limit.csv", MAX_ROWS)
+        with capture_logs() as logs:
+            result = parse_csv(path)
+        assert result.error is None
+        assert result.total_pages == MAX_ROWS
+        assert result.rows_left_out == 0
+        assert not [e for e in logs if e["event"] == "csv_truncated"]
+
+    def test_rows_past_max_counted_and_logged(self, tmp_path):
+        from structlog.testing import capture_logs
+
+        from stratakb.knowledge.parsers.csv_parser import MAX_ROWS, parse_csv
+
+        path = _write_rows(tmp_path / "big.csv", MAX_ROWS + 5)
+        with capture_logs() as logs:
+            result = parse_csv(path)
+        assert result.error is None
+        assert result.total_pages == MAX_ROWS
+        assert result.rows_left_out == 5
+        truncated = [e for e in logs if e["event"] == "csv_truncated"]
+        assert len(truncated) == 1
+        assert truncated[0]["log_level"] == "warning"
+        assert truncated[0]["rows_read"] == MAX_ROWS
+        assert truncated[0]["rows_left_out"] == 5
+
+    def test_short_row_keeps_its_values(self, tmp_path):
+        from stratakb.knowledge.parsers.csv_parser import parse_csv
+
+        path = tmp_path / "short.csv"
+        path.write_text("a,b,c\n1,2\n3,4,5\n", encoding="utf-8")
+        result = parse_csv(path)
+        assert result.error is None
+        assert result.total_pages == 2
+        first = result.pages[0].text
+        assert "**a:** 1" in first
+        assert "**b:** 2" in first
+        assert "**c:**" not in first
+        assert "**c:** 5" in result.pages[1].text
+
+    def test_long_row_keeps_extra_values(self, tmp_path):
+        from stratakb.knowledge.parsers.csv_parser import parse_csv
+
+        path = tmp_path / "long.csv"
+        path.write_text("a,b\n1,2,3,4\n5,6\n", encoding="utf-8")
+        result = parse_csv(path)
+        assert result.error is None
+        assert result.total_pages == 2
+        first = result.pages[0].text
+        assert "**a:** 1" in first
+        assert "**b:** 2" in first
+        assert "**Column 3:** 3" in first
+        assert "**Column 4:** 4" in first
+        assert "Column" not in result.pages[1].text
+
+    def test_empty_header_labelled_by_position(self, tmp_path):
+        from stratakb.knowledge.parsers.csv_parser import parse_csv
+
+        path = tmp_path / "empty_header.csv"
+        path.write_text("a,,c\n1,2,3\n", encoding="utf-8")
+        result = parse_csv(path)
+        assert result.error is None
+        assert result.total_pages == 1
+        lines = result.pages[0].text.splitlines()
+        assert lines == ["**a:** 1", "**Column 2:** 2", "**c:** 3"]
+        assert not [line for line in lines if line.startswith("**:**")]
+
+    def test_empty_header_in_long_row(self, tmp_path):
+        from stratakb.knowledge.parsers.csv_parser import parse_csv
+
+        path = tmp_path / "empty_header_long.csv"
+        path.write_text("a,,c\n1,2,3,4\n", encoding="utf-8")
+        result = parse_csv(path)
+        lines = result.pages[0].text.splitlines()
+        assert lines == ["**a:** 1", "**Column 2:** 2", "**c:** 3", "**Column 4:** 4"]
+
+    def test_repeated_header_keeps_both_values(self, tmp_path):
+        from stratakb.knowledge.parsers.csv_parser import parse_csv
+
+        path = tmp_path / "repeated.csv"
+        path.write_text("name,value,name\nx,1,y\n", encoding="utf-8")
+        result = parse_csv(path)
+        assert result.error is None
+        lines = result.pages[0].text.splitlines()
+        assert lines.count("**name:** x") == 1
+        assert lines.count("**name (2):** y") == 1
+        assert lines.count("**value:** 1") == 1
+
+    def test_repeated_title_column_uses_first(self, tmp_path):
+        from stratakb.knowledge.parsers.csv_parser import parse_csv
+
+        path = tmp_path / "repeated_title.csv"
+        path.write_text("Name,Name\nx,y\n", encoding="utf-8")
+        result = parse_csv(path)
+        text = result.pages[0].text
+        assert text.startswith("# x\n")
+        assert "**Name:** x" in text
+        assert "**Name (2):** y" in text
+
+    def test_title_falls_back_per_row(self, tmp_path):
+        from stratakb.knowledge.parsers.csv_parser import parse_csv
+
+        path = tmp_path / "fallback.csv"
+        path.write_text("Title,Name,Code\n,,C1\nT,,C2\n", encoding="utf-8")
+        result = parse_csv(path)
+        assert result.pages[0].text.startswith("# C1\n")
+        assert result.pages[1].text.startswith("# T\n")
+
+    def test_title_columns_once_per_header(self):
+        from stratakb.knowledge.parsers.csv_parser import _title_columns
+
+        assert _title_columns(["Code", "Name"]) == [1, 0]
+        assert _title_columns(["Name", "Name (2)", "Other"]) == [0]
+        assert _title_columns(["Other"]) == []
+
+    def test_header_whitespace_stripped(self, tmp_path):
+        from stratakb.knowledge.parsers.csv_parser import parse_csv
+
+        path = tmp_path / "spaced.csv"
+        path.write_text("Code, Name\nA1,Foo\n", encoding="utf-8")
+        result = parse_csv(path)
+        text = result.pages[0].text
+        assert text.startswith("# Foo\n")
+        assert "**Name:** Foo" in text
+        assert "** Name:**" not in text
+
+    def test_blank_lines_skipped(self, tmp_path):
+        from unittest.mock import patch
+
+        from stratakb.knowledge.parsers.csv_parser import parse_csv
+
+        path = tmp_path / "blank.csv"
+        path.write_text("a,b\n1,2\n\n3,4\n", encoding="utf-8")
+        result = parse_csv(path)
+        assert result.error is None
+        assert result.total_pages == 2
+        assert [p.page_number for p in result.pages] == [1, 2]
+        assert result.rows_left_out == 0
+
+        path.write_text("a,b\n1,2\n\n\n3,4\n", encoding="utf-8")
+        with patch("stratakb.knowledge.parsers.csv_parser.MAX_ROWS", 1):
+            result = parse_csv(path)
+        assert result.total_pages == 1
+        assert result.rows_left_out == 1
 
     def test_nonexistent_csv(self):
         from stratakb.knowledge.parsers.csv_parser import parse_csv
@@ -291,16 +457,16 @@ class TestCSVParser:
 
 
 class TestPipelineIntegration:
-    def test_yaml_registered_in_supported_parsers(self):
-        from stratakb.knowledge.ingestion import SUPPORTED_PARSERS
+    def test_yaml_registered_in_formats(self):
+        from stratakb.knowledge.parsers.registry import FORMATS
 
-        assert ".yaml" in SUPPORTED_PARSERS
-        assert ".yml" in SUPPORTED_PARSERS
+        assert ".yaml" in FORMATS
+        assert ".yml" in FORMATS
 
-    def test_csv_registered_in_supported_parsers(self):
-        from stratakb.knowledge.ingestion import SUPPORTED_PARSERS
+    def test_csv_registered_in_formats(self):
+        from stratakb.knowledge.parsers.registry import FORMATS
 
-        assert ".csv" in SUPPORTED_PARSERS
+        assert ".csv" in FORMATS
 
     def test_discover_yaml_files(self):
         from stratakb.knowledge.ingestion import _discover_files

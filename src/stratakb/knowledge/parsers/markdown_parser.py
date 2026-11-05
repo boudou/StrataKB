@@ -1,7 +1,8 @@
 """Markdown parser that splits documents by heading hierarchy.
 
-Chunks markdown files by H1/H2/H3 sections, preserving heading context
-so that each chunk is self-contained and searchable.
+Chunks markdown files by H1/H2/H3 sections. Each section keeps its own text;
+the parent headings travel on the side as the page's section path. Leading
+YAML front matter is not text.
 """
 
 from __future__ import annotations
@@ -15,15 +16,35 @@ from stratakb.knowledge.parsers.pdf_parser import ParsedDocument, ParsedPage
 
 logger = structlog.get_logger()
 
-# Matches ATX headings: # H1, ## H2, ### H3
-_HEADING_RE = re.compile(r"^(#{1,3})\s+(.+)$", re.MULTILINE)
+# ATX headings: # H1, ## H2, ### H3, indented by up to 3 spaces (4 is indented code)
+_HEADING_RE = re.compile(r"^ {0,3}(#{1,3})[ \t]+(.+)$")
+
+# Setext heading underline: '=' makes the line above an H1, two or more '-' an H2
+_SETEXT_RE = re.compile(r"^ {0,3}(=+|-{2,})[ \t]*$")
+
+# Lines that cannot be the text of a setext heading: block quotes and list items
+_NOT_PARAGRAPH_RE = re.compile(r"^ {0,3}(?:>|[-*+](?:[ \t]|$)|\d+[.)](?:[ \t]|$))")
+
+# Fenced code block delimiters (CommonMark): up to 3 spaces, then 3+ backticks or tildes
+_FENCE_OPEN_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
+_FENCE_CLOSE_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})[ \t]*$")
+
+# Leading YAML front matter: a first line holding only '---' (not followed by a
+# blank line, which would make it a thematic break), up to a line holding only '---' or '...'
+_FRONTMATTER_RE = re.compile(
+    r"\A\s*---[ \t]*\n(?![ \t]*\n)(.*?)^(?:---|\.\.\.)[ \t]*$",
+    re.DOTALL | re.MULTILINE,
+)
+
+# A YAML key line ('key:', '"key":' or "'key':", then a space or the line end)
+_YAML_KEY_RE = re.compile(r"""^(?:[\w.-]+|"[^"\n]*"|'[^'\n]*')[ \t]*:(?:[ \t]|$)""")
 
 
 def parse_markdown(file_path: str | Path) -> ParsedDocument:
     """Parse a Markdown file, splitting by heading hierarchy.
 
-    Each H1/H2/H3 section becomes a separate page. The heading context
-    (parent headings) is preserved in each page's text.
+    Each H1/H2/H3 section becomes a separate page whose text is the section's
+    own text. The heading chain is in the page's section_path.
 
     Args:
         file_path: Path to the Markdown file.
@@ -42,18 +63,22 @@ def parse_markdown(file_path: str | Path) -> ParsedDocument:
         return ParsedDocument(source_file=source, error=f"Not a Markdown file: {file_path}")
 
     try:
-        text = file_path.read_text(encoding="utf-8")
+        # utf-8-sig: a byte-order mark would hide the front matter
+        text = file_path.read_text(encoding="utf-8-sig")
     except Exception as e:
         return ParsedDocument(source_file=source, error=f"Read error: {e}")
 
-    if not text.strip():
+    # The front matter is never text, with or without headings
+    body = text[_frontmatter_end(text):]
+
+    if not body.strip():
         return ParsedDocument(source_file=source, pages=[], total_pages=0)
 
-    sections = _split_by_headings(text)
+    sections = _split_by_headings(body)
 
     if not sections:
         # No headings found — return as single page
-        page = ParsedPage(text=text.strip(), page_number=1, source_file=source)
+        page = ParsedPage(text=body.strip(), page_number=1, source_file=source)
         return ParsedDocument(source_file=source, pages=[page], total_pages=1)
 
     pages: list[ParsedPage] = []
@@ -64,6 +89,7 @@ def parse_markdown(file_path: str | Path) -> ParsedDocument:
                 text=section_text,
                 page_number=i + 1,
                 source_file=source,
+                section_path=section.get("section_path", []),
             ))
 
     logger.info(
@@ -78,12 +104,13 @@ def parse_markdown(file_path: str | Path) -> ParsedDocument:
 def _split_by_headings(text: str) -> list[dict]:
     """Split markdown text into sections by H1/H2/H3 headings.
 
-    Returns a list of dicts with keys: level, heading, text.
-    Parent heading context is prepended to each section.
+    Returns a list of dicts with keys: level, heading, text, section_path.
+    The text is the document's own text for the section, heading line included;
+    section_path is the heading chain (parent headings, then this heading).
     """
-    matches = list(_HEADING_RE.finditer(text))
+    headings = _find_headings(text)
 
-    if not matches:
+    if not headings:
         return []
 
     # Track parent headings for context
@@ -93,25 +120,17 @@ def _split_by_headings(text: str) -> list[dict]:
     sections: list[dict] = []
 
     # Handle any preamble before the first heading
-    preamble = text[:matches[0].start()].strip()
+    preamble = text[:headings[0][0]].strip()
     if preamble:
-        # Strip YAML frontmatter
-        preamble_clean = _strip_frontmatter(preamble)
-        if preamble_clean.strip():
-            sections.append({
-                "level": 0,
-                "heading": "Preamble",
-                "text": preamble_clean.strip(),
-            })
+        sections.append({
+            "level": 0,
+            "heading": "Preamble",
+            "text": preamble,
+        })
 
-    for i, match in enumerate(matches):
-        level = len(match.group(1))  # Number of # chars
-        heading = match.group(2).strip()
-
-        # Determine section content (from after this heading to the next heading)
-        start = match.end()
-        end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
-        body = text[start:end].strip()
+    for i, (start, level, heading) in enumerate(headings):
+        # Section text is the document's own text, from this heading to the next one
+        end = headings[i + 1][0] if i + 1 < len(headings) else len(text)
 
         # Update context
         if level == 1:
@@ -120,29 +139,97 @@ def _split_by_headings(text: str) -> list[dict]:
         elif level == 2:
             h2_context = heading
 
-        # Build section text with context
-        lines = []
+        path = []
         if level >= 2 and h1_context:
-            lines.append(f"# {h1_context}")
+            path.append(h1_context)
         if level >= 3 and h2_context:
-            lines.append(f"## {h2_context}")
-        lines.append(f"{'#' * level} {heading}")
-        if body:
-            lines.append(body)
+            path.append(h2_context)
+        path.append(heading)
 
         sections.append({
             "level": level,
             "heading": heading,
-            "text": "\n\n".join(lines),
+            "text": text[start:end].strip(),
+            "section_path": path,
         })
 
     return sections
 
 
-def _strip_frontmatter(text: str) -> str:
-    """Remove YAML frontmatter (--- ... ---) from the beginning of text."""
-    if text.startswith("---"):
-        end = text.find("---", 3)
-        if end != -1:
-            return text[end + 3:]
-    return text
+def _frontmatter_end(text: str) -> int:
+    """Return the offset just past the leading YAML front matter, or 0 when there is none.
+
+    A leading '---' block is front matter only when its lines look like YAML:
+    at least one 'key:' line, and every other non-blank line a key line, an
+    indented line, a list item or a '#' comment. Otherwise the '---' is a
+    thematic break and the block is text.
+    """
+    match = _FRONTMATTER_RE.match(text)
+    if not match:
+        return 0
+    lines = [line for line in match.group(1).split("\n") if line.strip()]
+    has_key = False
+    for line in lines:
+        if _YAML_KEY_RE.match(line):
+            has_key = True
+        elif not (line[0] in " \t" or line.startswith("#") or line == "-" or line.startswith("- ")):
+            return 0
+    return match.end() if has_key else 0
+
+
+def _find_headings(text: str) -> list[tuple[int, int, str]]:
+    """Return (start offset, level, heading text) for each H1/H2/H3 heading, in order.
+
+    One pass over the lines. ATX headings ('# Title') may be indented by up to
+    3 spaces. A setext underline ('===' for H1, '---' for H2) makes the line
+    directly above it a heading when that line is paragraph text; after a
+    blank line it is a thematic break. Of a multi-line paragraph over an
+    underline only the last line becomes the heading.
+
+    '#' lines and underlines inside code fences are not headings. A fence opens
+    with 3+ backticks or tildes (a backtick fence's info string has no
+    backtick, else the line is inline code) and closes on a line holding only
+    the same character, at least as many times. An unclosed fence runs to the end.
+    """
+    headings: list[tuple[int, int, str]] = []
+    fence = ""
+    # The previous line, when it could be the text of a setext heading
+    paragraph: tuple[int, str] | None = None
+    start = 0
+    for line in text.split("\n"):
+        line_start, start = start, start + len(line) + 1
+        if fence:
+            close = _FENCE_CLOSE_RE.match(line)
+            if close and close.group(1)[0] == fence[0] and len(close.group(1)) >= len(fence):
+                fence = ""
+            continue
+        opening = _FENCE_OPEN_RE.match(line)
+        if opening and not (opening.group(1)[0] == "`" and "`" in opening.group(2)):
+            fence = opening.group(1)
+            paragraph = None
+            continue
+
+        atx = _HEADING_RE.match(line)
+        if atx:
+            headings.append((line_start, len(atx.group(1)), atx.group(2).strip()))
+            paragraph = None
+            continue
+
+        underline = _SETEXT_RE.match(line)
+        if underline:
+            if paragraph:
+                level = 1 if underline.group(1)[0] == "=" else 2
+                headings.append((paragraph[0], level, paragraph[1]))
+            paragraph = None
+            continue
+
+        indent = len(line) - len(line.lstrip(" "))
+        is_paragraph = (
+            line.strip()
+            and indent <= 3
+            and not line[indent:].startswith("\t")
+            and not _NOT_PARAGRAPH_RE.match(line)
+        )
+        paragraph = (line_start, line.strip()) if is_paragraph else None
+
+    return headings

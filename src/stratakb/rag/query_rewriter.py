@@ -77,7 +77,7 @@ def build_domain_context(descriptions: dict[str, str]) -> str:
 
 def _skip_reason(settings: Settings, anthropic_api_key: str, model: str) -> str | None:
     """Say why no model would be asked to rewrite, or None when one would."""
-    from stratakb.config import Settings
+    from stratakb.core.egress import rewrite_model_unset
 
     provider = settings.query_rewrite_provider
     if provider == "anthropic":
@@ -85,8 +85,7 @@ def _skip_reason(settings: Settings, anthropic_api_key: str, model: str) -> str 
     if provider == "openai_compatible":
         if not settings.query_rewrite_base_url:
             return "no_base_url"
-        # The default is an Anthropic model name, which the endpoint would not know
-        if model == Settings.model_fields["query_rewrite_model"].default:
+        if rewrite_model_unset(model):
             return "model_not_set"
         return None
     return "unknown_provider"
@@ -145,13 +144,13 @@ async def _call_openai_compatible(
     settings: Settings, model: str, system: str, query: str
 ) -> str | None:
     """Ask the OpenAI-compatible endpoint in QUERY_REWRITE_BASE_URL and return the reply text."""
-    import openai
+    from stratakb.core.egress import openai_compatible_client
 
     # Always pass both: with None the SDK reads OPENAI_API_KEY and OPENAI_BASE_URL,
     # and OPENAI_API_KEY must never reach a custom endpoint
-    client = openai.AsyncOpenAI(
-        api_key=settings.query_rewrite_api_key,
-        base_url=settings.query_rewrite_base_url,
+    client = openai_compatible_client(
+        settings.query_rewrite_api_key,
+        settings.query_rewrite_base_url,
         timeout=_OPENAI_COMPATIBLE_TIMEOUT,
         max_retries=0,
     )
@@ -250,7 +249,7 @@ async def rewrite_query(
         return [enriched_query]
 
     # Learned rewrites and synonyms above are local and stay on
-    if settings.strata_local_only and rewrite_provider(settings, anthropic_api_key):
+    if settings.strata_local_only and rewrite_provider(settings, anthropic_api_key, model):
         logger.info("query_rewrite_skipped", reason="local_only")
         return [enriched_query]
 

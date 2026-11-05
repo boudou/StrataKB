@@ -258,6 +258,18 @@ def _outcomes(result) -> dict[str, tuple[str, str | None]]:
     return {f.relative_path: (f.outcome, f.reason) for f in result.files}
 
 
+def _locked_read_bytes(name: str):
+    """A Path.read_bytes that raises PermissionError("locked") for files called name."""
+    original_read = Path.read_bytes
+
+    def read_bytes(self):
+        if self.name == name:
+            raise PermissionError("locked")
+        return original_read(self)
+
+    return read_bytes
+
+
 class TestPolicyAndEmpty:
     async def test_secret_names_never_opened(self, db_url, layer, tmp_path):
         from stratakb.knowledge import ingestion
@@ -398,10 +410,38 @@ class TestPolicyAndEmpty:
         outcomes = _outcomes(result)
         assert outcomes["bad.md"] == ("failed", "parse_error")
         assert outcomes["good.md"] == ("added", None)
-        assert result.errors == [{"file": "bad.md", "error": "parser exploded"}]
+        assert result.errors == [
+            {"file": "bad.md", "error": "parser exploded", "reason": "parse_error"}
+        ]
         assert result.docs_failed == 1
         assert result.status == "partial"
         assert _ids_by_file(await _chunks(db_url, layer))["bad.md"] == before
+
+    async def test_unreadable_file_is_read_error(self, db_url, layer, tmp_path):
+        _write(tmp_path / "locked.md", "# Locked\n\nLocked content.\n")
+        _write(tmp_path / "a.md", "# Alpha\n\nAlpha content.\n")
+
+        with patch.object(Path, "read_bytes", _locked_read_bytes("locked.md")):
+            result, _ = await _ingest(db_url, layer, tmp_path)
+
+        outcomes = _outcomes(result)
+        assert outcomes["locked.md"] == ("failed", "read_error")
+        assert outcomes["a.md"] == ("added", None)
+        assert result.errors == [{"file": "locked.md", "error": "locked", "reason": "read_error"}]
+        assert result.docs_failed == 1
+        assert result.status == "partial"
+
+    async def test_tracked_file_unreadable_keeps_chunks(self, db_url, layer, tmp_path):
+        locked = _write(tmp_path / "locked.md", "# Locked\n\nFirst version.\n")
+        await _ingest(db_url, layer, tmp_path)
+        before = _ids_by_file(await _chunks(db_url, layer))["locked.md"]
+
+        _write(locked, "# Locked\n\nSecond version.\n")
+        with patch.object(Path, "read_bytes", _locked_read_bytes("locked.md")):
+            result, _ = await _ingest(db_url, layer, tmp_path)
+
+        assert _outcomes(result)["locked.md"] == ("failed", "read_error")
+        assert _ids_by_file(await _chunks(db_url, layer))["locked.md"] == before
 
     async def test_deleted_file_outcome(self, db_url, layer, tmp_path):
         from stratakb.knowledge.ingestion import FileOutcome
@@ -523,6 +563,60 @@ class TestScannedPdf:
         assert third.files_unchanged == 1
 
 
+def _csv(rows: list[str]) -> str:
+    return "Code,Name\n" + "".join(f"{r},Name of {r}\n" for r in rows)
+
+
+class TestTruncatedCsv:
+    """A CSV over the parser's row limit (patched to 2) is stored and flagged."""
+
+    async def _ingest_capped(self, db_url, layer, root: Path):
+        with patch("stratakb.knowledge.parsers.csv_parser.MAX_ROWS", 2):
+            result, _ = await _ingest(db_url, layer, root)
+        return result
+
+    async def test_over_limit_flagged_and_stored(self, db_url, layer, tmp_path):
+        _write(tmp_path / "codes.csv", _csv(["A1", "A2", "A3"]))
+        _write(tmp_path / "a.md", "# Alpha\n\nAlpha content.\n")
+
+        result = await self._ingest_capped(db_url, layer, tmp_path)
+
+        outcomes = _outcomes(result)
+        assert outcomes["codes.csv"] == ("flagged", "truncated")
+        assert outcomes["a.md"] == ("added", None)
+        assert result.files_flagged == 1
+        assert result.files_added == 2
+        assert result.status == "completed"
+        files = {f["relative_path"]: f for f in await _files(db_url, layer)}
+        assert files["codes.csv"]["chunk_count"] == 2
+
+    async def test_at_limit_not_flagged(self, db_url, layer, tmp_path):
+        _write(tmp_path / "codes.csv", _csv(["A1", "A2"]))
+
+        result = await self._ingest_capped(db_url, layer, tmp_path)
+
+        assert _outcomes(result)["codes.csv"] == ("added", None)
+        assert result.files_flagged == 0
+        assert result.files_added == 1
+
+    async def test_flagged_update_and_unchanged_rerun(self, db_url, layer, tmp_path):
+        codes = tmp_path / "codes.csv"
+        _write(codes, _csv(["A1", "A2", "A3"]))
+        first = await self._ingest_capped(db_url, layer, tmp_path)
+        assert _outcomes(first)["codes.csv"] == ("flagged", "truncated")
+
+        _write(codes, _csv(["B1", "B2", "B3", "B4"]))
+        second = await self._ingest_capped(db_url, layer, tmp_path)
+        assert _outcomes(second)["codes.csv"] == ("flagged", "truncated")
+        assert second.files_updated == 1
+        assert second.files_flagged == 1
+
+        third = await self._ingest_capped(db_url, layer, tmp_path)
+        assert _outcomes(third)["codes.csv"] == ("unchanged", None)
+        assert third.files_flagged == 0
+        assert third.files_unchanged == 1
+
+
 async def test_tool_returns_files_skipped():
     from stratakb.knowledge.ingestion import IngestionResult
     from stratakb.mcp_server import mcp
@@ -566,6 +660,86 @@ async def test_tool_returns_files_flagged():
     assert result["status"] == "completed"
     assert result["files_flagged"] == 1
     assert result["files_added"] == 1
+
+
+async def test_tool_reports_read_error(layer, tmp_path):
+    from stratakb.mcp_server import mcp
+
+    _write(tmp_path / "locked.md", "# Locked\n\nLocked content.\n")
+    _write(tmp_path / "a.md", "# Alpha\n\nAlpha content.\n")
+    with (
+        patch("stratakb.core.auth.get_current_user", return_value=("tester", "admin")),
+        patch("stratakb.knowledge.tools.get_current_user", return_value=("tester", "admin")),
+        patch("stratakb.knowledge.tools.write_audit_log", new_callable=AsyncMock),
+        patch(
+            "stratakb.knowledge.ingestion.embed_texts",
+            new_callable=AsyncMock,
+            side_effect=lambda texts, **_: [FAKE_EMBEDDING for _ in texts],
+        ),
+        patch.object(Path, "read_bytes", _locked_read_bytes("locked.md")),
+    ):
+        tool = mcp._tool_manager.get_tool("strata_ingest_documents")
+        result = await tool.fn(layer_name=layer, source_path=str(tmp_path))
+
+    assert result["status"] == "partial"
+    assert result["errors"] == [{"file": "locked.md", "error": "locked", "reason": "read_error"}]
+
+
+def test_file_outcome_rejects_values_outside_the_set():
+    from stratakb.knowledge.ingestion import REASONS, FileOutcome
+
+    for outcome, reason in [
+        ("addded", None),
+        ("failed", "read_eror"),
+        ("added", "secret"),
+        ("failed", None),
+    ]:
+        with pytest.raises(ValueError, match="Not an ingest outcome and reason"):
+            FileOutcome("a.md", outcome, reason)
+    for outcome, reasons in REASONS.items():
+        for reason in reasons:
+            assert FileOutcome("a.md", outcome, reason).reason == reason
+
+
+def test_reasons_cover_the_literals():
+    from typing import get_args
+
+    from stratakb.knowledge.ingestion import REASONS, Outcome, Reason
+
+    assert set(REASONS) == set(get_args(Outcome))
+    assert {r for rs in REASONS.values() for r in rs} - {None} == set(get_args(Reason))
+
+
+def test_outcome_keys_follow_outcome():
+    from typing import get_args
+
+    from stratakb.knowledge.add_folder import OUTCOME_KEYS
+    from stratakb.knowledge.ingestion import Outcome
+
+    assert OUTCOME_KEYS == get_args(Outcome) == (
+        "added", "updated", "unchanged", "removed", "skipped", "flagged", "failed",
+    )
+
+
+@pytest.mark.parametrize(
+    ("suffix", "data", "expected"),
+    [
+        (".md", b"", True),
+        (".pdf", b"", True),
+        (".md", b"  \n\t", True),
+        (".txt", b"\xef\xbb\xbf  ", True),
+        (None, b"   ", True),
+        (".md", b"x", False),
+        (".pdf", b"   ", False),
+        (".docx", b"\n", False),
+    ],
+)
+def test_has_no_text(suffix, data, expected):
+    from stratakb.knowledge.ingestion import _has_no_text
+    from stratakb.knowledge.parsers.registry import FORMATS
+
+    fmt = FORMATS[suffix] if suffix is not None else None
+    assert _has_no_text(fmt, data) is expected
 
 
 def _entries(root: Path, *relative_paths: str, carry_hash: bool = False) -> list:

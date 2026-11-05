@@ -330,6 +330,27 @@ async def test_first_add(db_url, tmp_path, cleanup):
     json.dumps(report.as_dict())
 
 
+async def test_unreadable_file_is_read_error(db_url, tmp_path, cleanup):
+    root = _docs(tmp_path)
+    name = _name()
+    cleanup.append(name)
+    original_read = Path.read_bytes
+
+    def locked_read(self):
+        if self.name == "notes.md":
+            raise PermissionError("locked")
+        return original_read(self)
+
+    with patch.object(Path, "read_bytes", locked_read):
+        _, report = await _run(db_url, root, Options(name=name))
+
+    assert _outcomes(report)["notes.md"] == ("failed", "read_error")
+    assert report.counts["failed"] == 1
+    assert {"path": "notes.md", "outcome": "failed", "reason": "read_error"} in (
+        report.as_dict()["files"]
+    )
+
+
 async def test_default_name_is_the_folder_slug(db_url, tmp_path, cleanup):
     folder = f"Add-Test {uuid4().hex[:8]}"
     root = tmp_path / folder
@@ -418,15 +439,22 @@ async def test_sync_sets_description_only_when_given(db_url, tmp_path, cleanup):
     assert (await _layer(db_url, name))["description"] == "Hand-written"
 
 
-async def _assert_nothing_written(db_url, p, name):
+async def _snapshot(db_url, root, name):
+    """The layer row (None when missing) and the audit rows for root."""
     from stratakb.knowledge.layers import LayerNotFoundError
 
+    layer = None
+    if name is not None:
+        with contextlib.suppress(LayerNotFoundError):
+            layer = await _layer(db_url, name)
+    return layer, await _audit_rows(db_url, root)
+
+
+async def _assert_nothing_written(db_url, p, name, *, before=(None, [])):
+    """apply() refuses the plan, and the layer row and audit rows stay as before."""
     with pytest.raises(ValueError):
         await add_folder.apply(db_url, _settings("tester"), p, confirmed={"broad_path"})
-    if name is not None:
-        with pytest.raises(LayerNotFoundError):
-            await _layer(db_url, name)
-    assert await _audit_rows(db_url, p.root) == []
+    assert await _snapshot(db_url, p.root, name) == before
 
 
 async def test_name_taken(db_url, tmp_path, cleanup):
@@ -441,13 +469,14 @@ async def test_name_taken(db_url, tmp_path, cleanup):
     await _ingest(db_url, name, other)
 
     root = _docs(tmp_path)
+    before = await _snapshot(db_url, root.resolve().as_posix(), name)
     p = await add_folder.plan(db_url, root, Options(name=name))
     assert p.refusal is not None and p.refusal[0] == "name_taken"
     assert p.layer == name and p.action is None
     with pytest.raises(ValueError):
         await add_folder.apply(db_url, _settings("tester"), p, confirmed=set())
+    await _assert_nothing_written(db_url, p, name, before=before)
     assert (await _layer(db_url, name))["root_path"] is None
-    assert await _audit_rows(db_url, p.root) == []
 
 
 async def test_root_taken(db_url, tmp_path, cleanup):
@@ -455,10 +484,14 @@ async def test_root_taken(db_url, tmp_path, cleanup):
     name = _name()
     cleanup.append(name)
     await _run(db_url, root, Options(name=name))
+    other = _name()
+    before = await _snapshot(db_url, root.resolve().as_posix(), other)
+    assert before[0] is None and len(before[1]) == 1
 
-    p = await add_folder.plan(db_url, root, Options(name=_name()))
+    p = await add_folder.plan(db_url, root, Options(name=other))
     assert p.refusal is not None and p.refusal[0] == "root_taken"
     assert name in p.refusal[1]
+    await _assert_nothing_written(db_url, p, other, before=before)
 
 
 async def test_overlapping_root(db_url, tmp_path, cleanup):
@@ -485,9 +518,11 @@ async def test_overlapping_root_case_only(db_url, tmp_path, cleanup, monkeypatch
     await create_layer(db_url, name=name, display_name="Upper", root_path=stored)
     monkeypatch.setattr("sys.platform", "win32")
 
-    p = await add_folder.plan(db_url, root, Options(name=_name()))
+    other = _name()
+    p = await add_folder.plan(db_url, root, Options(name=other))
     assert p.refusal is not None and p.refusal[0] == "overlapping_root"
     assert stored in p.refusal[1]
+    await _assert_nothing_written(db_url, p, other)
 
 
 async def test_preset_layer(db_url, tmp_path, cleanup):
@@ -496,8 +531,13 @@ async def test_preset_layer(db_url, tmp_path, cleanup):
     name = _name()
     cleanup.append(name)
     await create_layer(db_url, name=name, display_name="Preset", origin="preset:x")
-    p = await add_folder.plan(db_url, _docs(tmp_path), Options(name=name))
+    root = _docs(tmp_path)
+    before = await _snapshot(db_url, root.resolve().as_posix(), name)
+    assert before[0] is not None and before[1] == []
+
+    p = await add_folder.plan(db_url, root, Options(name=name))
     assert p.refusal is not None and p.refusal[0] == "preset_layer"
+    await _assert_nothing_written(db_url, p, name, before=before)
 
 
 async def test_nothing_to_add(db_url, tmp_path):
@@ -517,14 +557,22 @@ async def test_usage_and_path_refusals(db_url, tmp_path):
     assert p.layer is None
     await _assert_nothing_written(db_url, p, None)
 
-    p = await add_folder.plan(db_url, root, Options(name=_name(), max_file_size_mb=0))
-    assert p.refusal is not None and p.refusal[0] == "usage_error"
-
     p = await add_folder.plan(db_url, tmp_path / "missing", Options())
     assert p.refusal is not None and p.refusal[0] == "path_not_found"
+    await _assert_nothing_written(db_url, p, None)
 
     p = await add_folder.plan(db_url, root / "notes.md", Options())
     assert p.refusal is not None and p.refusal[0] == "not_a_folder"
+    await _assert_nothing_written(db_url, p, None)
+
+
+@pytest.mark.parametrize("size", [0, -1, float("nan"), float("inf"), float("-inf")])
+async def test_max_file_size_must_be_finite_and_positive(db_url, tmp_path, size):
+    name = _name()
+    p = await add_folder.plan(db_url, _docs(tmp_path), Options(name=name, max_file_size_mb=size))
+    assert p.refusal is not None and p.refusal[0] == "usage_error"
+    assert "--max-file-size" in p.refusal[1]
+    await _assert_nothing_written(db_url, p, name)
 
 
 async def test_adopt_manual_layer(db_url, tmp_path, cleanup):

@@ -61,7 +61,10 @@ class TestCustomEndpoint:
             _settings(embedding_base_url=BASE_URL, embedding_model="nomic-embed-text"),
             api_key="sk-openai",
         )
+        headers = client_kwargs.pop("default_headers")
         assert client_kwargs == {"api_key": "", "base_url": BASE_URL}
+        # Dropped: the SDK would fill them from OPENAI_ORG_ID and OPENAI_PROJECT_ID
+        assert set(headers) == {"OpenAI-Organization", "OpenAI-Project"}
         assert create_kwargs == {
             "input": ["x"],
             "model": "nomic-embed-text",

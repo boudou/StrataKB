@@ -24,7 +24,7 @@ You need [Docker](https://docs.docker.com/get-docker/), [uv](https://docs.astral
 
 ```mermaid
 flowchart LR
-    i["Install"] --> a["Add a folder"] --> c["Connect your client"] --> q["Ask"]
+    i["Install"] --> d["Start the database"] --> a["Add a folder"] --> c["Connect your client"] --> q["Ask"]
 ```
 
 ### 1. Install
@@ -32,9 +32,11 @@ flowchart LR
 ```bash
 git clone https://github.com/boudou/StrataKB.git
 cd StrataKB
-docker compose up -d        # the database, in Docker on port 5433
 uv sync
+uv run stratakb db up        # a local database in Docker, on 127.0.0.1:5433
 ```
+
+Run `uv run stratakb db up` again any time: it starts the database if it was stopped and keeps the data. `uv run stratakb db down` stops it. If it prints a `DATABASE_URL=` line, put that line where it says.
 
 ### 2. Add a folder
 
@@ -81,10 +83,10 @@ The reference below explains how StrataKB works, every tool and every setting; t
 - **Knowledge layers**: create a layer per domain at runtime, each with its own chunking and routing rules; no code changes to add a new domain
 - **Layer presets**: describe a layer and its source folders in one YAML file, then build or rebuild it in one call
 - **Hybrid retrieval**: pgvector HNSW similarity plus PostgreSQL full-text search, fused with Reciprocal Rank Fusion, then reranked by a cross-encoder
-- **Query routing**: when no layers are given, questions are routed to the right layers by each layer's patterns
+- **Query routing**: when no layers are given, questions are routed to the right layers by each layer's patterns. A routed search that finds fewer results than asked for, or only low-confidence ones, runs again across all layers, and the result says so (`routing_fallback`, with the reason). Layers you name yourself are never broadened
 - **Query rewriting** (optional): with an Anthropic API key or any OpenAI-compatible endpoint (including a local Ollama), `strata_ask` expands a question into several searches in the knowledge base's own terminology
 - **Learns from use**: records searches, detects rephrased questions and layer switches, and takes explicit feedback on each result's `interaction_id`. It then learns synonyms, query rewrites that worked (a proven rewrite skips the LLM call) and which layers a question belongs to
-- **Many formats**: PDF, DOCX, Markdown, HTML, plain text, reStructuredText, AsciiDoc, CSV, JSON, XML/XSD and OpenAPI/AsyncAPI YAML, each split along its natural structure
+- **Many formats**: PDF, DOCX, Markdown, HTML, plain text, reStructuredText, AsciiDoc, CSV (up to 10,000 rows per file), JSON, XML/XSD and OpenAPI/AsyncAPI YAML, each split along its natural structure
 - **Local embeddings by default**: `all-mpnet-base-v2` runs on CPU with no API key; OpenAI or any OpenAI-compatible server (Ollama, LM Studio, vLLM) is optional
 - **Roles and audit**: viewer, operator and admin roles on every tool, and an append-only audit log of searches and changes
 - **Local-only switch**: `STRATA_LOCAL_ONLY=true` refuses to start while any setting would send content off this machine, and keeps model downloads off; see [Where your data goes](#where-your-data-goes)
@@ -126,11 +128,27 @@ flowchart LR
     z -->|"yes"| t["No text:<br/>skip or remove"]
     z -->|"no"| p["Parse<br/>per format"]
     p -->|"no text"| t
-    p --> c["Chunk"] --> x["Prefix<br/>[layer > file > Page N]"] --> e["Embed"] --> v[("pgvector<br/>replace that file's chunks")]
-    p -.->|"scanned-looking PDF"| fl["Stored, reported<br/>as flagged"]
+    p --> c["Chunk<br/>(the file's own text)"] --> x["Add context for the embedding only<br/>[layer > file > headings or Page N]"] --> e["Embed"] --> v[("Store the document text<br/>(new version if it changed)<br/>and that file's chunks")]
+    p -.->|"scanned-looking PDF,<br/>CSV over 10,000 rows"| fl["Stored, reported<br/>as flagged"]
+    h -->|"can't read"| fe["Failed, keeps earlier chunks<br/>(read_error, parse_error)"]
+    p -->|"parser rejects"| fe
 ```
 
-Ingesting a folder again is a sync: unchanged files are skipped, changed files are replaced, new files are added, and files deleted from that folder are removed. Other folders in the same layer are left alone. Files whose names look like secrets (`.env`, `client_secret.json`, `id_rsa`, `*.pem`) are skipped without being opened, and one ingested earlier is removed. Empty files are reported as no text rather than as failures. A PDF that looks scanned (fewer than half its pages have text, or under 200 characters per page on average) is stored for the text it has and reported as flagged. A file that fails to parse is reported and the rest of the run carries on.
+Ingesting a folder again is a sync: unchanged files are skipped, changed files are replaced, new files are added, and files deleted from that folder are removed. Other folders in the same layer are left alone. Files whose names look like secrets (`.env`, `client_secret.json`, `id_rsa`, `*.pem`) are skipped without being opened, and one ingested earlier is removed. Empty files are reported as no text rather than as failures. A PDF that looks scanned (fewer than half its pages have text, or under 200 characters per page on average) is stored for the text it has and reported as flagged. A CSV file over 10,000 rows is stored for its first 10,000 rows and reported as flagged (`truncated`); the log says how many rows were left out. A CSV row with fewer fields than the header is stored with the values it has; one with more keeps the extra values, labelled by position (`Column 4`). A column with an empty header is labelled by position too (`Column 2`), and a header name used twice gets a number on its second use (`Name (2)`), so no value is lost. A file that cannot be read (locked, or no permission) or that its parser rejects is reported as failed and keeps its earlier chunks; the rest of the run carries on.
+
+Every file gets an outcome, and most outcomes a reason. `stratakb add --json` lists both for every file; `strata_ingest_documents` returns the counts, and each failed file in `errors` with its reason. `stratakb add` also reports the reasons of its own file selection (such as `code` or `ignored_by_gitignore`) for files it never reads.
+
+| Outcome | Reasons |
+|---|---|
+| `added`, `updated`, `unchanged` | none |
+| `flagged`: stored, and also counted as added or updated | `probably_scanned`, `truncated` |
+| `skipped`: not stored | `secret`, `no_text` |
+| `removed` | `deleted`, `not_selected`, `secret`, `no_text` |
+| `failed`: keeps its earlier chunks | `read_error` (could not be read), `parse_error` (the parser rejected it), `embed_error` (embedding or storing failed) |
+
+Each stored chunk is the document's own text as its parser extracted it (for Markdown and plain text, the file's characters; for PDF, HTML and other formats, the extracted text): search results quote that text exactly, and a Markdown or HTML section holds its own heading once. Where the chunk sits (`[layer > file > headings]` for Markdown and HTML, `[layer > file > Page N]` otherwise) is added only to the text that is embedded, so semantic search keeps that context; the heading path is also in the chunk's metadata as `section_path`. In Markdown, the front matter (a leading `---` block of `key: value` lines) is never part of the text, `#` lines inside code fences (```` ``` ```` or `~~~`) are not headings, so a shell comment does not split a code block, and headings may be indented up to three spaces or underlined with `===` / `---`. An HTML page's first `<title>` outside an inline `<svg>` is not part of the text: it is the section path of text that sits under no heading (the whole page, when it has no headings), while an SVG's `<title>` stays in the text. Keyword search matches the chunk text, not layer or file names. Chunks stored by earlier versions keep their bracketed prefix until their file is ingested again.
+
+Each file's extracted text is stored once as a document, and every chunk records where in that text it sits (a character range, from which the page and the line range follow), so a passage can be located and checked against its source. Lines count from the start of the page for PDFs and from the start of the document for other formats. When a file's text changes, the next ingest stores it as a new version; versions that no chunk uses any more are removed. Chunks ingested before this was added have no position until their file is ingested again.
 
 **Ask**
 
@@ -165,6 +183,7 @@ Run the same command again after editing the documents: it re-embeds only what c
 ```mermaid
 flowchart LR
     cmd["stratakb add &lt;folder&gt;"] --> plan["Plan: which layer,<br/>which files, what changed"]
+    cmd -->|"STRATA_LOCAL_ONLY on and<br/>embedding leaves the machine"| stop
     plan -->|"broad path or<br/>large run"| ask{"Confirmed?<br/>prompt, --allow-broad, --yes"}
     ask -->|"no"| stop["Refuse, nothing written<br/>(exit 2)"]
     ask -->|"yes"| apply
@@ -173,7 +192,7 @@ flowchart LR
     apply --> report["Report and exit code"]
 ```
 
-A drive root, your home folder (or a folder above it) and system folders need `--allow-broad`; a run that adds, updates or removes more than 2,000 files, adds or updates more than 500 MB, or removes at least 10 files that are more than half of the layer's files, needs `--yes`. At a terminal the command asks instead; in a script it refuses and names the flag. Exit codes: `0` done, `1` some files failed (the rest are stored), `2` refused or a usage error (nothing written), `3` the database is unreachable or its schema can't be updated, `130` interrupted (stored files stay; the next run carries on). The first run with the `local` backend downloads the embedding model and says so.
+A drive root, your home folder (or a folder above it) and system folders need `--allow-broad`; a run that adds, updates or removes more than 2,000 files, adds or updates more than 500 MB, or removes at least 10 files that are more than half of the layer's files, needs `--yes`. At a terminal the command asks instead; in a script it refuses and names the flag. Exit codes: `0` done, `1` some files failed (the rest are stored), `2` refused, a usage error, or `STRATA_LOCAL_ONLY` blocks the embedding path (nothing written), `3` the database is unreachable or its schema can't be updated, `130` interrupted (stored files stay; the next run carries on). The first run with the `local` backend downloads the embedding model and says so.
 
 `stratakb` with no command, or `stratakb serve`, starts the MCP server, as `python -m stratakb` does.
 
@@ -193,6 +212,7 @@ chunk_config: {chunk_size: 1200, chunk_overlap: 150}
 routing_patterns:            # questions matching any of these search this layer first
   - '\brunbooks?\b'
   - '\b(failover|incident|on-?call)\b'
+answer_mode: grounded        # or extractive; grounded for a new layer when left out
 sources:
   - name: runbooks
     path: runbooks
@@ -201,9 +221,24 @@ sources:
     download: https://wiki.example.com/postmortems   # shown when the folder is missing
 ```
 
-Apply it with `scripts/apply_preset.py` or the `strata_apply_preset` tool. Applying a preset again rebuilds the layer from scratch. Ready-made presets are in [examples/](examples/README.md): Python PEPs (the quickest to try), SEPA payments and ISO 20022 messaging.
+Apply it with `scripts/apply_preset.py` or the `strata_apply_preset` tool. Ready-made presets are in [examples/](examples/README.md): Python PEPs (the quickest to try), SEPA payments and ISO 20022 messaging.
+
+Edit the preset and apply it again to change the layer: the layer takes the preset's `display_name`, `description`, `metadata_schema`, `chunk_config`, `routing_patterns` and `answer_mode`, the result lists the settings that changed (`layer_changes`), and the chunks are rebuilt from the sources. There is no need to delete the layer first. A layer with the same name that was not made by this preset (one made with `stratakb add`, `strata_create_knowledge_layer` or another preset) is refused and left unchanged; rename the preset's `name` or delete that layer. `strata_apply_preset` with `dry_run=true` also lists the settings that would change (`layer_check`), or `would_claim` when a layer with no recorded origin already matches the preset and would be marked as made by it, or `unknown` when the database does not answer within 5 seconds, while the script's `--dry-run` only parses the files and needs no database.
+
+```mermaid
+flowchart TD
+    A[Apply preset] --> B{Layer exists?}
+    B -- no --> C[Create layer from the YAML]
+    B -- yes --> D{Made by}
+    D -- "this preset, or no origin recorded" --> E[Update the settings that differ]
+    D -- "stratakb add, manual, another preset" --> F[Refuse: nothing changed]
+    C --> G[Clear chunks, ingest every source]
+    E --> G
+```
 
 The layer's **description** also tells the query rewriter which terminology the layer uses, so a clear description improves `strata_ask`.
+
+The layer's **answer_mode** says how its questions are to be answered: `grounded` (the default) means your client writes the answer from the cited passages; `extractive` is for layers where paraphrase is not acceptable, answered with the document's own sentences. Any other value is refused. `strata_list_knowledge_layers` shows each layer's mode, applying a preset again sets the mode of an existing layer when the preset gives one (a preset without `answer_mode` leaves the layer's mode alone), and layers created before this setting read as `grounded`. The server records the mode but does not act on it yet: extractive answers are on the [roadmap](#roadmap).
 
 ### Try an example preset
 
@@ -223,7 +258,7 @@ Then ask from your client, for example *"How long should a line of Python be?"*.
 | Tool | Role | What it does |
 | --- | --- | --- |
 | `strata_ask` | viewer | Rewrites a question, searches in parallel, reranks, returns context with citations and a confidence level |
-| `strata_search` | viewer | Hybrid search for exact terms and identifiers, with optional layer and metadata filters |
+| `strata_search` | viewer | Hybrid search for exact terms and identifiers, with optional layer and metadata filters, and a confidence level |
 | `strata_list_knowledge_layers` | viewer | Lists layers with document and chunk counts |
 | `strata_get_layer_status` | viewer | One layer's configuration and ingestion history |
 | `strata_feedback` | viewer | Rates a result as helpful or not, per answer or per chunk |
@@ -237,18 +272,22 @@ Then ask from your client, for example *"How long should a line of Python be?"*.
 | `strata_db_explain` | operator | Query plan for a SQL statement (only with `READONLY_DATABASE_URL`) |
 | `strata_create_knowledge_layer` | admin | Creates a layer |
 | `strata_ingest_documents` | admin | Syncs a file or folder into a layer: adds, replaces and removes files; reports added, updated, unchanged, removed, skipped and flagged |
-| `strata_apply_preset` | admin | Creates a layer from a preset and ingests its sources |
+| `strata_apply_preset` | admin | Creates or updates a layer from a preset and ingests its sources |
 | `strata_delete_knowledge_layer` | admin | Deletes a layer and its chunks |
 | `strata_reset_learning` | admin | Clears learned patterns |
 | `strata_admin_audit_log` | admin | Queries the audit log |
 | `strata_admin_list_users` | admin | Lists users and roles |
 | `strata_admin_update_role` | admin | Changes a user's role |
 
-The two SQL tools never run as the owner role. They are only registered when `READONLY_DATABASE_URL` is set, and at startup the server removes them again when that role is a superuser, a member of a superuser role, a member of `pg_read_server_files`, `pg_write_server_files`, `pg_execute_server_program` or `pg_signal_backend`, or cannot be checked (for example, the database is unreachable; restart the server once it is up). `strata_admin_health` says which applies under `sql_tools`. The `strata_readonly` role can read four tables only: `strata_core.knowledge_layers`, `strata_core.ingestion_runs`, `strata_core.ingested_files` and `strata_vectors.chunks`. It cannot read the audit log, the users table or anything in `strata_learning`, and a table added later needs a `GRANT` by name. Existing databases get these grants when the server starts.
+The two SQL tools never run as the owner role. They are only registered when `READONLY_DATABASE_URL` is set, and at startup the server removes them again when that role is a superuser, a member of a superuser role, a member of `pg_read_server_files`, `pg_write_server_files`, `pg_execute_server_program` or `pg_signal_backend`, or cannot be checked within 5 seconds (for example, the database is unreachable or does not answer; restart the server once it is up). `strata_admin_health` says which applies under `sql_tools`. The `strata_readonly` role can read five tables only: `strata_core.knowledge_layers`, `strata_core.ingestion_runs`, `strata_core.ingested_files`, `strata_vectors.chunks` and `strata_vectors.documents`. It cannot read the audit log, the users table or anything in `strata_learning`, and a table added later needs a `GRANT` by name. Existing databases get these grants when the server starts.
 
 On the stdio transport, `STRATA_USER` and `STRATA_ROLE` set who you are. Whoever starts the server picks the role, so on stdio roles separate duties rather than enforce security; see [SECURITY.md](SECURITY.md).
 
 The `stratakb add` command has no role check: whoever can reach the database with `DATABASE_URL` can add a folder. Each run writes one audit entry with the tool name `cli:add`, the folder, the run id and the counts per outcome (no file names). Its user is `STRATA_USER` when you set it, otherwise `os:` plus your login name, a name nobody verified.
+
+`strata_feedback` and `strata_reset_learning` each write one audit entry. A feedback entry holds the interaction id and the rating, not the suggested query or layer; a reset entry names the layer, or says it reset everything.
+
+Each `strata_apply_preset` run writes one audit entry with the layer, whether it was created, updated or already up to date, the names of the settings that changed (never their values) and the number of documents and chunks ingested. A refused run writes none.
 
 ## Configuration
 
@@ -264,7 +303,7 @@ flowchart LR
 | Variable | Default | Description |
 | --- | --- | --- |
 | `STRATAKB_CONFIG` | | A settings file read after the user-level `config.env`; environment variables still win |
-| `DATABASE_URL` | `postgresql://strata:…@localhost:5433/strata` | PostgreSQL connection |
+| `DATABASE_URL` | `postgresql://strata:…@127.0.0.1:5433/strata` | PostgreSQL connection |
 | `READONLY_DATABASE_URL` | | Connection for `strata_db_query` and `strata_db_explain`; point it at the `strata_readonly` role from `db/03_readonly_role.sql`. Empty means the two tools are off; a superuser, or a member of a superuser or server-access role (such as the Docker `strata` user) is refused |
 | `STRATA_USER`, `STRATA_ROLE` | `developer`, `viewer` | Identity and role on stdio |
 | `EMBEDDING_BACKEND` | `local` | `local` (sentence-transformers) or `openai` (OpenAI, or the OpenAI-compatible server in `EMBEDDING_BASE_URL`) |
@@ -281,6 +320,7 @@ flowchart LR
 | `HYBRID_SEARCH_ENABLED` | `true` | Vector plus full-text search |
 | `HYBRID_SEMANTIC_WEIGHT`, `HYBRID_KEYWORD_WEIGHT` | `0.7`, `0.3` | RRF weights |
 | `HYBRID_RRF_K` | `60` | RRF constant |
+| `HYBRID_KEYWORD_SLOTS` | `1` | Results kept for the best full-text matches, so an exact term the embedding misses still comes back (at most `top_k` − 1; `0` turns it off) |
 | `HNSW_EF_SEARCH` | `40` | Recall versus latency for the vector index |
 | `RERANKING_ENABLED` | `true` | Cross-encoder reranking in `strata_ask` |
 | `RERANKING_MODEL` | `cross-encoder/ms-marco-MiniLM-L-6-v2` | Reranker |
@@ -296,13 +336,39 @@ flowchart LR
 | `STRATA_LOCAL_ONLY` | `false` | Refuse to start while any provider would send content off this machine, and load models from local files only; see [Where your data goes](#where-your-data-goes) |
 | `LOG_LEVEL` | `INFO` | Structured JSON logs on stderr |
 
-To change the embedding model, update `EMBEDDING_BACKEND`, `EMBEDDING_MODEL` and `EMBEDDING_DIMENSIONS` (and `EMBEDDING_BASE_URL` for a model server), then re-embed each layer with `vector_store.re_embed_layer()`, which resizes the vector column when the dimensions change and re-embeds the stored chunk text in place without re-parsing files.
+To change the embedding model, update `EMBEDDING_BACKEND`, `EMBEDDING_MODEL` and `EMBEDDING_DIMENSIONS` (and `EMBEDDING_BASE_URL` for a model server), then re-embed every layer at once with `vector_store.re_embed_all_layers()`. It re-embeds the stored chunk text without re-parsing files and resizes the vector column once when the dimensions change; if anything fails, every layer and the column stay as they were. It works in two phases. First it reads the chunks a batch at a time, embeds them and keeps the new vectors aside, while searches and ingests carry on as usual. When more than one batch of chunks was added in the meantime, it embeds those too, still without a lock (up to three extra passes). Then one transaction locks the chunks table, resizes the column if needed, writes the new vectors and embeds the few chunks added since. Ingests wait for that transaction, and searches wait too when it resizes the column. The model runs under the lock for at most about one batch of chunks, usually none, but writing the vectors and rebuilding the index still takes longer the more chunks there are, so plan a resize of a large knowledge base for a quiet moment. Each statement of that transaction may take up to 10 minutes (`locked_timeout=600`, in seconds); one that takes longer rolls everything back, and the error says so. Pass a larger `locked_timeout` for a very large knowledge base.
+
+```mermaid
+flowchart LR
+    A["Phase 1: read a batch of chunks"] --> B["Embed it with the new model"]
+    B --> C["Keep the vectors aside"]
+    C -->|more chunks| A
+    C -->|all done| N{"More than a batch added meanwhile?"}
+    N -->|"yes, up to 3 passes"| A
+    N -->|no| D["Phase 2: lock the chunks table"]
+    D --> E{"Dimensions changed?"}
+    E -->|yes| F["Resize the vector column"]
+    E -->|no| G["Write the new vectors"]
+    F --> G
+    G --> H["Embed the few chunks added since"]
+    H --> I["Commit"]
+```
+
+```bash
+uv run python -c "import asyncio; from stratakb.config import get_settings; from stratakb.knowledge.vector_store import re_embed_all_layers; print(asyncio.run(re_embed_all_layers(get_settings().database_url)))"
+```
+
+Every layer shares the one vector column, so `vector_store.re_embed_layer()` re-embeds a single layer at the column's current size only, and refuses any other size. When `re_embed_all_layers()` resizes the column while `re_embed_layer()` is running, the single-layer run stops before its next write and says which size to set.
 
 ### Database and models
 
+`stratakb db up` runs the container `stratakb-db` from the image `pgvector/pgvector:pg16`, with its data in the Docker volume `stratakb-data`. It binds to `127.0.0.1` only, connects as the user `strata` with the default password, and brings the schema up to date before it returns. `--port` picks another host port when the container is created; an existing container keeps its port. `stratakb db down` stops the container and keeps the volume. The container starts again with Docker until `stratakb db down` stops it. It creates no `strata_readonly` role, so the SQL tools stay off until `db/03_readonly_role.sql` is applied (see `READONLY_DATABASE_URL`). With no `docker` on `PATH`, or the Docker daemon not running, it exits with code 3 and says which.
+
 Any empty PostgreSQL 16 database with pgvector works as well: `stratakb add` and the server create the schema on first use, as long as the user in `DATABASE_URL` may create the `vector` and `pg_trgm` extensions.
 
-The server answers its client at once and, with the default `local` backend, loads the embedding model in the background; a search sent before the model is ready waits for it. The first start downloads the embedding model (about 420 MB) and the first `strata_ask` downloads the reranker (about 90 MB), both into your Hugging Face cache. With `STRATA_LOCAL_ONLY=true` nothing is downloaded; see [Where your data goes](#where-your-data-goes).
+A schema update waits at most 30 seconds for a lock that another process holds (another StrataKB process updating the schema, or a session using a table the update changes), then stops and says which lock it waited on. A user that is neither the database owner nor a superuser can use a schema that is current; when an update is due, they are told which file to apply as the owner (`psql -f`). A user without `USAGE` on the StrataKB schemas is told which privilege is missing.
+
+The server answers its client at once and, with the default `local` backend, loads the embedding model in the background; a search sent before the model is ready waits for it. The first start downloads the embedding model (about 420 MB) and the first `strata_ask` downloads the reranker (about 90 MB), both into your Hugging Face cache. After that, both load from the cache without contacting Hugging Face. With `STRATA_LOCAL_ONLY=true` nothing is downloaded; see [Where your data goes](#where-your-data-goes).
 
 ### Embeddings from a model server
 
@@ -319,9 +385,9 @@ EMBEDDING_MODEL=nomic-embed-text
 # EMBEDDING_API_KEY=           # only if the server asks for a key
 ```
 
-The URL ends in `/v1`. A model with other dimensions, for example `mxbai-embed-large` (1024), needs `EMBEDDING_DIMENSIONS` and the `vector(…)` column changed to match. Switching models means re-embedding every layer with `vector_store.re_embed_layer()`, even when the dimensions match: vectors from two models cannot be compared.
+The URL ends in `/v1`. A model with other dimensions, for example `mxbai-embed-large` (1024), needs `EMBEDDING_DIMENSIONS` changed to match; `vector_store.re_embed_all_layers()` then resizes the `vector(…)` column (see [Configuration](#configuration)). Switching models means re-embedding every layer with it, even when the dimensions match: vectors from two models cannot be compared.
 
-Once at startup, in the background, the server asks the server in `EMBEDDING_BASE_URL` for its model list and checks the vector column's size against `EMBEDDING_DIMENSIONS`. `strata_admin_health` reports both under `embedding` (`model` and `vector_column`), and `overall` turns `degraded` when the model is not listed or the sizes differ; the message names the setting to change. `nomic-embed-text` matches `nomic-embed-text:latest`. The check compares names only: a server that serves any requested name under one listed file name (llama.cpp's server does this) can show the model as missing while embedding works, and that report can be ignored. A server that cannot list its models, or is not up yet, shows `unchecked` and does not degrade health. After pulling a model or resizing the column, restart StrataKB to check again.
+Once at startup, in the background, the server asks the server in `EMBEDDING_BASE_URL` for its model list and checks the vector column's size against `EMBEDDING_DIMENSIONS`. `strata_admin_health` reports both under `embedding` (`model` and `vector_column`), and `overall` turns `degraded` when the model is not listed or the sizes differ; the message names the setting to change. `nomic-embed-text` matches `nomic-embed-text:latest`. The check compares names only: a server that serves any requested name under one listed file name (llama.cpp's server does this) can show the model as missing while embedding works, and that report can be ignored. A server that cannot list its models, or is not up yet, shows `unchecked` and does not degrade health. When the model is missing, the report lists at most 20 of the server's model names, each cut to 100 printable characters. After pulling a model or resizing the column, restart StrataKB to check again.
 
 ### Query rewriting through a model server
 
@@ -364,14 +430,14 @@ Dotted paths are off by default and blocked by `STRATA_LOCAL_ONLY=true`.
 | PostgreSQL | Documents, chunks, stored queries, audit entries | `DATABASE_URL` (always) | No |
 | Your MCP client and its language model | Retrieved text, sources | Every search and ask | No |
 | Anthropic query rewriting | Questions and layer descriptions | `ANTHROPIC_API_KEY` | Yes |
-| Rewrite endpoint on another host | Questions and layer descriptions | `QUERY_REWRITE_PROVIDER=openai_compatible` with `QUERY_REWRITE_BASE_URL` pointing off this machine | Yes |
-| Rewrite endpoint on this machine | Questions and layer descriptions, to `127.0.0.1`, `::1` or `localhost` | `QUERY_REWRITE_PROVIDER=openai_compatible` with `QUERY_REWRITE_BASE_URL` | No |
+| Rewrite endpoint on another host | Questions and layer descriptions | `QUERY_REWRITE_PROVIDER=openai_compatible` with `QUERY_REWRITE_BASE_URL` pointing off this machine and `QUERY_REWRITE_MODEL` set | Yes |
+| Rewrite endpoint on this machine | Questions and layer descriptions, to `127.0.0.1`, `::1` or `localhost` | `QUERY_REWRITE_PROVIDER=openai_compatible` with `QUERY_REWRITE_BASE_URL` and `QUERY_REWRITE_MODEL` set | No |
 | OpenAI embeddings | Documents and questions | `EMBEDDING_BACKEND=openai` without `EMBEDDING_BASE_URL` | Yes |
 | Embedding server on another host | Documents and questions | `EMBEDDING_BASE_URL` pointing off this machine | Yes |
 | Embedding server on this machine | Documents and questions, to `127.0.0.1`, `::1` or `localhost` | `EMBEDDING_BASE_URL` | No |
 | Hugging Face downloads | Nothing about your documents; model files come in | The first start, the first `stratakb add` and the first `strata_ask` | Yes |
 
-With `STRATA_LOCAL_ONLY=true` the server refuses to start while any blocked path is configured, and the error names each setting that caused it. The embedding calls and query rewriting check the switch again on every call, so a key added later is refused too. The Hugging Face libraries run offline and load the embedding and reranking models from local files only; a model that is not installed fails with a message that says how to install it (`uv run hf download <model>` on a machine that may download, or `EMBEDDING_MODEL` / `RERANKING_MODEL` set to a folder that holds it). The switch does not cover the database: `DATABASE_URL` may point at a team server on purpose. `stratakb add` does not refuse up front: with a blocked embedding path configured, each file fails to embed and the run exits with `1`. The OpenAI and Anthropic SDKs also read `OPENAI_BASE_URL` and `ANTHROPIC_BASE_URL`; StrataKB treats them as the destination of those paths, and `STRATA_LOCAL_ONLY` checks them too.
+With `STRATA_LOCAL_ONLY=true` the server refuses to start while any blocked path is configured, and the error names each setting that caused it. The embedding calls and query rewriting check the switch again on every call, so a key added later is refused too. The Hugging Face libraries run offline and load the embedding and reranking models from local files only; a model that is not installed fails with a message that says how to install it (`uv run hf download <model>` on a machine that may download, or `EMBEDDING_MODEL` / `RERANKING_MODEL` set to a folder that holds it). The switch does not cover the database: `DATABASE_URL` may point at a team server on purpose. `stratakb add` checks the embedding path before it starts: with a blocked one configured it refuses with exit `2` (`reason` `local_only` in `--json`), names the setting and writes nothing. It does not check query rewriting, which it never uses. The OpenAI and Anthropic SDKs also read `OPENAI_BASE_URL` and `ANTHROPIC_BASE_URL`; StrataKB treats them as the destination of those paths, and `STRATA_LOCAL_ONLY` checks them too. Requests to `EMBEDDING_BASE_URL` and `QUERY_REWRITE_BASE_URL` never carry `OPENAI_API_KEY`, `OPENAI_ORG_ID` or `OPENAI_PROJECT_ID`.
 
 `strata_admin_health` always lists the switch (`local_only`) and the active outbound providers (`outbound`: provider, purpose, what it sends, destination host and the setting that turns it on), whether the switch is on or not. It never shows keys, credentials, paths or ports.
 
@@ -382,7 +448,7 @@ StrataKB cannot control what your MCP client's language model does with the retr
 ## Glossary
 
 - **Chunk**: a passage of a document, cut along its headings or structure. Search returns chunks, each with its file and section.
-- **Confidence**: `high`, `medium` or `low`, from the reranker's scores (or the similarity scores when reranking is off), returned with every `strata_ask` result; a low one comes with a warning.
+- **Confidence**: `high`, `medium` or `low`, returned with every `strata_ask` and `strata_search` result; a low one comes with a warning. It is judged on the reranker's relevance probability (0 to 1) or, with reranking off, on each chunk's `similarity` (how similar the question and the chunk are by meaning); the result says which (`basis`: `rerank` or `similarity`). Each `strata_ask` chunk carries `score` (its merged rank, best 1.0), `similarity`, `rerank_score` (null with reranking off), `source_file` and `section`, and each source's `relevance_score` is the score confidence was judged on. `strata_search` results carry each chunk's `similarity` (with hybrid search on, the default, its `score` is the fused rank, where the best result is always 1.0), and `strata_search` judges its confidence on that similarity (`basis` `similarity`), never on the fused `score`; a chunk without an embedding counts as similarity 0. The learning loop stores the confidence the tool returned, and each stored result keeps its `similarity`. The thresholds are provisional until the evaluation suite measures them.
 - **Embedding**: a list of numbers that stands for a chunk's meaning, so similar meanings get similar numbers. The embedding model (`all-mpnet-base-v2` by default) makes them; the vector column stores them (`EMBEDDING_DIMENSIONS`, 768 by default).
 - **HNSW**: the pgvector index that finds similar embeddings quickly; `HNSW_EF_SEARCH` trades recall for speed.
 - **Hybrid search**: a search by meaning (embeddings) and a search by words (PostgreSQL full-text search), merged into one list with RRF.
@@ -391,7 +457,7 @@ StrataKB cannot control what your MCP client's language model does with the retr
 - **Query rewriting**: optional; a language model turns a question into several searches in the layer's own terms. Learned rewrites are reused without the model.
 - **Reranking**: in `strata_ask`, a second model (a cross-encoder, `RERANKING_MODEL`) reads the question with each candidate chunk and puts the best first.
 - **Routing patterns**: a layer's regular expressions. When a question names no layers, those whose patterns match are searched first.
-- **RRF** (Reciprocal Rank Fusion): how hybrid search merges its two lists by rank, weighted by `HYBRID_SEMANTIC_WEIGHT` and `HYBRID_KEYWORD_WEIGHT`, with the constant `HYBRID_RRF_K`.
+- **RRF** (Reciprocal Rank Fusion): how hybrid search merges its two lists by rank, weighted by `HYBRID_SEMANTIC_WEIGHT` and `HYBRID_KEYWORD_WEIGHT`, with the constant `HYBRID_RRF_K`. The best full-text matches keep `HYBRID_KEYWORD_SLOTS` places in the results, because a chunk found only by words would otherwise rank below every chunk found by meaning. `strata_ask` merges the results of its searches (one per rewritten query) the same way, by rank with `HYBRID_RRF_K`: a chunk several searches find comes first, and ties go to the more similar chunk.
 - **top_k**: how many chunks a tool returns: 5 by default for `strata_search`, 10 for `strata_ask`.
 
 ## Project structure
@@ -401,10 +467,10 @@ db/                   03_readonly_role.sql (SQL tools role, applied with psql)
 examples/             Example layer presets (Python PEPs, SEPA, ISO 20022)
 scripts/              apply_preset.py, backup_restore.py
 src/stratakb/
-  cli.py              The stratakb command: add a folder, or start the server
+  cli.py              The stratakb command: add a folder, start a local database, or start the server
   mcp_server.py       MCP server: admin and user tools
-  core/               Database pool, roles, audit log, logging, schema migrations
-    sql/              Schema, applied in version order by the server: 01_init, 02_learning, then 04–06 upgrades
+  core/               Database pool, roles, audit log, logging, schema migrations, local database in Docker
+    sql/              Schema, applied in version order by the server: 01_init, 02_learning, then the 04–12 upgrades
   knowledge/          Layers, presets, ingestion pipeline, parsers, embeddings, vector store
     add_folder.py     Turns one folder into one layer and keeps it in sync
   rag/                Retriever (hybrid + RRF), reranker, cache, routing, query rewriter, tools
@@ -417,6 +483,7 @@ docs/IMPROVEMENTS.md  Product goal and order of work (issues hold the items)
 ## Development
 
 ```bash
+docker compose up -d           # the development database (container strata-postgres, port 5433, with the read-only role)
 uv sync --extra dev
 uv run pytest                  # full suite; integration tests need the database running
 uv run ruff check src tests    # lint
@@ -425,9 +492,9 @@ uv run stratakb add docs --name strata_docs --json   # add a folder as a layer
 uv run stratakb --help         # the commands and their flags
 ```
 
-Without a running database, the integration tests fail with a connection error and the rest pass.
+Without a running database, the integration tests fail with a connection error and the rest pass. `docker compose` and `stratakb db up` both use port 5433, so run one at a time, or pass `--port` to `stratakb db up`. Both containers (`strata-postgres` and `stratakb-db`) start again with Docker unless they were stopped, so on a machine with both on 5433 they race for the port at every Docker start. Stop the one you don't use (`stratakb db down` or `docker compose stop`) and it stays stopped, or give `stratakb db up --port` another port when it creates the container.
 
-`scripts/backup_restore.py` backs up the whole database or exports and imports a single layer, through `docker exec` in the `strata-postgres` container. A layer export holds its configuration and chunks but not its file tracking, so the first ingestion after an import rebuilds the layer.
+`scripts/backup_restore.py` backs up the whole database or exports and imports a single layer, through `docker exec` in the `strata-postgres` container; `DB_CONTAINER=stratakb-db` points it at the `stratakb db up` database. A layer export holds its configuration and chunks but not its file tracking, so the first ingestion after an import rebuilds the layer.
 
 ## Roadmap
 

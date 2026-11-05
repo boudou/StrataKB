@@ -227,3 +227,117 @@ async def test_layer_switch_compares_with_previous_auto_detection():
 
     names = [c.kwargs["signal_name"] for c in store.store_feedback.call_args_list]
     assert names == ["layer_switch"]
+
+
+@pytest.mark.asyncio
+async def test_track_search_stores_the_confidence_the_tool_returned():
+    with patch("stratakb.learning.tracker.get_settings", return_value=_enabled_settings()):
+        from stratakb.learning.tracker import Tracker
+
+        store = _mock_store()
+        tracker = Tracker(store)
+
+        # The similarities alone would score high: the tracker must not rescore.
+        search = AsyncMock(return_value={
+            "status": "ok",
+            "confidence": {
+                "level": "medium", "top_score": 0.5,
+                "relevant_sources": 1, "basis": "similarity",
+            },
+            "results": [
+                {"chunk_id": f"c{i}", "score": 1.0 - i * 0.1, "similarity": 0.9}
+                for i in range(3)
+            ],
+        })
+        await tracker.track_search(search, "SEPA reject codes", ["sepa"], 5, None)
+
+    kwargs = store.store_interaction.call_args.kwargs
+    assert kwargs["confidence_level"] == "medium"
+    assert kwargs["confidence_score"] == 0.5
+
+
+@pytest.mark.asyncio
+async def test_track_search_stores_result_similarity():
+    with patch("stratakb.learning.tracker.get_settings", return_value=_enabled_settings()):
+        from stratakb.learning.tracker import Tracker
+
+        store = _mock_store()
+        tracker = Tracker(store)
+
+        search = AsyncMock(return_value={"status": "ok", "results": [
+            {"chunk_id": "c1", "content": "text", "score": 1.0, "similarity": 0.3,
+             "layer": "sepa", "source_file": "rules.md"},
+        ]})
+        await tracker.track_search(search, "SEPA reject codes", ["sepa"], 5, None)
+
+    kwargs = store.store_interaction.call_args.kwargs
+    assert kwargs["results"][0] == {
+        "chunk_id": "c1", "score": 1.0, "similarity": 0.3,
+        "layer": "sepa", "source_file": "rules.md",
+    }
+
+
+@pytest.mark.asyncio
+async def test_track_ask_records_rewritten_queries_and_chunks():
+    with patch("stratakb.learning.tracker.get_settings", return_value=_enabled_settings()):
+        from stratakb.learning.tracker import Tracker
+
+        store = _mock_store()
+        tracker = Tracker(store)
+
+        ask = AsyncMock(return_value={
+            "status": "ok", "queries_used": ["a", "b"],
+            "retrieved_chunks": [{"chunk_id": "c1"}, {"chunk_id": "c2"}],
+            "confidence": {"level": "high", "top_score": 0.8},
+        })
+        result = await tracker.track_ask(ask, "question", ["sepa"], True, 10)
+
+    ask.assert_awaited_once_with("question", ["sepa"], True, 10)
+    assert result["interaction_id"] == "int-9"
+    kwargs = store.store_interaction.call_args.kwargs
+    assert kwargs["tool_used"] == "strata_ask"
+    assert kwargs["rewritten_queries"] == ["a", "b"]
+    assert kwargs["result_count"] == 2
+    assert kwargs["confidence_level"] == "high"
+    assert kwargs["confidence_score"] == 0.8
+
+
+@pytest.mark.asyncio
+async def test_track_search_records_no_rewritten_queries():
+    with patch("stratakb.learning.tracker.get_settings", return_value=_enabled_settings()):
+        from stratakb.learning.tracker import Tracker
+
+        store = _mock_store()
+        tracker = Tracker(store)
+
+        search = AsyncMock(return_value={
+            "status": "ok", "queries_used": ["ignored"],
+            "results": [{"chunk_id": "c1"}],
+            "retrieved_chunks": [{"chunk_id": "x"}, {"chunk_id": "y"}],
+        })
+        await tracker.track_search(search, "query", ["sepa"], 5, {"doc_type": "pdf"})
+
+    search.assert_awaited_once_with("query", ["sepa"], 5, {"doc_type": "pdf"})
+    kwargs = store.store_interaction.call_args.kwargs
+    assert kwargs["tool_used"] == "strata_search"
+    assert kwargs["rewritten_queries"] is None
+    assert kwargs["result_count"] == 1
+    assert kwargs["results"][0]["chunk_id"] == "c1"
+    assert kwargs["confidence_level"] is None
+    assert kwargs["confidence_score"] is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tool", ["track_ask", "track_search"])
+async def test_track_returns_error_result_without_recording(tool):
+    with patch("stratakb.learning.tracker.get_settings", return_value=_enabled_settings()):
+        from stratakb.learning.tracker import Tracker
+
+        store = _mock_store()
+        tracker = Tracker(store)
+
+        error = {"status": "error", "error": "boom"}
+        result = await getattr(tracker, tool)(AsyncMock(return_value=error), "query")
+
+    assert result is error
+    store.store_interaction.assert_not_awaited()

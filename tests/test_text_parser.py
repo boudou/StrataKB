@@ -12,7 +12,7 @@ from uuid import uuid4
 
 import pytest
 
-from stratakb.knowledge.parsers.registry import SUPPORTED_PARSERS
+from stratakb.knowledge.parsers.registry import FORMATS, extensions_for
 from stratakb.knowledge.parsers.text_parser import parse_text
 
 FAKE_EMBEDDING = [0.01] * 768
@@ -83,14 +83,14 @@ def test_rst_and_adoc_parse(tmp_path, name):
 
 def test_registry_maps_text_formats():
     for ext in (".txt", ".rst", ".adoc"):
-        assert SUPPORTED_PARSERS[ext] is parse_text
-    assert all(callable(parser) for parser in SUPPORTED_PARSERS.values())
+        assert FORMATS[ext].parser is parse_text
+    assert extensions_for(parse_text) == (".txt", ".rst", ".adoc")
 
 
 def test_ingestion_uses_the_registry():
     from stratakb.knowledge import ingestion
 
-    assert ingestion.SUPPORTED_PARSERS is SUPPORTED_PARSERS
+    assert ingestion.FORMATS is FORMATS
 
 
 @pytest.mark.parametrize(("name", "doc_type"), [

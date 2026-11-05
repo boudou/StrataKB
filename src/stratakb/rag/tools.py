@@ -6,13 +6,17 @@ Registers knowledge search tools with the MCP server.
 from __future__ import annotations
 
 import asyncio
-from typing import Any
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 from mcp.server.fastmcp import FastMCP
 
 from stratakb.core.audit import write_audit_log
 from stratakb.core.auth import get_current_user, require_role
 from stratakb.core.logging import log_tool_call
+from stratakb.rag.confidence import score_confidence, similarity_or_zero
+
+if TYPE_CHECKING:
+    from stratakb.rag.retriever import SearchResult
 
 
 async def _detect_layers(database_url: str, query: str, learning_enabled: bool) -> list[str]:
@@ -53,6 +57,91 @@ def _routing_fallback_reason(
     return None
 
 
+def _fuse_query_results(
+    batch_results: list[list[SearchResult]], k: int
+) -> list[tuple[SearchResult, float]]:
+    """Merge the results of several searches by rank (Reciprocal Rank Fusion).
+
+    Each search's own scores are normalized to its top result, so they do not
+    compare across searches; positions do. The searches are fused with
+    fuse_rrf, all weighted equally, so a chunk found by several searches
+    comes first. Ties go to the higher similarity (a missing one counts as
+    0.0), then to the first seen. Each chunk is represented by its most
+    similar copy. Chunks are told apart by their chunk_id, so two different
+    chunks with the same text both stay. The results are never modified (the
+    search cache shares them); the fused score, best 1.0, travels alongside.
+    """
+    from stratakb.rag.retriever import fuse_rrf
+
+    best: dict[str, SearchResult] = {}
+    rank_lists: list[list[tuple[str, int]]] = []
+    for results in batch_results:
+        rank_lists.append([(r.chunk_id, rank) for rank, r in enumerate(results, start=1)])
+        seen: set[str] = set()
+        for r in results:
+            # Like fuse_rrf, only a chunk's first copy in each search counts
+            if r.chunk_id in seen:
+                continue
+            seen.add(r.chunk_id)
+            current = best.get(r.chunk_id)
+            if current is None or (
+                similarity_or_zero(r.similarity) > similarity_or_zero(current.similarity)
+            ):
+                best[r.chunk_id] = r
+
+    fused = sorted(
+        fuse_rrf(rank_lists, k=k),
+        key=lambda item: (-item[1], -similarity_or_zero(best[item[0]].similarity)),
+    )
+    if not fused:
+        return []
+    top = fused[0][1]
+    return [(best[cid], round(score / top, 4)) for cid, score in fused]
+
+
+class _Collected(NamedTuple):
+    """One strata_ask retrieval: candidates found, chunks kept, their confidence."""
+
+    candidate_count: int
+    chunks: list[dict[str, Any]]
+    confidence: dict[str, Any]
+
+
+def _ask_chunk(r: SearchResult, score: float) -> dict[str, Any]:
+    """The one shape of a strata_ask chunk; the reranker fills rerank_score."""
+    return {
+        "chunk_id": r.chunk_id,
+        "content": r.content,
+        "score": score,
+        "similarity": r.similarity,
+        "rerank_score": None,
+        "layer": r.layer_name,
+        "source_file": r.source_file,
+        "section": r.source_section,
+        "doc_type": r.doc_type,
+        "metadata": r.metadata,
+    }
+
+
+def _basis_score(chunk: dict[str, Any], basis: str) -> float:
+    """The score confidence judges a strata_ask chunk on, for this basis."""
+    if basis == "rerank":
+        return chunk["rerank_score"]
+    return similarity_or_zero(chunk["similarity"])
+
+
+def _search_confidence(results: list[SearchResult]) -> dict[str, Any]:
+    """Judge strata_search results on cosine similarity, never the fused score.
+
+    The fused score is divided by the top score, so the best result is
+    always 1.0. A result without an embedding counts as similarity 0.0.
+    """
+    return score_confidence(
+        [similarity_or_zero(r.similarity) for r in results],
+        basis="similarity",
+    )
+
+
 def register_rag_tools(
     mcp: FastMCP, database_url: str, openai_api_key: str = ""
 ) -> None:
@@ -79,7 +168,6 @@ def register_rag_tools(
         """Run strata_search; the tool below documents the arguments."""
         from stratakb.config import get_settings
         from stratakb.knowledge.embeddings import embedding_key_error
-        from stratakb.rag.confidence import score_confidence
         from stratakb.rag.retriever import search_chunks
 
         _settings = get_settings()
@@ -112,11 +200,9 @@ def register_rag_tools(
                 metadata_filter=metadata_filter,
             )
 
+            confidence = _search_confidence(results)
             fallback_reason = None
             if detected_layers:
-                confidence = score_confidence([
-                    r.similarity_score for r in results if r.similarity_score is not None
-                ])
                 fallback_reason = _routing_fallback_reason(len(results), top_k, confidence)
                 if fallback_reason:
                     results = await search_chunks(
@@ -124,6 +210,7 @@ def register_rag_tools(
                         layers=None, top_k=top_k, metadata_filter=metadata_filter,
                     )
                     layers = None
+                    confidence = _search_confidence(results)
 
             user_id, _ = get_current_user()
             await write_audit_log(
@@ -143,6 +230,7 @@ def register_rag_tools(
             response = {
                 "status": "ok",
                 "query": query,
+                "confidence": confidence,
                 "results": [
                     {
                         "chunk_id": r.chunk_id,
@@ -153,6 +241,7 @@ def register_rag_tools(
                         "section": r.source_section,
                         "doc_type": r.doc_type,
                         "metadata": r.metadata,
+                        "similarity": r.similarity,
                     }
                     for r in results
                 ],
@@ -183,8 +272,9 @@ def register_rag_tools(
         Runs hybrid search (vector similarity plus full-text) across the
         ingested knowledge layers and returns the most relevant chunks with
         their source file and section. Use strata_list_knowledge_layers to see
-        which layers exist. The response carries an interaction_id to pass to
-        strata_feedback.
+        which layers exist. The response carries a confidence level (high,
+        medium or low) judged on the results' similarity, with a warning when
+        low, and an interaction_id to pass to strata_feedback.
 
         Args:
             query: Natural language search query, or exact terms and identifiers.
@@ -209,13 +299,12 @@ def register_rag_tools(
     ) -> dict:
         """Run strata_ask; the tool below documents the arguments."""
         from stratakb.config import get_settings
-        from stratakb.rag.confidence import score_confidence
         from stratakb.rag.query_rewriter import (
             build_domain_context,
             rewrite_configured,
             rewrite_query,
         )
-        from stratakb.rag.retriever import SearchResult, search_chunks
+        from stratakb.rag.retriever import search_chunks
 
         _settings = get_settings()
 
@@ -259,7 +348,7 @@ def register_rag_tools(
 
             async def _collect(
                 search_layers: list[str] | None,
-            ) -> tuple[list[SearchResult], list[dict[str, Any]] | None, dict[str, Any]]:
+            ) -> _Collected:
                 async def _run_search(q: str) -> list[SearchResult]:
                     return await search_chunks(
                         database_url, openai_api_key, q,
@@ -267,98 +356,57 @@ def register_rag_tools(
                     )
 
                 batch_results = await asyncio.gather(*(_run_search(q) for q in queries))
-                all_results: dict[str, SearchResult] = {}
-                for results in batch_results:
-                    for r in results:
-                        key = str(hash(r.content[:200]))
-                        existing = all_results.get(key)
-                        if not existing or r.score > existing.score:
-                            all_results[key] = r
+                fused = _fuse_query_results(list(batch_results), _settings.hybrid_rrf_k)
 
                 rerank_limit = (
                     top_k * _settings.reranking_candidate_multiplier
                     if _settings.reranking_enabled else top_k
                 )
-                ranked = sorted(
-                    all_results.values(), key=lambda r: r.score, reverse=True
-                )[:rerank_limit]
-                reranked_chunks = None
-                if _settings.reranking_enabled and ranked:
+                candidates = [_ask_chunk(r, s) for r, s in fused[:rerank_limit]]
+                if _settings.reranking_enabled and candidates:
                     from stratakb.rag.reranker import rerank_results
 
-                    chunks_for_rerank = [
-                        {"chunk_id": r.chunk_id, "content": r.content, "score": r.score,
-                         "layer": r.layer_name, "source_file": r.source_file,
-                         "section": r.source_section, "doc_type": r.doc_type,
-                         "metadata": r.metadata}
-                        for r in ranked
-                    ]
-                    reranked_chunks = await asyncio.to_thread(
-                        rerank_results, question, chunks_for_rerank, top_k,
+                    chunks = await asyncio.to_thread(
+                        rerank_results, question, candidates, top_k,
                         _settings.reranking_model,
                     )
-                    scores = [c.get("rerank_score", c.get("score", 0)) for c in reranked_chunks]
+                    # The reranker's relevance probabilities (0-1)
+                    basis = "rerank"
                 else:
-                    scores = [
-                        r.similarity_score for r in ranked if r.similarity_score is not None
-                    ]
-                return ranked, reranked_chunks, score_confidence(scores)
+                    # Cosine similarity, never a fused score: that one is
+                    # normalized so the top result is always 1.0
+                    chunks = candidates
+                    basis = "similarity"
+                confidence = score_confidence(
+                    [_basis_score(c, basis) for c in chunks], basis=basis
+                )
+                return _Collected(len(candidates), chunks, confidence)
 
-            ranked, reranked_chunks, confidence = await _collect(layers)
+            collected = await _collect(layers)
             fallback_reason = None
             if detected:
-                result_count = len(reranked_chunks) if reranked_chunks is not None else len(ranked)
-                fallback_reason = _routing_fallback_reason(result_count, top_k, confidence)
+                fallback_reason = _routing_fallback_reason(
+                    len(collected.chunks), top_k, collected.confidence
+                )
                 if fallback_reason:
-                    ranked, reranked_chunks, confidence = await _collect(None)
+                    collected = await _collect(None)
                     layers = None
+            chunks, confidence = collected.chunks, collected.confidence
 
-            if reranked_chunks is not None:
-                chunks = reranked_chunks
-                sources = []
+            sources = []
+            if include_sources:
                 seen_sources = set()
-                for c in reranked_chunks:
-                    if include_sources:
-                        source_key = (
-                            f"{c['layer']}:{c.get('source_file', '')}:{c.get('section', '')}"
-                        )
-                        if source_key not in seen_sources:
-                            seen_sources.add(source_key)
-                            sources.append({
-                                "layer": c["layer"],
-                                "file": c.get("source_file", ""),
-                                "section": c.get("section", ""),
-                                "doc_type": c.get("doc_type", ""),
-                                "relevance_score": c.get("rerank_score", c.get("score", 0)),
-                            })
-
-            else:
-                # Build response
-                chunks = []
-                sources = []
-                seen_sources = set()
-
-                for r in ranked:
-                    chunks.append({
-                        "chunk_id": r.chunk_id,
-                        "content": r.content,
-                        "score": r.score,
-                        "layer": r.layer_name,
-                        "doc_type": r.doc_type,
-                        "metadata": r.metadata,
-                    })
-
-                    if include_sources:
-                        source_key = f"{r.layer_name}:{r.source_file}:{r.source_section}"
-                        if source_key not in seen_sources:
-                            seen_sources.add(source_key)
-                            sources.append({
-                                "layer": r.layer_name,
-                                "file": r.source_file,
-                                "section": r.source_section,
-                                "doc_type": r.doc_type,
-                                "relevance_score": r.score,
-                            })
+                for c in chunks:
+                    source_key = f"{c['layer']}:{c['source_file']}:{c['section']}"
+                    if source_key not in seen_sources:
+                        seen_sources.add(source_key)
+                        sources.append({
+                            "layer": c["layer"],
+                            "file": c["source_file"],
+                            "section": c["section"],
+                            "doc_type": c["doc_type"],
+                            "relevance_score": _basis_score(c, confidence["basis"]),
+                        })
 
             # Audit
             user_id, _ = get_current_user()
@@ -373,7 +421,9 @@ def register_rag_tools(
                     "queries_used": len(queries),
                     "routing_fallback": bool(fallback_reason),
                 },
-                result_summary=f"{len(ranked)} chunks, confidence={confidence['level']}",
+                result_summary=(
+                    f"{collected.candidate_count} chunks, confidence={confidence['level']}"
+                ),
             )
 
             response: dict = {

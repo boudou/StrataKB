@@ -10,6 +10,17 @@ from pydantic_settings import BaseSettings
 
 DOTENV_WARNING = "./.env is not read; set STRATAKB_CONFIG=.env to use it."
 
+# The local database: the default DATABASE_URL and the stratakb db up container
+# (core/local_db.py) both use these
+LOCAL_DB_USER = "strata"
+LOCAL_DB_PASSWORD = "strata_dev_password"
+LOCAL_DB_NAME = "strata"
+LOCAL_DB_PORT = 5433
+
+
+def local_database_url(port: int = LOCAL_DB_PORT) -> str:
+    return f"postgresql://{LOCAL_DB_USER}:{LOCAL_DB_PASSWORD}@127.0.0.1:{port}/{LOCAL_DB_NAME}"
+
 
 class Settings(BaseSettings):
     """Application settings.
@@ -19,10 +30,12 @@ class Settings(BaseSettings):
     environment variables. ./.env is not read unless STRATAKB_CONFIG names it.
     """
 
-    # Database
-    database_url: str = "postgresql://strata:strata_dev_password@localhost:5433/strata"
+    # Database (127.0.0.1, not localhost: on Windows localhost resolves to ::1
+    # first, and Docker in WSL forwards IPv4 only)
+    database_url: str = local_database_url()
     # Connection for strata_db_query and strata_db_explain; empty = the SQL tools
-    # are not registered. A superuser role is refused at startup.
+    # are not registered. A superuser, a member of a superuser or server-access
+    # role, or a role that can't be checked is refused at startup.
     # Point it at the strata_readonly role from db/03_readonly_role.sql.
     readonly_database_url: str = ""
 
@@ -63,6 +76,7 @@ class Settings(BaseSettings):
     hybrid_semantic_weight: float = 0.7  # RRF weight for vector results
     hybrid_keyword_weight: float = 0.3   # RRF weight for full-text results
     hybrid_rrf_k: int = 60              # RRF constant (standard = 60)
+    hybrid_keyword_slots: int = 1       # results kept for the best full-text hits
 
     # Reranking
     reranking_enabled: bool = True

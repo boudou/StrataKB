@@ -5,6 +5,9 @@ Registers knowledge layer management tools with the MCP server.
 
 from __future__ import annotations
 
+import asyncio
+
+import structlog
 from mcp.server.fastmcp import FastMCP
 
 from stratakb.core.audit import write_audit_log
@@ -20,6 +23,8 @@ from stratakb.knowledge.layers import (
     get_layer_status,
     list_layers,
 )
+
+logger = structlog.get_logger()
 
 
 def _serialize(obj: object) -> object:
@@ -43,10 +48,19 @@ def _serialize(obj: object) -> object:
 _ADMIN_ONLY_LAYER_FIELDS = ("owner", "root_path")
 
 
-def _for_caller(layer: dict) -> dict:
-    """Drop the admin-only layer fields when the caller is below admin."""
+# strata_apply_preset's dry run reports layer_check "unknown" after this many seconds
+_LAYER_CHECK_TIMEOUT_S = 5.0
+
+
+def _caller_is_admin() -> bool:
+    """True when the current caller has the admin role."""
     _, role = get_current_user()
-    if check_role(role, "admin"):
+    return check_role(role, "admin")
+
+
+def _for_caller(layer: dict, is_admin: bool) -> dict:
+    """Drop the admin-only layer fields when the caller is below admin."""
+    if is_admin:
         return layer
     return {k: v for k, v in layer.items() if k not in _ADMIN_ONLY_LAYER_FIELDS}
 
@@ -67,8 +81,9 @@ def register_knowledge_tools(
         are available in the system.
         """
         layers = await list_layers(database_url)
+        is_admin = _caller_is_admin()
         return {
-            "layers": [_serialize(_for_caller(layer)) for layer in layers],
+            "layers": [_serialize(_for_caller(layer, is_admin)) for layer in layers],
             "total": len(layers),
         }
 
@@ -144,7 +159,7 @@ def register_knowledge_tools(
         """
         try:
             status = await get_layer_status(database_url, name=name)
-            return {"status": "ok", "layer": _serialize(_for_caller(status))}
+            return {"status": "ok", "layer": _serialize(_for_caller(status, _caller_is_admin()))}
         except LayerNotFoundError as e:
             return {"status": "error", "error": str(e)}
 
@@ -190,8 +205,10 @@ def register_knowledge_tools(
         content is unchanged are skipped, changed files are replaced, new files
         are added, and files ingested from that folder that no longer exist are
         removed. Other folders ingested into the layer are left alone, and a
-        single-file source_path never removes anything. A file that fails to
-        parse keeps its previous chunks and is listed in errors.
+        single-file source_path never removes anything. A file that cannot be
+        read or fails to parse keeps its previous chunks and is listed in
+        errors with file, error and reason ("read_error": locked or no
+        permission, "parse_error", or "embed_error").
 
         Files whose names look like secrets (.env, keys, certificates,
         credentials, e.g. client_secret.json) are always skipped and never
@@ -200,7 +217,8 @@ def register_knowledge_tools(
         files_skipped counts the skipped files. A PDF that looks scanned
         (under half its pages have text, or under 200 characters per page on
         average) is stored for the text it has and counted in files_flagged;
-        it also counts as added or updated.
+        it also counts as added or updated. A CSV over 10,000 rows is stored
+        for its first 10,000 rows and also counted in files_flagged.
 
         Unchanged means the same file content (SHA-256). A change to the
         layer's chunk_config or to the embedding model is not detected: use
@@ -276,18 +294,25 @@ def register_knowledge_tools(
         docs_root: str | None = None,
         dry_run: bool = False,
     ) -> dict:
-        """Create a knowledge layer from a preset file and ingest all its sources.
+        """Create or update a knowledge layer from a preset file and ingest all its sources.
 
         A preset is a YAML file describing one layer (name, description,
         chunking, routing patterns) and the folders to ingest into it. This
         tool:
-        1. Creates the layer if it does not exist yet
+        1. Creates the layer, or updates an existing layer made by this preset
+           to the preset's settings; a layer with the same name made another
+           way is refused and left unchanged
         2. Deletes the layer's existing chunks
         3. Ingests every source folder listed in the preset
 
+        The result lists the layer settings that changed (layer_changes).
         Source folders that are missing are skipped and reported together with
         their download link, if the preset gives one. Use dry_run=True to check
-        that all files parse, without a database or embeddings.
+        that all files parse, without embeddings; it also reports which layer
+        settings would change (layer_check). layer_check is 'would_claim'
+        when a layer with no recorded origin already matches the preset and
+        would be marked as made by it, and 'unknown' when the database does
+        not answer within 5 seconds.
 
         Args:
             preset_path: Path to the preset YAML file. Example: "examples/sepa/preset.yaml"
@@ -301,6 +326,7 @@ def register_knowledge_tools(
         from stratakb.knowledge.embeddings import embedding_key_error
         from stratakb.knowledge.layers import LayerValidationError
         from stratakb.knowledge.presets import (
+            check_preset_layer,
             create_preset_layer,
             dry_run_parse,
             ingest_preset,
@@ -321,6 +347,14 @@ def register_knowledge_tools(
 
         if dry_run:
             result = dry_run_parse(preset, root)
+            try:
+                layer_check = await asyncio.wait_for(
+                    check_preset_layer(database_url, preset), _LAYER_CHECK_TIMEOUT_S
+                )
+            except Exception as e:
+                # No message: it can hold the database URL
+                logger.warning("preset_layer_check_failed", error_type=type(e).__name__)
+                layer_check = {"status": "unknown", "changes": []}
             return {
                 "status": "dry_run_complete",
                 "layer": preset.name,
@@ -338,13 +372,21 @@ def register_knowledge_tools(
                     for name, stats in result.group_stats.items()
                 },
                 "errors": result.errors[:20] if result.errors else None,
+                "layer_check": layer_check,
             }
 
         if err := embedding_key_error(_settings, openai_api_key):
             return {"status": "error", "error": err}
 
         user_id, _ = get_current_user()
-        layer_result = await create_preset_layer(database_url, preset)
+        try:
+            layer_result = await create_preset_layer(database_url, preset)
+            error = layer_result["message"] if layer_result["status"] == "refused" else None
+        except LayerError as e:
+            error = str(e)
+        if error is not None:
+            # Nothing was changed, so there is nothing to audit
+            return {"status": "error", "error": error}
         ingest_result = await ingest_preset(database_url, openai_api_key, preset, root)
 
         await write_audit_log(
@@ -354,7 +396,9 @@ def register_knowledge_tools(
             tool_name="strata_apply_preset",
             parameters={"preset_path": preset_path, "docs_root": docs_root},
             result_summary=(
-                f"Layer '{preset.name}': {layer_result['status']}, "
+                f"Layer '{preset.name}': {layer_result['status']}"
+                + (f" ({', '.join(layer_result['changes'])})" if layer_result["changes"] else "")
+                + ", "
                 f"ingested {ingest_result['total_docs']} docs, "
                 f"{ingest_result['total_chunks']} chunks"
             ),
@@ -363,5 +407,6 @@ def register_knowledge_tools(
         return {
             "status": "completed",
             "layer": layer_result["status"],
+            "layer_changes": layer_result["changes"],
             "ingestion": ingest_result,
         }
