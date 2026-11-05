@@ -6,13 +6,14 @@ Registers knowledge search tools with the MCP server.
 from __future__ import annotations
 
 import asyncio
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 from mcp.server.fastmcp import FastMCP
 
 from stratakb.core.audit import write_audit_log
 from stratakb.core.auth import get_current_user, require_role
 from stratakb.core.logging import log_tool_call
+from stratakb.rag.confidence import score_confidence, similarity_or_zero
 
 if TYPE_CHECKING:
     from stratakb.rag.retriever import SearchResult
@@ -62,42 +63,48 @@ def _fuse_query_results(
     """Merge the results of several searches by rank (Reciprocal Rank Fusion).
 
     Each search's own scores are normalized to its top result, so they do not
-    compare across searches; positions do. A chunk earns 1 / (k + rank) from
-    each search that finds it, so one found by several searches comes first.
-    Ties go to the higher similarity, then to the first seen. Each chunk is
-    represented by its most similar copy. Chunks are told apart by their
-    chunk_id, so two different chunks with the same text both stay. The
-    results are never modified (the search cache shares them); the fused
-    score, best 1.0, travels alongside.
+    compare across searches; positions do. The searches are fused with
+    fuse_rrf, all weighted equally, so a chunk found by several searches
+    comes first. Ties go to the higher similarity (a missing one counts as
+    0.0), then to the first seen. Each chunk is represented by its most
+    similar copy. Chunks are told apart by their chunk_id, so two different
+    chunks with the same text both stay. The results are never modified (the
+    search cache shares them); the fused score, best 1.0, travels alongside.
     """
-    fused: dict[str, float] = {}
-    best: dict[str, SearchResult] = {}
-    for results in batch_results:
-        seen: set[str] = set()
-        for rank, r in enumerate(results, start=1):
-            key = r.chunk_id
-            if key in seen:
-                continue
-            seen.add(key)
-            fused[key] = fused.get(key, 0.0) + 1.0 / (k + rank)
-            current = best.get(key)
-            if current is None or (r.similarity is not None and (
-                current.similarity is None or r.similarity > current.similarity
-            )):
-                best[key] = r
+    from stratakb.rag.retriever import fuse_rrf
 
-    order = sorted(
-        fused,
-        key=lambda key: (
-            -fused[key],
-            best[key].similarity is None,
-            -(best[key].similarity or 0.0),
-        ),
+    best: dict[str, SearchResult] = {}
+    rank_lists: list[list[tuple[str, int]]] = []
+    for results in batch_results:
+        rank_lists.append([(r.chunk_id, rank) for rank, r in enumerate(results, start=1)])
+        seen: set[str] = set()
+        for r in results:
+            # Like fuse_rrf, only a chunk's first copy in each search counts
+            if r.chunk_id in seen:
+                continue
+            seen.add(r.chunk_id)
+            current = best.get(r.chunk_id)
+            if current is None or (
+                similarity_or_zero(r.similarity) > similarity_or_zero(current.similarity)
+            ):
+                best[r.chunk_id] = r
+
+    fused = sorted(
+        fuse_rrf(rank_lists, k=k),
+        key=lambda item: (-item[1], -similarity_or_zero(best[item[0]].similarity)),
     )
-    if not order:
+    if not fused:
         return []
-    top = fused[order[0]]
-    return [(best[key], round(fused[key] / top, 4)) for key in order]
+    top = fused[0][1]
+    return [(best[cid], round(score / top, 4)) for cid, score in fused]
+
+
+class _Collected(NamedTuple):
+    """One strata_ask retrieval: candidates found, chunks kept, their confidence."""
+
+    candidate_count: int
+    chunks: list[dict[str, Any]]
+    confidence: dict[str, Any]
 
 
 def _ask_chunk(r: SearchResult, score: float) -> dict[str, Any]:
@@ -120,7 +127,7 @@ def _basis_score(chunk: dict[str, Any], basis: str) -> float:
     """The score confidence judges a strata_ask chunk on, for this basis."""
     if basis == "rerank":
         return chunk["rerank_score"]
-    return chunk["similarity"] if chunk["similarity"] is not None else 0.0
+    return similarity_or_zero(chunk["similarity"])
 
 
 def _search_confidence(results: list[SearchResult]) -> dict[str, Any]:
@@ -129,10 +136,8 @@ def _search_confidence(results: list[SearchResult]) -> dict[str, Any]:
     The fused score is divided by the top score, so the best result is
     always 1.0. A result without an embedding counts as similarity 0.0.
     """
-    from stratakb.rag.confidence import score_confidence
-
     return score_confidence(
-        [r.similarity if r.similarity is not None else 0.0 for r in results],
+        [similarity_or_zero(r.similarity) for r in results],
         basis="similarity",
     )
 
@@ -294,7 +299,6 @@ def register_rag_tools(
     ) -> dict:
         """Run strata_ask; the tool below documents the arguments."""
         from stratakb.config import get_settings
-        from stratakb.rag.confidence import score_confidence
         from stratakb.rag.query_rewriter import (
             build_domain_context,
             rewrite_configured,
@@ -344,7 +348,7 @@ def register_rag_tools(
 
             async def _collect(
                 search_layers: list[str] | None,
-            ) -> tuple[int, list[dict[str, Any]], str, dict[str, Any]]:
+            ) -> _Collected:
                 async def _run_search(q: str) -> list[SearchResult]:
                     return await search_chunks(
                         database_url, openai_api_key, q,
@@ -358,7 +362,7 @@ def register_rag_tools(
                     top_k * _settings.reranking_candidate_multiplier
                     if _settings.reranking_enabled else top_k
                 )
-                candidates = [_ask_chunk(r, s) for r, s in fused][:rerank_limit]
+                candidates = [_ask_chunk(r, s) for r, s in fused[:rerank_limit]]
                 if _settings.reranking_enabled and candidates:
                     from stratakb.rag.reranker import rerank_results
 
@@ -376,15 +380,18 @@ def register_rag_tools(
                 confidence = score_confidence(
                     [_basis_score(c, basis) for c in chunks], basis=basis
                 )
-                return len(candidates), chunks, basis, confidence
+                return _Collected(len(candidates), chunks, confidence)
 
-            candidate_count, chunks, basis, confidence = await _collect(layers)
+            collected = await _collect(layers)
             fallback_reason = None
             if detected:
-                fallback_reason = _routing_fallback_reason(len(chunks), top_k, confidence)
+                fallback_reason = _routing_fallback_reason(
+                    len(collected.chunks), top_k, collected.confidence
+                )
                 if fallback_reason:
-                    candidate_count, chunks, basis, confidence = await _collect(None)
+                    collected = await _collect(None)
                     layers = None
+            chunks, confidence = collected.chunks, collected.confidence
 
             sources = []
             if include_sources:
@@ -398,7 +405,7 @@ def register_rag_tools(
                             "file": c["source_file"],
                             "section": c["section"],
                             "doc_type": c["doc_type"],
-                            "relevance_score": _basis_score(c, basis),
+                            "relevance_score": _basis_score(c, confidence["basis"]),
                         })
 
             # Audit
@@ -414,7 +421,9 @@ def register_rag_tools(
                     "queries_used": len(queries),
                     "routing_fallback": bool(fallback_reason),
                 },
-                result_summary=f"{candidate_count} chunks, confidence={confidence['level']}",
+                result_summary=(
+                    f"{collected.candidate_count} chunks, confidence={confidence['level']}"
+                ),
             )
 
             response: dict = {

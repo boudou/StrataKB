@@ -10,6 +10,7 @@ import json
 import re
 import time
 import uuid
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 
@@ -237,6 +238,46 @@ def _sanitize_key(key: str) -> str:
 _WEBSEARCH_SYNTAX = re.compile(r'"|\bOR\b|(?:^|\s)-\w')
 
 
+def fuse_rrf(
+    rank_lists: Sequence[Sequence[tuple[str, int]]],
+    *,
+    k: int,
+    weights: Sequence[float] | None = None,
+) -> list[tuple[str, float]]:
+    """Weighted Reciprocal Rank Fusion of any number of rank lists.
+
+    A chunk earns weight / (k + rank) from each list that holds it, counted
+    once per list at its first appearance.
+
+    Args:
+        rank_lists: Lists of (chunk_id, rank), one per search.
+        k: RRF constant.
+        weights: One weight per list; None weighs every list 1.0.
+
+    Returns:
+        Sorted list of (chunk_id, fused_score) highest first; ties keep the
+        order in which the chunks were first seen.
+
+    Raises:
+        ValueError: If weights does not hold one weight per list.
+    """
+    if weights is None:
+        weights = [1.0] * len(rank_lists)
+    elif len(weights) != len(rank_lists):
+        raise ValueError(
+            f"fuse_rrf got {len(weights)} weights for {len(rank_lists)} rank lists"
+        )
+    scores: dict[str, float] = {}
+    for ranks, weight in zip(rank_lists, weights, strict=True):
+        seen: set[str] = set()
+        for chunk_id, rank in ranks:
+            if chunk_id in seen:
+                continue
+            seen.add(chunk_id)
+            scores[chunk_id] = scores.get(chunk_id, 0.0) + weight / (k + rank)
+    return sorted(scores.items(), key=lambda x: x[1], reverse=True)
+
+
 def _fuse_rrf(
     semantic: list[tuple[str, int]],
     keyword: list[tuple[str, int]],
@@ -256,12 +297,7 @@ def _fuse_rrf(
     Returns:
         Sorted list of (chunk_id, fused_score) highest first.
     """
-    scores: dict[str, float] = {}
-    for chunk_id, rank in semantic:
-        scores[chunk_id] = scores.get(chunk_id, 0) + sem_weight / (k + rank)
-    for chunk_id, rank in keyword:
-        scores[chunk_id] = scores.get(chunk_id, 0) + kw_weight / (k + rank)
-    return sorted(scores.items(), key=lambda x: x[1], reverse=True)
+    return fuse_rrf([semantic, keyword], k=k, weights=[sem_weight, kw_weight])
 
 
 def _reserve_keyword_slots(

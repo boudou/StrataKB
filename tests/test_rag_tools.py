@@ -221,6 +221,35 @@ class TestConfidenceScoring:
         result = score_confidence([0.95], basis="similarity")
         assert result["level"] == "medium"
 
+    def test_warning_only_for_low(self):
+        from stratakb.rag.confidence import score_confidence
+
+        assert "warning" not in score_confidence([0.92, 0.85, 0.81], basis="similarity")
+        medium = score_confidence([0.72, 0.65], basis="similarity")
+        assert medium["level"] == "medium"
+        assert "warning" not in medium
+        assert score_confidence([0.4], basis="similarity")["warning"].startswith(
+            "Low confidence results"
+        )
+        assert score_confidence([], basis="similarity")["warning"].startswith(
+            "No results found"
+        )
+
+    def test_thresholds_are_frozen(self):
+        from dataclasses import FrozenInstanceError
+
+        from stratakb.rag.confidence import SIMILARITY_THRESHOLDS
+
+        with pytest.raises(FrozenInstanceError):
+            SIMILARITY_THRESHOLDS.high_score = 0.1
+
+    def test_similarity_or_zero(self):
+        from stratakb.rag.confidence import similarity_or_zero
+
+        assert similarity_or_zero(None) == 0.0
+        assert similarity_or_zero(-0.2) == -0.2
+        assert similarity_or_zero(0.7) == 0.7
+
 
 # ==========================================
 # Query rewriter tests
@@ -790,6 +819,25 @@ class TestAskOrdering:
 
         assert [c["chunk_id"] for c in result["retrieved_chunks"]] == ["both"]
         assert result["retrieved_chunks"][0]["score"] == 1.0
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("swapped", [False, True])
+    async def test_ask_tie_counts_missing_similarity_as_zero(self, no_sdk_env, swapped):
+        """A chunk without an embedding ties as similarity 0.0, below a real 0.3."""
+        by_query = {"one": [_result("none", 1.0, None)], "two": [_result("real", 1.0, 0.3)]}
+        if swapped:
+            by_query = dict(reversed(list(by_query.items())))
+        result = await _ask_with(by_query)
+
+        assert [c["chunk_id"] for c in result["retrieved_chunks"]] == ["real", "none"]
+        assert result["confidence"]["top_score"] == 0.3
+
+    @pytest.mark.asyncio
+    async def test_ask_tie_ranks_missing_similarity_above_negative(self, no_sdk_env):
+        by_query = {"one": [_result("neg", 1.0, -0.2)], "two": [_result("none", 1.0, None)]}
+        result = await _ask_with(by_query)
+
+        assert [c["chunk_id"] for c in result["retrieved_chunks"]] == ["none", "neg"]
 
 
 # ==========================================

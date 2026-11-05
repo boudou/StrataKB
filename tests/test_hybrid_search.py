@@ -12,6 +12,7 @@ from stratakb.rag.retriever import (
     _hybrid_search,
     _reserve_keyword_slots,
     _search_fetch,
+    fuse_rrf,
 )
 
 
@@ -322,3 +323,41 @@ async def test_hybrid_still_finds_chunk_without_embedding(monkeypatch, vacuumed_
     finally:
         async with pool.acquire() as conn:
             await conn.execute("DELETE FROM strata_vectors.chunks WHERE layer_name = $1", layer)
+
+
+def test_fuse_rrf_three_lists_unweighted():
+    lists = [
+        [("a", 1), ("b", 2)],
+        [("c", 1), ("a", 2)],
+        [("a", 3), ("c", 2)],
+    ]
+    fused = dict(fuse_rrf(lists, k=60))
+
+    assert next(iter(fused)) == "a"
+    assert fused["a"] == 1 / 61 + 1 / 62 + 1 / 63
+    assert fused["c"] == 1 / 61 + 1 / 62
+    assert fused["b"] == 1 / 62
+
+
+def test_fuse_rrf_counts_repeated_id_once_per_list():
+    assert fuse_rrf([[("a", 1), ("a", 2)]], k=60) == [("a", 1 / 61)]
+
+
+def test_fuse_rrf_weights_length_mismatch_raises():
+    with pytest.raises(ValueError):
+        fuse_rrf([[("a", 1)], [("b", 1)]], k=60, weights=[1.0])
+
+
+def test_fuse_rrf_matches_two_leg_wrapper():
+    semantic = [("id1", 1), ("id2", 2), ("id3", 3)]
+    keyword = [("id2", 1), ("id4", 2), ("id1", 3)]
+
+    assert _fuse_rrf(semantic, keyword, k=60, sem_weight=0.7, kw_weight=0.3) == fuse_rrf(
+        [semantic, keyword], k=60, weights=[0.7, 0.3]
+    )
+
+
+def test_fuse_rrf_ties_keep_first_seen_order():
+    fused = fuse_rrf([[("x", 1)], [("y", 1)], [("z", 1)]], k=60)
+
+    assert [cid for cid, _ in fused] == ["x", "y", "z"]

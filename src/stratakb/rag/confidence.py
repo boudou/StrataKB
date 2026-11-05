@@ -11,7 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 
-@dataclass
+@dataclass(frozen=True)
 class ConfidenceThresholds:
     """Thresholds for one score scale; the score cut-offs have no default."""
 
@@ -32,6 +32,17 @@ _BASIS_THRESHOLDS = {
     "similarity": SIMILARITY_THRESHOLDS,
     "rerank": RERANK_THRESHOLDS,
 }
+
+_NO_RESULTS_WARNING = "No results found. Try broadening your search or using different terms."
+_LOW_CONFIDENCE_WARNING = (
+    "Low confidence results. Consider verifying with authoritative sources"
+    " or refining your query."
+)
+
+
+def similarity_or_zero(similarity: float | None) -> float:
+    """A chunk without an embedding has no similarity; it counts as 0.0."""
+    return 0.0 if similarity is None else similarity
 
 
 def score_confidence(scores: list[float], *, basis: str) -> dict:
@@ -56,7 +67,6 @@ def score_confidence(scores: list[float], *, basis: str) -> dict:
 
     if not scores:
         level, top_score, relevant = "low", 0.0, 0
-        warning = "No results found. Try broadening your search or using different terms."
     else:
         top_score = max(scores)
         # Count sources above medium threshold as "relevant"
@@ -67,10 +77,6 @@ def score_confidence(scores: list[float], *, basis: str) -> dict:
             level = "medium"
         else:
             level = "low"
-        warning = (
-            "Low confidence results. Consider verifying with authoritative sources"
-            " or refining your query."
-        )
 
     result = {
         "level": level,
@@ -79,5 +85,5 @@ def score_confidence(scores: list[float], *, basis: str) -> dict:
         "basis": basis,
     }
     if level == "low":
-        result["warning"] = warning
+        result["warning"] = _LOW_CONFIDENCE_WARNING if scores else _NO_RESULTS_WARNING
     return result
