@@ -64,6 +64,9 @@ Notable changes to StrataKB. The format follows [Keep a Changelog](https://keepa
 - `strata_feedback` rejects an unknown `interaction_id` instead of reporting success.
 - The query and routing caches are cleared when any process changes a layer (checked at most every 2 s); before, searches could serve results up to 10 minutes old.
 - The CI and release workflows pin `astral-sh/setup-uv` to a tag that exists.
+- The embedding and reranking models are downloaded when they are not cached. Before, the server switched Hugging Face to offline mode when it loaded, so a new install could not ingest, search or ask until the models were downloaded by hand. A cached model still loads without contacting Hugging Face, and with `STRATA_LOCAL_ONLY=true` nothing is downloaded.
+- Each layer is chunked with its own `chunk_size` and `chunk_overlap`. Before, the stored settings came back from the database as text and every layer was chunked at 1000/200. Layer listings return `chunk_config` and `metadata_schema` as objects and `routing_patterns` as a list.
+- `strata_search` interactions store a confidence judged on the query/chunk similarity, with its level. Before, they stored the top fused score, which is always 1.0, and no level, so the learning loop never learned from searches. `strata_search` results now carry each chunk's `similarity`.
 
 ### Security
 
