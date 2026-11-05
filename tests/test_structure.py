@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import contextlib
 import shutil
+import threading
 import time
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
@@ -16,8 +17,8 @@ from uuid import uuid4
 import pytest
 
 from stratakb.knowledge.documents import build_document_text
-from stratakb.knowledge.ingestion import _chunk_document, _parse_file
-from stratakb.knowledge.structure import chunk_spans, detect_sections
+from stratakb.knowledge.ingestion import _chunk_document, _map_document, _parse_file
+from stratakb.knowledge.structure import PATH_SEPARATOR, chunk_spans, detect_sections
 
 FIXTURES = Path(__file__).parent / "fixtures"
 FAKE_EMBEDDING = [0.01] * 768
@@ -37,7 +38,12 @@ def _assert_no_chunk_crosses(sections, spans, text):
     for start, end, path in spans:
         assert text[start:end].strip() == text[start:end]
         for s in sections:
+            # A bare heading folds into its first subsection: the chunk may
+            # hold the start of its own section or of one of its ancestors
+            if s.path == path or path.startswith(s.path + PATH_SEPARATOR):
+                continue
             assert not (start < s.char_start < end), (path, s.path)
+        for s in sections:
             assert not (start < s.char_end < end), (path, s.path)
 
 
@@ -264,6 +270,55 @@ def test_extra_pattern_adds_sections():
     ]
 
 
+def test_markdown_loose_list_is_not_a_clause():
+    guide = (
+        "# Guide\n\nIntro.\n\n1. Install the tool\n\nRun it once.\n\n"
+        "2. Configure it\n\nEdit the file.\n"
+    )
+    lone = "Some intro.\n\n1. Install the tool\n\nMore prose.\n"
+    assert [s.path for s in detect_sections(guide, markdown=True)] == ["Guide"]
+    assert detect_sections(lone, markdown=True) == []
+    # Outside Markdown the same lines stay clauses
+    assert [s.path for s in detect_sections(guide)] == [
+        "Guide", "Guide > 1 Install the tool", "Guide > 2 Configure it",
+    ]
+    assert [s.path for s in detect_sections(lone)] == ["1 Install the tool"]
+
+
+def test_markdown_run_with_subclauses_is_kept():
+    sections = _map_document(_parse_file(FIXTURES / "contract.md")).sections
+    assert [s.path for s in sections] == [
+        "1 Definitions",
+        "2 Termination",
+        "2 Termination > 2.1 Notice",
+        "2 Termination > 2.2 Termination for cause",
+        "Annex II",
+    ]
+    text = "1. Scope\n\nText.\n\n1.1 Rules\n\nText.\n\n2. Fees\n\n2.1 Due\n\nText.\n"
+    assert [s.label for s in detect_sections(text, markdown=True)] == ["1", "1.1", "2", "2.1"]
+
+
+def test_front_matter_is_not_a_heading():
+    assert detect_sections("---\ntitle: Foo\n---\n\nBody text here.\n") == []
+    sections = detect_sections("---\ntitle: Foo\n---\nIntro\n=====\n\nText.\n")
+    assert [s.path for s in sections] == ["Intro"]
+
+
+def test_underline_right_after_front_matter():
+    # The closing '---' is not an overline: the section starts at 'Intro'
+    t = "---\ntitle: Foo\n---\nIntro\n-----\n\nText.\n"
+    sections = detect_sections(t)
+    assert [(s.path, s.char_start) for s in sections] == [("Intro", t.index("Intro"))]
+
+
+def test_toc_entry_with_extra_pattern_is_skipped():
+    text = "Contents\n\nAT-01 Payments ..... 6\nAT-02 Refunds ..... 8\n\nAT-01 Payments\n\nText.\n"
+    sections = detect_sections(text, [r"(?P<label>AT-\d+)\b"])
+    assert [(s.label, s.char_start) for s in sections] == [
+        ("at-01", text.rindex("AT-01 Payments")),
+    ]
+
+
 # ---------------------------------------------------------------------------
 # Chunking along the structure
 # ---------------------------------------------------------------------------
@@ -342,6 +397,77 @@ def test_pages_are_cuts_and_keep_their_numbers():
     assert all(text[c.char_start:c.char_end] == c.content for c in chunks)
 
 
+_TERMINATION = (
+    "6. Fees\n\nPay on time.\n\n7. Termination\n\n"
+    "7.1 The Provider may end this.\n\n7.2 The Client may end this.\n"
+)
+
+
+def test_heading_only_section_folds_into_first_child():
+    t = _TERMINATION
+    sections = detect_sections(t)
+    assert [(s.path, s.char_start, s.char_end) for s in sections] == [
+        ("6 Fees", 0, t.index("7. ")),
+        ("7 Termination", t.index("7. "), len(t)),
+        ("7 Termination > 7.1 The Provider may end this", t.index("7.1"), t.index("7.2")),
+        ("7 Termination > 7.2 The Client may end this", t.index("7.2"), len(t)),
+    ]
+    spans = chunk_spans(sections, t, 500, 50)
+    assert [(t[a:b], path) for a, b, path in spans] == [
+        ("6. Fees\n\nPay on time.", "6 Fees"),
+        (
+            "7. Termination\n\n7.1 The Provider may end this.",
+            "7 Termination > 7.1 The Provider may end this",
+        ),
+        ("7.2 The Client may end this.", "7 Termination > 7.2 The Client may end this"),
+    ]
+    _assert_no_chunk_crosses(sections, spans, t)
+
+
+def test_heading_folds_into_a_first_child_longer_than_chunk_size():
+    first = "7.1 The Provider may end this agreement on notice. " * 23
+    t = f"7. Termination\n\n{first.strip()}\n\n7.2 Done.\n"
+    assert len(first) > 1000
+    sections = detect_sections(t)
+    spans = chunk_spans(sections, t, 1000, 200)
+    assert all(t[a:b] != "7. Termination" for a, b, _ in spans)
+    assert spans[0][0] == 0
+    assert t[spans[0][0]:spans[0][1]].startswith("7. Termination\n\n7.1 ")
+    assert spans[0][2] == sections[1].path
+    _assert_no_chunk_crosses(sections, spans, t)
+    covered = set()
+    for start, end, _ in spans:
+        covered.update(range(start, end))
+    assert all(i in covered for i, ch in enumerate(t) if not ch.isspace())
+
+
+def test_heading_chain_folds():
+    t = "Part I\n\nArticle 1 Scope\n\n1.1 The rules apply.\n\n1.2 Others.\n"
+    spans = chunk_spans(detect_sections(t), t, 500, 50)
+    assert [(t[a:b], path) for a, b, path in spans] == [
+        (
+            "Part I\n\nArticle 1 Scope\n\n1.1 The rules apply.",
+            "Part I > Article 1 Scope > 1.1 The rules apply",
+        ),
+        ("1.2 Others.", "Part I > Article 1 Scope > 1.2 Others"),
+    ]
+
+
+def test_fold_stops_at_page_boundary():
+    t = _TERMINATION
+    spans = chunk_spans(detect_sections(t), t, 500, 50, boundaries=[t.index("7.1")])
+    assert ("7. Termination", "7 Termination") in [(t[a:b], path) for a, b, path in spans]
+
+
+def test_prose_clause_keeps_its_own_chunk():
+    t = (
+        "7. The Provider may end this agreement by notice, as follows:\n\n"
+        "7.1 By post.\n\n7.2 By email.\n"
+    )
+    spans = chunk_spans(detect_sections(t), t, 500, 50)
+    assert [path for _, _, path in spans] == ["7", "7 > 7.1 By post", "7 > 7.2 By email"]
+
+
 # ---------------------------------------------------------------------------
 # Stored map (database)
 # ---------------------------------------------------------------------------
@@ -416,7 +542,7 @@ async def test_ingest_stores_the_map_and_clause_paths(db_url, layer, tmp_path):
     assert result.docs_failed == 0
     sections, chunks = await _stored(db_url, layer)
 
-    expected = detect_sections(_document_text("contract.md"))
+    expected = _map_document(_parse_file(FIXTURES / "contract.md")).sections
     assert [
         (r["label"], r["title"], r["path"], r["depth"], r["char_start"], r["char_end"])
         for r in sections
@@ -424,7 +550,6 @@ async def test_ingest_stores_the_map_and_clause_paths(db_url, layer, tmp_path):
     assert {c["clause_path"] for c in chunks} == {
         None,
         "1 Definitions",
-        "2 Termination",
         "2 Termination > 2.1 Notice",
         "2 Termination > 2.2 Termination for cause",
         "Annex II",
@@ -486,3 +611,79 @@ def test_cite_prefers_the_structure_map_path():
     assert cite(chunk, None)["clause_path"] == "7 Termination > 7.2 Notice"
     del chunk["clause_path"]
     assert cite(chunk, None)["clause_path"] == "Master agreement"
+
+
+async def test_ingest_builds_text_once_off_the_loop(db_url, layer, tmp_path):
+    from stratakb.knowledge import ingestion
+
+    src = tmp_path / "docs"
+    src.mkdir()
+    shutil.copy(FIXTURES / "contract.md", src / "contract.md")
+    (src / "notes.txt").write_text(_TERMINATION, encoding="utf-8")
+
+    off_loop: list[tuple[str, bool]] = []
+
+    def spy(name, real):
+        def wrapper(*args, **kwargs):
+            off_loop.append((name, threading.current_thread() is not threading.main_thread()))
+            return real(*args, **kwargs)
+        return wrapper
+
+    with (
+        patch.object(ingestion, "build_document_text",
+                     spy("build_document_text", ingestion.build_document_text)),
+        patch.object(ingestion, "_parse_file", spy("_parse_file", ingestion._parse_file)),
+        patch.object(ingestion, "detect_sections",
+                     spy("detect_sections", ingestion.detect_sections)),
+    ):
+        result = await _ingest(db_url, layer, src)
+
+    assert result.docs_processed == 2
+    names = [name for name, _ in off_loop]
+    assert names.count("build_document_text") == 2
+    assert names.count("_parse_file") == 2
+    assert names.count("detect_sections") == 2
+    assert all(threaded for name, threaded in off_loop)
+
+
+async def test_ingest_markdown_loose_list_stores_no_section(db_url, layer, tmp_path):
+    src = tmp_path / "docs"
+    src.mkdir()
+    (src / "guide.md").write_text(
+        "Some intro.\n\n1. Install the tool\n\nRun it once.\n\n2. Configure it\n\nEdit the file.\n",
+        encoding="utf-8",
+    )
+    result = await _ingest(db_url, layer, src)
+    assert result.docs_processed == 1
+    sections, chunks = await _stored(db_url, layer)
+    assert sections == []
+    assert chunks and all(c["clause_path"] is None for c in chunks)
+
+
+async def test_apply_preset_dry_run_runs_in_a_thread():
+    from stratakb.knowledge import presets
+    from stratakb.mcp_server import mcp
+
+    threads: list[bool] = []
+    real = presets.dry_run_parse
+
+    def spy(*args, **kwargs):
+        threads.append(threading.current_thread() is not threading.main_thread())
+        return real(*args, **kwargs)
+
+    preset_path = Path(__file__).parent.parent / "examples" / "sepa" / "preset.yaml"
+    tool = mcp._tool_manager.get_tool("strata_apply_preset")
+    with (
+        patch("stratakb.core.auth.get_current_user", return_value=("tester", "admin")),
+        patch("stratakb.knowledge.tools.get_current_user", return_value=("tester", "admin")),
+        patch("stratakb.knowledge.presets.dry_run_parse", side_effect=spy),
+        patch(
+            "stratakb.knowledge.presets.check_preset_layer",
+            new_callable=AsyncMock,
+            return_value={"status": "would_create", "changes": []},
+        ),
+    ):
+        result = await tool.fn(preset_path=str(preset_path), dry_run=True)
+
+    assert result["status"] == "dry_run_complete"
+    assert threads == [True]

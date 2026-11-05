@@ -7,6 +7,7 @@ names → skip unchanged → skip empty → parse → map structure → chunk al
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import os
@@ -504,7 +505,8 @@ async def ingest_documents(
                 continue
 
             try:
-                parsed = _parse_file(file_path)
+                # Parsing, mapping and chunking are CPU work: off the event loop
+                parsed = await asyncio.to_thread(_parse_file, file_path)
             except Exception as e:
                 logger.warning(
                     "file_parse_raised", layer=layer_name, file=relative_path,
@@ -517,14 +519,12 @@ async def ingest_documents(
                 continue
             parsed.source_file = relative_path
 
-            document_text, page_map = build_document_text(parsed)
-            sections = detect_sections(document_text)
-            doc_chunks = _chunk_document(
+            mapped, doc_chunks = await asyncio.to_thread(
+                _map_and_chunk,
                 parsed,
                 layer_name=layer_name,
                 chunk_size=chunk_size,
                 chunk_overlap=chunk_overlap,
-                sections=sections,
             )
             if not doc_chunks:
                 await drop(relative_path, previous, "no_text")
@@ -554,9 +554,9 @@ async def ingest_documents(
                     content_hash=content_hash,
                     size_bytes=len(data),
                     chunks=doc_chunks,
-                    document_text=document_text,
-                    page_map=page_map,
-                    sections=sections,
+                    document_text=mapped.text,
+                    page_map=mapped.page_map,
+                    sections=mapped.sections,
                 )
             except (asyncpg.PostgresConnectionError, asyncpg.InterfaceError, OSError):
                 # A lost database is an error for the whole run, not one failed file
@@ -744,20 +744,51 @@ def _flag_reason(fmt: Format | None, parsed: ParsedDocument) -> Reason | None:
     return None
 
 
+@dataclass(frozen=True)
+class _DocumentMap:
+    """A parsed document's text, page map and structure map, built once."""
+
+    text: str
+    page_map: list[list[int]] | None
+    sections: list[Section]
+
+
+def _map_document(doc: ParsedDocument) -> _DocumentMap:
+    """Build doc's text (documents.build_document_text) and its structure map."""
+    text, page_map = build_document_text(doc)
+    fmt = FORMATS.get(Path(doc.source_file).suffix.lower())
+    markdown = fmt is not None and fmt.doc_type == "markdown"
+    return _DocumentMap(text, page_map, detect_sections(text, markdown=markdown))
+
+
+def _map_and_chunk(
+    doc: ParsedDocument, *, layer_name: str, chunk_size: int, chunk_overlap: int
+) -> tuple[_DocumentMap, list[ChunkRecord]]:
+    """doc's map and its chunks along it; sync, run in a worker thread."""
+    mapped = _map_document(doc)
+    return mapped, _chunk_document(
+        doc,
+        layer_name=layer_name,
+        chunk_size=chunk_size,
+        chunk_overlap=chunk_overlap,
+        mapped=mapped,
+    )
+
+
 def _chunk_document(
     doc: ParsedDocument,
     *,
     layer_name: str,
     chunk_size: int,
     chunk_overlap: int,
-    sections: list[Section] | None = None,
+    mapped: _DocumentMap | None = None,
 ) -> list[ChunkRecord]:
     """Split a parsed document into chunks along its structure map.
 
-    sections is the document text's structure map (structure.detect_sections,
-    detected here when None). The text is cut at every section and page
-    start, and a chunk carries the clause_path of the section it lies in.
-    Without sections, each page is split by size alone.
+    mapped is the document's text and structure map (_map_document, built
+    here when None). The text is cut at every section and page start, and a
+    chunk carries the clause_path of the section it lies in. Without
+    sections, each page is split by size alone.
 
     Each chunk gets char_start and char_end into the document text (see
     documents.build_document_text).
@@ -767,10 +798,10 @@ def _chunk_document(
     fmt = FORMATS.get(ext)
     doc_type = fmt.doc_type if fmt is not None else ext.lstrip(".") or "unknown"
 
-    text = build_document_text(doc)[0]
+    if mapped is None:
+        mapped = _map_document(doc)
+    text, sections = mapped.text, mapped.sections
     starts = page_starts(doc)
-    if sections is None:
-        sections = detect_sections(text)
 
     def record(page, content: str, char_start: int | None, clause_path: str | None):
         metadata: dict = {

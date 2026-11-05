@@ -346,7 +346,7 @@ def register_knowledge_tools(
             return {"status": "error", "error": f"Documents root not found: {docs_root}"}
 
         if dry_run:
-            result = dry_run_parse(preset, root)
+            result = await asyncio.to_thread(dry_run_parse, preset, root)
             try:
                 layer_check = await asyncio.wait_for(
                     check_preset_layer(database_url, preset), _LAYER_CHECK_TIMEOUT_S
