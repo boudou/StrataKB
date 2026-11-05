@@ -166,6 +166,31 @@ async def test_available_is_sorted_and_capped():
     assert available == sorted(ids)[:20]
 
 
+async def test_long_id_is_cut():
+    await _run(_settings(), ["x" * 10_000])
+    available = embedding_checks_status()["model"]["available"]
+    assert len(available) == 1
+    assert len(available[0]) <= 100
+    assert available[0].endswith("…")
+
+
+async def test_unprintable_characters_are_dropped():
+    await _run(_settings(), ["bad\nmo\x1bdel‮"])
+    assert embedding_checks_status()["model"]["available"] == ["badmodel"]
+
+
+async def test_non_string_ids_are_skipped():
+    await _run(_settings(), [None, 5, "llama3.2"])
+    model = embedding_checks_status()["model"]
+    assert model["status"] == "missing"
+    assert model["available"] == ["llama3.2"]
+
+
+async def test_ids_that_clean_alike_appear_once():
+    await _run(_settings(), ["llama3.2", "llama3.2\n"])
+    assert embedding_checks_status()["model"]["available"] == ["llama3.2"]
+
+
 async def test_listing_failure_is_unchecked():
     import httpx
     import openai

@@ -19,13 +19,14 @@ import structlog
 
 from stratakb.config import Settings
 from stratakb.core.database import get_pool
-from stratakb.core.egress import embedding_provider
+from stratakb.core.egress import embedding_provider, openai_compatible_client
 from stratakb.knowledge.embeddings import resolve_embedding_model
 
 logger = structlog.get_logger()
 
 _TIMEOUT_SECONDS = 5.0
 _MAX_LISTED = 20
+_MAX_ID_CHARS = 100
 
 _COLUMN_SIZE_QUERY = (
     "SELECT atttypmod FROM pg_attribute "
@@ -62,6 +63,24 @@ def model_listed(model: str, ids: list[str] | set[str]) -> bool:
     return model in ids or f"{model}:latest" in ids
 
 
+def _shown_ids(ids) -> list[str]:
+    """Return the model ids fit for the health report: printable, short, at most 20.
+
+    The ids come from the model server and are shown to any viewer, so
+    non-strings are skipped, unprintable characters dropped and long ids cut.
+    """
+    shown = set()
+    for raw in ids:
+        if not isinstance(raw, str):
+            continue
+        text = "".join(c for c in raw if c.isprintable())
+        if len(text) > _MAX_ID_CHARS:
+            text = text[: _MAX_ID_CHARS - 1] + "…"
+        if text:
+            shown.add(text)
+    return sorted(shown)[:_MAX_LISTED]
+
+
 async def check_embedding_model(settings: Settings) -> dict:
     """Check that the server in EMBEDDING_BASE_URL lists the embedding model."""
     if settings.embedding_backend == "local" or not settings.embedding_base_url:
@@ -73,13 +92,12 @@ async def check_embedding_model(settings: Settings) -> dict:
         }
 
     model = resolve_embedding_model(settings.embedding_backend, settings.embedding_model)
-    import openai
 
     # Always pass a string key: with None the SDK would read OPENAI_API_KEY
     # from the environment and send it to the custom server.
-    client = openai.AsyncOpenAI(
-        api_key=settings.embedding_api_key,
-        base_url=settings.embedding_base_url,
+    client = openai_compatible_client(
+        settings.embedding_api_key,
+        settings.embedding_base_url,
         timeout=_TIMEOUT_SECONDS,
         max_retries=0,
     )
@@ -102,7 +120,7 @@ async def check_embedding_model(settings: Settings) -> dict:
     return {
         "status": "missing",
         "model": model,
-        "available": sorted(ids)[:_MAX_LISTED],
+        "available": _shown_ids(ids),
         "detail": (
             f"The server in EMBEDDING_BASE_URL does not list the model {model} "
             "(EMBEDDING_MODEL). Pull or load it on that server, or set "

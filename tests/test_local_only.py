@@ -30,6 +30,7 @@ def _no_base_url_env(monkeypatch):
     """Keep SDK base-URL overrides from the shell out of the tests."""
     monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
     monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
+    monkeypatch.delenv("QUERY_REWRITE_MODEL", raising=False)
 
 
 def _settings(**overrides) -> Settings:
@@ -139,6 +140,15 @@ def test_rewrite_endpoint_hides_credentials():
     assert not any("pw" in str(v) for v in vars(p).values())
 
 
+def test_rewrite_endpoint_without_model_is_not_outbound():
+    # The default model is an Anthropic name: rewrite_query skips, nothing is sent
+    settings = _settings(
+        query_rewrite_provider="openai_compatible",
+        query_rewrite_base_url="http://gpu-box:11434/v1",
+    )
+    assert outbound_providers(settings) == []
+
+
 def test_anthropic_key_unused_with_openai_compatible():
     settings = _rewrite_endpoint("http://127.0.0.1:11434/v1", anthropic_api_key="sk-ant-test")
     assert outbound_providers(settings) == []
@@ -211,6 +221,7 @@ def test_main_refuses_remote_rewrite_endpoint(server, monkeypatch):
     monkeypatch.setattr(
         settings, "query_rewrite_base_url", "http://user:pw@gpu-box:11434/v1"
     )
+    monkeypatch.setattr(settings, "query_rewrite_model", "llama3.2")
     with pytest.raises(SystemExit) as exc:
         mcp_server.main(settings)
     text = str(exc.value)
@@ -218,6 +229,14 @@ def test_main_refuses_remote_rewrite_endpoint(server, monkeypatch):
     assert "gpu-box" in text
     assert "pw" not in text
     run.assert_not_called()
+
+
+def test_main_starts_with_remote_rewrite_endpoint_without_model(server, monkeypatch):
+    mcp_server, settings, run = server
+    monkeypatch.setattr(settings, "query_rewrite_provider", "openai_compatible")
+    monkeypatch.setattr(settings, "query_rewrite_base_url", "http://gpu-box:11434/v1")
+    mcp_server.main(settings)
+    run.assert_called_once()
 
 
 def test_main_starts_with_loopback_rewrite_endpoint(server, monkeypatch):
@@ -463,6 +482,25 @@ async def test_openai_compatible_rewrite_skipped_under_local_only():
         patch("openai.AsyncOpenAI") as client_cls,
     ):
         result = await rewrite_query("q")
+    assert result == ["q"]
+    client_cls.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_explicit_model_rewrite_refused_under_local_only():
+    from stratakb.rag.query_rewriter import rewrite_query
+
+    # The settings model is the default, but the caller names one: it would be sent
+    settings = _settings(
+        query_rewrite_provider="openai_compatible",
+        query_rewrite_base_url="http://gpu-box:11434/v1",
+        strata_local_only=True,
+    )
+    with (
+        patch("stratakb.config.get_settings", return_value=settings),
+        patch("openai.AsyncOpenAI") as client_cls,
+    ):
+        result = await rewrite_query("q", model="llama3.2")
     assert result == ["q"]
     client_cls.assert_not_called()
 

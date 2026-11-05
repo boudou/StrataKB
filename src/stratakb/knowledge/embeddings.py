@@ -245,10 +245,16 @@ async def _embed_openai(
     """Embed texts using the OpenAI API or an OpenAI-compatible server."""
     from openai import AsyncOpenAI
 
+    from stratakb.core.egress import openai_compatible_client
+
     # Always pass a string key: with None the SDK would read OPENAI_API_KEY
     # from the environment and send it to the custom server. base_url=None
-    # keeps the SDK default (OpenAI, or OPENAI_BASE_URL).
-    client = AsyncOpenAI(api_key=api_key, base_url=base_url or None)
+    # keeps the SDK default (OpenAI, or OPENAI_BASE_URL), where the SDK's
+    # OPENAI_ORG_ID and OPENAI_PROJECT_ID headers belong.
+    if base_url:
+        client = openai_compatible_client(api_key, base_url)
+    else:
+        client = AsyncOpenAI(api_key=api_key, base_url=None)
     create_kwargs: dict = {"model": model}
     # Other servers may reject "dimensions" for models that cannot shorten
     # their output; _check_dimensions catches a server that ignores it.

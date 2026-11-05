@@ -98,23 +98,56 @@ def anthropic_provider(
     )
 
 
+def rewrite_model_unset(model: str) -> bool:
+    """True when an OpenAI-compatible rewrite has no model of its own.
+
+    The QUERY_REWRITE_MODEL default is an Anthropic model name, which the
+    endpoint would not know, so the rewrite is skipped and sends nothing.
+    """
+    from stratakb.config import Settings
+
+    return model == Settings.model_fields["query_rewrite_model"].default
+
+
+def openai_compatible_client(api_key: str, base_url: str, **options):
+    """Build an AsyncOpenAI client for a base URL from StrataKB's own settings.
+
+    Pass a string key: with None the SDK reads OPENAI_API_KEY. With no
+    organization or project the SDK reads OPENAI_ORG_ID and OPENAI_PROJECT_ID
+    and sends them as headers; Omit() drops both, so neither reaches the
+    configured endpoint.
+    """
+    import openai
+
+    return openai.AsyncOpenAI(
+        api_key=api_key,
+        base_url=base_url,
+        default_headers={"OpenAI-Organization": openai.Omit(), "OpenAI-Project": openai.Omit()},
+        **options,
+    )
+
+
 def rewrite_provider(
-    settings: Settings, api_key: str | None = None
+    settings: Settings, api_key: str | None = None, model: str = ""
 ) -> OutboundProvider | None:
     """Return query rewriting as a provider when it would leave this machine, else None.
 
     Follows QUERY_REWRITE_PROVIDER: "anthropic" sends to the Anthropic API,
-    "openai_compatible" to QUERY_REWRITE_BASE_URL. Any other value rewrites
-    nothing, so it is not outbound.
+    "openai_compatible" to QUERY_REWRITE_BASE_URL, but only once a model is
+    set (see rewrite_model_unset). Any other value rewrites nothing, so it is
+    not outbound.
 
     Args:
         settings: The settings to check.
         api_key: The Anthropic key the rewrite would use; defaults to ANTHROPIC_API_KEY.
+        model: The model the rewrite would use; defaults to QUERY_REWRITE_MODEL.
     """
     provider = settings.query_rewrite_provider
     if provider == "anthropic":
         return anthropic_provider(settings, api_key)
     if provider != "openai_compatible":
+        return None
+    if rewrite_model_unset(model or settings.query_rewrite_model):
         return None
     url = settings.query_rewrite_base_url
     if not url or is_loopback(url):
