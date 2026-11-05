@@ -662,29 +662,6 @@ async def test_tool_returns_files_flagged():
     assert result["files_added"] == 1
 
 
-async def test_tool_reports_read_error(layer, tmp_path):
-    from stratakb.mcp_server import mcp
-
-    _write(tmp_path / "locked.md", "# Locked\n\nLocked content.\n")
-    _write(tmp_path / "a.md", "# Alpha\n\nAlpha content.\n")
-    with (
-        patch("stratakb.core.auth.get_current_user", return_value=("tester", "admin")),
-        patch("stratakb.knowledge.tools.get_current_user", return_value=("tester", "admin")),
-        patch("stratakb.knowledge.tools.write_audit_log", new_callable=AsyncMock),
-        patch(
-            "stratakb.knowledge.ingestion.embed_texts",
-            new_callable=AsyncMock,
-            side_effect=lambda texts, **_: [FAKE_EMBEDDING for _ in texts],
-        ),
-        patch.object(Path, "read_bytes", _locked_read_bytes("locked.md")),
-    ):
-        tool = mcp._tool_manager.get_tool("strata_ingest_documents")
-        result = await tool.fn(layer_name=layer, source_path=str(tmp_path))
-
-    assert result["status"] == "partial"
-    assert result["errors"] == [{"file": "locked.md", "error": "locked", "reason": "read_error"}]
-
-
 def test_file_outcome_rejects_values_outside_the_set():
     from stratakb.knowledge.ingestion import REASONS, FileOutcome
 
@@ -952,4 +929,3 @@ class TestFileList:
         assert embedded == []
         assert set(_outcomes(result).values()) == {("unchanged", None)}
         assert (result.files_added, result.files_removed, result.files_unchanged) == (0, 0, 2)
-

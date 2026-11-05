@@ -50,6 +50,9 @@ EMBED_BATCH_SIZE = 100
 # A PDF averaging fewer characters per page than this probably holds scanned images
 _SCANNED_MIN_CHARS_PER_PAGE = 200
 
+# The longest error message recorded for one file
+_ERROR_MAX_CHARS = 300
+
 Outcome = Literal["added", "updated", "unchanged", "removed", "skipped", "flagged", "failed"]
 Reason = Literal[
     "deleted", "not_selected", "secret", "no_text",
@@ -444,9 +447,10 @@ async def ingest_documents(
             result.files.append(FileOutcome(relative_path, "removed", reason))
             result.files_removed += 1
 
-        def fail(relative_path: str, error: str, reason: Reason) -> None:
+        def fail(relative_path: str, file_path: Path, error: str, reason: Reason) -> None:
             result.files.append(FileOutcome(relative_path, "failed", reason))
             result.docs_failed += 1
+            error = _file_error(error, file_path=file_path, relative_path=relative_path, root=root)
             result.errors.append({"file": relative_path, "error": error, "reason": reason})
 
         # Step 4: Parse, chunk, embed and store each new or changed file
@@ -473,7 +477,7 @@ async def ingest_documents(
                     "file_read_failed", layer=layer_name, file=relative_path,
                     error_type=type(e).__name__,
                 )
-                fail(relative_path, str(e), "read_error")
+                fail(relative_path, file_path, str(e), "read_error")
                 continue
             content_hash = carried_hash or hashlib.sha256(data).hexdigest()
 
@@ -495,10 +499,10 @@ async def ingest_documents(
                     "file_parse_raised", layer=layer_name, file=relative_path,
                     error_type=type(e).__name__,
                 )
-                fail(relative_path, str(e), "parse_error")
+                fail(relative_path, file_path, str(e), "parse_error")
                 continue
             if parsed.error:
-                fail(relative_path, parsed.error, "parse_error")
+                fail(relative_path, file_path, parsed.error, "parse_error")
                 continue
             parsed.source_file = relative_path
 
@@ -521,9 +525,10 @@ async def ingest_documents(
                 )
             except Exception as e:
                 logger.warning(
-                    "file_ingestion_failed", layer=layer_name, file=relative_path, error=str(e)
+                    "file_ingestion_failed", layer=layer_name, file=relative_path,
+                    error_type=type(e).__name__,
                 )
-                fail(relative_path, str(e), "embed_error")
+                fail(relative_path, file_path, str(e), "embed_error")
                 continue
 
             document_text, page_map = build_document_text(parsed)
@@ -544,9 +549,10 @@ async def ingest_documents(
                 raise
             except Exception as e:
                 logger.warning(
-                    "file_ingestion_failed", layer=layer_name, file=relative_path, error=str(e)
+                    "file_ingestion_failed", layer=layer_name, file=relative_path,
+                    error_type=type(e).__name__,
                 )
-                fail(relative_path, str(e), "embed_error")
+                fail(relative_path, file_path, str(e), "embed_error")
                 continue
 
             flag = _flag_reason(fmt, parsed)
@@ -627,6 +633,24 @@ def _discover_files(source: Path) -> list[Path]:
     for ext in FORMATS:
         files.extend(source.rglob(f"*{ext}"))
     return sorted(files)
+
+
+def _file_error(message: str, *, file_path: Path, relative_path: str, root: Path) -> str:
+    """An error message for one file, safe to return and store: the absolute
+    path (which can hold the user's name) replaced by the relative one, the
+    root by ".", and the text cut to _ERROR_MAX_CHARS."""
+    replacements = []
+    for absolute, relative in ((file_path, relative_path), (root, ".")):
+        if str(absolute) == absolute.anchor:
+            continue  # a bare "/" or "C:\" would rewrite every slash
+        for form in {str(absolute), absolute.as_posix()}:
+            # OSError and repr() show a Windows path with doubled backslashes
+            replacements += [(form.replace("\\", "\\\\"), relative), (form, relative)]
+    for form, relative in replacements:
+        message = message.replace(form, relative)
+    if len(message) > _ERROR_MAX_CHARS:
+        message = message[: _ERROR_MAX_CHARS - 3] + "..."
+    return message
 
 
 def _parse_file(file_path: Path) -> ParsedDocument:
