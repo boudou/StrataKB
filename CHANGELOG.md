@@ -36,6 +36,7 @@ Notable changes to StrataKB. The format follows [Keep a Changelog](https://keepa
 - `stratakb db up` starts a local PostgreSQL with pgvector in Docker (container `stratakb-db`, volume `stratakb-data`, `127.0.0.1:5433` or `--port`), waits until it accepts connections and builds the schema; it needs no checkout of the repository. Run again, it leaves a running database alone and starts a stopped one with its data. `stratakb db down` stops it and keeps the volume. The Quick start uses it; `docker compose` stays for development. When `stratakb add` or the server cannot reach the database, the message ends with "Run `stratakb db up` to start a local database."
 - `vector_store.re_embed_all_layers()` re-embeds every layer in one transaction and resizes the shared vector column once when the dimensions change.
 - Layers have an `answer_mode`, `grounded` (default) or `extractive` (migration `12_answer_mode.sql`). Presets set it with an `answer_mode` key, and layer listings show it. The server records the mode but does not act on it yet.
+- `strata_apply_preset` reports the layer settings that changed (`layer_changes`), and its dry run the settings that would change (`layer_check`).
 
 ### Changed
 
@@ -54,6 +55,8 @@ Notable changes to StrataKB. The format follows [Keep a Changelog](https://keepa
 - `strata_ask` confidence is judged on a meaningful scale: the reranker's relevance probability (0 to 1, the reranker now applies a sigmoid) or, with reranking off, the query/chunk cosine similarity. Before, hybrid scores were divided by the top score, so almost any answer came back `high`. The result reports the `basis` (`rerank` or `similarity`). The thresholds are provisional. Confidence stored for earlier interactions is on the old scale.
 - Both search queries run with a 10 s statement timeout.
 - A schema update waits at most 30 seconds for a lock another process holds, then stops and names the lock.
+- Applying a preset again updates the layer's `display_name`, `description`, `metadata_schema`, `chunk_config`, `routing_patterns` and `answer_mode` from the YAML before the chunks are rebuilt; before, they were set only when the layer was created. A layer with the same name made another way (`stratakb add`, `strata_create_knowledge_layer`, another preset) is refused and left unchanged instead of being cleared; a layer from before origins were recorded is taken over by the preset. A preset without `answer_mode` leaves an existing layer's mode alone, and a `metadata_schema` that is not a mapping is refused when the preset loads.
+- The default `DATABASE_URL` uses `127.0.0.1` instead of `localhost`, which can resolve to `::1` and fail with Docker in WSL.
 
 ### Fixed
 
@@ -72,6 +75,8 @@ Notable changes to StrataKB. The format follows [Keep a Changelog](https://keepa
 - `vector_store.re_embed_layer()` no longer resizes the vector column that every layer shares, which left the other layers unsearchable and locked the whole table. It refuses a new size and points at `re_embed_all_layers()`; the startup check's message says the same.
 - A half-built schema (`01_init.sql` applied without `02_learning.sql`) is repaired instead of failing the update. A user without `USAGE` on the StrataKB schemas is told which privilege is missing, instead of being sent to a schema file. Migration 06 is no longer recorded when the database user could not revoke the grants it removes.
 - `strata_search` interactions store a confidence judged on the query/chunk similarity, with its level. Before, they stored the top fused score, which is always 1.0, and no level, so the learning loop never learned from searches. `strata_search` results now carry each chunk's `similarity`.
+- A CSV file over 10,000 rows was cut short without a message. It is now stored for its first 10,000 rows and reported as flagged (`truncated`), and the log says how many rows were left out.
+- `stratakb add --max-file-size inf` crashed; it is now a usage error (exit 2), like `0`, a negative value or `nan`, and the command refuses them before it connects to the database.
 
 ### Security
 
