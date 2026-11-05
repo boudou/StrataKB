@@ -86,5 +86,5 @@ def parse_pdf(file_path: str | Path) -> ParsedDocument:
         )
 
     except Exception as e:
-        logger.error("pdf_parse_error", file=source, error=str(e))
+        logger.error("pdf_parse_error", file=source, error_type=type(e).__name__)
         return ParsedDocument(source_file=source, error=str(e))

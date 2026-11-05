@@ -285,7 +285,7 @@ async def _embed_openai(
                 "openai_embedding_api_error",
                 batch_start=i,
                 batch_size=len(batch),
-                error=str(e),
+                error_type=type(e).__name__,
             )
             raise RuntimeError(f"Embedding API error: {e}") from e
 

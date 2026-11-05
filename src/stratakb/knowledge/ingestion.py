@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import re
 from bisect import bisect_right
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
@@ -650,7 +652,10 @@ def _discover_files(source: Path) -> list[Path]:
 def _file_error(message: str, *, file_path: Path, relative_path: str, root: Path) -> str:
     """An error message for one file, safe to return and store: the absolute
     path (which can hold the user's name) replaced by the relative one, the
-    root by ".", and the text cut to _ERROR_MAX_CHARS."""
+    root by ".", and the text cut to _ERROR_MAX_CHARS. A path is replaced only
+    where it is not part of a longer name (/data/docs2 stays with root
+    /data/docs), and in any letter case when the folder's filesystem ignores
+    case."""
     replacements = []
     for absolute, relative in ((file_path, relative_path), (root, ".")):
         if str(absolute) == absolute.anchor:
@@ -658,11 +663,34 @@ def _file_error(message: str, *, file_path: Path, relative_path: str, root: Path
         for form in {str(absolute), absolute.as_posix()}:
             # OSError and repr() show a Windows path with doubled backslashes
             replacements += [(form.replace("\\", "\\\\"), relative), (form, relative)]
+    flags = re.IGNORECASE if replacements and _case_insensitive_fs(root) else 0
     for form, relative in replacements:
-        message = message.replace(form, relative)
+        pattern = _PATH_BEFORE + re.escape(form) + _PATH_AFTER
+        message = re.sub(pattern, lambda _, r=relative: r, message, flags=flags)
     if len(message) > _ERROR_MAX_CHARS:
         message = message[: _ERROR_MAX_CHARS - 3] + "..."
     return message
+
+
+# A path in an error message starts where no name character precedes it and
+# ends at the end, a separator, whitespace, a quote, closing punctuation or a
+# sentence-ending period.
+_PATH_BEFORE = r"(?<![\w.\-])"
+_PATH_AFTER = r"(?=$|[\\/\s'\"),:;\]>]|\.(?:$|\s))"
+
+
+def _case_insensitive_fs(path: Path) -> bool:
+    """Whether the filesystem holding path ignores letter case: the path with
+    its case swapped names the same file. True on Windows and default macOS
+    volumes, False on Linux; False when the path has no letters or cannot be
+    checked."""
+    swapped = Path(str(path).swapcase())
+    if str(swapped) == str(path):
+        return False
+    try:
+        return swapped.exists() and os.path.samefile(path, swapped)
+    except OSError:
+        return False
 
 
 def _parse_file(file_path: Path) -> ParsedDocument:
