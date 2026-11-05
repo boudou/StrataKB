@@ -763,3 +763,115 @@ class TestUpdateLayer:
             assert result["updated_at"] == before["updated_at"]
         finally:
             await _drop_layers(db_url, name)
+
+    async def test_update_layer_without_settings_returns_layer_columns(self, db_url):
+        from stratakb.knowledge.layers import create_layer, get_layer, update_layer
+
+        name = "test_update_layer_shape"
+        await _drop_layers(db_url, name)
+        try:
+            await create_layer(db_url, name=name, display_name="Shape")
+            result = await update_layer(db_url, name)
+            assert result.keys() == (await get_layer(db_url, name=name)).keys()
+            assert "ingestion_run_count" not in result
+        finally:
+            await _drop_layers(db_url, name)
+
+    @pytest.mark.parametrize(
+        ("stored", "outcome"),
+        [(None, "written"), ("preset:x", "written"), ("manual", "refused")],
+    )
+    async def test_update_layer_claim_origin(self, db_url, stored, outcome):
+        from stratakb.knowledge.layers import (
+            LayerOriginError,
+            create_layer,
+            get_layer,
+            update_layer,
+        )
+
+        name = "test_update_claim"
+        await _drop_layers(db_url, name)
+        try:
+            await create_layer(
+                db_url, name=name, display_name="Claim", description="old", origin=stored
+            )
+            before = await get_layer(db_url, name=name)
+            if outcome == "written":
+                updated = await update_layer(
+                    db_url, name, description="new", claim_origin="preset:x"
+                )
+                assert updated["origin"] == "preset:x"
+                assert updated["description"] == "new"
+            else:
+                with pytest.raises(LayerOriginError) as caught:
+                    await update_layer(db_url, name, description="new", claim_origin="preset:x")
+                assert caught.value.origin == "manual"
+                assert await get_layer(db_url, name=name) == before
+        finally:
+            await _drop_layers(db_url, name)
+
+    async def test_update_layer_claim_origin_missing_layer(self, db_url):
+        from stratakb.knowledge.layers import update_layer
+
+        await _drop_layers(db_url, "test_update_claim_missing")
+        with pytest.raises(LayerNotFoundError):
+            await update_layer(db_url, "test_update_claim_missing", claim_origin="preset:x")
+
+    async def test_get_layer_missing_raises(self, db_url):
+        from stratakb.knowledge.layers import get_layer
+
+        await _drop_layers(db_url, "test_get_layer_missing")
+        with pytest.raises(LayerNotFoundError):
+            await get_layer(db_url, name="test_get_layer_missing")
+
+    async def test_set_description_rejects_non_string(self, db_url):
+        from stratakb.knowledge.layers import set_description
+
+        for value in (None, 5):
+            with pytest.raises(LayerValidationError, match="description"):
+                await set_description(db_url, "test_any_layer", value)
+
+
+class TestWriteColumns:
+    """_write_columns only puts known column names into the SQL (no database)."""
+
+    async def test_write_columns_rejects_unknown_column(self):
+        from unittest.mock import AsyncMock, patch
+
+        from stratakb.knowledge.layers import _write_columns
+
+        with (
+            patch("stratakb.knowledge.layers.ensure_schema", new_callable=AsyncMock) as schema,
+            patch("stratakb.knowledge.layers.get_pool", new_callable=AsyncMock) as pool,
+            pytest.raises(ValueError, match="DROP TABLE"),
+        ):
+            await _write_columns("postgresql://test", "x", {"name; DROP TABLE t": ("v", "")})
+        schema.assert_not_awaited()
+        pool.assert_not_awaited()
+
+
+class TestListRoleCheck:
+    """strata_list_knowledge_layers checks the caller's role once per request."""
+
+    async def test_list_checks_role_once(self):
+        from unittest.mock import AsyncMock, patch
+
+        from stratakb.core.auth import check_role
+        from stratakb.mcp_server import mcp
+
+        layers = [{"name": f"l{i}", "owner": "u", "root_path": "/r"} for i in range(3)]
+        with (
+            patch("stratakb.core.auth.get_current_user", return_value=("u", "viewer")),
+            patch("stratakb.knowledge.tools.get_current_user", return_value=("u", "viewer")),
+            patch("stratakb.knowledge.tools.check_role", wraps=check_role) as role_check,
+            patch(
+                "stratakb.knowledge.tools.list_layers",
+                new_callable=AsyncMock,
+                return_value=layers,
+            ),
+        ):
+            listed = await mcp._tool_manager.get_tool("strata_list_knowledge_layers").fn()
+
+        assert role_check.call_count == 1
+        assert [layer["name"] for layer in listed["layers"]] == ["l0", "l1", "l2"]
+        assert all("owner" not in layer for layer in listed["layers"])

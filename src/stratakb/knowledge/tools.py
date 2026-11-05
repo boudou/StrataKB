@@ -5,6 +5,8 @@ Registers knowledge layer management tools with the MCP server.
 
 from __future__ import annotations
 
+import asyncio
+
 import structlog
 from mcp.server.fastmcp import FastMCP
 
@@ -46,10 +48,19 @@ def _serialize(obj: object) -> object:
 _ADMIN_ONLY_LAYER_FIELDS = ("owner", "root_path")
 
 
-def _for_caller(layer: dict) -> dict:
-    """Drop the admin-only layer fields when the caller is below admin."""
+# strata_apply_preset's dry run reports layer_check "unknown" after this many seconds
+_LAYER_CHECK_TIMEOUT_S = 5.0
+
+
+def _caller_is_admin() -> bool:
+    """True when the current caller has the admin role."""
     _, role = get_current_user()
-    if check_role(role, "admin"):
+    return check_role(role, "admin")
+
+
+def _for_caller(layer: dict, is_admin: bool) -> dict:
+    """Drop the admin-only layer fields when the caller is below admin."""
+    if is_admin:
         return layer
     return {k: v for k, v in layer.items() if k not in _ADMIN_ONLY_LAYER_FIELDS}
 
@@ -70,8 +81,9 @@ def register_knowledge_tools(
         are available in the system.
         """
         layers = await list_layers(database_url)
+        is_admin = _caller_is_admin()
         return {
-            "layers": [_serialize(_for_caller(layer)) for layer in layers],
+            "layers": [_serialize(_for_caller(layer, is_admin)) for layer in layers],
             "total": len(layers),
         }
 
@@ -147,7 +159,7 @@ def register_knowledge_tools(
         """
         try:
             status = await get_layer_status(database_url, name=name)
-            return {"status": "ok", "layer": _serialize(_for_caller(status))}
+            return {"status": "ok", "layer": _serialize(_for_caller(status, _caller_is_admin()))}
         except LayerNotFoundError as e:
             return {"status": "error", "error": str(e)}
 
@@ -280,7 +292,7 @@ def register_knowledge_tools(
         docs_root: str | None = None,
         dry_run: bool = False,
     ) -> dict:
-        """Create a knowledge layer from a preset file and ingest all its sources.
+        """Create or update a knowledge layer from a preset file and ingest all its sources.
 
         A preset is a YAML file describing one layer (name, description,
         chunking, routing patterns) and the folders to ingest into it. This
@@ -295,7 +307,8 @@ def register_knowledge_tools(
         Source folders that are missing are skipped and reported together with
         their download link, if the preset gives one. Use dry_run=True to check
         that all files parse, without embeddings; it also reports which layer
-        settings would change (layer_check).
+        settings would change (layer_check). layer_check is 'unknown' when
+        the database does not answer within 5 seconds.
 
         Args:
             preset_path: Path to the preset YAML file. Example: "examples/sepa/preset.yaml"
@@ -331,7 +344,9 @@ def register_knowledge_tools(
         if dry_run:
             result = dry_run_parse(preset, root)
             try:
-                layer_check = await check_preset_layer(database_url, preset)
+                layer_check = await asyncio.wait_for(
+                    check_preset_layer(database_url, preset), _LAYER_CHECK_TIMEOUT_S
+                )
             except Exception as e:
                 # No message: it can hold the database URL
                 logger.warning("preset_layer_check_failed", error_type=type(e).__name__)
@@ -360,7 +375,11 @@ def register_knowledge_tools(
             return {"status": "error", "error": err}
 
         user_id, _ = get_current_user()
-        layer_result = await create_preset_layer(database_url, preset)
+        try:
+            layer_result = await create_preset_layer(database_url, preset)
+        except LayerError as e:
+            # Nothing was changed, so there is nothing to audit
+            return {"status": "error", "error": str(e)}
         if layer_result["status"] == "refused":
             # Nothing was changed, so there is nothing to audit
             return {"status": "error", "error": layer_result["message"]}

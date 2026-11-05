@@ -27,7 +27,12 @@ from stratakb.knowledge.documents import (
     store_document_version,
 )
 from stratakb.knowledge.embeddings import embed_texts
-from stratakb.knowledge.layers import LayerNotFoundError, get_layer_status
+from stratakb.knowledge.layers import (
+    DEFAULT_CHUNK_OVERLAP,
+    DEFAULT_CHUNK_SIZE,
+    LayerNotFoundError,
+    get_layer_status,
+)
 from stratakb.knowledge.parsers.pdf_parser import ParsedDocument
 from stratakb.knowledge.parsers.registry import SUPPORTED_PARSERS
 from stratakb.knowledge.policy import is_secret_name
@@ -306,8 +311,8 @@ async def ingest_documents(
 
     layer_id = layer["id"]
     chunk_config = layer["chunk_config"]
-    chunk_size = chunk_config.get("chunk_size", 1000)
-    chunk_overlap = chunk_config.get("chunk_overlap", 200)
+    chunk_size = chunk_config.get("chunk_size", DEFAULT_CHUNK_SIZE)
+    chunk_overlap = chunk_config.get("chunk_overlap", DEFAULT_CHUNK_OVERLAP)
 
     # Step 2: Discover files
     source = Path(source_path)

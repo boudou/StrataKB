@@ -135,6 +135,17 @@ class TestLoadPreset:
         with pytest.raises(LayerValidationError, match="metadata_schema"):
             load_preset(path)
 
+    @pytest.mark.parametrize("display_name", ['"   "', "42"])
+    def test_blank_display_name_rejected(self, tmp_path, display_name):
+        path = _write_preset(tmp_path, (
+            "name: runbooks\n"
+            f"display_name: {display_name}\n"
+            "sources:\n"
+            "  - {name: docs, path: docs}\n"
+        ))
+        with pytest.raises(LayerValidationError, match="display_name"):
+            load_preset(path)
+
     def test_answer_mode_invalid_refused(self, tmp_path):
         path = _write_preset(tmp_path, (
             "name: runbooks\n"
@@ -270,7 +281,7 @@ class TestCreatePresetLayer:
         assert mock_create.call_args.kwargs["answer_mode"] == "grounded"
 
     async def _create_existing(self, existing_origin, existing_mode="grounded", preset=None,
-                               **stored):
+                               update_error=None, **stored):
         """Apply a preset to a mocked existing layer that matches it, except for `stored`."""
         from stratakb.knowledge.layers import LayerExistsError
 
@@ -293,23 +304,22 @@ class TestCreatePresetLayer:
                 side_effect=LayerExistsError("exists"),
             ),
             patch(
-                "stratakb.knowledge.presets.get_layer_status",
+                "stratakb.knowledge.presets.get_layer",
                 new_callable=AsyncMock,
                 return_value=existing,
             ),
             patch(
-                "stratakb.knowledge.presets.set_origin", new_callable=AsyncMock
-            ) as mock_set_origin,
-            patch(
-                "stratakb.knowledge.presets.update_layer", new_callable=AsyncMock
+                "stratakb.knowledge.presets.update_layer",
+                new_callable=AsyncMock,
+                side_effect=update_error,
             ) as mock_update,
         ):
             result = await create_preset_layer("postgresql://test", preset)
         self.mock_update = mock_update
-        return result, mock_set_origin
+        return result
 
     async def test_existing_layer_reported(self):
-        result, _ = await self._create_existing("preset:sepa")
+        result = await self._create_existing("preset:sepa")
 
         assert result["status"] == "exists"
         assert result["changes"] == []
@@ -320,37 +330,59 @@ class TestCreatePresetLayer:
         self.mock_update.assert_not_awaited()
 
     async def test_existing_layer_updated(self):
-        result, _ = await self._create_existing("preset:sepa", description="Old description")
+        result = await self._create_existing("preset:sepa", description="Old description")
 
         assert result["status"] == "updated"
         assert result["changes"] == ["description"]
         preset = load_preset(SEPA_PRESET)
         self.mock_update.assert_awaited_once_with(
-            "postgresql://test", "sepa", description=preset.description
+            "postgresql://test", "sepa", claim_origin="preset:sepa",
+            description=preset.description,
         )
 
     async def test_existing_layer_backfills_origin(self):
-        result, mock_set_origin = await self._create_existing(
-            None, routing_patterns=["old"]
-        )
+        result = await self._create_existing(None, routing_patterns=["old"])
 
         assert result["status"] == "updated"
         assert result["changes"] == ["routing_patterns"]
-        mock_set_origin.assert_awaited_once_with("postgresql://test", "sepa", "preset:sepa")
-        self.mock_update.assert_awaited_once()
+        # One write: the origin and the changed settings together
+        preset = load_preset(SEPA_PRESET)
+        self.mock_update.assert_awaited_once_with(
+            "postgresql://test", "sepa", claim_origin="preset:sepa",
+            routing_patterns=preset.routing_patterns,
+        )
+
+    async def test_existing_layer_without_origin_unchanged_claims_origin(self):
+        result = await self._create_existing(None)
+
+        assert result["status"] == "exists"
+        assert result["changes"] == []
+        self.mock_update.assert_awaited_once_with(
+            "postgresql://test", "sepa", claim_origin="preset:sepa"
+        )
+
+    async def test_origin_taken_during_apply_refused(self):
+        from stratakb.knowledge.layers import LayerOriginError
+
+        result = await self._create_existing(
+            None, description="Old", update_error=LayerOriginError("taken", "manual")
+        )
+
+        assert result["status"] == "refused"
+        assert result["changes"] == []
+        assert "origin 'manual'" in result["message"]
 
     @pytest.mark.parametrize("origin", ["manual", "folder", "preset:other"])
     async def test_existing_layer_other_origin_refused(self, origin):
-        result, mock_set_origin = await self._create_existing(origin, description="Old")
+        result = await self._create_existing(origin, description="Old")
 
         assert result["status"] == "refused"
         assert result["changes"] == []
         assert f"origin '{origin}'" in result["message"]
-        mock_set_origin.assert_not_awaited()
         self.mock_update.assert_not_awaited()
 
     async def test_missing_answer_mode_keeps_layer_mode(self):
-        result, _ = await self._create_existing("preset:sepa", existing_mode="extractive")
+        result = await self._create_existing("preset:sepa", existing_mode="extractive")
 
         assert result["status"] == "exists"
         self.mock_update.assert_not_awaited()
@@ -358,11 +390,11 @@ class TestCreatePresetLayer:
     async def test_existing_layer_takes_preset_answer_mode(self):
         preset = load_preset(SEPA_PRESET)
         preset.answer_mode = "extractive"
-        result, _ = await self._create_existing("preset:sepa", preset=preset)
+        result = await self._create_existing("preset:sepa", preset=preset)
 
         assert result["changes"] == ["answer_mode"]
         self.mock_update.assert_awaited_once_with(
-            "postgresql://test", "sepa", answer_mode="extractive"
+            "postgresql://test", "sepa", claim_origin="preset:sepa", answer_mode="extractive"
         )
 
     async def test_answer_mode_extractive_stored(self, tmp_path):
@@ -417,7 +449,7 @@ class TestReapplyPresetIntegration:
 
         db_url = get_settings().database_url
         yield db_url
-        for name in ("test_preset_reapply", "test_preset_manual"):
+        for name in ("test_preset_reapply", "test_preset_manual", "test_preset_race"):
             with contextlib.suppress(LayerNotFoundError):
                 await delete_layer(db_url, name=name)
 
@@ -485,6 +517,42 @@ class TestReapplyPresetIntegration:
         assert result["status"] == "refused"
         after = await get_layer_status(db_url, name=name)
         assert after == before
+
+    async def test_concurrent_set_origin_not_overwritten(self, db_url, tmp_path):
+        import contextlib
+
+        from stratakb.knowledge import layers
+        from stratakb.knowledge.layers import (
+            LayerNotFoundError,
+            create_layer,
+            delete_layer,
+            get_layer,
+            set_origin,
+        )
+
+        name = "test_preset_race"
+        with contextlib.suppress(LayerNotFoundError):
+            await delete_layer(db_url, name=name)
+        # Made before origins were recorded: the preset may adopt it
+        await create_layer(db_url, name=name, display_name="Race", description="Kept")
+        path = _write_preset(tmp_path, RUNBOOKS_YAML.format(
+            name=name, description="Replaced", chunk_size=800, pattern="ops",
+        ))
+
+        async def read_then_race(database_url, *, name):
+            stale = await layers.get_layer(database_url, name=name)
+            # Another process records an origin between the preset's read and its write
+            await set_origin(database_url, name, "manual")
+            return stale
+
+        with patch("stratakb.knowledge.presets.get_layer", side_effect=read_then_race):
+            result = await create_preset_layer(db_url, load_preset(path))
+
+        assert result["status"] == "refused"
+        assert "origin 'manual'" in result["message"]
+        stored = await get_layer(db_url, name=name)
+        assert stored["origin"] == "manual"
+        assert stored["description"] == "Kept"
 
 
 class TestPresetLayerChanges:
@@ -575,6 +643,25 @@ class TestApplyPresetTool:
         ingest.assert_not_awaited()
         audit.assert_not_awaited()
 
+    async def test_layer_error_returns_error(self):
+        auth, tools_auth = self._admin()
+        with (
+            auth, tools_auth,
+            patch("stratakb.knowledge.embeddings.embedding_key_error", return_value=None),
+            patch(
+                "stratakb.knowledge.presets.create_preset_layer",
+                new_callable=AsyncMock,
+                side_effect=LayerValidationError("display_name is required."),
+            ),
+            patch("stratakb.knowledge.presets.ingest_preset", new_callable=AsyncMock) as ingest,
+            patch("stratakb.knowledge.tools.write_audit_log", new_callable=AsyncMock) as audit,
+        ):
+            result = await self._call()
+
+        assert result == {"status": "error", "error": "display_name is required."}
+        ingest.assert_not_awaited()
+        audit.assert_not_awaited()
+
     async def test_real_run_reports_layer_changes(self):
         auth, tools_auth = self._admin()
         with (
@@ -603,7 +690,7 @@ class TestApplyPresetTool:
         with (
             auth, tools_auth,
             patch(
-                "stratakb.knowledge.presets.get_layer_status",
+                "stratakb.knowledge.presets.get_layer",
                 new_callable=AsyncMock,
                 return_value=stored,
                 side_effect=side_effect,
@@ -646,6 +733,21 @@ class TestApplyPresetTool:
         result = await self._dry_run(side_effect=OSError("connection refused"))
 
         assert result["layer_check"] == {"status": "unknown", "changes": []}
+
+    async def test_dry_run_check_times_out(self):
+        import asyncio
+        import time
+
+        async def hang(*args, **kwargs):
+            await asyncio.sleep(5)
+
+        with patch("stratakb.knowledge.tools._LAYER_CHECK_TIMEOUT_S", 0.05):
+            started = time.monotonic()
+            result = await self._dry_run(side_effect=hang)
+            elapsed = time.monotonic() - started
+
+        assert result["layer_check"] == {"status": "unknown", "changes": []}
+        assert elapsed < 2
 
 
 class TestApplyPresetScript:
