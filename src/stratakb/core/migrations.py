@@ -261,6 +261,16 @@ MIGRATIONS: list[Migration] = [
         """,
     ),
     Migration(
+        10,
+        "10_receipts.sql",
+        _tables_present(
+            (
+                ("strata_core", "receipts"),
+                ("strata_core", "receipt_documents"),
+            )
+        ),
+    ),
+    Migration(
         12,
         "12_answer_mode.sql",
         """

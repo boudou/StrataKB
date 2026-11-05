@@ -175,7 +175,7 @@ async def prune_documents(
     source_root: str | None = None,
     relative_paths: Sequence[str] | None = None,
 ) -> int:
-    """Delete documents that no chunk references; return the count.
+    """Delete documents that no chunk and no receipt references; return the count.
 
     Without source_root and relative_paths the whole layer is swept; with
     them, only those files' versions. Pass both or neither.
@@ -193,6 +193,9 @@ async def prune_documents(
         WHERE d.layer_id = $1 {scope}
           AND NOT EXISTS (
               SELECT 1 FROM strata_vectors.chunks c WHERE c.document_id = d.id
+          )
+          AND NOT EXISTS (
+              SELECT 1 FROM strata_core.receipt_documents r WHERE r.document_id = d.id
           )
         """,
         *args,

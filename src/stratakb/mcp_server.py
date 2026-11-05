@@ -38,6 +38,7 @@ from stratakb.knowledge.embedding_checks import (
 )
 from stratakb.knowledge.tools import register_knowledge_tools
 from stratakb.learning.tools import register_learning_tools
+from stratakb.rag.receipt_tools import register_receipt_tools
 from stratakb.rag.tools import register_rag_tools
 
 logger = structlog.get_logger()
@@ -141,6 +142,7 @@ def build_server(settings: Settings) -> FastMCP:
     # Register module tools
     register_knowledge_tools(mcp, settings.database_url, settings.openai_api_key)
     register_rag_tools(mcp, settings.database_url, settings.openai_api_key)
+    register_receipt_tools(mcp, settings.database_url)
     register_database_tools(mcp, settings.database_url, settings.readonly_database_url)
     register_learning_tools(mcp, settings.database_url)
     _register_admin_tools(mcp, settings)

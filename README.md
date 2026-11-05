@@ -274,6 +274,7 @@ Then ask from your client, for example *"How long should a line of Python be?"*.
 | `strata_search` | viewer | Hybrid search for exact terms and identifiers, with optional layer and metadata filters, and a confidence level |
 | `strata_list_knowledge_layers` | viewer | Lists layers with document and chunk counts |
 | `strata_get_layer_status` | viewer | One layer's configuration and ingestion history |
+| `strata_get_receipt` | viewer | Opens a receipt (`rcpt_…`, also the resource `strata://receipts/{receipt_id}`): the stored quotes of an answer, each in its surrounding document text, flagged when its source changed since. Open to whoever asked and to anyone who may read every cited layer |
 | `strata_feedback` | viewer | Rates a result as helpful or not, per answer or per passage (`S1`) or chunk |
 | `strata_learning_stats` | viewer | What the learning system has recorded and learned |
 | `strata_whoami` | viewer | Your identity and role |
