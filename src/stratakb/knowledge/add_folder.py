@@ -17,6 +17,7 @@ import asyncio
 import dataclasses
 import getpass
 import hashlib
+import math
 import os
 import re
 import sys
@@ -443,8 +444,10 @@ async def plan(database_url: str, path: str | os.PathLike, options: Options) -> 
             f"Invalid layer name '{options.name}'. Must be 3-100 chars, "
             "lowercase alphanumeric with underscores, starting with a letter.",
         )
-    if not options.max_file_size_mb > 0:
-        return _refuse(result, "usage_error", "--max-file-size must be a positive number.")
+    if not (math.isfinite(options.max_file_size_mb) and options.max_file_size_mb > 0):
+        return _refuse(
+            result, "usage_error", "--max-file-size must be a finite number above 0."
+        )
     max_bytes = int(options.max_file_size_mb * 1_000_000)
 
     # 2. Broad paths

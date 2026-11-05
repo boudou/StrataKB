@@ -19,6 +19,7 @@ import argparse
 import asyncio
 import contextlib
 import json
+import math
 import os
 import sys
 from collections.abc import Sequence
@@ -78,7 +79,7 @@ def _parser() -> _ArgumentParser:
     add.add_argument("--description", help="layer description (default: from the README)")
     add.add_argument(
         "--max-file-size",
-        type=float,
+        type=_size_mb,
         default=50.0,
         metavar="MB",
         help="skip files larger than this many megabytes (default: 50)",
@@ -109,6 +110,17 @@ def _parser() -> _ArgumentParser:
     )
     db_commands.add_parser("down", help="stop the local database; its data stays")
     return parser
+
+
+def _size_mb(text: str) -> float:
+    try:
+        size = float(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"not a number: {text}") from None
+    # float() also accepts inf and nan; neither is a size
+    if not (math.isfinite(size) and size > 0):
+        raise argparse.ArgumentTypeError(f"not a finite number above 0: {text}")
+    return size
 
 
 def _port(text: str) -> int:
