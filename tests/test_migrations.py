@@ -140,14 +140,38 @@ def test_readonly_lists_agree():
     assert in_readme == in_module
 
     schemas = {schema for schema, _ in pairs}
+    assert set(migrations._READABLE_SCHEMAS) == schemas
     assert _granted(migrations._load_sql("06_readonly_grants.sql"), "USAGE") == schemas
     assert _granted(db_03, "USAGE") == schemas
+
+    # 06 also names the StrataKB schemas by hand where it revokes
+    sql_06 = "\n".join(
+        line
+        for line in migrations._load_sql("06_readonly_grants.sql").splitlines()
+        if not line.lstrip().startswith("--")
+    )
+    all_schemas = set(migrations._STRATA_SCHEMAS)
+    acl_list = re.search(r"n\.nspname IN \((.+?)\)", sql_06, re.S)
+    assert acl_list
+    assert {name.strip().strip("'") for name in acl_list.group(1).split(",")} == all_schemas
+    for pattern, expected in (
+        (r"REVOKE ALL ON ALL TABLES IN SCHEMA (.+?) FROM", all_schemas),
+        (r"REVOKE ALL ON SCHEMA (.+?) FROM", all_schemas - schemas),
+    ):
+        found = re.search(pattern, sql_06, re.S)
+        assert found
+        assert {name.strip() for name in found.group(1).split(",")} == expected
+
+
+def test_usage_refused_names_readable_schemas():
+    text = migrations._USAGE_REFUSED.format(error="x")
+    assert all(schema in text for schema in migrations._READABLE_SCHEMAS)
+    assert "strata_learning" not in text
 
 
 def test_stage_errors_cover_every_stage():
     assert set(migrations._STAGE_ERRORS) == set(migrations._Stage)
     for stage in migrations._Stage:
-        assert isinstance(stage.value, int)
         errors = migrations._STAGE_ERRORS[stage]
         assert errors.lock and errors.refused and errors.failed
 

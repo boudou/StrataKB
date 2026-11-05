@@ -37,6 +37,10 @@ _READONLY_TABLES = (
     ("strata_core", "ingested_files"),
     ("strata_vectors", "chunks"),
 )
+_STRATA_SCHEMA_LIST = ", ".join(f"'{schema}'" for schema in _STRATA_SCHEMAS)
+# The schemas strata_readonly gets USAGE on, which are also the ones the
+# presence queries resolve with to_regclass
+_READABLE_SCHEMAS = tuple(dict.fromkeys(schema for schema, _ in _READONLY_TABLES))
 
 
 @dataclass(frozen=True)
@@ -87,7 +91,6 @@ def _readonly_grants_present() -> str:
     returns NULL for a missing table, so each check keeps its own COALESCE.
     Default privileges count on tables only, the kind 06 revokes.
     """
-    schemas = ", ".join(f"'{schema}'" for schema in _STRATA_SCHEMAS)
     guard = "\n            OR ".join(
         f"to_regnamespace('{schema}') IS NULL" for schema in _STRATA_SCHEMAS
     )
@@ -96,9 +99,8 @@ def _readonly_grants_present() -> str:
         f"                    r.oid, to_regclass('{schema}.{table}'), 'SELECT'), false)"
         for schema, table in _READONLY_TABLES
     )
-    readable_schemas = {schema for schema, _ in _READONLY_TABLES}
     usage = "\n                AND ".join(
-        ("" if schema in readable_schemas else "NOT ")
+        ("" if schema in _READABLE_SCHEMAS else "NOT ")
         + f"has_schema_privilege(r.oid, '{schema}', 'USAGE')"
         for schema in _STRATA_SCHEMAS
     )
@@ -111,7 +113,7 @@ def _readonly_grants_present() -> str:
                 AND NOT EXISTS (
                     SELECT 1 FROM pg_class c
                     JOIN pg_namespace n ON n.oid = c.relnamespace
-                    WHERE n.nspname IN ({schemas})
+                    WHERE n.nspname IN ({_STRATA_SCHEMA_LIST})
                       AND c.relkind IN ('r', 'p', 'v', 'm', 'f')
                       AND (n.nspname, c.relname) NOT IN ({_pair_list(_READONLY_TABLES)})
                       AND has_table_privilege(r.oid, c.oid, 'SELECT')
@@ -121,7 +123,7 @@ def _readonly_grants_present() -> str:
                     JOIN pg_namespace n ON n.oid = d.defaclnamespace
                     CROSS JOIN LATERAL aclexplode(d.defaclacl) a
                     WHERE d.defaclobjtype = 'r'
-                      AND n.nspname IN ({schemas})
+                      AND n.nspname IN ({_STRATA_SCHEMA_LIST})
                       AND a.grantee = r.oid
                 )
             FROM pg_roles r WHERE r.rolname = 'strata_readonly'
@@ -248,7 +250,6 @@ _REFUSED = (asyncpg.InsufficientPrivilegeError, asyncpg.ReadOnlySQLTransactionEr
 # True when current_user has the privileges of the owner of every StrataKB
 # schema, every table-like relation in them and every role that set default
 # privileges there (a superuser always has). Reads pg_catalog only.
-_STRATA_SCHEMA_LIST = ", ".join(f"'{schema}'" for schema in _STRATA_SCHEMAS)
 _OWNS_STRATA_OBJECTS = f"""
     SELECT COALESCE(bool_and(pg_has_role(current_user, o.owner, 'USAGE')), false) FROM (
         SELECT n.nspowner AS owner FROM pg_catalog.pg_namespace n
@@ -298,8 +299,9 @@ class _StageErrors:
 # Presence queries only read, so a refusal there is a missing USAGE
 _USAGE_REFUSED = (
     "Could not read the database schema: {error}. The user in DATABASE_URL "
-    "needs USAGE on the strata_core and strata_vectors schemas; connect "
-    "as the database owner or grant it."
+    "needs USAGE on the "
+    + " and ".join(_READABLE_SCHEMAS)
+    + " schemas; connect as the database owner or grant it."
 )
 _MAY_NOT_UPDATE = "The database schema is out of date and this user may not update it. {fix}"
 _READ_FAILED = "Could not read the database schema: {error}."
@@ -430,17 +432,19 @@ async def ensure_schema(database_url: str) -> None:
                         # A file can run without effect (REVOKE and GRANT only
                         # warn when this user may not change a privilege)
                         if not await conn.fetchval(m.presence):
+                            not_in_place = (
+                                f"{m.file} ran without an error, but its changes are "
+                                "not in place."
+                            )
                             if m.not_in_place_as_owner and await conn.fetchval(
                                 _OWNS_STRATA_OBJECTS
                             ):
                                 raise MigrationError(
-                                    f"{m.file} ran without an error, but its changes are "
-                                    f"not in place. {m.not_in_place_as_owner}"
+                                    f"{not_in_place} {m.not_in_place_as_owner}"
                                 )
                             detail = f" {m.not_in_place}" if m.not_in_place else ""
                             raise MigrationError(
-                                f"{m.file} ran without an error, but its changes are not "
-                                f"in place.{detail} {_owner_fix(m.file)}"
+                                f"{not_in_place}{detail} {_owner_fix(m.file)}"
                             )
                         logger.info("migration_applied", version=m.version, file=m.file)
                     await conn.execute(
@@ -449,8 +453,6 @@ async def ensure_schema(database_url: str) -> None:
                         m.version,
                         m.file,
                     )
-        except asyncpg.LockNotAvailableError as e:
-            raise _error_for(stage, e, current) from e
         except _REFUSED as e:
             # The transaction has rolled back. In TABLE and FILE every presence
             # query has run, before any write.

@@ -45,6 +45,7 @@ from stratakb.knowledge.layers import (
     _validate_routing_patterns,
     create_layer,
     get_layer,
+    may_claim,
     update_layer,
 )
 from stratakb.knowledge.policy import is_secret_name
@@ -236,7 +237,7 @@ def _preset_settings(preset: LayerPreset) -> dict:
     answer_mode is left out when the preset does not set it.
     """
     settings = {
-        "display_name": preset.display_name.strip(),
+        "display_name": preset.display_name,
         "description": preset.description or "",
         "metadata_schema": preset.metadata_schema,
         "chunk_config": preset.chunk_config,
@@ -254,40 +255,46 @@ def preset_layer_changes(existing: dict, preset: LayerPreset) -> list[str]:
     ]
 
 
-def _owns_layer(existing: dict, preset: LayerPreset) -> bool:
-    """True when the layer was made by this preset, or before origins were recorded."""
-    return existing.get("origin") in (None, f"preset:{preset.name}")
+def _preset_origin(preset: LayerPreset) -> str:
+    """The origin recorded on a layer made by the preset."""
+    return f"preset:{preset.name}"
 
 
-def _refused_message(origin: str | None, preset: LayerPreset) -> str:
-    return (
+def _refused(origin: str | None, preset: LayerPreset) -> dict:
+    message = (
         f"The layer '{preset.name}' was not made by this preset "
         f"(origin '{origin}'). "
         "Rename the preset's 'name' or delete that layer."
     )
-
-
-def _refused(origin: str | None, preset: LayerPreset) -> dict:
-    return {"status": "refused", "changes": [], "message": _refused_message(origin, preset)}
+    return {"status": "refused", "changes": [], "message": message}
 
 
 def _layer_decision(existing: dict, preset: LayerPreset) -> dict:
     """What applying the preset does to its existing layer, as the dry run reports it.
 
+    "would_claim" is a layer with no recorded origin whose settings already
+    match: applying the preset only marks it as made by the preset.
+
     Returns {"status": "refused", "changes": [], "message": ...} or
-    {"status": "would_update" | "unchanged", "changes": [setting names]}.
+    {"status": "would_update" | "would_claim" | "unchanged", "changes": [setting names]}.
     """
-    if not _owns_layer(existing, preset):
+    if not may_claim(existing.get("origin"), _preset_origin(preset)):
         return _refused(existing.get("origin"), preset)
     changes = preset_layer_changes(existing, preset)
-    return {"status": "would_update" if changes else "unchanged", "changes": changes}
+    if changes:
+        status = "would_update"
+    elif existing.get("origin") is None:
+        status = "would_claim"
+    else:
+        status = "unchanged"
+    return {"status": status, "changes": changes}
 
 
 async def check_preset_layer(database_url: str, preset: LayerPreset) -> dict:
     """Report, without writing, what applying the preset would do to its layer.
 
-    Returns {"status": "would_create" | "would_update" | "unchanged" | "refused",
-    "changes": [setting names]}, plus a "message" when refused.
+    Returns {"status": "would_create" | "would_update" | "would_claim" | "unchanged"
+    | "refused", "changes": [setting names]}, plus a "message" when refused.
     """
     try:
         existing = await get_layer(database_url, name=preset.name)
@@ -309,7 +316,7 @@ async def create_preset_layer(database_url: str, preset: LayerPreset) -> dict:
     "changes": [setting names]}, plus "layer" when created and "message"
     otherwise.
     """
-    origin = f"preset:{preset.name}"
+    origin = _preset_origin(preset)
     try:
         layer = await create_layer(
             database_url,

@@ -307,8 +307,10 @@ def register_knowledge_tools(
         Source folders that are missing are skipped and reported together with
         their download link, if the preset gives one. Use dry_run=True to check
         that all files parse, without embeddings; it also reports which layer
-        settings would change (layer_check). layer_check is 'unknown' when
-        the database does not answer within 5 seconds.
+        settings would change (layer_check). layer_check is 'would_claim'
+        when a layer with no recorded origin already matches the preset and
+        would be marked as made by it, and 'unknown' when the database does
+        not answer within 5 seconds.
 
         Args:
             preset_path: Path to the preset YAML file. Example: "examples/sepa/preset.yaml"
@@ -377,12 +379,12 @@ def register_knowledge_tools(
         user_id, _ = get_current_user()
         try:
             layer_result = await create_preset_layer(database_url, preset)
+            error = layer_result["message"] if layer_result["status"] == "refused" else None
         except LayerError as e:
+            error = str(e)
+        if error is not None:
             # Nothing was changed, so there is nothing to audit
-            return {"status": "error", "error": str(e)}
-        if layer_result["status"] == "refused":
-            # Nothing was changed, so there is nothing to audit
-            return {"status": "error", "error": layer_result["message"]}
+            return {"status": "error", "error": error}
         ingest_result = await ingest_preset(database_url, openai_api_key, preset, root)
 
         await write_audit_log(

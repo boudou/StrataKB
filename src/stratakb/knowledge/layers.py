@@ -386,21 +386,31 @@ async def layer_holds_folder(database_url: str, layer_name: str, root_path: str)
     return not row["other_root"] and not row["legacy"]
 
 
+def may_claim(stored_origin: str | None, claim_origin: str) -> bool:
+    """Who may claim a layer for claim_origin: no origin recorded yet, or the same one.
+
+    _write_columns applies the same rule in its SQL guard, so that the check
+    and the write are one statement; a test keeps the two in agreement.
+    """
+    return stored_origin is None or stored_origin == claim_origin
+
+
 async def _write_columns(
     database_url: str,
     name: str,
-    values: dict[_LayerColumn, tuple[object, str]],
+    values: dict[_LayerColumn, object],
     *,
     claim_origin: str | None = None,
 ) -> dict:
     """Write the given columns of a layer in one UPDATE and bump updated_at.
 
-    values maps a column to (value, SQL cast). With claim_origin, the UPDATE
-    also sets origin to it, and only succeeds while the stored origin is NULL
-    or already claim_origin.
+    values maps a column to its value; columns in _JSONB_COLUMNS are
+    JSON-encoded and cast to jsonb. With claim_origin, the UPDATE also sets
+    origin to it, and only succeeds while may_claim(stored origin, claim_origin).
 
     Returns the updated layer record.
-    Raises ValueError if a column is not one of _WRITABLE_COLUMNS.
+    Raises ValueError if a column is not one of _WRITABLE_COLUMNS, or if values
+    holds origin together with claim_origin.
     Raises LayerNotFoundError if the layer doesn't exist.
     Raises LayerOriginError if claim_origin is given and another origin is stored.
     Raises RootTakenError if another layer already holds the root_path written.
@@ -409,19 +419,25 @@ async def _write_columns(
     unknown = [column for column in values if column not in _WRITABLE_COLUMNS]
     if unknown:
         raise ValueError(f"Not a writable layer column: {unknown[0]!r}")
+    if claim_origin is not None and "origin" in values:
+        raise ValueError("Pass origin through claim_origin only, not in values.")
 
     columns = dict(values)
     if claim_origin is not None:
-        columns["origin"] = (claim_origin, "")
+        columns["origin"] = claim_origin
     params: list[object] = [name]
     assignments = []
-    for column, (value, cast) in columns.items():
-        params.append(value)
-        assignments.append(f"{column} = ${len(params)}{cast}")
+    for column, value in columns.items():
+        if column in _JSONB_COLUMNS:
+            params.append(json.dumps(value))
+            assignments.append(f"{column} = ${len(params)}::jsonb")
+        else:
+            params.append(value)
+            assignments.append(f"{column} = ${len(params)}")
     guard = ""
     if claim_origin is not None:
         params.append(claim_origin)
-        guard = f" AND (origin IS NULL OR origin = ${len(params)})"
+        guard = f" AND (origin IS NULL OR origin = ${len(params)})"  # may_claim, in SQL
 
     await ensure_schema(database_url)
     pool = await get_pool(database_url)
@@ -436,7 +452,7 @@ async def _write_columns(
             *params,
         )
     except asyncpg.UniqueViolationError as e:
-        _raise_if_root_taken(e, columns.get("root_path", (None, ""))[0])
+        _raise_if_root_taken(e, columns.get("root_path"))
         raise
     if row is None:
         # The guarded write changed nothing: find out why (the layer may be gone by now)
@@ -460,7 +476,14 @@ async def set_root_path(database_url: str, layer_name: str, root_path: str | Non
     Raises LayerNotFoundError if the layer doesn't exist.
     Raises RootTakenError if another layer already holds root_path.
     """
-    await _write_columns(database_url, layer_name, {"root_path": (root_path, "")})
+    await _write_columns(database_url, layer_name, {"root_path": root_path})
+
+
+def _validate_description(description: object) -> str:
+    """Return description unchanged; raise LayerValidationError if it is not a string."""
+    if not isinstance(description, str):
+        raise LayerValidationError("description must be a string.")
+    return description
 
 
 async def set_description(database_url: str, layer_name: str, description: str) -> None:
@@ -469,9 +492,9 @@ async def set_description(database_url: str, layer_name: str, description: str) 
     Raises LayerNotFoundError if the layer doesn't exist.
     Raises LayerValidationError if description is not a string.
     """
-    if not isinstance(description, str):
-        raise LayerValidationError("description must be a string.")
-    await _write_columns(database_url, layer_name, {"description": (description, "")})
+    await _write_columns(
+        database_url, layer_name, {"description": _validate_description(description)}
+    )
 
 
 async def set_origin(database_url: str, layer_name: str, origin: str | None) -> None:
@@ -481,7 +504,7 @@ async def set_origin(database_url: str, layer_name: str, origin: str | None) -> 
     Raises LayerValidationError if origin is longer than its column.
     """
     _validate_length("origin", origin, MAX_ORIGIN_LENGTH)
-    await _write_columns(database_url, layer_name, {"origin": (origin, "")})
+    await _write_columns(database_url, layer_name, {"origin": origin})
 
 
 async def set_layer_answer_mode(database_url: str, layer_name: str, answer_mode: str) -> None:
@@ -491,7 +514,7 @@ async def set_layer_answer_mode(database_url: str, layer_name: str, answer_mode:
     Raises LayerValidationError if answer_mode is not one of ANSWER_MODES.
     """
     _validate_answer_mode(answer_mode)
-    await _write_columns(database_url, layer_name, {"answer_mode": (answer_mode, "")})
+    await _write_columns(database_url, layer_name, {"answer_mode": answer_mode})
 
 
 async def update_layer(
@@ -513,26 +536,23 @@ async def update_layer(
 
     Returns the updated layer record (unchanged when nothing is given).
     Raises LayerNotFoundError if the layer doesn't exist.
-    Raises LayerValidationError if a value is invalid; nothing is written then.
+    Raises LayerValidationError if a value is invalid (a non-string description
+    too); nothing is written then.
     Raises LayerOriginError if another origin is stored; nothing is written then.
     """
-    values: dict[_LayerColumn, tuple[object, str]] = {}
+    values: dict[_LayerColumn, object] = {}
     if display_name is not None:
-        values["display_name"] = (_validate_display_name(display_name), "")
+        values["display_name"] = _validate_display_name(display_name)
     if description is not None:
-        values["description"] = (description, "")
+        values["description"] = _validate_description(description)
     if metadata_schema is not None:
-        values["metadata_schema"] = (
-            _json_str(_validate_metadata_schema(metadata_schema)),
-            "::jsonb",
-        )
+        values["metadata_schema"] = _validate_metadata_schema(metadata_schema)
     if chunk_config is not None:
-        values["chunk_config"] = (_json_str(_validate_chunk_config(chunk_config)), "::jsonb")
+        values["chunk_config"] = _validate_chunk_config(chunk_config)
     if routing_patterns is not None:
-        patterns = _validate_routing_patterns(routing_patterns)
-        values["routing_patterns"] = (json.dumps(patterns), "::jsonb")
+        values["routing_patterns"] = _validate_routing_patterns(routing_patterns)
     if answer_mode is not None:
-        values["answer_mode"] = (_validate_answer_mode(answer_mode), "")
+        values["answer_mode"] = _validate_answer_mode(answer_mode)
     if claim_origin is not None:
         _validate_length("origin", claim_origin, MAX_ORIGIN_LENGTH)
 

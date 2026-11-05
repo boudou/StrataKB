@@ -589,12 +589,17 @@ class TestPresetLayerChanges:
         preset = load_preset(SEPA_PRESET)
         assert preset_layer_changes(self._stored(preset, **{key: stored}), preset) == [key]
 
-    def test_display_name_compared_stripped(self):
+    def test_display_name_compared_stripped(self, tmp_path):
         from stratakb.knowledge.presets import preset_layer_changes
 
-        preset = load_preset(SEPA_PRESET)
-        stored = self._stored(preset)
-        preset.display_name = f"  {preset.display_name}  "
+        path = _write_preset(tmp_path, (
+            "name: runbooks\n"
+            "display_name: '  Ops Runbooks  '\n"
+            "sources:\n"
+            "  - {name: docs, path: docs}\n"
+        ))
+        preset = load_preset(path)
+        stored = self._stored(preset, display_name="Ops Runbooks")
         assert preset_layer_changes(stored, preset) == []
 
     def test_answer_mode_none_never_reported(self):
@@ -715,6 +720,38 @@ class TestApplyPresetTool:
         assert result["layer_check"] == {
             "status": "would_update", "changes": ["description", "routing_patterns"],
         }
+
+    @staticmethod
+    def _matching(preset, **overrides):
+        return {
+            "origin": None,
+            "display_name": preset.display_name,
+            "description": preset.description,
+            "metadata_schema": preset.metadata_schema,
+            "chunk_config": preset.chunk_config,
+            "routing_patterns": preset.routing_patterns,
+            "answer_mode": "grounded",
+            **overrides,
+        }
+
+    async def test_dry_run_would_claim(self):
+        # The real run writes the origin of a matching layer that has none
+        preset = load_preset(SEPA_PRESET)
+        result = await self._dry_run(self._matching(preset))
+
+        assert result["layer_check"] == {"status": "would_claim", "changes": []}
+
+    async def test_dry_run_unclaimed_would_update(self):
+        preset = load_preset(SEPA_PRESET)
+        result = await self._dry_run(self._matching(preset, description="Old"))
+
+        assert result["layer_check"] == {"status": "would_update", "changes": ["description"]}
+
+    async def test_dry_run_own_layer_unchanged(self):
+        preset = load_preset(SEPA_PRESET)
+        result = await self._dry_run(self._matching(preset, origin="preset:sepa"))
+
+        assert result["layer_check"] == {"status": "unchanged", "changes": []}
 
     async def test_dry_run_would_create(self):
         from stratakb.knowledge.layers import LayerNotFoundError
