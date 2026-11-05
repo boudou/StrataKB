@@ -23,13 +23,15 @@ def register_receipt_tools(mcp: FastMCP, database_url: str) -> None:
         """Open a receipt: the stored record of what StrataKB returned or verified.
 
         Shows each quote in its surrounding document text, with the document
-        version, SHA-256, offsets and clause path it came from. A quote whose
-        source changed since says so ("v1 → v2") and still shows the original
-        text. Open to the person who asked and to anyone who may read every
+        version, SHA-256, offsets and clause path it came from. Each quote has a
+        status: current; changed, with a note naming the newer version ("v1 →
+        v2"); or gone, when its file was removed from its folder or its layer
+        was deleted. A changed or gone quote still shows the original text. Open
+        to the person who asked, to admins and to anyone who may read every
         cited layer.
 
         Args:
-            receipt_id: The receipt id (rcpt_...).
+            receipt_id: The receipt id: rcpt_ and 22 URL-safe characters.
         """
         user_id, role = get_current_user()
         try:
