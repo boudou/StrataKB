@@ -23,8 +23,9 @@ GRANT USAGE ON SCHEMA strata_core, strata_vectors TO strata_readonly;
 GRANT SELECT ON strata_core.knowledge_layers, strata_core.ingestion_runs, strata_vectors.chunks
     TO strata_readonly;
 
--- 04_ingested_files.sql runs after this file on a fresh Docker volume and in
--- CI; the server's migration 06 (06_readonly_grants.sql) grants it then
+-- 04_ingested_files.sql runs after this file on a fresh Docker volume only;
+-- the server's migration 06 (06_readonly_grants.sql) grants it then. In CI the
+-- server's migrations run first, so the block below grants it
 DO $$
 BEGIN
     IF to_regclass('strata_core.ingested_files') IS NOT NULL THEN

@@ -28,6 +28,7 @@ configure_logging(_settings.log_level)
 from stratakb.core.audit import write_audit_log, query_audit_log
 from stratakb.core.auth import get_current_user, require_role
 from stratakb.core.database import check_connection, close_pool, get_pool
+from stratakb.core.local_db import START_HINT
 from stratakb.core.migrations import ensure_schema
 from stratakb.core.users import ensure_user, list_users, update_user_role
 from stratakb.database_access.tools import (
@@ -69,7 +70,7 @@ async def _lifespan(server: FastMCP):
             await conn.fetchval("SELECT 1")
         logger.info("db_pool_warmed")
     except Exception as e:
-        logger.warning("db_warmup_failed", error=str(e))
+        logger.warning("db_warmup_failed", error=str(e), hint=START_HINT)
     else:
         db_ready = True
         # Bring an existing database up to the current schema (no-op when

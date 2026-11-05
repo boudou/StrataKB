@@ -24,7 +24,7 @@ You need [Docker](https://docs.docker.com/get-docker/), [uv](https://docs.astral
 
 ```mermaid
 flowchart LR
-    i["Install"] --> a["Add a folder"] --> c["Connect your client"] --> q["Ask"]
+    i["Install"] --> d["Start the database"] --> a["Add a folder"] --> c["Connect your client"] --> q["Ask"]
 ```
 
 ### 1. Install
@@ -32,9 +32,11 @@ flowchart LR
 ```bash
 git clone https://github.com/boudou/StrataKB.git
 cd StrataKB
-docker compose up -d        # the database, in Docker on port 5433
 uv sync
+uv run stratakb db up        # a local database in Docker, on 127.0.0.1:5433
 ```
+
+Run `uv run stratakb db up` again any time: it starts the database if it was stopped and keeps the data. `uv run stratakb db down` stops it. If it prints a `DATABASE_URL=` line, put that line where it says.
 
 ### 2. Add a folder
 
@@ -314,6 +316,8 @@ Every layer shares the one vector column, so `vector_store.re_embed_layer()` re-
 
 ### Database and models
 
+`stratakb db up` runs the container `stratakb-db` from the image `pgvector/pgvector:pg16`, with its data in the Docker volume `stratakb-data`. It binds to `127.0.0.1` only, connects as the user `strata` with the default password, and brings the schema up to date before it returns. `--port` picks another host port when the container is created; an existing container keeps its port. `stratakb db down` stops the container and keeps the volume. It creates no `strata_readonly` role, so the SQL tools stay off until `db/03_readonly_role.sql` is applied (see `READONLY_DATABASE_URL`). With no `docker` on `PATH`, or the Docker daemon not running, it exits with code 3 and says which.
+
 Any empty PostgreSQL 16 database with pgvector works as well: `stratakb add` and the server create the schema on first use, as long as the user in `DATABASE_URL` may create the `vector` and `pg_trgm` extensions.
 
 A schema update waits at most 30 seconds for a lock that another process holds (another StrataKB process updating the schema, or a session using a table the update changes), then stops and says which lock it waited on. A user that is neither the database owner nor a superuser can use a schema that is current; when an update is due, they are told which file to apply as the owner (`psql -f`). A user without `USAGE` on the StrataKB schemas is told which privilege is missing.
@@ -417,9 +421,9 @@ db/                   03_readonly_role.sql (SQL tools role, applied with psql)
 examples/             Example layer presets (Python PEPs, SEPA, ISO 20022)
 scripts/              apply_preset.py, backup_restore.py
 src/stratakb/
-  cli.py              The stratakb command: add a folder, or start the server
+  cli.py              The stratakb command: add a folder, start a local database, or start the server
   mcp_server.py       MCP server: admin and user tools
-  core/               Database pool, roles, audit log, logging, schema migrations
+  core/               Database pool, roles, audit log, logging, schema migrations, local database in Docker
     sql/              Schema, applied in version order by the server: 01_init, 02_learning, then 04–06 upgrades
   knowledge/          Layers, presets, ingestion pipeline, parsers, embeddings, vector store
     add_folder.py     Turns one folder into one layer and keeps it in sync
@@ -433,6 +437,7 @@ docs/IMPROVEMENTS.md  Product goal and order of work (issues hold the items)
 ## Development
 
 ```bash
+docker compose up -d           # the development database (container strata-postgres, port 5433, with the read-only role)
 uv sync --extra dev
 uv run pytest                  # full suite; integration tests need the database running
 uv run ruff check src tests    # lint
@@ -441,9 +446,9 @@ uv run stratakb add docs --name strata_docs --json   # add a folder as a layer
 uv run stratakb --help         # the commands and their flags
 ```
 
-Without a running database, the integration tests fail with a connection error and the rest pass.
+Without a running database, the integration tests fail with a connection error and the rest pass. `docker compose` and `stratakb db up` both use port 5433, so run one at a time, or pass `--port` to `stratakb db up`.
 
-`scripts/backup_restore.py` backs up the whole database or exports and imports a single layer, through `docker exec` in the `strata-postgres` container. A layer export holds its configuration and chunks but not its file tracking, so the first ingestion after an import rebuilds the layer.
+`scripts/backup_restore.py` backs up the whole database or exports and imports a single layer, through `docker exec` in the `strata-postgres` container; `DB_CONTAINER=stratakb-db` points it at the `stratakb db up` database. A layer export holds its configuration and chunks but not its file tracking, so the first ingestion after an import rebuilds the layer.
 
 ## Roadmap
 

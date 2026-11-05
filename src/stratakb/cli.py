@@ -3,6 +3,8 @@
     stratakb                  start the MCP server on stdio (as before)
     stratakb serve            the same
     stratakb add <path> ...   turn a folder into a layer, or sync it
+    stratakb db up            start a local database in Docker, creating it on first use
+    stratakb db down          stop it; its data stays
 
 Each subcommand is a subparser and a handler; a new one adds both and
 nothing else. The command owns the terminal (prompts, progress, the report
@@ -17,6 +19,7 @@ import argparse
 import asyncio
 import contextlib
 import json
+import os
 import sys
 from collections.abc import Sequence
 from pathlib import Path
@@ -89,7 +92,33 @@ def _parser() -> _ArgumentParser:
         "--yes", action="store_true", help="go ahead with a large run without asking"
     )
     add.add_argument("--json", action="store_true", help="print the report as JSON")
+
+    db = commands.add_parser(
+        "db",
+        help="start or stop a local database in Docker",
+        description="Start or stop a local PostgreSQL database in a Docker "
+        "container, bound to 127.0.0.1. Its data stays in a Docker volume.",
+    )
+    db_commands = db.add_subparsers(dest="db_command", metavar="<command>", required=True)
+    up = db_commands.add_parser("up", help="start the local database, creating it on first use")
+    up.add_argument(
+        "--port",
+        type=_port,
+        default=5433,
+        help="host port on 127.0.0.1 when the container is created (default: 5433)",
+    )
+    db_commands.add_parser("down", help="stop the local database; its data stays")
     return parser
+
+
+def _port(text: str) -> int:
+    try:
+        port = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"not a port number: {text}") from None
+    if not 1 <= port <= 65535:
+        raise argparse.ArgumentTypeError(f"not a port number (1-65535): {text}")
+    return port
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -100,6 +129,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     except _UsageError as e:
         return _usage_error(str(e), argv)
 
+    if args.command == "db":
+        return _run_db(args)
     if args.command == "add":
         return _run_add(args)
     return _serve()
@@ -197,6 +228,75 @@ class _Progress:
         if self.shown:
             sys.stderr.write("\n")
             sys.stderr.flush()
+
+
+# ── db ───────────────────────────────────────────────────
+
+
+def _run_db(args: argparse.Namespace) -> int:
+    import asyncpg
+
+    from stratakb.config import config_files, get_settings, user_config_file
+    from stratakb.core import local_db
+    from stratakb.core.logging import configure_logging
+    from stratakb.core.migrations import MigrationError
+
+    configure_logging("WARNING")
+    _use_utf8_output()
+
+    try:
+        if args.db_command == "down":
+            _out(_down_text(asyncio.run(local_db.down())))
+            return EXIT_OK
+        result = asyncio.run(local_db.up(args.port, notify=_err))
+    except KeyboardInterrupt:
+        _err("Interrupted.")
+        return EXIT_INTERRUPTED
+    except (local_db.LocalDbError, MigrationError) as e:
+        _err(str(e))
+        return EXIT_DATABASE
+    except (
+        OSError,
+        asyncpg.PostgresConnectionError,
+        asyncpg.InvalidAuthorizationSpecificationError,
+        asyncpg.InvalidCatalogNameError,
+        asyncpg.InterfaceError,
+    ) as e:
+        _err(f"Can't reach the database in {local_db.CONTAINER} ({type(e).__name__}).")
+        return EXIT_DATABASE
+
+    state = {"created": "created", "started": "started"}.get(result.state, "already running")
+    _out(
+        f"Database ready at 127.0.0.1:{result.port} "
+        f"(container {local_db.CONTAINER}, {state})."
+    )
+    if local_db.points_here(get_settings().database_url, result.port):
+        _out("Nothing to configure: DATABASE_URL already points here.")
+        return EXIT_OK
+    _out(f"DATABASE_URL={result.url}")
+    if any(key.upper() == "DATABASE_URL" for key in os.environ):
+        _out(
+            "Your environment sets DATABASE_URL to another database; "
+            "set it to the line above to use this one."
+        )
+    else:
+        files = config_files()
+        target = files[-1] if files else user_config_file()
+        _out(f"Put this line in {target} to use this database.")
+    return EXIT_OK
+
+
+def _down_text(outcome: str) -> str:
+    from stratakb.core.local_db import CONTAINER, VOLUME
+
+    if outcome == "stopped":
+        return (
+            f"Stopped {CONTAINER}. Its data stays in the Docker volume {VOLUME}; "
+            "stratakb db up starts it again."
+        )
+    if outcome == "not_running":
+        return f"{CONTAINER} is not running."
+    return f"There is no {CONTAINER} container; nothing to stop."
 
 
 # ── add ──────────────────────────────────────────────────
@@ -383,11 +483,12 @@ def _model_notice(plan: Plan, settings: Any) -> None:
 
 def _unreachable_message(target: str, error: BaseException) -> str:
     from stratakb.config import config_files
+    from stratakb.core.local_db import START_HINT
 
     files = ", ".join(str(path) for path in config_files()) or "none"
     return (
         f"Can't reach the database at {target} ({type(error).__name__}). "
-        f"Config files read: {files}. Set DATABASE_URL or STRATAKB_CONFIG."
+        f"Config files read: {files}. Set DATABASE_URL or STRATAKB_CONFIG. {START_HINT}"
     )
 
 

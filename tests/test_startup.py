@@ -5,6 +5,7 @@ Tests cover:
 - A failed model preload is logged, not raised
 - No preload for a remote embedding backend
 - The startup migration runs only after a successful database warm-up
+- A failed warm-up logs the hint to run stratakb db up
 - The SQL tools role check runs before the lifespan yields
 - An unread ./.env and a missing STRATAKB_CONFIG file are logged, without the path
 - The lifespan yields without waiting for the embedding checks, and cancels them on exit
@@ -26,6 +27,7 @@ import pytest
 from structlog.testing import capture_logs
 
 from stratakb import mcp_server
+from stratakb.core import local_db
 
 
 def _fake_pool() -> MagicMock:
@@ -138,7 +140,8 @@ async def test_migration_skipped_when_database_unreachable(monkeypatch):
             pass
 
     migrate.assert_not_called()
-    assert any(e["event"] == "db_warmup_failed" for e in logs)
+    warnings = [e for e in logs if e["event"] == "db_warmup_failed"]
+    assert warnings and warnings[0]["hint"] == local_db.START_HINT
 
 
 async def test_migration_runs_after_warmup(db_ok, monkeypatch):

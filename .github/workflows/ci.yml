@@ -36,12 +36,11 @@ jobs:
       - uses: astral-sh/setup-uv@v10.3.3
         with:
           enable-cache: true
+      - run: uv sync --extra dev --locked
       - name: Create schemas
         run: |
-          for f in src/stratakb/core/sql/01_init.sql src/stratakb/core/sql/02_learning.sql db/03_readonly_role.sql src/stratakb/core/sql/04_ingested_files.sql; do
-            psql -h localhost -p 5433 -U strata -d strata -v ON_ERROR_STOP=1 -f "$f"
-          done
-      - run: uv sync --extra dev --locked
+          uv run python -c "import asyncio, os; from stratakb.core.migrations import ensure_schema; asyncio.run(ensure_schema(os.environ['DATABASE_URL']))"
+          psql -h localhost -p 5433 -U strata -d strata -v ON_ERROR_STOP=1 -f db/03_readonly_role.sql
       - name: Fetch a few PEPs
         run: |
           git clone --depth 1 --filter=blob:none --sparse https://github.com/python/peps.git examples/peps/source
