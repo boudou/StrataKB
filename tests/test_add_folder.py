@@ -330,6 +330,27 @@ async def test_first_add(db_url, tmp_path, cleanup):
     json.dumps(report.as_dict())
 
 
+async def test_unreadable_file_is_read_error(db_url, tmp_path, cleanup):
+    root = _docs(tmp_path)
+    name = _name()
+    cleanup.append(name)
+    original_read = Path.read_bytes
+
+    def locked_read(self):
+        if self.name == "notes.md":
+            raise PermissionError("locked")
+        return original_read(self)
+
+    with patch.object(Path, "read_bytes", locked_read):
+        _, report = await _run(db_url, root, Options(name=name))
+
+    assert _outcomes(report)["notes.md"] == ("failed", "read_error")
+    assert report.counts["failed"] == 1
+    assert {"path": "notes.md", "outcome": "failed", "reason": "read_error"} in (
+        report.as_dict()["files"]
+    )
+
+
 async def test_default_name_is_the_folder_slug(db_url, tmp_path, cleanup):
     folder = f"Add-Test {uuid4().hex[:8]}"
     root = tmp_path / folder

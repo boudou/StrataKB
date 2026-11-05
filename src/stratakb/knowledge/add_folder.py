@@ -25,13 +25,13 @@ from collections import Counter
 from collections.abc import Callable, Collection
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, get_args
 from urllib.parse import urlsplit
 from uuid import uuid4
 
 from stratakb.core.audit import write_audit_log
 from stratakb.core.database import get_pool
-from stratakb.knowledge.ingestion import ingest_documents
+from stratakb.knowledge.ingestion import Outcome, ingest_documents
 from stratakb.knowledge.layers import (
     MAX_OWNER_LENGTH,
     NAME_PATTERN,
@@ -58,7 +58,7 @@ LARGE_RUN_BYTES = 500_000_000
 # ... and so does removing at least this many files, when that is more than half
 LARGE_REMOVAL_MIN = 10
 
-OUTCOME_KEYS = ("added", "updated", "unchanged", "removed", "skipped", "flagged", "failed")
+OUTCOME_KEYS = get_args(Outcome)
 
 # The keys of the JSON report, in order: a stable interface
 REPORT_KEYS = (

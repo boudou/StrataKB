@@ -13,7 +13,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 import asyncpg
 import structlog
@@ -34,7 +34,7 @@ from stratakb.knowledge.layers import (
     get_layer_status,
 )
 from stratakb.knowledge.parsers.pdf_parser import ParsedDocument
-from stratakb.knowledge.parsers.registry import FORMATS
+from stratakb.knowledge.parsers.registry import FORMATS, Format
 from stratakb.knowledge.policy import is_secret_name
 from stratakb.knowledge.vector_store import ChunkRecord, chunk_embed_text, insert_chunks
 
@@ -48,6 +48,24 @@ EMBED_BATCH_SIZE = 100
 # A PDF averaging fewer characters per page than this probably holds scanned images
 _SCANNED_MIN_CHARS_PER_PAGE = 200
 
+Outcome = Literal["added", "updated", "unchanged", "removed", "skipped", "flagged", "failed"]
+Reason = Literal[
+    "deleted", "not_selected", "secret", "no_text",
+    "probably_scanned", "truncated",
+    "read_error", "parse_error", "embed_error",
+]
+
+# The reasons each outcome may carry; None: no reason
+REASONS: dict[str, frozenset[str | None]] = {
+    "added": frozenset({None}),
+    "updated": frozenset({None}),
+    "unchanged": frozenset({None}),
+    "removed": frozenset({"deleted", "not_selected", "secret", "no_text"}),
+    "skipped": frozenset({"secret", "no_text"}),
+    "flagged": frozenset({"probably_scanned", "truncated"}),
+    "failed": frozenset({"read_error", "parse_error", "embed_error"}),
+}
+
 
 @dataclass(frozen=True)
 class FileOutcome:
@@ -58,13 +76,20 @@ class FileOutcome:
     reason: why a file was removed ("deleted", "not_selected" when a file list
     left out a file that still exists, "secret", "no_text"), skipped
     ("secret", "no_text"), flagged ("probably_scanned", "truncated": stored,
-    and counted as added or updated) or failed ("parse_error", "embed_error"); None
-    otherwise.
+    and counted as added or updated) or failed ("read_error" when it could not
+    be read, "parse_error", "embed_error"); None otherwise. REASONS holds the
+    allowed pairs; any other pair raises ValueError.
     """
 
     relative_path: str
-    outcome: str
-    reason: str | None = None
+    outcome: Outcome
+    reason: Reason | None = None
+
+    def __post_init__(self) -> None:
+        if self.reason not in REASONS.get(self.outcome, frozenset()):
+            raise ValueError(
+                f"Not an ingest outcome and reason: {self.outcome!r}, {self.reason!r}"
+            )
 
 
 @dataclass
@@ -225,8 +250,9 @@ async def ingest_documents(
     single file's parent folder). A re-run skips files whose SHA-256 is
     unchanged, replaces changed files, adds new ones and, for a folder, removes
     files ingested from that same folder that no longer exist. A file that
-    fails to parse keeps its previous chunks. Each file's chunks are replaced
-    in one transaction.
+    cannot be read or fails to parse keeps its previous chunks, and its entry
+    in result.errors carries the reason. Each file's chunks are replaced in
+    one transaction.
 
     A file whose name looks like a secret (see policy.is_secret_name) is
     never read: it is skipped, or removed when it was tracked. A file without
@@ -373,12 +399,11 @@ async def ingest_documents(
         # the tracked one is known to be unchanged
         total = sum(
             1 for rel, _, carried in work
-            if not is_secret_name(rel)
-            and (carried is None or rel not in tracked or tracked[rel]["content_hash"] != carried)
+            if not is_secret_name(rel) and not _matches_tracked(carried, tracked.get(rel))
         )
         done = 0
 
-        async def drop(relative_path: str, previous, reason: str) -> None:
+        async def drop(relative_path: str, previous, reason: Reason) -> None:
             """Skip a file, or remove it (row and chunks) when it was tracked."""
             if previous is None:
                 result.files.append(FileOutcome(relative_path, "skipped", reason))
@@ -392,10 +417,10 @@ async def ingest_documents(
             result.files.append(FileOutcome(relative_path, "removed", reason))
             result.files_removed += 1
 
-        def fail(relative_path: str, error: str, reason: str) -> None:
+        def fail(relative_path: str, error: str, reason: Reason) -> None:
             result.files.append(FileOutcome(relative_path, "failed", reason))
             result.docs_failed += 1
-            result.errors.append({"file": relative_path, "error": error})
+            result.errors.append({"file": relative_path, "error": error, "reason": reason})
 
         # Step 4: Parse, chunk, embed and store each new or changed file
         seen: set[str] = set()
@@ -409,11 +434,7 @@ async def ingest_documents(
                 continue
 
             # A carried hash equal to the tracked one: unchanged, never opened
-            if (
-                carried_hash is not None
-                and previous is not None
-                and previous["content_hash"] == carried_hash
-            ):
+            if _matches_tracked(carried_hash, previous):
                 result.files_unchanged += 1
                 result.files.append(FileOutcome(relative_path, "unchanged"))
                 continue
@@ -421,21 +442,22 @@ async def ingest_documents(
             try:
                 data = file_path.read_bytes()
             except OSError as e:
-                fail(relative_path, str(e), "parse_error")
+                logger.warning(
+                    "file_read_failed", layer=layer_name, file=relative_path,
+                    error_type=type(e).__name__,
+                )
+                fail(relative_path, str(e), "read_error")
                 continue
             content_hash = carried_hash or hashlib.sha256(data).hexdigest()
 
-            if previous is not None and previous["content_hash"] == content_hash:
+            if _matches_tracked(content_hash, previous):
                 result.files_unchanged += 1
                 result.files.append(FileOutcome(relative_path, "unchanged"))
                 continue
 
             # A listed file may have an unknown extension: _parse_file rejects it
             fmt = FORMATS.get(file_path.suffix.lower())
-            if not data or (
-                (fmt is None or not fmt.binary)
-                and not data.decode("utf-8-sig", errors="replace").strip()
-            ):
+            if _has_no_text(fmt, data):
                 await drop(relative_path, previous, "no_text")
                 continue
 
@@ -500,18 +522,16 @@ async def ingest_documents(
                 fail(relative_path, str(e), "embed_error")
                 continue
 
+            flag = _flag_reason(fmt, parsed)
             if previous is None:
                 result.files_added += 1
-                outcome = FileOutcome(relative_path, "added")
             else:
                 result.files_updated += 1
-                outcome = FileOutcome(relative_path, "updated")
-            if fmt is not None and fmt.scanned_check and _probably_scanned(parsed):
+            if flag is not None:
                 result.files_flagged += 1
-                outcome = FileOutcome(relative_path, "flagged", "probably_scanned")
-            elif parsed.rows_left_out:
-                result.files_flagged += 1
-                outcome = FileOutcome(relative_path, "flagged", "truncated")
+                outcome = FileOutcome(relative_path, "flagged", flag)
+            else:
+                outcome = FileOutcome(relative_path, "added" if previous is None else "updated")
             result.files.append(outcome)
             result.docs_processed += 1
             result.chunks_created += len(doc_chunks)
@@ -605,6 +625,35 @@ def _probably_scanned(doc: ParsedDocument) -> bool:
         2 * len(doc.pages) < doc.total_pages
         or sum(len(p.text) for p in doc.pages) / doc.total_pages < _SCANNED_MIN_CHARS_PER_PAGE
     )
+
+
+def _matches_tracked(content_hash: str | None, previous) -> bool:
+    """Whether a file's hash equals the hash tracked for it (so it is unchanged)."""
+    return (
+        content_hash is not None
+        and previous is not None
+        and previous["content_hash"] == content_hash
+    )
+
+
+def _has_no_text(fmt: Format | None, data: bytes) -> bool:
+    """Whether a file's bytes hold no text: 0 bytes, or a text format (or an
+    unknown one) that decodes to whitespace only. A binary format's bytes are
+    left to its parser."""
+    return not data or (
+        (fmt is None or not fmt.binary)
+        and not data.decode("utf-8-sig", errors="replace").strip()
+    )
+
+
+def _flag_reason(fmt: Format | None, parsed: ParsedDocument) -> Reason | None:
+    """Why a stored file is flagged: it looks scanned, or its parser cut rows
+    at a limit; None when it is not flagged."""
+    if fmt is not None and fmt.scanned_check and _probably_scanned(parsed):
+        return "probably_scanned"
+    if parsed.rows_left_out:
+        return "truncated"
+    return None
 
 
 def _chunk_document(

@@ -205,8 +205,10 @@ def register_knowledge_tools(
         content is unchanged are skipped, changed files are replaced, new files
         are added, and files ingested from that folder that no longer exist are
         removed. Other folders ingested into the layer are left alone, and a
-        single-file source_path never removes anything. A file that fails to
-        parse keeps its previous chunks and is listed in errors.
+        single-file source_path never removes anything. A file that cannot be
+        read or fails to parse keeps its previous chunks and is listed in
+        errors with file, error and reason ("read_error": locked or no
+        permission, "parse_error", or "embed_error").
 
         Files whose names look like secrets (.env, keys, certificates,
         credentials, e.g. client_secret.json) are always skipped and never
