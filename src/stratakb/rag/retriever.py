@@ -196,11 +196,10 @@ async def search_chunks(
 
 async def _search_fetch(pool, settings, sql: str, params: list) -> list:
     """Run one search query in a transaction with the search settings."""
-    async with pool.acquire() as conn:
-        async with conn.transaction():
-            await conn.execute(f"SET LOCAL hnsw.ef_search = {settings.hnsw_ef_search}")
-            await conn.execute(f"SET LOCAL statement_timeout = '{_SEARCH_TIMEOUT}s'")
-            return await conn.fetch(sql, *params)
+    async with pool.acquire() as conn, conn.transaction():
+        await conn.execute(f"SET LOCAL hnsw.ef_search = {settings.hnsw_ef_search}")
+        await conn.execute(f"SET LOCAL statement_timeout = '{_SEARCH_TIMEOUT}s'")
+        return await conn.fetch(sql, *params)
 
 
 def _row_to_result(row, score: float, similarity: float | None) -> SearchResult:
