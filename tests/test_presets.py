@@ -690,6 +690,50 @@ class TestApplyPresetTool:
         assert result["layer"] == "updated"
         assert result["layer_changes"] == ["description"]
 
+    async def _audited_run(self, layer_result):
+        auth, tools_auth = self._admin()
+        with (
+            auth, tools_auth,
+            patch("stratakb.knowledge.embeddings.embedding_key_error", return_value=None),
+            patch(
+                "stratakb.knowledge.presets.create_preset_layer",
+                new_callable=AsyncMock,
+                return_value=layer_result,
+            ),
+            patch(
+                "stratakb.knowledge.presets.ingest_preset",
+                new_callable=AsyncMock,
+                return_value={"total_docs": 4, "total_chunks": 31},
+            ),
+            patch("stratakb.knowledge.tools.write_audit_log", new_callable=AsyncMock) as audit,
+        ):
+            await self._call()
+        audit.assert_awaited_once()
+        return audit.await_args.kwargs["result_summary"]
+
+    async def test_audit_names_changed_settings(self):
+        summary = await self._audited_run(
+            {"status": "updated", "changes": ["description", "routing_patterns"], "message": ""}
+        )
+        assert summary == (
+            "Layer 'sepa': updated (description, routing_patterns), ingested 4 docs, 31 chunks"
+        )
+
+    async def test_audit_has_no_setting_values(self):
+        description = load_preset(SEPA_PRESET).description
+        assert description
+        summary = await self._audited_run(
+            {"status": "updated", "changes": ["description"], "message": "ZZ-old-description-7f3"}
+        )
+        assert "(description)" in summary
+        assert "ZZ-old-description-7f3" not in summary
+        assert description not in summary
+
+    @pytest.mark.parametrize("status", ["created", "exists"])
+    async def test_audit_unchanged_without_changes(self, status):
+        summary = await self._audited_run({"status": status, "changes": [], "message": ""})
+        assert summary == f"Layer 'sepa': {status}, ingested 4 docs, 31 chunks"
+
     async def _dry_run(self, stored=None, side_effect=None):
         auth, tools_auth = self._admin()
         with (

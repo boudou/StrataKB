@@ -396,7 +396,9 @@ def register_knowledge_tools(
             tool_name="strata_apply_preset",
             parameters={"preset_path": preset_path, "docs_root": docs_root},
             result_summary=(
-                f"Layer '{preset.name}': {layer_result['status']}, "
+                f"Layer '{preset.name}': {layer_result['status']}"
+                + (f" ({', '.join(layer_result['changes'])})" if layer_result["changes"] else "")
+                + ", "
                 f"ingested {ingest_result['total_docs']} docs, "
                 f"{ingest_result['total_chunks']} chunks"
             ),
