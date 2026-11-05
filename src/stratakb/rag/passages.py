@@ -42,6 +42,41 @@ _NEXT_STEPS = {
 }
 
 
+def ask_chunk(
+    *,
+    chunk_id: str | None,
+    content: str,
+    score: float,
+    similarity: float | None,
+    layer: str,
+    source_file: str,
+    section: str | None,
+    doc_type: str | None,
+    metadata: dict[str, Any],
+    document_id: int | None,
+    char_start: int | None,
+    char_end: int | None,
+    clause_path: str | None,
+) -> dict[str, Any]:
+    """The one shape of a strata_ask chunk; the reranker fills rerank_score."""
+    return {
+        "chunk_id": chunk_id,
+        "content": content,
+        "score": score,
+        "similarity": similarity,
+        "rerank_score": None,
+        "layer": layer,
+        "source_file": source_file,
+        "section": section,
+        "doc_type": doc_type,
+        "metadata": metadata,
+        "document_id": document_id,
+        "char_start": char_start,
+        "char_end": char_end,
+        "clause_path": clause_path,
+    }
+
+
 def estimate_tokens(text: str) -> int:
     """A rough token count: about four characters per token."""
     return math.ceil(len(text) / 4)

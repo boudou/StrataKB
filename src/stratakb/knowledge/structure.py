@@ -154,7 +154,8 @@ def _lines(text: str) -> list[tuple[int, str]]:
     return lines
 
 
-def _normalise(label: str) -> str:
+def normalise_label(label: str) -> str:
+    """A section label as stored and looked up: lower case, single spaces."""
     return " ".join(label.lower().split())
 
 
@@ -167,13 +168,13 @@ def _heading_label(heading: str) -> tuple[str, str | None]:
     """
     heading = heading.strip()
     if m := _KEYWORD_RE.match(heading):
-        return _normalise(f"{m.group(1)} {m.group(2)}"), m.group(3) or None
+        return normalise_label(f"{m.group(1)} {m.group(2)}"), m.group(3) or None
     if m := _PAREN_RE.match(heading):
         label = m.group(1) + f"({m.group(2)})" + (f"({m.group(3)})" if m.group(3) else "")
         return label, m.group(4) or None
     if m := _DOTTED_RE.match(heading):
         return m.group(1), m.group(3) or None
-    return _normalise(heading), heading
+    return normalise_label(heading), heading
 
 
 def _short_title(rest: str | None) -> str | None:
@@ -380,7 +381,7 @@ def _scan(text: str, extra_patterns: Sequence[re.Pattern[str]]) -> list[_Candida
                 keyword_rank = _KEYWORD_RANKS[keyword.group(1).lower()]
                 current = None
                 name = f"{keyword.group(1)} {keyword.group(2)}"
-                label = _normalise(name)
+                label = normalise_label(name)
                 add(_KEYWORD, (markup_level, keyword_rank, 0),
                     f"{name} {title}" if title else name, offset,
                     label=label, title=title)
@@ -391,7 +392,7 @@ def _scan(text: str, extra_patterns: Sequence[re.Pattern[str]]) -> list[_Candida
             if m := pattern.match(line):
                 label = m.groupdict().get("label") or m.group(0)
                 add(_NUMBERED, (markup_level, keyword_rank, 1), line, offset,
-                    label=_normalise(label), title=None, own_text=True)
+                    label=normalise_label(label), title=None, own_text=True)
                 current = None
                 matched_extra = True
                 break

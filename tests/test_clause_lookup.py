@@ -1,0 +1,424 @@
+"""Exact lookup of clause and section references (stratakb.rag.clause_lookup).
+
+The reference parsing and trimming tests are pure. The tool tests ingest the
+fixture contract through the real pipeline (embeddings mocked) into the test
+database, then call strata_ask and strata_search in-process with the search
+patched.
+"""
+
+from __future__ import annotations
+
+import contextlib
+import json
+import shutil
+from pathlib import Path
+from unittest.mock import AsyncMock, patch
+from uuid import uuid4
+
+import pytest
+
+from stratakb.rag.clause_lookup import (
+    Reference,
+    find_references,
+    fit_to_budget,
+    without_exact_spans,
+)
+from stratakb.rag.passages import passage_cost
+from stratakb.rag.retriever import SearchResult
+
+FIXTURES = Path(__file__).parent / "fixtures"
+FAKE_EMBEDDING = [0.01] * 768
+CLAUSE_PATH = "2 Termination > 2.2 Termination for cause"
+
+
+def _labels(question: str, extra=()) -> list[tuple[str, ...]]:
+    return [ref.labels for ref in find_references(question, extra)]
+
+
+# ---------------------------------------------------------------------------
+# Reference parsing
+# ---------------------------------------------------------------------------
+
+
+class TestFindReferences:
+    def test_clause_number(self):
+        assert find_references("What does clause 7.2 say?") == [
+            Reference("clause 7.2", ("7.2", "clause 7.2"))
+        ]
+
+    def test_section_sign(self):
+        assert _labels("show § 4") == [("4", "section 4")]
+        assert _labels("show §4(2)") == [("4(2)", "section 4(2)")]
+
+    def test_article_and_annex(self):
+        assert _labels("Article 12 and Annex II") == [
+            ("12", "article 12"),
+            ("annex ii",),
+        ]
+        assert _labels("see appendix A") == [("appendix a",)]
+
+    def test_statute_style_number(self):
+        assert _labels("what is 7(2)(b)") == [("7(2)(b)",)]
+        assert _labels("section 7(2)(b) applies") == [("7(2)(b)", "section 7(2)(b)")]
+
+    def test_bare_dotted_number(self):
+        assert _labels("explain 4.3.2 please") == [("4.3.2",)]
+
+    def test_preset_pattern(self):
+        assert _labels("show AT-44") == []
+        assert _labels("show AT-44", [r"(?P<label>AT-\d+)\b"]) == [("at-44",)]
+
+    def test_year_is_not_a_reference(self):
+        assert find_references("what changed in 2026") == []
+        assert find_references("the 05.11.2026 release") == []
+        assert find_references("the 7 days notice") == []
+
+    def test_words_are_not_numerals(self):
+        assert find_references("which section is about payments?") == []
+        assert find_references("the part in question") == []
+
+    def test_repeats_are_dropped(self):
+        assert _labels("clause 2.1, then clause 2.1 again, and 2.2") == [
+            ("2.1", "clause 2.1"),
+            ("2.2",),
+        ]
+
+
+# ---------------------------------------------------------------------------
+# Trimming and deduplication
+# ---------------------------------------------------------------------------
+
+
+def _exact(text: str, start: int = 100) -> dict:
+    return {
+        "chunk_id": None, "content": text, "score": 1.0, "layer": "docs",
+        "source_file": "a.md", "metadata": {}, "document_id": 1,
+        "char_start": start, "char_end": start + len(text), "clause_path": "7 X",
+        "match": "exact",
+    }
+
+
+def test_fit_to_budget_keeps_offsets():
+    text = " ".join(f"word{i}" for i in range(2000))
+    chunk = _exact(text)
+    budget = 300
+
+    trimmed = fit_to_budget(chunk, budget)
+
+    assert passage_cost(trimmed) <= budget
+    assert text.startswith(trimmed["content"])
+    assert trimmed["char_end"] - trimmed["char_start"] == len(trimmed["content"])
+    assert not trimmed["content"].endswith((" ", "wor"))
+    assert fit_to_budget(_exact("short"), budget)["content"] == "short"
+
+
+def test_chunks_inside_an_exact_span_are_dropped():
+    exact = [_exact("x" * 50, start=100)]
+    chunks = [
+        {"document_id": 1, "char_start": 110, "char_end": 140},
+        {"document_id": 1, "char_start": 140, "char_end": 200},
+        {"document_id": 2, "char_start": 110, "char_end": 140},
+        {"document_id": None, "char_start": None, "char_end": None},
+    ]
+    assert without_exact_spans(chunks, exact) == chunks[1:]
+
+
+# ---------------------------------------------------------------------------
+# strata_ask and strata_search (database)
+# ---------------------------------------------------------------------------
+
+
+def _payload(result) -> dict:
+    if isinstance(result, tuple):
+        result = result[0]
+    if isinstance(result, dict):
+        return result
+    return json.loads(result[0].text)
+
+
+@pytest.fixture
+def settings():
+    from stratakb.config import Settings, get_settings
+
+    return Settings(
+        _env_file=None,
+        database_url=get_settings().database_url,
+        learning_enabled=False,
+        reranking_enabled=False,
+        strata_user="test-user",
+        strata_role="viewer",
+    )
+
+
+@pytest.fixture
+def audit():
+    return AsyncMock()
+
+
+@pytest.fixture
+def server(settings, audit):
+    from stratakb.mcp_server import build_server
+
+    with (
+        patch("stratakb.config.get_settings", return_value=settings),
+        patch("stratakb.rag.tools.write_audit_log", audit),
+        patch(
+            "stratakb.rag.query_rewriter.rewrite_query",
+            AsyncMock(side_effect=lambda question, **_: [question]),
+        ),
+    ):
+        yield build_server(settings)
+
+
+async def _make_layer(db_url: str) -> str:
+    from stratakb.knowledge.layers import create_layer
+
+    name = f"test_clause_{uuid4().hex[:10]}"
+    await create_layer(
+        db_url, name=name, display_name="Test Clause",
+        chunk_config={"chunk_size": 200, "chunk_overlap": 40},
+    )
+    return name
+
+
+async def _ingest(db_url: str, layer: str, source: Path) -> None:
+    from stratakb.knowledge.ingestion import ingest_documents
+
+    with patch("stratakb.knowledge.ingestion.embed_texts", new_callable=AsyncMock) as mock:
+        mock.side_effect = lambda texts, **_: [FAKE_EMBEDDING for _ in texts]
+        result = await ingest_documents(
+            db_url, "fake-key", layer_name=layer, source_path=str(source)
+        )
+    assert result.docs_failed == 0
+
+
+@pytest.fixture
+async def layers(settings, tmp_path):
+    """Two layers: one holding contract.md, one holding it twice under other names."""
+    from stratakb.knowledge.layers import LayerNotFoundError, delete_layer
+
+    db_url = settings.database_url
+    one, two = await _make_layer(db_url), await _make_layer(db_url)
+    single = tmp_path / "single"
+    single.mkdir()
+    shutil.copy(FIXTURES / "contract.md", single / "contract.md")
+    double = tmp_path / "double"
+    double.mkdir()
+    shutil.copy(FIXTURES / "contract.md", double / "acme.md")
+    shutil.copy(FIXTURES / "contract.md", double / "globex.md")
+    await _ingest(db_url, one, single)
+    await _ingest(db_url, two, double)
+    yield one, two
+    for name in (one, two):
+        with contextlib.suppress(LayerNotFoundError):
+            await delete_layer(db_url, name=name)
+
+
+async def _document(db_url: str, layer: str, relative_path: str) -> dict:
+    from stratakb.core.database import get_pool
+
+    pool = await get_pool(db_url)
+    row = await pool.fetchrow(
+        """
+        SELECT d.id, d.text FROM strata_vectors.documents d
+        JOIN strata_core.knowledge_layers kl ON kl.id = d.layer_id
+        WHERE kl.name = $1 AND d.relative_path = $2
+        ORDER BY d.version DESC LIMIT 1
+        """,
+        layer,
+        relative_path,
+    )
+    return dict(row)
+
+
+def _retrieved(layer: str, document_id: int | None = None, span=None) -> SearchResult:
+    start, end = span if span else (None, None)
+    return SearchResult(
+        chunk_id=str(uuid4()), content="retrieved text", score=1.0, layer_name=layer,
+        source_file="other.md", source_section="", doc_type="markdown",
+        similarity=0.5, document_id=document_id, char_start=start, char_end=end,
+    )
+
+
+async def _call(server, tool: str, results, **arguments):
+    search = AsyncMock(return_value=results)
+    with patch("stratakb.rag.retriever.search_chunks", search):
+        response = _payload(await server.call_tool(tool, arguments))
+    return response, search
+
+
+class TestAskClause:
+    async def test_clause_22_first(self, server, settings, layers, audit):
+        layer, _ = layers
+        doc = await _document(settings.database_url, layer, "contract.md")
+        expected = doc["text"][doc["text"].index("2.2 Termination for cause"):
+                               doc["text"].index("\nAnnex II\n")].rstrip()
+
+        response, search = await _call(
+            server, "strata_ask", [_retrieved(layer)],
+            question="what does clause 2.2 say", layers=[layer],
+        )
+
+        assert response["status"] == "found"
+        first = response["passages"][0]
+        start = doc["text"].index(expected)
+        assert first["ref"] == f"d{doc['id']}:{start}-{start + len(expected)}"
+        assert first["text"] == expected == doc["text"][start:start + len(expected)]
+        citation = first["citation"]
+        assert citation["file"] == "contract.md"
+        assert citation["clause_path"] == CLAUSE_PATH
+        assert citation["layer"] == layer
+        assert citation["lines"] == "15-28"
+        # Retrieval still adds its passages after the exact one
+        assert search.await_count == 1
+        assert [p["text"] for p in response["passages"][1:]] == ["retrieved text"]
+        assert audit.await_args.kwargs["parameters"]["exact_matches"] == 1
+
+    async def test_detailed_marks_the_exact_chunk(self, server, settings, layers):
+        layer, _ = layers
+        response, _ = await _call(
+            server, "strata_ask", [],
+            question="show clause 2.2", layers=[layer], response_format="detailed",
+        )
+
+        assert response["answer_status"] == "found"
+        chunk = response["retrieved_chunks"][0]
+        assert chunk["match"] == "exact"
+        assert chunk["chunk_id"] is None
+        assert chunk["clause_path"] == CLAUSE_PATH
+        assert response["sources"][0]["relevance_score"] == 1.0
+
+    async def test_same_clause_two_documents(self, server, settings, layers):
+        _, layer = layers
+
+        response, _ = await _call(
+            server, "strata_ask", [],
+            question="what does clause 2.2 say", layers=[layer],
+        )
+
+        exact = response["passages"][:2]
+        assert sorted(p["citation"]["file"] for p in exact) == ["acme.md", "globex.md"]
+        assert {p["citation"]["clause_path"] for p in exact} == {CLAUSE_PATH}
+        assert exact[0]["text"] == exact[1]["text"]
+        assert len(response["passages"]) == 2
+
+    async def test_lookup_stays_in_the_layers_searched(self, server, settings, layers):
+        one, _ = layers
+
+        response, _ = await _call(
+            server, "strata_ask", [], question="clause 2.2", layers=[one],
+        )
+
+        assert [p["citation"]["file"] for p in response["passages"]] == ["contract.md"]
+
+    async def test_retrieved_chunk_inside_the_clause_is_dropped(
+        self, server, settings, layers
+    ):
+        layer, _ = layers
+        doc = await _document(settings.database_url, layer, "contract.md")
+        start = doc["text"].index("Either party may terminate this agreement with")
+        inside = _retrieved(layer, doc["id"], (start, start + 40))
+
+        response, _ = await _call(
+            server, "strata_ask", [inside], question="clause 2.2", layers=[layer],
+        )
+
+        assert len(response["passages"]) == 1
+        assert response["passages"][0]["citation"]["clause_path"] == CLAUSE_PATH
+
+    async def test_unknown_clause_falls_back(self, server, settings, layers, audit):
+        layer, _ = layers
+
+        response, search = await _call(
+            server, "strata_ask", [_retrieved(layer)],
+            question="what does clause 9.4 say", layers=[layer], response_format="detailed",
+        )
+
+        assert search.await_count == 1
+        assert [c.get("match") for c in response["retrieved_chunks"]] == [None]
+        assert [p["text"] for p in response["passages"]] == ["retrieved text"]
+        assert audit.await_args.kwargs["parameters"]["exact_matches"] == 0
+
+    async def test_long_clause_is_trimmed_to_the_budget(self, server, settings, layers):
+        layer, _ = layers
+        settings.answer_token_budget = 120
+        doc = await _document(settings.database_url, layer, "contract.md")
+
+        response, _ = await _call(
+            server, "strata_ask", [], question="clause 2", layers=[layer],
+        )
+
+        first = response["passages"][0]
+        start = doc["text"].index("2. Termination")
+        assert first["text"] == doc["text"][start:start + len(first["text"])]
+        assert first["ref"] == f"d{doc['id']}:{start}-{start + len(first['text'])}"
+        assert len(first["text"]) < len("2. Termination\n\n2.1 Notice") + 200
+
+
+async def test_resolve_caps_a_label_many_documents_share(settings, tmp_path):
+    from stratakb.knowledge.layers import LayerNotFoundError, delete_layer
+    from stratakb.rag.clause_lookup import MAX_EXACT_MATCHES, resolve
+
+    db_url = settings.database_url
+    layer = await _make_layer(db_url)
+    names = [f"doc{i:02d}.md" for i in range(MAX_EXACT_MATCHES + 3)]
+    for name in names:
+        shutil.copy(FIXTURES / "contract.md", tmp_path / name)
+    try:
+        await _ingest(db_url, layer, tmp_path)
+
+        chunks = await resolve(db_url, find_references("clause 2.2"), [layer])
+
+        assert len(chunks) == MAX_EXACT_MATCHES
+        assert [c["source_file"] for c in chunks] == names[:MAX_EXACT_MATCHES]
+        assert {c["clause_path"] for c in chunks} == {CLAUSE_PATH}
+        assert all(c["match"] == "exact" and c["content"] for c in chunks)
+    finally:
+        with contextlib.suppress(LayerNotFoundError):
+            await delete_layer(db_url, name=layer)
+
+
+def test_exact_chunk_has_the_ask_chunk_shape():
+    from stratakb.rag.clause_lookup import _exact_chunk
+    from stratakb.rag.tools import _ask_chunk
+
+    row = {
+        "layer_name": "docs", "source_file": "a.md", "path": "7 X", "doc_type": "markdown",
+        "document_id": 1, "char_start": 10,
+    }
+    exact = _exact_chunk(row, "text")
+    retrieved = _ask_chunk(_retrieved("docs", 1, (10, 14)), 0.5)
+
+    assert list(exact) == [*retrieved, "match"]
+    assert exact["char_end"] == 14
+
+
+class TestSearchClause:
+    async def test_exact_result_first(self, server, settings, layers, audit):
+        layer, _ = layers
+
+        response, search = await _call(
+            server, "strata_search", [_retrieved(layer)],
+            query="clause 2.2", layers=[layer],
+        )
+
+        assert search.await_count == 1
+        first, second = response["results"]
+        assert first["match"] == "exact"
+        assert first["section"] == CLAUSE_PATH
+        assert first["content"].startswith("2.2 Termination for cause")
+        assert first["chunk_id"] is None
+        assert second["content"] == "retrieved text"
+        assert "match" not in second
+        assert response["total"] == 2
+        assert audit.await_args.kwargs["parameters"]["exact_matches"] == 1
+
+    async def test_unknown_reference_is_plain_search(self, server, settings, layers):
+        layer, _ = layers
+
+        response, _ = await _call(
+            server, "strata_search", [_retrieved(layer)],
+            query="version 7.25", layers=[layer],
+        )
+
+        assert [r["content"] for r in response["results"]] == ["retrieved text"]

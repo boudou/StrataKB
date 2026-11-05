@@ -15,9 +15,12 @@ from stratakb.core.audit import write_audit_log
 from stratakb.core.auth import get_current_user, require_role
 from stratakb.core.logging import log_tool_call
 from stratakb.learning.pii import scrub_query
+from stratakb.rag.clause_lookup import in_exact_span, without_exact_spans
+from stratakb.rag.clause_lookup import lookup as lookup_clauses
 from stratakb.rag.confidence import answer_status, score_confidence, similarity_or_zero
 from stratakb.rag.passages import (
     RESPONSE_FORMATS,
+    ask_chunk,
     build_passages,
     next_step,
     pack_passages,
@@ -124,23 +127,22 @@ class _Collected(NamedTuple):
 
 
 def _ask_chunk(r: SearchResult, score: float) -> dict[str, Any]:
-    """The one shape of a strata_ask chunk; the reranker fills rerank_score."""
-    return {
-        "chunk_id": r.chunk_id,
-        "content": r.content,
-        "score": score,
-        "similarity": r.similarity,
-        "rerank_score": None,
-        "layer": r.layer_name,
-        "source_file": r.source_file,
-        "section": r.source_section,
-        "doc_type": r.doc_type,
-        "metadata": r.metadata,
-        "document_id": r.document_id,
-        "char_start": r.char_start,
-        "char_end": r.char_end,
-        "clause_path": r.clause_path,
-    }
+    """A retrieved chunk in the strata_ask chunk shape (passages.ask_chunk)."""
+    return ask_chunk(
+        chunk_id=r.chunk_id,
+        content=r.content,
+        score=score,
+        similarity=r.similarity,
+        layer=r.layer_name,
+        source_file=r.source_file,
+        section=r.source_section,
+        doc_type=r.doc_type,
+        metadata=r.metadata,
+        document_id=r.document_id,
+        char_start=r.char_start,
+        char_end=r.char_end,
+        clause_path=r.clause_path,
+    )
 
 
 async def _cited_documents(
@@ -169,8 +171,29 @@ async def _cited_documents(
         return {}
 
 
+def _search_item(chunk: dict[str, Any]) -> dict[str, Any]:
+    """An exact clause chunk as a strata_search result, marked exact."""
+    return {
+        "chunk_id": None,
+        "content": chunk["content"],
+        "score": chunk["score"],
+        "layer": chunk["layer"],
+        "source_file": chunk["source_file"],
+        "section": chunk["section"],
+        "doc_type": chunk["doc_type"],
+        "metadata": chunk["metadata"],
+        "similarity": None,
+        "match": "exact",
+    }
+
+
 def _basis_score(chunk: dict[str, Any], basis: str) -> float:
-    """The score confidence judges a strata_ask chunk on, for this basis."""
+    """The score confidence judges a strata_ask chunk on, for this basis.
+
+    An exact clause match is the passage asked for: it scores 1.0.
+    """
+    if chunk.get("match") == "exact":
+        return 1.0
     if basis == "rerank":
         return chunk["rerank_score"]
     return similarity_or_zero(chunk["similarity"])
@@ -258,6 +281,28 @@ def register_rag_tools(
                     layers = None
                     confidence = _search_confidence(results)
 
+            # A clause or section the query names comes first, verbatim
+            exact = await lookup_clauses(
+                database_url, query, layers, _settings.answer_token_budget
+            )
+            found = [
+                {
+                    "chunk_id": r.chunk_id,
+                    "content": r.content,
+                    "score": r.score,
+                    "layer": r.layer_name,
+                    "source_file": r.source_file,
+                    "section": r.source_section,
+                    "doc_type": r.doc_type,
+                    "metadata": r.metadata,
+                    "similarity": r.similarity,
+                }
+                for r in results
+                if not in_exact_span(r.document_id, r.char_start, r.char_end, exact)
+            ]
+            items = [_search_item(e) for e in exact] + found
+            items = items[: max(top_k, len(exact))]
+
             user_id, _ = get_current_user()
             await write_audit_log(
                 database_url,
@@ -269,29 +314,17 @@ def register_rag_tools(
                     "layers": layers,
                     "top_k": top_k,
                     "routing_fallback": bool(fallback_reason),
+                    "exact_matches": len(exact),
                 },
-                result_summary=f"Found {len(results)} results",
+                result_summary=f"Found {len(items)} results",
             )
 
             response = {
                 "status": "ok",
                 "query": query,
                 "confidence": confidence,
-                "results": [
-                    {
-                        "chunk_id": r.chunk_id,
-                        "content": r.content,
-                        "score": r.score,
-                        "layer": r.layer_name,
-                        "source_file": r.source_file,
-                        "section": r.source_section,
-                        "doc_type": r.doc_type,
-                        "metadata": r.metadata,
-                        "similarity": r.similarity,
-                    }
-                    for r in results
-                ],
-                "total": len(results),
+                "results": items,
+                "total": len(items),
             }
             if detected_layers:
                 response["auto_detected_layers"] = detected_layers
@@ -320,7 +353,9 @@ def register_rag_tools(
         their source file and section. Use strata_list_knowledge_layers to see
         which layers exist. The response carries a confidence level (high,
         medium or low) judged on the results' similarity, with a warning when
-        low, and an interaction_id to pass to strata_feedback.
+        low, and an interaction_id to pass to strata_feedback. A clause or
+        section the query names ("clause 7.2") comes first, verbatim,
+        marked "match": "exact".
 
         Args:
             query: Natural language search query, or exact terms and identifiers.
@@ -437,9 +472,17 @@ def register_rag_tools(
                 if fallback_reason:
                     collected = await _collect(None)
                     layers = None
+            # A clause or section the question names comes first, verbatim,
+            # looked up in the layers searched; retrieved chunks inside it go
+            exact = await lookup_clauses(
+                database_url, question, layers, _settings.answer_token_budget
+            )
             # The best chunks that fit the answer budget; confidence is judged
             # on the reranked chunks, the answer status on what is returned
-            chunks = pack_passages(collected.chunks, _settings.answer_token_budget)
+            chunks = pack_passages(
+                exact + without_exact_spans(collected.chunks, exact),
+                _settings.answer_token_budget,
+            )
             confidence = collected.confidence
             basis = confidence["basis"]
             passages = build_passages(chunks, await _cited_documents(database_url, chunks))
@@ -475,6 +518,7 @@ def register_rag_tools(
                     "layers": layers,
                     "queries_used": len(queries),
                     "routing_fallback": bool(fallback_reason),
+                    "exact_matches": len(exact),
                 },
                 result_summary=(
                     f"{collected.candidate_count} chunks, {len(passages)} passages, "
@@ -529,7 +573,9 @@ def register_rag_tools(
         budget (ANSWER_TOKEN_BUDGET, about 1,500 tokens, each passage's id,
         ref and citation counted with its text; at most 50 passages). The
         server does not write an answer; the client composes it from the
-        passages and cites them by id.
+        passages and cites them by id. A clause or section the question
+        names ("clause 7.2", "Annex II") is looked up exactly and comes
+        first, verbatim, once per document that has it.
 
         The response: status is found, partly_found or not_found, with a
         next_step for the last two; mode is grounded; passages lists S1, S2,

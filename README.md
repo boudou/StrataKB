@@ -165,6 +165,7 @@ flowchart LR
 flowchart LR
     q["Question"] --> r["Route to layers"] --> rw["Rewrite<br/>(optional)"] --> h["Hybrid search per query<br/>cache, HNSW + full-text, RRF"]
     h --> d["Merge the searches<br/>by rank (RRF)"] --> rr["Cross-encoder<br/>rerank"] --> b["Keep the best passages<br/>that fit ANSWER_TOKEN_BUDGET"]
+    r --> x{"Names a clause<br/>or section?"} -->|"in the structure map"| ex["That section's text,<br/>first and verbatim"] --> b
     b --> c["Cite each passage<br/>file, page, lines, headings"] --> o{"Best passage<br/>scores"}
     o -->|"high"| f["found"]
     o -->|"medium"| pf["partly_found<br/>+ next step"]
@@ -272,7 +273,7 @@ Then ask from your client, for example *"How long should a line of Python be?"*.
 | --- | --- | --- |
 | `strata_ask` | viewer | Rewrites a question, searches in parallel, reranks, and returns found, partly found or not found with the best passages, each with its file, page, lines and headings ([what it returns](#what-strata_ask-returns)) |
 | `strata_verify` | viewer | Checks a drafted answer against the passages it cites: every quote, number, date, amount, code and clause reference must be in them. A verified draft gets a receipt ([checking a drafted answer](#checking-a-drafted-answer)) |
-| `strata_search` | viewer | Hybrid search for exact terms and identifiers, with optional layer and metadata filters, and a confidence level |
+| `strata_search` | viewer | Hybrid search for exact terms and identifiers, with optional layer and metadata filters, and a confidence level; a clause or section the query names (`clause 7.2`) comes first, verbatim |
 | `strata_list_knowledge_layers` | viewer | Lists layers with document and chunk counts |
 | `strata_get_layer_status` | viewer | One layer's configuration and ingestion history |
 | `strata_get_receipt` | viewer | Opens a receipt (`rcpt_…`, also the resource `strata://receipts/{receipt_id}`): the stored quotes of an answer, each in its surrounding document text, flagged when its source changed since. Open to whoever asked and to anyone who may read every cited layer, for `RECEIPT_RETENTION_DAYS` (90 by default). Receipts are issued by `strata_verify`; extractive answers will issue them too ([roadmap](#roadmap)) |
@@ -334,6 +335,7 @@ By default the answer is short: a status, the mode and the passages, each with i
 
 - `status` is `found` when the best passage scores high, `partly_found` when it scores medium, and `not_found` when it scores low or nothing came back. The last two add a `next_step`, such as adding a folder with `stratakb add` when no layer covers the question. The thresholds are the provisional ones of [Confidence](#glossary).
 - `mode` is `grounded`: the client writes the answer from the passages and cites them by id.
+- A question that names a clause or section (`clause 7.2`, `Article 12`, `§ 4`, `Annex II`, or a bare `4.3.2` or `7(2)(b)`) is looked up exactly in the [structure map](#how-it-works) of the layers searched: that section's text comes back first, verbatim, with its citation and `status` `found`, cut at a word when it would pass the budget. When the same number exists in several documents, each one comes back, cited by its file. The search's own passages follow, without the parts already inside the section. A reference that matches no section (a bare `7.2` that is a version or an amount) changes nothing. `strata_search` puts the same sections first among its results, marked `"match": "exact"`. Exact passages have no chunk id, so `strata_feedback` cannot rate them by passage id yet.
 - The passages come best first and fill a budget of about 1,500 tokens (`ANSWER_TOKEN_BUDGET`), each passage's id, ref and citation counted with its text; the first passage always comes back, at most 50 come back, and `top_k` (default 10) only bounds the search before that.
 - Each passage's `text` is the stored document's own text. `ref` names its span in the stored document (`d<document id>:<start>-<end>`), or the chunk (`c<chunk id>`) for a chunk ingested before documents were stored. The citation has the file's path relative to the ingested folder, the page (PDFs; `page_end` too when the passage spans pages), the line range (from the page's start for PDFs) and the clause path from the structure map (for a chunk without one, such as one stored before the map existed or text before the first heading, the parser's heading path when it has one). A chunk ingested before documents were stored is cited by its file name, without lines.
 - `interaction_id` goes to `strata_feedback`, which takes passage ids for every passage returned: `{"S1": "useful", "S2": "wrong"}`.
