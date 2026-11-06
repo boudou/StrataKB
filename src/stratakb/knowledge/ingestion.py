@@ -223,7 +223,7 @@ async def _store_file(
             await insert_chunks(database_url, chunks, conn=conn)
             # Only after the insert: until then the current version is unreferenced
             await prune_documents(
-                conn, layer_id, source_root=source_root, relative_paths=[relative_path]
+                conn, [layer_id], source_root=source_root, relative_paths=[relative_path]
             )
 
 
@@ -245,7 +245,7 @@ async def _remove_files(
             [file_id for _, file_id in files],
         )
         await prune_documents(
-            conn, layer_id, source_root=source_root, relative_paths=[path for path, _ in files]
+            conn, [layer_id], source_root=source_root, relative_paths=[path for path, _ in files]
         )
 
 
@@ -288,7 +288,7 @@ async def clear_layer(database_url: str, layer_name: str) -> None:
                     "DELETE FROM strata_core.ingested_files WHERE layer_id = $1", layer_id
                 )
                 files = int(deleted.split()[-1])
-                await prune_documents(conn, layer_id)
+                await prune_documents(conn, [layer_id])
     # After the commit: the recount runs on another connection
     await _update_layer_stats(database_url, layer_name)
     logger.info(

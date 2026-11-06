@@ -13,6 +13,7 @@ import json
 from bisect import bisect_right
 from collections.abc import Sequence
 from pathlib import Path
+from uuid import UUID
 
 import asyncpg
 import structlog
@@ -184,15 +185,19 @@ def _version_lock_key(layer_id: str, source_root: str, relative_path: str) -> in
 
 async def prune_documents(
     conn: asyncpg.Connection,
-    layer_id: str,
+    layer_ids: Sequence[str | UUID],
     *,
     source_root: str | None = None,
     relative_paths: Sequence[str] | None = None,
 ) -> int:
     """Delete documents that no chunk and no receipt references; return the count.
 
-    Without source_root and relative_paths the whole layer is swept; with
-    them, only those files' versions. Pass both or neither.
+    Without source_root and relative_paths the whole of each layer in
+    layer_ids is swept; with them, only those files' versions, and layer_ids
+    must then hold exactly one layer (a file belongs to one). Pass both or
+    neither. Several layers are swept in one statement, so their versions are
+    locked in one id order across layers, the order a receipt locks the
+    versions it cites (sweeping them one by one could deadlock).
 
     Two statements, because a lone DELETE that waits on an uncommitted
     reference still deletes once it commits: its checks keep the snapshot taken
@@ -205,8 +210,10 @@ async def prune_documents(
     """
     if (source_root is None) != (relative_paths is None):
         raise ValueError("Pass both source_root and relative_paths, or neither")
+    if source_root is not None and len(layer_ids) != 1:
+        raise ValueError("A file scope needs exactly one layer")
     scope = ""
-    args: list = [layer_id]
+    args: list = [list(layer_ids)]
     if source_root is not None:
         scope = "AND d.source_root = $2 AND d.relative_path = ANY($3::text[])"
         args += [source_root, list(relative_paths)]
@@ -222,7 +229,7 @@ async def prune_documents(
         rows = await conn.fetch(
             f"""
             SELECT d.id FROM strata_vectors.documents d
-            WHERE d.layer_id = $1 {scope} {unreferenced}
+            WHERE d.layer_id = ANY($1::uuid[]) {scope} {unreferenced}
             ORDER BY d.id
             FOR UPDATE OF d
             """,

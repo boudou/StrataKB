@@ -110,7 +110,7 @@ async def issue_receipt(
         ids = sorted({int(q["document_id"]) for q in quotes})
         # The lock keeps a concurrent prune from deleting a row before it is
         # linked below; a row it already deleted is simply not found. In id
-        # order, as prune_documents locks.
+        # order across layers, as prune_documents locks.
         rows = await conn.fetch(
             """
             SELECT d.id, d.version, d.sha256, d.text_origin, d.relative_path,
@@ -354,7 +354,7 @@ async def open_receipt(
 async def prune_receipts(database_url: str, retention_days: int) -> dict:
     """Delete receipts older than retention_days and the versions only they kept.
 
-    Then sweeps every layer those receipts cited with prune_documents, which
+    Then sweeps every layer those receipts cited with one prune_documents, which
     removes the versions no chunk and no other receipt references; current
     versions keep their chunks and stay. 0 deletes nothing. A run that deleted
     something is audited as user "system" with the counts. Safe to run from
@@ -385,8 +385,10 @@ async def prune_receipts(database_url: str, retention_days: int) -> dict:
         )
         receipts = int(deleted.split()[-1])
         documents = 0
-        for row in layer_ids:
-            documents += await prune_documents(conn, row["layer_id"])
+        if layer_ids:
+            # All layers at once: versions are locked in id order across
+            # layers, as issue_receipt locks them, so the two cannot deadlock
+            documents = await prune_documents(conn, [row["layer_id"] for row in layer_ids])
 
     counts = {"receipts": receipts, "documents": documents}
     if receipts:

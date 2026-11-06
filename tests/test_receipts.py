@@ -536,7 +536,7 @@ class TestReceipts:
 
         async def prune() -> int:
             async with pool.acquire() as conn, conn.transaction():
-                return await prune_documents(conn, layer_id)
+                return await prune_documents(conn, [layer_id])
 
         async with pool.acquire() as issuing:
             tx = issuing.transaction()
