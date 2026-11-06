@@ -143,6 +143,20 @@ def _mock_store(recent=None):
     return store
 
 
+def _ask_result(**fields):
+    from stratakb.rag.passages import AskResult
+
+    defaults = {
+        "question": "question",
+        "queries_used": ["question"],
+        "confidence": {"level": "medium", "top_score": 0.5, "basis": "similarity"},
+        "chunks": [{"chunk_id": "c1"}],
+        "passages": [],
+        "status": "found",
+    }
+    return AskResult(**{**defaults, **fields})
+
+
 def _enabled_settings():
     return MagicMock(
         learning_enabled=True,
@@ -182,11 +196,12 @@ async def test_track_ask_survives_recording_failure():
     store.store_interaction = AsyncMock(side_effect=RuntimeError("db down"))
     tracker = Tracker(store, _enabled_settings())
 
-    ask = AsyncMock(return_value={"status": "ok", "retrieved_chunks": [], "confidence": {}})
+    ask = AsyncMock(return_value=_ask_result(chunks=[], confidence={}))
     result = await tracker.track_ask(ask, "question", ["sepa"], True, 10)
 
-    assert result["status"] == "ok"
-    assert "interaction_id" not in result
+    assert result.status == "found"
+    assert result.interaction_id is None
+    assert "interaction_id" not in result.concise()
 
 
 @pytest.mark.asyncio
@@ -275,21 +290,40 @@ async def test_track_ask_records_rewritten_queries_and_chunks():
     store = _mock_store()
     tracker = Tracker(store, _enabled_settings())
 
-    ask = AsyncMock(return_value={
-        "status": "ok", "queries_used": ["a", "b"],
-        "retrieved_chunks": [{"chunk_id": "c1"}, {"chunk_id": "c2"}],
-        "confidence": {"level": "high", "top_score": 0.8},
-    })
+    ask = AsyncMock(return_value=_ask_result(
+        queries_used=["a", "b"],
+        chunks=[{"chunk_id": "c1"}, {"chunk_id": "c2"}],
+        confidence={"level": "high", "top_score": 0.8, "basis": "similarity"},
+    ))
     result = await tracker.track_ask(ask, "question", ["sepa"], True, 10)
 
     ask.assert_awaited_once_with("question", ["sepa"], True, 10)
-    assert result["interaction_id"] == "int-9"
+    assert result.interaction_id == "int-9"
+    assert result.concise()["interaction_id"] == "int-9"
     kwargs = store.store_interaction.call_args.kwargs
     assert kwargs["tool_used"] == "strata_ask"
     assert kwargs["rewritten_queries"] == ["a", "b"]
     assert kwargs["result_count"] == 2
     assert kwargs["confidence_level"] == "high"
     assert kwargs["confidence_score"] == 0.8
+    # Named by the caller: nothing was detected
+    assert kwargs["layers_searched"] == ["sepa"]
+    assert kwargs["layers_detected"] is None
+
+
+@pytest.mark.asyncio
+async def test_track_ask_records_detected_layers():
+    from stratakb.learning.tracker import Tracker
+
+    store = _mock_store()
+    tracker = Tracker(store, _enabled_settings())
+
+    ask = AsyncMock(return_value=_ask_result(auto_detected_layers=["iso20022"]))
+    await tracker.track_ask(ask, "question", None, True, 10)
+
+    kwargs = store.store_interaction.call_args.kwargs
+    assert kwargs["layers_searched"] == ["iso20022"]
+    assert kwargs["layers_detected"] == ["iso20022"]
 
 
 @pytest.mark.asyncio

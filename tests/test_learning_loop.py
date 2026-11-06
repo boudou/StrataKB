@@ -14,6 +14,7 @@ import pytest
 
 from stratakb.learning.promoter import Promoter
 from stratakb.learning.store import LearningStore
+from stratakb.rag.passages import AskResult
 
 
 @pytest.fixture
@@ -52,17 +53,19 @@ def _tracker(store):
 
 def _ask_returning(queries, level, layers=None):
     async def ask(question, layers_arg, include_sources, top_k):
-        result = {
-            "status": "ok",
-            "queries_used": queries,
-            "confidence": {"level": level, "top_score": 0.9 if level == "high" else 0.3},
-            "retrieved_chunks": [
-                {"chunk_id": "c1", "score": 0.5, "layer": "sepa", "source_file": "a.md"}
-            ],
-        }
-        if layers:
-            result["auto_detected_layers"] = layers
-        return result
+        return AskResult(
+            question=question,
+            queries_used=queries,
+            confidence={
+                "level": level,
+                "top_score": 0.9 if level == "high" else 0.3,
+                "basis": "similarity",
+            },
+            chunks=[{"chunk_id": "c1", "score": 0.5, "layer": "sepa", "source_file": "a.md"}],
+            passages=[],
+            status="found" if level == "high" else "not_found",
+            auto_detected_layers=layers or [],
+        )
 
     return ask
 
@@ -91,8 +94,8 @@ async def test_helpful_asks_promote_a_rewrite_that_bypasses_the_llm(store, tag):
     ask = _ask_returning(rewrite, "medium")
     for _ in range(5):
         result = await tracker.track_ask(ask, question, None, True, 10)
-        assert result["interaction_id"]
-        assert await store.store_feedback(result["interaction_id"], "explicit", "helpful", 1.0)
+        assert result.interaction_id
+        assert await store.store_feedback(result.interaction_id, "explicit", "helpful", 1.0)
 
     assert await Promoter(store).promote_rewrites() >= 1
 
