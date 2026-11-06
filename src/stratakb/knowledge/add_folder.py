@@ -139,6 +139,11 @@ class Plan:
     broad_why: str | None = None
     layer_id: Any = None
 
+    @property
+    def added_or_updated(self) -> int:
+        """Files this run adds or updates: the ones it embeds."""
+        return self.planned.get("added", 0) + self.planned.get("updated", 0)
+
 
 @dataclass
 class Report:
