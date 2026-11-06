@@ -24,6 +24,7 @@ from stratakb.core.egress import (
     openai_compatible_client,
     unauthorized_detail,
 )
+from stratakb.core.terminal_text import printable_only
 from stratakb.knowledge.embeddings import embedding_local_only_error, resolve_embedding_model
 from stratakb.knowledge.vector_store import _vector_column_size
 
@@ -86,7 +87,7 @@ def _shown_ids(ids) -> list[str]:
     for raw in ids:
         if not isinstance(raw, str):
             continue
-        text = "".join(c for c in raw if c.isprintable())
+        text = printable_only(raw)
         if len(text) > _MAX_ID_CHARS:
             text = text[: _MAX_ID_CHARS - 1] + "…"
         if text:

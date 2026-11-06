@@ -526,6 +526,20 @@ def test_json_keeps_non_ascii_paths():
     assert tuple(json.loads(text)) == REPORT_KEYS
 
 
+def test_json_escapes_c1_del_and_bidi_in_paths(capsys):
+    # A one-byte CSI, DEL and a right-to-left override: json.dumps leaves them raw
+    path = "evil\x9b2J\x7f‮dm.md"
+    report = _report(files=[{"path": path, "outcome": "added", "reason": None}])
+    code, _, _ = _run(["add", ROOT, "--json"], report=report)
+    assert code == 0
+    out = capsys.readouterr().out
+    for raw in ("\x9b", "\x7f", "‮"):
+        assert raw not in out
+    for escape in ("\\u009b", "\\u007f", "\\u202e"):
+        assert escape in out
+    assert json.loads(out)["files"][0]["path"] == path
+
+
 def test_refusal_json_shape():
     report = add_folder.refused("broad_path", "Pass --allow-broad.", root=ROOT, layer="docs")
     data = json.loads(cli.render_json(report))

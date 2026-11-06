@@ -118,12 +118,15 @@ def test_changed_source_flagged(cited, db_url, layer, tmp_path, capsys):
 OSC_52 = "\x1b]52;c;cm0gLXJmIH4=\x07"
 
 
-async def _cited_hostile(db_url: str, layer: str, docs) -> str:
-    """A receipt quoting a document and a draft that carry terminal escapes."""
+async def _cited_hostile(db_url: str, layer: str, docs, quoted: str = "\x1b[8m hidden") -> str:
+    """A receipt quoting a document and a draft that carry terminal escapes.
+
+    The quote is QUOTE followed by `quoted`.
+    """
     from stratakb.rag.receipts import issue_receipt
     from tests.test_receipts import _latest_document
 
-    text = f"Intro{OSC_52} text.\n\n{QUOTE}\x1b[8m hidden\x1b[0m\n\nClosing remarks.\n"
+    text = f"Intro{OSC_52} text.\n\n{QUOTE}{quoted}\x1b[0m\n\nClosing remarks.\n"
     # Bytes, so the newlines stay as written on every platform
     (docs / "policy.md").write_bytes(text.encode("utf-8"))
     await _ingest(db_url, layer, docs)
@@ -140,7 +143,7 @@ async def _cited_hostile(db_url: str, layer: str, docs) -> str:
                 {
                     "document_id": doc["id"],
                     "char_start": start,
-                    "char_end": start + len(QUOTE) + len("\x1b[8m hidden"),
+                    "char_end": start + len(QUOTE) + len(quoted),
                     "clause_path": None,
                 }
             ],
@@ -175,6 +178,94 @@ def test_json_keeps_control_characters_escaped(db_url, layer, tmp_path, capsys):
     out = capsys.readouterr().out
     assert "\x1b" not in out and "\r" not in out
     assert json.loads(out)["receipt"]["draft"].startswith("Kept\x08")
+
+
+# A one-byte CSI, DEL and a right-to-left override: json.dumps leaves them raw
+C1_QUOTED = " \x9b2J\x7f‮ hidden"
+
+
+def _assert_json_escapes(out: str) -> None:
+    for raw in ("\x9b", "\x7f", "‮"):
+        assert raw not in out
+    for escape in ("\\u009b", "\\u007f", "\\u202e"):
+        assert escape in out
+
+
+def test_json_escapes_c1_del_and_bidi(db_url, layer, tmp_path, capsys):
+    docs = tmp_path / "docs"
+    docs.mkdir()
+    receipt_id = _run(_cited_hostile(db_url, layer, docs, quoted=C1_QUOTED))
+    capsys.readouterr()  # the setup's log lines
+
+    assert _main(["receipt", receipt_id, "--json"]) == cli.EXIT_OK
+    out = capsys.readouterr().out
+    _assert_json_escapes(out)
+    # Still valid JSON, decoding to the stored text
+    receipt = json.loads(out)["receipt"]
+    assert receipt["quotes"][0]["quote"] == QUOTE + C1_QUOTED
+    assert receipt["draft"] == "Kept\x08\x08\x08\x08Gone\x1b[2K\x9b31m‮"
+
+
+def test_text_escapes_c1_del_and_bidi(db_url, layer, tmp_path, capsys):
+    docs = tmp_path / "docs"
+    docs.mkdir()
+    receipt_id = _run(_cited_hostile(db_url, layer, docs, quoted=C1_QUOTED))
+    capsys.readouterr()  # the setup's log lines
+
+    assert _main(["receipt", receipt_id]) == cli.EXIT_OK
+    out = capsys.readouterr().out
+    for raw in ("\x9b", "\x7f", "‮"):
+        assert raw not in out
+    assert f">>> {QUOTE} \\x9b2J\\x7f\\u202e hidden <<<" in out
+
+
+def test_render_receipt_escapes_every_field():
+    """The whole text is escaped once, so no field can slip through unescaped."""
+    hostile = "x\x9b‮"
+    quote = {
+        "file": hostile,
+        "layer": hostile,
+        "version": hostile,
+        "clause_path": hostile,
+        "char_start": hostile,
+        "char_end": hostile,
+        "status": hostile,
+        "note": hostile,
+        "context_before": f"before{hostile}\r\nline\x0c",
+        "quote": hostile,
+        "context_after": f"after{hostile}\n",
+    }
+    receipt = {
+        "receipt_id": hostile,
+        "kind": hostile,
+        "mode": hostile,
+        "layers": [hostile],
+        "issued_at": hostile,
+        "issued_by": hostile,
+        "question": hostile,
+        "draft": hostile,
+        "quotes": [quote],
+    }
+    text = cli.render_receipt(receipt)
+    for raw in ("\x9b", "‮", "\r", "\x0c"):
+        assert raw not in text
+    assert text.count("x\\x9b\\u202e") == 19
+    # Lines break on newlines only; a carriage return or form feed is shown
+    assert "    beforex\\x9b\\u202e\\x0d\n    line\\x0c>>> x\\x9b\\u202e <<<afterx" in text
+    assert text.endswith("<<<afterx\\x9b\\u202e")
+
+
+def test_json_error_form_escapes_c1_del_and_bidi(capsys):
+    import argparse
+
+    message = "Can't reach the database at db\x9b2J\x7f‮."
+    code = cli._receipt_failed(message, argparse.Namespace(json=True), cli.EXIT_DATABASE)
+    assert code == cli.EXIT_DATABASE
+    captured = capsys.readouterr()
+    _assert_json_escapes(captured.out)
+    assert json.loads(captured.out) == {"status": "error", "error": message}
+    # The stderr line too
+    assert captured.err == "Can't reach the database at db\\x9b2J\\x7f\\u202e.\n"
 
 
 async def _call_receipt_tool(db_url: str, receipt_id: str) -> dict:

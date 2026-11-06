@@ -378,7 +378,7 @@ uv run stratakb receipt rcpt_…          # each quote marked >>> <<< in its con
 uv run stratakb receipt rcpt_… --json   # the same data as strata_get_receipt
 ```
 
-It makes the same access check as `strata_get_receipt`, with `STRATA_USER` and `STRATA_ROLE` as on stdio, and writes the same audit entry with the tool name `cli:receipt`. An unknown receipt, or one you may not open, exits with code `1` and one line on stderr; an unreachable database exits with `3`. The text form shows control characters from documents, file names, questions and drafts as escapes such as `\x1b`, so a document cannot hide or rewrite what your terminal shows.
+It makes the same access check as `strata_get_receipt`, with `STRATA_USER` and `STRATA_ROLE` as on stdio, and writes the same audit entry with the tool name `cli:receipt`. An unknown receipt, or one you may not open, exits with code `1` and one line on stderr; an unreachable database exits with `3`. The text form shows control characters from documents, file names, questions and drafts as escapes such as `\x1b`, so a document cannot hide or rewrite what your terminal shows. The `--json` forms of `stratakb receipt` and `stratakb add` write them as JSON escapes such as `\u009b` (also DEL and bidi overrides such as U+202E, written as `\u202e`), so the output stays valid JSON and decodes to the original text.
 
 ## Configuration
 

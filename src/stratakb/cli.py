@@ -19,7 +19,6 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
-import json
 import os
 import sys
 from collections.abc import Callable, Sequence
@@ -27,6 +26,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, NamedTuple
 
 import structlog
+
+from stratakb.core.terminal_text import terminal_safe_json, visible
 
 if TYPE_CHECKING:
     from stratakb.core.local_db import DownOutcome, UpState
@@ -615,7 +616,7 @@ def _run_receipt(args: argparse.Namespace) -> int:
         return _receipt_failed(str(e), args, e.exit_code)
 
     if args.json:
-        _out(json.dumps({"status": "ok", "receipt": receipt}, ensure_ascii=False, indent=2))
+        _out(terminal_safe_json({"status": "ok", "receipt": receipt}, indent=2))
     else:
         _out(render_receipt(receipt))
     return EXIT_OK
@@ -654,9 +655,9 @@ async def _open_receipt(url: str, receipt_id: str, user_id: str, role: str) -> d
 
 def _receipt_failed(message: str, args: argparse.Namespace, exit_code: int) -> int:
     """One line on stderr; with --json, the tool's error form on stdout too."""
-    _err(message)
+    _err(visible(message))
     if args.json:
-        _out(json.dumps({"status": "error", "error": message}, ensure_ascii=False))
+        _out(terminal_safe_json({"status": "error", "error": message}))
     return exit_code
 
 
@@ -713,63 +714,45 @@ def render_text(report: Report) -> str:
     return "\n".join(lines)
 
 
-def _visible(value: Any) -> str:
-    """Text safe for a terminal: control characters become visible escapes.
-
-    Document text, file names and the caller's question and draft can carry
-    ANSI or OSC sequences, a carriage return or a backspace that would hide
-    or rewrite what is shown. Newlines and tabs stay.
-    """
-    out = []
-    for char in str(value):
-        if char.isprintable() or char in "\n\t":
-            out.append(char)
-        elif ord(char) <= 0xFF:
-            out.append(f"\\x{ord(char):02x}")
-        else:
-            out.append(f"\\u{ord(char):04x}")
-    return "".join(out)
-
-
 def render_receipt(receipt: dict) -> str:
-    """A receipt for a person to read: each quote marked >>> <<< in its context."""
+    """A receipt for a person to read: each quote marked >>> <<< in its context.
+
+    The whole text is escaped once at the end (stratakb.core.terminal_text),
+    so no field reaches the terminal with its control characters.
+    """
     from stratakb.rag.receipts import CONTEXT_CHARS
 
-    v = _visible
-    lines = [
-        f"Receipt {v(receipt['receipt_id'])} ({v(receipt['kind'])}, {v(receipt['mode'])} mode)"
-    ]
-    layers = ", ".join(v(layer) for layer in receipt["layers"]) or "none"
-    lines.append(f"Issued {v(receipt['issued_at'])} by {v(receipt['issued_by'])}; layers: {layers}")
+    lines = [f"Receipt {receipt['receipt_id']} ({receipt['kind']}, {receipt['mode']} mode)"]
+    layers = ", ".join(str(layer) for layer in receipt["layers"]) or "none"
+    lines.append(f"Issued {receipt['issued_at']} by {receipt['issued_by']}; layers: {layers}")
     if receipt.get("question"):
-        lines.append(f"Question: {v(receipt['question'])}")
+        lines.append(f"Question: {receipt['question']}")
     if receipt.get("draft"):
-        lines.append(f"Draft: {v(receipt['draft'])}")
+        lines.append(f"Draft: {receipt['draft']}")
     for position, quote in enumerate(receipt["quotes"], start=1):
-        where = [f"layer {v(quote['layer'])}", f"v{v(quote['version'])}"]
+        where = [f"layer {quote['layer']}", f"v{quote['version']}"]
         if quote.get("clause_path"):
-            where.append(f"clause {v(quote['clause_path'])}")
-        where.append(f"chars {v(quote['char_start'])}-{v(quote['char_end'])}")
+            where.append(f"clause {quote['clause_path']}")
+        where.append(f"chars {quote['char_start']}-{quote['char_end']}")
         lines.append("")
-        lines.append(
-            f"[{position}] {v(quote['file'])} ({', '.join(where)}): {v(quote['status'])}"
-        )
+        lines.append(f"[{position}] {quote['file']} ({', '.join(where)}): {quote['status']}")
         if quote.get("note"):
-            lines.append(f"    {v(quote['note'])}")
+            lines.append(f"    {quote['note']}")
         # An ellipsis where the shown context stops short of the text around it
         before = "…" if len(quote["context_before"]) == CONTEXT_CHARS else ""
         after = "…" if len(quote["context_after"]) == CONTEXT_CHARS else ""
         shown = (
-            f"{before}{v(quote['context_before'])}>>> {v(quote['quote'])} <<<"
-            f"{v(quote['context_after'])}{after}"
+            f"{before}{quote['context_before']}>>> {quote['quote']} <<<"
+            f"{quote['context_after']}{after}"
         )
-        lines.extend(f"    {line}".rstrip() for line in shown.splitlines())
+        # Split on newlines only: a carriage return or form feed is shown escaped
+        lines.extend(f"    {line}".rstrip(" \t") for line in shown.removesuffix("\n").split("\n"))
     if not receipt["quotes"]:
         lines.append("No quotes.")
-    return "\n".join(lines)
+    return visible("\n".join(lines))
 
 
 def render_json(report: Report) -> str:
     """The report as one JSON object with exactly the REPORT_KEYS."""
-    return json.dumps(report.as_dict(), ensure_ascii=False, indent=2)
+    return terminal_safe_json(report.as_dict(), indent=2)
 
