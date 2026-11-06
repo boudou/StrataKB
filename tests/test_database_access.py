@@ -323,21 +323,26 @@ async def _hang(*args, **kwargs):
     await asyncio.Event().wait()
 
 
-def _fake_connect(row=None, error=None):
+def _fake_connect(row=None, *, query_error=None, connect_error=None):
     """Patch asyncpg.connect in the tools module; return (patcher, conn).
 
-    `row` is the role check's result, an exception it raises, or a function
-    standing in for it; `error` is what connect raises, or a function.
+    `row` is the role check's result; `query_error` is what the check raises,
+    or a function standing in for it; `connect_error` is what connect raises,
+    or a function.
     """
     from unittest.mock import patch
 
     conn = MagicMock()
-    if isinstance(row, BaseException) or callable(row):
-        conn.fetchrow = AsyncMock(side_effect=row)
+    if query_error is not None:
+        conn.fetchrow = AsyncMock(side_effect=query_error)
     else:
         conn.fetchrow = AsyncMock(return_value=row or _SAFE_ROW)
     conn.close = AsyncMock()
-    connect = AsyncMock(side_effect=error) if error else AsyncMock(return_value=conn)
+    connect = (
+        AsyncMock(side_effect=connect_error)
+        if connect_error is not None
+        else AsyncMock(return_value=conn)
+    )
     return patch("stratakb.database_access.tools.asyncpg.connect", connect), conn
 
 
@@ -380,15 +385,31 @@ class TestSqlToolsGate:
         assert _tool_names(_server()) >= _SQL_TOOL_NAMES
         assert sql_tools_status() == {"status": "enabled"}
 
-    async def _secure(self, server, row=None, error=None):
+    async def _secure(self, server, row=None, *, query_error=None, connect_error=None):
         from structlog.testing import capture_logs
 
         from stratakb.database_access.tools import secure_sql_tools
 
-        patcher, conn = _fake_connect(row, error)
+        patcher, conn = _fake_connect(
+            row, query_error=query_error, connect_error=connect_error
+        )
         with patcher, capture_logs() as logs:
             await secure_sql_tools(server, _FAKE_URL)
         return logs, conn
+
+    async def _secure_stalled(self, server, **stall):
+        """Run the check with a 0.05 s deadline and assert it ended within 1 s."""
+        import time
+        from unittest.mock import patch
+
+        started = time.monotonic()
+        with patch("stratakb.database_access.tools._CHECK_TIMEOUT", 0.05):
+            logs, conn = await self._secure(server, **stall)
+        assert time.monotonic() - started < 1
+        self._assert_disabled(
+            server, logs, "could not check the READONLY_DATABASE_URL role: TimeoutError"
+        )
+        return conn
 
     def _assert_disabled(self, server, logs, reason_part):
         from stratakb.database_access.tools import sql_tools_status
@@ -423,7 +444,9 @@ class TestSqlToolsGate:
     @pytest.mark.asyncio
     async def test_unreachable_role_removes_sql_tools(self):
         server = _server()
-        logs, _ = await self._secure(server, error=OSError("connection refused"))
+        logs, _ = await self._secure(
+            server, connect_error=OSError("connection refused")
+        )
         self._assert_disabled(
             server, logs, "could not check the READONLY_DATABASE_URL role: OSError"
         )
@@ -431,7 +454,7 @@ class TestSqlToolsGate:
     @pytest.mark.asyncio
     async def test_failed_check_query_terminates_connection(self):
         server = _server()
-        logs, conn = await self._secure(server, RuntimeError("boom"))
+        logs, conn = await self._secure(server, query_error=RuntimeError("boom"))
         self._assert_disabled(server, logs, "could not check")
         conn.terminate.assert_called_once()
         conn.close.assert_not_awaited()
@@ -439,17 +462,8 @@ class TestSqlToolsGate:
     @pytest.mark.asyncio
     async def test_stalled_query_fails_closed(self):
         """A query that never returns ends the check within the timeout."""
-        import time
-        from unittest.mock import patch
-
         server = _server()
-        started = time.monotonic()
-        with patch("stratakb.database_access.tools._CHECK_TIMEOUT", 0.05):
-            logs, conn = await self._secure(server, _hang)
-        assert time.monotonic() - started < 1
-        self._assert_disabled(
-            server, logs, "could not check the READONLY_DATABASE_URL role: TimeoutError"
-        )
+        conn = await self._secure_stalled(server, query_error=_hang)
         # Dropped, not closed: a graceful close would wait on the stalled server
         conn.terminate.assert_called_once()
         conn.close.assert_not_awaited()
@@ -457,17 +471,8 @@ class TestSqlToolsGate:
     @pytest.mark.asyncio
     async def test_stalled_connect_fails_closed(self):
         """A connection that never opens ends the check within the timeout."""
-        import time
-        from unittest.mock import patch
-
         server = _server()
-        started = time.monotonic()
-        with patch("stratakb.database_access.tools._CHECK_TIMEOUT", 0.05):
-            logs, _ = await self._secure(server, error=_hang)
-        assert time.monotonic() - started < 1
-        self._assert_disabled(
-            server, logs, "could not check the READONLY_DATABASE_URL role: TimeoutError"
-        )
+        await self._secure_stalled(server, connect_error=_hang)
 
     @pytest.mark.asyncio
     async def test_safe_role_keeps_sql_tools(self):

@@ -16,6 +16,7 @@ from mcp.server.fastmcp.exceptions import ToolError
 
 from stratakb.core.audit import write_audit_log
 from stratakb.core.auth import require_role
+from stratakb.core.database import connect_once
 from stratakb.core.logging import log_tool_call
 
 logger = structlog.get_logger()
@@ -143,15 +144,8 @@ async def _unsafe_role_reason(query_database_url: str) -> str | None:
     role it belongs to with set_config('role', ...), even in a read-only
     transaction, and rolsuper is not inherited.
     """
-    conn = await asyncpg.connect(query_database_url)
-    try:
+    async with connect_once(query_database_url, timeout=_CHECK_TIMEOUT) as conn:
         row = await conn.fetchrow(_ROLE_CHECK_QUERY, list(_SERVER_ACCESS_ROLES))
-    except BaseException:
-        # Drop the socket: a graceful close first cancels the stalled query
-        # over a new connection, which has no deadline
-        conn.terminate()
-        raise
-    await conn.close()
     if row["superuser"]:
         return "the READONLY_DATABASE_URL role is a superuser or a member of a superuser role"
     if row["members"]:

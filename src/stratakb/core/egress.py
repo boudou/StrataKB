@@ -12,9 +12,10 @@ import ipaddress
 import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal
-from urllib.parse import urlsplit
 
 import structlog
+
+from stratakb.core.database import url_host
 
 if TYPE_CHECKING:
     from stratakb.config import Settings
@@ -61,17 +62,9 @@ class OutboundProvider:
         }
 
 
-def _host(url: str) -> str:
-    """Return the host of a URL, or "" when it cannot be parsed."""
-    try:
-        return urlsplit(url).hostname or ""
-    except ValueError:
-        return ""
-
-
 def is_loopback(url: str) -> bool:
     """True when the URL's host is this machine (localhost, 127.0.0.0/8, ::1)."""
-    host = _host(url)
+    host = url_host(url)
     if not host:
         return False
     if host == "localhost":
@@ -185,7 +178,7 @@ def rewrite_provider(
         provider=entry.name,
         purpose="query rewriting",
         sends=entry.sends,
-        destination=_host(url) or "unknown host",
+        destination=url_host(url) or "unknown host",
         setting_name=entry.setting,
     )
 
@@ -211,7 +204,7 @@ def embedding_provider(settings: Settings, backend: str = "") -> OutboundProvide
         provider="embeddings",
         purpose="embedding",
         sends="documents and questions",
-        destination=_host(url) or "unknown host",
+        destination=url_host(url) or "unknown host",
         setting_name="EMBEDDING_BASE_URL" if by_url else "EMBEDDING_BACKEND",
         setting_value="" if by_url else backend,
     )

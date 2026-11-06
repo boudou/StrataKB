@@ -19,7 +19,7 @@ from pathlib import Path
 import asyncpg
 import structlog
 
-from stratakb.core.database import url_host_port
+from stratakb.core.database import connect_once, url_host_port
 
 logger = structlog.get_logger()
 
@@ -372,6 +372,12 @@ _USAGE_REFUSED = (
 )
 _MAY_NOT_UPDATE = "The database schema is out of date and this user may not update it. {fix}"
 _READ_FAILED = "Could not read the database schema: {error}."
+_RESERVED_DATABASE = (
+    'Refusing to set up StrataKB in {target}: "{name}" is '
+    "PostgreSQL's {kind}, not a database for your data. "
+    "Create one (CREATE DATABASE strata;) and point "
+    "DATABASE_URL at it."
+)
 
 _STAGE_ERRORS: dict[_Stage, _StageErrors] = {
     _Stage.LOCK: _StageErrors(
@@ -472,8 +478,7 @@ async def ensure_schema(
         return
 
     migrations = list(MIGRATIONS)
-    conn = await asyncpg.connect(database_url, timeout=_TIMEOUT_S)
-    try:
+    async with connect_once(database_url, timeout=_TIMEOUT_S) as conn:
         present: dict[int, bool] = {}
         recorded: set[int] = set()
         stage = _Stage.LOCK
@@ -504,10 +509,7 @@ async def ensure_schema(
                     kind = _reserved_database(name)
                     if kind is not None:
                         raise MigrationError(
-                            f'Refusing to set up StrataKB in {target}: "{name}" is '
-                            f"PostgreSQL's {kind}, not a database for your data. "
-                            "Create one (CREATE DATABASE strata;) and point "
-                            "DATABASE_URL at it."
+                            _RESERVED_DATABASE.format(target=target, name=name, kind=kind)
                         )
                     logger.info("setting_up_database", target=target)
                     if on_setup is not None:
@@ -571,7 +573,5 @@ async def ensure_schema(
             raise _error_for(stage, e, current) from e
         except asyncpg.PostgresError as e:
             raise _error_for(stage, e, current) from e
-    finally:
-        await conn.close()
 
     _checked.add(database_url)
