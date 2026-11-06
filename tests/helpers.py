@@ -19,6 +19,16 @@ if TYPE_CHECKING:
 
 FAKE_EMBEDDING = [0.01] * 768
 
+# The tables strata_readonly may read, written out here so the tests catch a
+# change to the list in core/migrations.py
+READONLY_READABLE = (
+    "strata_core.knowledge_layers",
+    "strata_core.ingestion_runs",
+    "strata_core.ingested_files",
+    "strata_vectors.chunks",
+    "strata_vectors.documents",
+)
+
 
 async def call_tool(server: FastMCP, name: str, /, **arguments) -> dict:
     """Call tool `name` on a built server, through its role and logging decorators."""
@@ -209,3 +219,59 @@ async def receipt_audit_rows(db_url: str, receipt_id: str) -> list:
         "ORDER BY created_at, id",
         receipt_id,
     )
+
+
+async def owner_execute(db_url: str, sql: str) -> None:
+    """Run sql on a connection of its own, as the user in db_url."""
+    import asyncpg
+
+    conn = await asyncpg.connect(db_url)
+    try:
+        await conn.execute(sql)
+    finally:
+        await conn.close()
+
+
+async def recorded_versions(db_url: str) -> set[int]:
+    """The migration versions strata_core.schema_migrations records."""
+    import asyncpg
+
+    conn = await asyncpg.connect(db_url)
+    try:
+        rows = await conn.fetch("SELECT version FROM strata_core.schema_migrations")
+    finally:
+        await conn.close()
+    return {row["version"] for row in rows}
+
+
+async def readonly_privileges(db_url: str) -> dict:
+    """What strata_readonly may read in the database at db_url."""
+    import asyncpg
+
+    conn = await asyncpg.connect(db_url)
+    try:
+        tables = {
+            row["t"]: row["readable"]
+            for row in await conn.fetch(
+                """
+                SELECT format('%I.%I', n.nspname, c.relname) AS t,
+                       has_table_privilege('strata_readonly', c.oid, 'SELECT') AS readable
+                FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+                WHERE n.nspname IN ('strata_core', 'strata_vectors', 'strata_learning')
+                  AND c.relkind IN ('r', 'p', 'v', 'm', 'f')
+                """
+            )
+        }
+        learning_usage = await conn.fetchval(
+            "SELECT has_schema_privilege('strata_readonly', 'strata_learning', 'USAGE')"
+        )
+        default_acls = await conn.fetchval(
+            """
+            SELECT count(*) FROM pg_default_acl d
+            CROSS JOIN LATERAL aclexplode(d.defaclacl) a
+            WHERE a.grantee = 'strata_readonly'::regrole
+            """
+        )
+    finally:
+        await conn.close()
+    return {"tables": tables, "learning_usage": learning_usage, "default_acls": default_acls}

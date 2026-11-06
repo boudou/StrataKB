@@ -6,9 +6,11 @@
 -- The role may SELECT from five tables only: strata_core.knowledge_layers,
 -- strata_core.ingestion_runs, strata_core.ingested_files,
 -- strata_vectors.chunks and strata_vectors.documents. Not the audit log, users
--- or anything in strata_learning. A table added later is not readable until granted by name.
+-- or anything in strata_learning. A table added later is not readable until
+-- granted by name.
 --
--- The password comes from the READONLY_DB_PASSWORD environment variable (psql 15+):
+-- The password comes from the READONLY_DB_PASSWORD environment variable
+-- (psql 15+):
 --   READONLY_DB_PASSWORD=... psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f db/03_readonly_role.sql
 -- Run it after 01_init.sql and 02_learning.sql, as the owner of the schemas.
 

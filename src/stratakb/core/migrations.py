@@ -33,18 +33,18 @@ _MIGRATION_LOCK_KEY = 0x5354524154414B42
 # A lock timeout, not a statement timeout: 07 may build an index for longer.
 _TIMEOUT_S = 30
 
-# The StrataKB schemas, and the tables strata_readonly may read (as granted
-# by 06_readonly_grants.sql, 08_readonly_documents.sql and db/03_readonly_role.sql)
+# The StrataKB schemas, and the tables strata_readonly may read, by the migration
+# that first grants them (06_readonly_grants.sql, 08_readonly_documents.sql);
+# db/03_readonly_role.sql grants the full list
 _STRATA_SCHEMAS = ("strata_core", "strata_vectors", "strata_learning")
-_READONLY_TABLES = (
+_READONLY_TABLES_06 = (
     ("strata_core", "knowledge_layers"),
     ("strata_core", "ingestion_runs"),
     ("strata_core", "ingested_files"),
     ("strata_vectors", "chunks"),
-    ("strata_vectors", "documents"),
 )
-# The readable tables a migration after 06 creates; 08 grants them
-_READONLY_TABLES_AFTER_06 = (("strata_vectors", "documents"),)
+_READONLY_TABLES_08 = (("strata_vectors", "documents"),)
+_READONLY_TABLES = (*_READONLY_TABLES_06, *_READONLY_TABLES_08)
 _STRATA_SCHEMA_LIST = ", ".join(f"'{schema}'" for schema in _STRATA_SCHEMAS)
 # The schemas strata_readonly gets USAGE on, which are also the ones the
 # presence queries resolve with to_regclass
@@ -107,8 +107,7 @@ def _readonly_grants_present() -> str:
     readable = "\n                AND ".join(
         f"COALESCE(has_table_privilege(\n"
         f"                    r.oid, to_regclass('{schema}.{table}'), 'SELECT'), false)"
-        for schema, table in _READONLY_TABLES
-        if (schema, table) not in _READONLY_TABLES_AFTER_06
+        for schema, table in _READONLY_TABLES_06
     )
     usage = "\n                AND ".join(
         ("" if schema in _READABLE_SCHEMAS else "NOT ")
@@ -153,7 +152,7 @@ def _readonly_later_grants_present() -> str:
     readable = "\n            AND ".join(
         f"COALESCE(has_table_privilege(\n"
         f"                r.oid, to_regclass('{schema}.{table}'), 'SELECT'), false)"
-        for schema, table in _READONLY_TABLES_AFTER_06
+        for schema, table in _READONLY_TABLES_08
     )
     return f"""
         SELECT COALESCE((

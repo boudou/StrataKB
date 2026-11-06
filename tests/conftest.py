@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+from urllib.parse import urlsplit, urlunsplit
 from uuid import uuid4
 
 import asyncpg
@@ -93,6 +94,94 @@ async def vacuumed_chunks():
         await conn.execute("VACUUM strata_vectors.chunks")
     finally:
         await conn.close()
+
+
+@pytest.fixture
+def clear_checked():
+    """Forget which databases ensure_schema has checked, before and after a test."""
+    from stratakb.core import migrations
+
+    migrations._checked.clear()
+    yield
+    migrations._checked.clear()
+
+
+@pytest.fixture
+async def restore_schema(db_url):
+    """Put the shared test schema back after a test that drops parts of it.
+
+    Replays every migration file as the owner (they are idempotent), so the
+    restore does not depend on ensure_schema working, then records the versions.
+    """
+    from stratakb.core import migrations
+    from tests.helpers import owner_execute
+
+    yield
+    for m in migrations.MIGRATIONS:
+        await owner_execute(db_url, migrations._load_sql(m.file))
+    migrations._checked.clear()
+    await migrations.ensure_schema(db_url)
+
+
+async def _new_database(db_url: str, name: str):
+    """Yield the URL of a new, empty database name next to db_url, then drop it."""
+    from tests.helpers import owner_execute
+
+    parts = urlsplit(db_url)
+    try:
+        await owner_execute(db_url, f'DROP DATABASE IF EXISTS "{name}" WITH (FORCE)')
+        await owner_execute(db_url, f'CREATE DATABASE "{name}"')
+    except asyncpg.InsufficientPrivilegeError:
+        pytest.skip("the owner may not create databases")
+    try:
+        yield urlunsplit(parts._replace(path=f"/{name}"))
+    finally:
+        await owner_execute(db_url, f'DROP DATABASE IF EXISTS "{name}" WITH (FORCE)')
+
+
+@pytest.fixture
+async def fresh_url(db_url):
+    """URL of a new, empty database next to db_url, dropped afterwards."""
+    parts = urlsplit(db_url)
+    async for url in _new_database(db_url, f"{parts.path.lstrip('/')}_fresh"):
+        yield url
+
+
+@pytest.fixture
+async def reserved_url(db_url):
+    """URL of a new, empty database named template_<db_url's database>, dropped afterwards."""
+    parts = urlsplit(db_url)
+    async for url in _new_database(db_url, f"template_{parts.path.lstrip('/')}"):
+        yield url
+
+
+@pytest.fixture
+async def probe_url(db_url):
+    """URL for a new login role with no privileges on the StrataKB schemas."""
+    from tests.helpers import owner_execute
+
+    parts = urlsplit(db_url)
+    role = f"strata_probe_{parts.path.lstrip('/')}"
+    password = "probe_password"
+    drop = f"""
+        DO $$
+        BEGIN
+            IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '{role}') THEN
+                DROP OWNED BY "{role}";
+                DROP ROLE "{role}";
+            END IF;
+        END $$;
+    """
+    try:
+        await owner_execute(db_url, drop)
+        await owner_execute(db_url, f"CREATE ROLE \"{role}\" LOGIN PASSWORD '{password}'")
+    except asyncpg.InsufficientPrivilegeError:
+        pytest.skip("the owner may not create roles")
+    try:
+        netloc = f"{role}:{password}@{parts.hostname}:{parts.port}"
+        yield urlunsplit(parts._replace(netloc=netloc))
+    finally:
+        await owner_execute(db_url, drop)
 
 
 @pytest.fixture(autouse=True)

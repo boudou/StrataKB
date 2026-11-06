@@ -4,7 +4,8 @@
 -- audit log, users, schema_migrations or anything in strata_learning. On a new
 -- database this file runs before 07 creates the document table, so 08 grants
 -- that one; a later run grants it here too. Older installs got SELECT on every
--- table plus default privileges for future tables; this file removes them. Idempotent, run after 04: applied by the server on startup
+-- table plus default privileges for future tables; this file removes them.
+-- Idempotent, run after 04: applied by the server on startup
 -- (stratakb.core.migrations) and by psql as the database owner. Does nothing
 -- when the role does not exist.
 
