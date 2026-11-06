@@ -525,7 +525,7 @@ async def _add(args: argparse.Namespace, settings: Any, root: str) -> Report:
     except RootTakenError as e:
         return refuse("root_taken", str(e))
     except Exception as e:
-        # LayerNotFoundError (the layer was deleted meanwhile) lands here too
+        # LayerError from apply() (the layer was deleted meanwhile) lands here too
         logger.error("add_failed", error_type=type(e).__name__)
         return refuse("internal_error", f"{type(e).__name__}: {e}", EXIT_FAILED)
     finally:

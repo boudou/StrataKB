@@ -63,6 +63,24 @@ class TestSync:
         assert second.docs_processed == 0
         assert len(await _chunks(db_url, layer)) == first.chunks_created
 
+    async def test_tracked_files_by_relative_path(self, db_url, layer, tmp_path):
+        from stratakb.knowledge.ingestion import tracked_files
+        from stratakb.knowledge.layers import get_layer
+
+        write_file(tmp_path / "a.md", "# Alpha\n\nAlpha content.\n")
+        write_file(tmp_path / "sub" / "b.md", "# Beta\n\nBeta content.\n")
+        await ingest_with_texts(db_url, layer, tmp_path)
+        layer_id = (await get_layer(db_url, name=layer))["id"]
+        source_root = tmp_path.resolve().as_posix()
+
+        tracked = await tracked_files(db_url, layer_id, source_root)
+
+        stored = {r["relative_path"]: r["content_hash"] for r in await _files(db_url, layer)}
+        assert set(tracked) == {"a.md", "sub/b.md"}
+        assert {rel: r["content_hash"] for rel, r in tracked.items()} == stored
+        assert all(tracked[rel]["relative_path"] == rel for rel in tracked)
+        assert await tracked_files(db_url, layer_id, source_root + "/other") == {}
+
     async def test_edit_replaces_only_that_file(self, db_url, layer, tmp_path):
         write_file(tmp_path / "a.md", "# Alpha\n\nAlpha content.\n")
         b = write_file(tmp_path / "b.md", "# Beta\n\nBeta content.\n")

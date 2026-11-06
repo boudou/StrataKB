@@ -243,6 +243,26 @@ async def _remove_files(
         )
 
 
+async def tracked_files(
+    database_url: str, layer_id: UUID, source_root: str
+) -> dict[str, asyncpg.Record]:
+    """The tracked files of a layer and root, keyed by relative path.
+
+    Each row holds id, relative_path and content_hash. The caller has
+    already run ensure_schema.
+    """
+    pool = await get_pool(database_url)
+    rows = await pool.fetch(
+        """
+        SELECT id, relative_path, content_hash FROM strata_core.ingested_files
+        WHERE layer_id = $1 AND source_root = $2
+        """,
+        layer_id,
+        source_root,
+    )
+    return {r["relative_path"]: r for r in rows}
+
+
 async def clear_layer(database_url: str, layer_name: str) -> None:
     """Delete every chunk and ingested_files row of a layer, and its unreferenced documents."""
     await ensure_schema(database_url)
@@ -416,15 +436,7 @@ async def ingest_documents(
                 result.rebuilt_legacy = True
                 logger.info("legacy_chunks_removed", layer=layer_name, count=legacy_count)
 
-        rows = await pool.fetch(
-            """
-            SELECT id, relative_path, content_hash FROM strata_core.ingested_files
-            WHERE layer_id = $1 AND source_root = $2
-            """,
-            layer_id,
-            source_root,
-        )
-        tracked = {r["relative_path"]: r for r in rows}
+        tracked = await tracked_files(database_url, layer_id, source_root)
 
         # A file list may be empty: it then removes everything tracked
         if files is None and not work and (single_file or not tracked):

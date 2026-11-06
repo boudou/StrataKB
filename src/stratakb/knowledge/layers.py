@@ -329,28 +329,53 @@ async def find_layer_by_root(database_url: str, root_path: str) -> dict | None:
     return _layer_dict(row) if row is not None else None
 
 
-async def find_overlapping_roots(database_url: str, root_path: str) -> list[dict]:
+def root_key(path: str, fold: bool = False) -> str:
+    """A comparison key for a folder: forward slashes, one trailing slash.
+
+    Casefolded when fold is set (where the filesystem folds case). A
+    filesystem root ("/" or "C:/") keeps its slash, so it stays a prefix of
+    its children.
+    """
+    key = path.replace("\\", "/").rstrip("/") + "/"
+    return key.casefold() if fold else key
+
+
+def is_under(key: str, folder_key: str) -> bool:
+    """Whether key is folder_key or lies below it.
+
+    Both are keys from root_key, or relative paths with folder_key ending in
+    "/", so the test is on whole components: /a/bc/ is not under /a/b/.
+    """
+    return key.startswith(folder_key)
+
+
+async def find_overlapping_roots(
+    database_url: str, root_path: str, *, fold: bool = False
+) -> list[dict]:
     """Return the layers whose root is an ancestor or a descendant of root_path.
 
     Paths are compared on whole components: /a/b overlaps /a/b/c and /a, but
-    not /a/bc. A layer holding root_path itself is not included.
+    not /a/bc. Case is folded when fold is set. A layer holding root_path
+    itself is not included; with fold, one holding a case variant of it is.
     """
     await ensure_schema(database_url)
     pool = await get_pool(database_url)
-    # starts_with, not LIKE: _ and % are ordinary characters in folder names.
-    # rtrim keeps a filesystem root ("/" or "C:/") a prefix of its children.
     rows = await pool.fetch(
         f"""
         SELECT {_LAYER_COLUMNS}
         FROM strata_core.knowledge_layers
         WHERE root_path IS NOT NULL AND root_path <> $1
-          AND (starts_with($1, rtrim(root_path, '/') || '/')
-               OR starts_with(root_path, rtrim($1, '/') || '/'))
         ORDER BY name
         """,
         root_path,
     )
-    return [_layer_dict(r) for r in rows]
+    key = root_key(root_path, fold)
+    overlapping = []
+    for row in rows:
+        other = root_key(row["root_path"], fold)
+        if is_under(key, other) or is_under(other, key):
+            overlapping.append(_layer_dict(row))
+    return overlapping
 
 
 async def layer_holds_folder(database_url: str, layer_name: str, root_path: str) -> bool:

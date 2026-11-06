@@ -428,6 +428,25 @@ class TestFolderFieldsIntegration:
         finally:
             await _drop_layers(db_url, name)
 
+    async def test_find_overlapping_roots_folds_case(self, db_url):
+        from stratakb.knowledge.layers import create_layer, find_overlapping_roots
+
+        name = "test_overlap_case"
+        await _drop_layers(db_url, name)
+        try:
+            await create_layer(db_url, name=name, display_name="Case", root_path=f"{ROOT}/Case/A")
+            assert await find_overlapping_roots(db_url, f"{ROOT}/case/a/sub") == []
+            folded = await find_overlapping_roots(db_url, f"{ROOT}/case/a/sub", fold=True)
+            assert [layer["name"] for layer in folded] == [name]
+            # A root differing only in case overlaps too, but only when folded
+            assert await find_overlapping_roots(db_url, f"{ROOT}/case/a") == []
+            same = await find_overlapping_roots(db_url, f"{ROOT}/case/a", fold=True)
+            assert [layer["name"] for layer in same] == [name]
+            # The exact root itself is never returned
+            assert await find_overlapping_roots(db_url, f"{ROOT}/Case/A", fold=True) == []
+        finally:
+            await _drop_layers(db_url, name)
+
     @pytest.mark.parametrize(
         ("setup", "expected"),
         [
@@ -620,6 +639,25 @@ class TestFolderFieldsIntegration:
             assert status["owner"] == "tester"
         finally:
             await _drop_layers(db_url, name)
+
+
+class TestRootKey:
+    def test_root_key(self):
+        from stratakb.knowledge.layers import root_key
+
+        assert root_key("C:\\X\\", fold=True) == "c:/x/"
+        assert root_key("C:\\X\\") == "C:/X/"
+        assert root_key("/") == "/"
+        assert root_key("C:/") == "C:/"
+        assert root_key("/a/b") == "/a/b/"
+
+    def test_is_under(self):
+        from stratakb.knowledge.layers import is_under
+
+        assert is_under("/a/b/", "/a/")
+        assert is_under("/a/", "/a/")
+        assert not is_under("/a/bc/", "/a/b/")
+        assert not is_under("/a/", "/a/b/")
 
 
 class TestLayerFieldsForCaller:
