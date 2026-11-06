@@ -285,7 +285,6 @@ async def test_health_lists_outbound():
     settings = _settings(anthropic_api_key="sk-ant-test")
     with (
         patch("stratakb.config.get_settings", return_value=settings),
-        patch("stratakb.mcp_server.get_settings", return_value=settings),
         patch(
             "stratakb.mcp_server.check_connection",
             AsyncMock(return_value={"status": "ok"}),
@@ -317,7 +316,6 @@ async def test_health_lists_rewrite_endpoint():
     )
     with (
         patch("stratakb.config.get_settings", return_value=settings),
-        patch("stratakb.mcp_server.get_settings", return_value=settings),
         patch(
             "stratakb.mcp_server.check_connection",
             AsyncMock(return_value={"status": "ok"}),

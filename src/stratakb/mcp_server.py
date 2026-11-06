@@ -16,7 +16,9 @@ from contextlib import asynccontextmanager
 import structlog
 from mcp.server.fastmcp import FastMCP
 
-from stratakb.config import Settings, config_file_missing, dotenv_warning, get_settings
+# get_settings is imported where it is called, never here: a module-level binding
+# made while a test patches stratakb.config.get_settings keeps the mock for good
+from stratakb.config import Settings, config_file_missing, dotenv_warning
 from stratakb.core.audit import query_audit_log, write_audit_log
 from stratakb.core.auth import require_role
 from stratakb.core.database import check_connection, close_pool, get_pool
@@ -203,6 +205,8 @@ def _register_admin_tools(mcp: FastMCP, settings: Settings) -> None:
         A missing model or a size mismatch turns overall to degraded; restart
         the server after fixing either.
         """
+        from stratakb.config import get_settings
+
         result: dict[str, object] = {}
         current = get_settings()
 
@@ -366,6 +370,8 @@ def _register_admin_tools(mcp: FastMCP, settings: Settings) -> None:
 def main(settings: Settings | None = None) -> None:
     """Run the StrataKB MCP server, built from `settings` (default: the environment)."""
     if settings is None:
+        from stratakb.config import get_settings
+
         settings = get_settings()
 
     # Configure structured logging (centralized)
@@ -393,6 +399,8 @@ def __getattr__(name: str) -> FastMCP:
     the tests build their own servers with build_server.
     """
     if name == "mcp":
+        from stratakb.config import get_settings
+
         return build_server(get_settings())
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 

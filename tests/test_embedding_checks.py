@@ -109,7 +109,6 @@ async def _health(settings: Settings) -> dict:
 
     with (
         patch("stratakb.config.get_settings", return_value=settings),
-        patch("stratakb.mcp_server.get_settings", return_value=settings),
         patch(
             "stratakb.mcp_server.check_connection",
             AsyncMock(return_value={"status": "ok"}),

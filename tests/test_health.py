@@ -1,7 +1,9 @@
 """Test the health check tool."""
 
+import ast
 import subprocess
 import sys
+from pathlib import Path
 from unittest.mock import AsyncMock, call, patch
 
 import pytest
@@ -31,8 +33,28 @@ def test_import_reads_no_settings():
         "with patch.object(stratakb.config, 'get_settings',"
         " side_effect=AssertionError('settings read at import')):\n"
         "    import stratakb.mcp_server\n"
+        "assert not hasattr(stratakb.mcp_server, 'get_settings')\n"
     )
     subprocess.run([sys.executable, "-c", code], check=True, capture_output=True)
+
+
+def test_no_module_binds_get_settings_at_import():
+    """No src module imports get_settings at module level.
+
+    A module first imported while a test patches stratakb.config.get_settings
+    would keep the mock for the rest of the session (#170).
+    """
+    src = Path(__file__).resolve().parent.parent / "src" / "stratakb"
+    bound = []
+    for path in sorted(src.rglob("*.py")):
+        for node in ast.parse(path.read_text(encoding="utf-8")).body:
+            if (
+                isinstance(node, ast.ImportFrom)
+                and node.module == "stratakb.config"
+                and any(alias.name == "get_settings" for alias in node.names)
+            ):
+                bound.append(path.relative_to(src).as_posix())
+    assert bound == []
 
 
 def test_tracker_import_reads_no_settings():
@@ -60,7 +82,6 @@ def test_two_servers_track_with_their_own_settings():
 
     with (
         patch("stratakb.config.get_settings", return_value=env),
-        patch("stratakb.mcp_server.get_settings", return_value=env),
         patch("stratakb.learning.tracker.Tracker", wraps=Tracker) as tracker_cls,
     ):
         mcp_server.build_server(a)
