@@ -32,18 +32,30 @@ def _fake_embed(value: float):
 
 @contextlib.asynccontextmanager
 async def _restoring_size(db_url, pool, size, layers):
-    """On exit, re-embed every layer back at `size`, delete `layers` and check the size."""
+    """On exit, re-embed every layer back at `size`, delete `layers` and check the size.
+
+    A failure in the test stays the reported one; a failed restore becomes a note on it.
+    """
     from stratakb.knowledge.vector_store import delete_layer_chunks, re_embed_all_layers
 
+    test_error = None
     try:
         yield
+    except BaseException as exc:
+        test_error = exc
+        raise
     finally:
-        with patch(EMBED_TEXTS, new_callable=AsyncMock) as mock:
-            mock.side_effect = _fake_embed(0.1)
-            await re_embed_all_layers(db_url, new_dimensions=size)
-        for layer in layers:
-            await delete_layer_chunks(db_url, layer)
-    assert await vector_column_size(pool) == size
+        try:
+            with patch(EMBED_TEXTS, new_callable=AsyncMock) as mock:
+                mock.side_effect = _fake_embed(0.1)
+                await re_embed_all_layers(db_url, new_dimensions=size)
+            for layer in layers:
+                await delete_layer_chunks(db_url, layer)
+            assert await vector_column_size(pool) == size
+        except Exception as restore_error:
+            if test_error is None:
+                raise
+            test_error.add_note(f"Restoring the vector size also failed: {restore_error!r}")
 
 
 async def _staging_tables(pool) -> int:

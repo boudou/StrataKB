@@ -11,6 +11,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock, MagicMock, patch
+from urllib.parse import urlsplit, urlunsplit
 from uuid import uuid4
 
 if TYPE_CHECKING:
@@ -407,6 +408,55 @@ async def owner_execute(db_url: str, sql: str) -> None:
         await conn.execute(sql)
     finally:
         await conn.close()
+
+
+async def replay_migrations(db_url: str) -> None:
+    """Run every migration file in order as the user in db_url (they are idempotent)."""
+    from stratakb.core import migrations
+
+    for m in migrations.MIGRATIONS:
+        await owner_execute(db_url, migrations._load_sql(m.file))
+
+
+def url_with_credentials(url: str, user: str, password: str) -> str:
+    """url with only the user and password replaced."""
+    parts = urlsplit(url)
+    host = parts.hostname or ""
+    if ":" in host:
+        host = f"[{host}]"
+    netloc = f"{user}:{password}@{host}" + (f":{parts.port}" if parts.port else "")
+    return urlunsplit(parts._replace(netloc=netloc))
+
+
+@contextlib.asynccontextmanager
+async def login_role_url(db_url: str, role: str):
+    """Create a throwaway login role; yield db_url logged in as it, then drop it.
+
+    Skip the test when the user in db_url may not create roles. Roles are
+    cluster-wide, so role must not clash with another database's tests.
+    """
+    import asyncpg
+    import pytest
+
+    password = uuid4().hex
+    drop = f"""
+        DO $$
+        BEGIN
+            IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '{role}') THEN
+                DROP OWNED BY "{role}";
+                DROP ROLE "{role}";
+            END IF;
+        END $$;
+    """
+    try:
+        await owner_execute(db_url, drop)
+        await owner_execute(db_url, f"CREATE ROLE \"{role}\" LOGIN PASSWORD '{password}'")
+    except asyncpg.InsufficientPrivilegeError:
+        pytest.skip("the owner may not create roles")
+    try:
+        yield url_with_credentials(db_url, role, password)
+    finally:
+        await owner_execute(db_url, drop)
 
 
 async def recorded_versions(db_url: str) -> set[int]:

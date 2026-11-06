@@ -151,15 +151,14 @@ def clear_checked():
 async def restore_schema(db_url):
     """Put the shared test schema back after a test that drops parts of it.
 
-    Replays every migration file as the owner (they are idempotent), so the
-    restore does not depend on ensure_schema working, then records the versions.
+    Replays every migration file as the owner, so the restore does not depend on
+    ensure_schema working, then records the versions.
     """
     from stratakb.core import migrations
-    from tests.helpers import owner_execute
+    from tests.helpers import replay_migrations
 
     yield
-    for m in migrations.MIGRATIONS:
-        await owner_execute(db_url, migrations._load_sql(m.file))
+    await replay_migrations(db_url)
     migrations._checked.clear()
     await migrations.ensure_schema(db_url)
 
@@ -199,30 +198,29 @@ async def reserved_url(db_url):
 @pytest.fixture
 async def probe_url(db_url):
     """URL for a new login role with no privileges on the StrataKB schemas."""
-    from tests.helpers import owner_execute
+    from tests.helpers import login_role_url
 
-    parts = urlsplit(db_url)
-    role = f"strata_probe_{parts.path.lstrip('/')}"
-    password = "probe_password"
-    drop = f"""
-        DO $$
-        BEGIN
-            IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '{role}') THEN
-                DROP OWNED BY "{role}";
-                DROP ROLE "{role}";
-            END IF;
-        END $$;
-    """
+    role = f"strata_probe_{urlsplit(db_url).path.lstrip('/')}"
+    async with login_role_url(db_url, role) as url:
+        yield url
+
+
+@pytest.fixture
+async def superuser_conn(db_url):
+    """A connection to db_url; skip unless it is reachable and its role is a superuser."""
     try:
-        await owner_execute(db_url, drop)
-        await owner_execute(db_url, f"CREATE ROLE \"{role}\" LOGIN PASSWORD '{password}'")
-    except asyncpg.InsufficientPrivilegeError:
-        pytest.skip("the owner may not create roles")
+        conn = await asyncpg.connect(db_url, timeout=5)
+    except Exception:
+        pytest.skip("database not reachable")
     try:
-        netloc = f"{role}:{password}@{parts.hostname}:{parts.port}"
-        yield urlunsplit(parts._replace(netloc=netloc))
+        superuser = await conn.fetchval(
+            "SELECT rolsuper FROM pg_roles WHERE rolname = current_user"
+        )
+        if not superuser:
+            pytest.skip("DATABASE_URL role is not a superuser")
+        yield conn
     finally:
-        await owner_execute(db_url, drop)
+        await conn.close()
 
 
 @pytest.fixture(autouse=True)

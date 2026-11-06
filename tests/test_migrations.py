@@ -23,6 +23,8 @@ from tests.helpers import (
     owner_execute,
     readonly_privileges,
     recorded_versions,
+    replay_migrations,
+    url_with_credentials,
 )
 
 pytestmark = pytest.mark.usefixtures("clear_checked")
@@ -160,11 +162,9 @@ async def _schema_snapshot(db_url: str) -> dict:
 
 async def test_sql_files_apply_twice(db_url):
     await migrations.ensure_schema(db_url)
-    for m in migrations.MIGRATIONS:
-        await owner_execute(db_url, migrations._load_sql(m.file))
+    await replay_migrations(db_url)
     first = await _schema_snapshot(db_url)
-    for m in migrations.MIGRATIONS:
-        await owner_execute(db_url, migrations._load_sql(m.file))
+    await replay_migrations(db_url)
     assert await _schema_snapshot(db_url) == first
     assert first["columns"]
     assert {row[0] for row in first["columns"]} == {
@@ -565,26 +565,23 @@ async def test_still_missing_file_has_generic_message(db_url):
 
 
 async def test_bad_password_passes_through(db_url):
-    parts = urlsplit(db_url)
-    user = parts.username or "strata"
-    netloc = f"{user}:wrong-password@{parts.hostname}:{parts.port}"
-    bad_url = urlunsplit(parts._replace(netloc=netloc))
+    user = urlsplit(db_url).username or "strata"
+    bad_url = url_with_credentials(db_url, user, "wrong-password")
     with pytest.raises(asyncpg.InvalidPasswordError):
         await migrations.ensure_schema(bad_url)
     assert bad_url not in migrations._checked
 
 
-async def test_non_owner_schema_present(db_url, readonly_url):
+async def test_non_owner_schema_present(db_url, readonly_url, restore_schema):
     await owner_execute(db_url, "DROP TABLE strata_core.schema_migrations")
-    try:
-        with capture_logs() as logs:
-            await migrations.ensure_schema(readonly_url)
-        events = [entry for entry in logs if entry["event"] == "migration_not_recorded"]
-        assert len(events) == 1
-        assert events[0]["versions"] == sorted(ALL_VERSIONS)
-        assert readonly_url in migrations._checked
-    finally:
-        await migrations.ensure_schema(db_url)
+    with capture_logs() as logs:
+        await migrations.ensure_schema(readonly_url)
+    events = [entry for entry in logs if entry["event"] == "migration_not_recorded"]
+    assert len(events) == 1
+    assert events[0]["versions"] == sorted(ALL_VERSIONS)
+    assert readonly_url in migrations._checked
+
+    await migrations.ensure_schema(db_url)
     assert await recorded_versions(db_url) == ALL_VERSIONS
 
 
@@ -619,7 +616,7 @@ async def test_held_advisory_lock_times_out(db_url):
         await holder.close()
 
 
-async def test_table_lock_names_the_file(db_url):
+async def test_table_lock_names_the_file(db_url, restore_schema):
     await migrations.ensure_schema(db_url)
     migrations._checked.clear()
     await owner_execute(
@@ -643,8 +640,9 @@ async def test_table_lock_names_the_file(db_url):
     finally:
         await tx.rollback()
         await holder.close()
-        migrations._checked.clear()
-        await migrations.ensure_schema(db_url)
+
+    migrations._checked.clear()
+    await migrations.ensure_schema(db_url)
     assert 12 in await recorded_versions(db_url)
 
 
