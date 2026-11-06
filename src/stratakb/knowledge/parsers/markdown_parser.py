@@ -13,6 +13,7 @@ from pathlib import Path
 import structlog
 
 from stratakb.knowledge.parsers.pdf_parser import ParsedDocument, ParsedPage
+from stratakb.knowledge.structure import frontmatter_end
 
 logger = structlog.get_logger()
 
@@ -28,17 +29,6 @@ _NOT_PARAGRAPH_RE = re.compile(r"^ {0,3}(?:>|[-*+](?:[ \t]|$)|\d+[.)](?:[ \t]|$)
 # Fenced code block delimiters (CommonMark): up to 3 spaces, then 3+ backticks or tildes
 _FENCE_OPEN_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
 _FENCE_CLOSE_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})[ \t]*$")
-
-# Leading YAML front matter: a first line holding only '---' (not followed by a
-# blank line, which would make it a thematic break), up to a line holding only '---' or '...'
-_FRONTMATTER_RE = re.compile(
-    r"\A\s*---[ \t]*\n(?![ \t]*\n)(.*?)^(?:---|\.\.\.)[ \t]*$",
-    re.DOTALL | re.MULTILINE,
-)
-
-# A YAML key line ('key:', '"key":' or "'key':", then a space or the line end).
-# A plain key runs up to the first ': ' and may hold spaces ('date created: 2024')
-_YAML_KEY_RE = re.compile(r"""^(?:"[^"\n]*"|'[^'\n]*'|[^\s#"'][^\n]*?)[ \t]*:(?:[ \t]|$)""")
 
 
 def parse_markdown(file_path: str | Path) -> ParsedDocument:
@@ -70,7 +60,7 @@ def parse_markdown(file_path: str | Path) -> ParsedDocument:
         return ParsedDocument(source_file=source, error=f"Read error: {e}")
 
     # The front matter is never text, with or without headings
-    body = text[_frontmatter_end(text):]
+    body = text[frontmatter_end(text):]
 
     if not body.strip():
         return ParsedDocument(source_file=source, pages=[], total_pages=0)
@@ -155,27 +145,6 @@ def _split_by_headings(text: str) -> list[dict]:
         })
 
     return sections
-
-
-def _frontmatter_end(text: str) -> int:
-    """Return the offset just past the leading YAML front matter, or 0 when there is none.
-
-    A leading '---' block is front matter only when its lines look like YAML:
-    at least one 'key:' line, and every other non-blank line a key line, an
-    indented line, a list item or a '#' comment. Otherwise the '---' is a
-    thematic break and the block is text.
-    """
-    match = _FRONTMATTER_RE.match(text)
-    if not match:
-        return 0
-    lines = [line for line in match.group(1).split("\n") if line.strip()]
-    has_key = False
-    for line in lines:
-        if _YAML_KEY_RE.match(line):
-            has_key = True
-        elif not (line[0] in " \t" or line.startswith("#") or line == "-" or line.startswith("- ")):
-            return 0
-    return match.end() if has_key else 0
 
 
 def _find_headings(text: str) -> list[tuple[int, int, str]]:

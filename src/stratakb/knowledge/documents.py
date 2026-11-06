@@ -18,7 +18,7 @@ import asyncpg
 import structlog
 
 from stratakb.knowledge.parsers.pdf_parser import ParsedDocument
-from stratakb.knowledge.structure import Section
+from stratakb.knowledge.structure import Heading, Section
 
 logger = structlog.get_logger()
 
@@ -58,6 +58,20 @@ def build_document_text(doc: ParsedDocument) -> tuple[str, list[list[int]] | Non
             [start, page.page_number] for start, page in zip(starts, doc.pages, strict=True)
         ]
     return text, page_map
+
+
+def document_headings(doc: ParsedDocument) -> list[Heading]:
+    """The headings the parser read outside the text (a PDF outline, Word
+    heading styles), with their offsets in the document text.
+
+    Offsets are those of build_document_text's text; the list is empty for
+    formats whose parser reports none.
+    """
+    return [
+        heading._replace(offset=start + heading.offset)
+        for start, page in zip(page_starts(doc), doc.pages, strict=True)
+        for heading in page.headings
+    ]
 
 
 async def store_document_version(

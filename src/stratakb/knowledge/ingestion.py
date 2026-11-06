@@ -26,6 +26,7 @@ from stratakb.core.database import get_pool
 from stratakb.core.migrations import ensure_schema
 from stratakb.knowledge.documents import (
     build_document_text,
+    document_headings,
     page_starts,
     prune_documents,
     store_document_version,
@@ -756,14 +757,17 @@ def _map_document(
     """Build doc's text (documents.build_document_text) and its structure map.
 
     structure_patterns are the layer's own section starts, matched at line
-    starts next to the generic detectors (structure.detect_sections).
+    starts next to the generic detectors (structure.detect_sections). The
+    headings the parser read outside the text (a PDF outline, Word heading
+    styles) come first.
     """
     text, page_map = build_document_text(doc)
     fmt = FORMATS.get(Path(doc.source_file).suffix.lower())
     markdown = fmt is not None and fmt.doc_type == "markdown"
-    return _DocumentMap(
-        text, page_map, detect_sections(text, structure_patterns, markdown=markdown)
+    sections = detect_sections(
+        text, structure_patterns, markdown=markdown, explicit=document_headings(doc)
     )
+    return _DocumentMap(text, page_map, sections)
 
 
 def _map_and_chunk(
