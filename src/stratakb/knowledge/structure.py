@@ -105,6 +105,9 @@ _MAX_TITLE_CHARS = 60
 # The longest line taken as a heading above an adornment or after a keyword
 _MAX_HEADING_CHARS = 120
 
+# How much of a line's start an extra pattern is matched against
+_MAX_PATTERN_CHARS = 200
+
 # Section kinds: markup headings close every numbered or keyword section
 _MARKUP, _KEYWORD, _NUMBERED = "markup", "keyword", "numbered"
 
@@ -142,6 +145,22 @@ class _Candidate:
     # its line starts with an ordered-list marker ('1.', '2)')
     clause: bool = False
     list_marker: bool = False
+    # Levels added because the clause's numbering sits inside an
+    # extra-pattern section
+    nest: int = 0
+
+
+@dataclass(frozen=True)
+class _PatternSection:
+    """The extra-pattern section the scanner is in.
+
+    under is the clause numbering that was open when the first of these
+    sections started (None when none was), and depth the sections' level
+    below the enclosing heading: one below under.
+    """
+
+    under: tuple[int, ...] | None
+    depth: int
 
 
 def _lines(text: str) -> list[tuple[int, str]]:
@@ -235,6 +254,98 @@ def _continues(number: tuple[int, ...], current: tuple[int, ...] | None) -> bool
     return number[k - 1] == expected
 
 
+class _Numbering:
+    """The clause numbering the scanner is in, between two markup or keyword headings.
+
+    The open numbering run ends at clause number _current; it starts at
+    found[_run_start] with number _run_first, and _run_body is True once body
+    text came after its first clause. _section is the extra-pattern section
+    the scanner is in, if any; _own_run is True when the open run started
+    inside it, so belongs to it alone and nests below it.
+    """
+
+    def __init__(self, found: list[_Candidate]) -> None:
+        self._found = found
+        self.reset()
+
+    def reset(self) -> None:
+        """Forget the numbering: a markup or keyword heading starts a new one."""
+        self._current: tuple[int, ...] | None = None
+        self._run_start, self._run_first, self._run_body = 0, (), False
+        self._section: _PatternSection | None = None
+        self._own_run = False
+
+    @property
+    def nest(self) -> int:
+        """Levels the open run's clauses sit below the numbering around them."""
+        return self._section.depth if self._own_run and self._section else 0
+
+    def saw_text(self) -> None:
+        """Note a line of body text: the open run is not a bare table of contents."""
+        self._run_body = True
+
+    def enter_pattern_section(self) -> int:
+        """Start an extra-pattern section; return its level below the enclosing heading.
+
+        One level below the numbering open when the first of these sections
+        started: under clause 4.1 an attribute is level 3, so it closes the
+        attribute before it and the next clause (4.2) closes it. A numbered
+        list inside the attribute before does not count: the outer numbering
+        is restored, so 4.2 still continues 4.1.
+        """
+        under = self._section.under if self._section is not None else self._current
+        self._section = _PatternSection(under, len(under) + 1 if under is not None else 1)
+        self._current, self._own_run = under, False
+        return self._section.depth
+
+    def place(self, number: tuple[int, ...], *, breaks: bool, can_start: bool) -> int | None:
+        """The level of the clause numbered number, or None when the line is no clause.
+
+        breaks is True when the line follows a break, which a clause needs;
+        can_start is False when the line may continue the open run but not
+        start one (a first clause whose line reads as prose needs a blank
+        line before it).
+        """
+        context, ends_section = self._context(number)
+        if not breaks or (context is None and not can_start):
+            self._run_body = True
+            return None
+        if not _continues(number, context):
+            if context is not None and not self._run_body and number == self._run_first:
+                # The run so far was a table of contents without page numbers:
+                # the numbering starts again here
+                del self._found[self._run_start:]
+                context = None
+            else:
+                self._run_body = True
+                return None
+        if ends_section:
+            self._section, self._own_run = None, False
+        if context is None:
+            self._run_start, self._run_first, self._run_body = len(self._found), number, False
+            self._own_run = self._section is not None
+        self._current = number
+        return self.nest + len(number)
+
+    def _context(self, number: tuple[int, ...]) -> tuple[tuple[int, ...] | None, bool]:
+        """(the numbering number continues, whether it ends the extra-pattern section).
+
+        Outside an extra-pattern section that numbering is the open run.
+        Inside one, the section's own run comes first (step 5 after step 4
+        of a list, even under clause 4), then the outer numbering (4.2 after
+        an attribute of 4.1, which ends the section); any other number starts
+        a run of the section's own when none is open.
+        """
+        section = self._section
+        if section is None:
+            return self._current, False
+        if self._own_run and _continues(number, self._current):
+            return self._current, False
+        if section.under is not None and _continues(number, section.under):
+            return section.under, True
+        return (self._current if self._own_run else None), False
+
+
 def _is_list_item(lines: list[tuple[int, str]], i: int) -> bool:
     """True when line i is a one-level '1.' or '1)' item next to another one."""
     if not _LIST_ITEM_RE.match(lines[i][1]):
@@ -274,6 +385,21 @@ def _is_toc_entry(line: str) -> bool:
     return len(gap) >= 2 or "\t" in gap or before.endswith(("..", "…"))
 
 
+def _pattern_match(patterns: Sequence[re.Pattern[str]], line: str) -> re.Match[str] | None:
+    """The first extra pattern's match at the start of line, past its indent.
+
+    Only the first _MAX_PATTERN_CHARS characters are matched: an id starts
+    the line, and a pattern cannot then take long on a very long line.
+    """
+    if not patterns:
+        return None
+    head = line.lstrip(" \t")[:_MAX_PATTERN_CHARS]
+    for pattern in patterns:
+        if m := pattern.match(head):
+            return m
+    return None
+
+
 def _scan(text: str, extra_patterns: Sequence[re.Pattern[str]]) -> list[_Candidate]:
     """Every heading line of text, in order."""
     # Leading YAML front matter holds no headings: its lines are left out, so
@@ -285,10 +411,7 @@ def _scan(text: str, extra_patterns: Sequence[re.Pattern[str]]) -> list[_Candida
     adornments: list[tuple[str, bool]] = []  # reStructuredText styles in order of use
     markup_level = 0
     keyword_rank = 0
-    current: tuple[int, ...] | None = None
-    # The current numbering run: where it starts in found, its first number,
-    # and whether any body text came after its first clause
-    run_start, run_first, run_body = 0, (), False
+    numbering = _Numbering(found)
     fence: str | None = None
     skip_next = False
     heading_line = -1  # index of the last line of the last heading
@@ -309,6 +432,7 @@ def _scan(text: str, extra_patterns: Sequence[re.Pattern[str]]) -> list[_Candida
         found.append(_Candidate(
             kind, level, label, title, name.strip(), start, body_start,
             clause=clause, list_marker=clause and _LIST_MARKER_RE.match(line) is not None,
+            nest=numbering.nest if clause else 0,
         ))
 
     for i, (offset, line) in enumerate(lines):
@@ -355,7 +479,8 @@ def _scan(text: str, extra_patterns: Sequence[re.Pattern[str]]) -> list[_Candida
                     start = lines[i - 1][0]
                 skip_next = True
         if heading is not None:
-            markup_level, keyword_rank, current = level, 0, None
+            markup_level, keyword_rank = level, 0
+            numbering.reset()
             add(_MARKUP, (level, 0, 0), heading, start, *_heading_label(heading))
             continue
 
@@ -367,7 +492,7 @@ def _scan(text: str, extra_patterns: Sequence[re.Pattern[str]]) -> list[_Candida
 
         keyword = _KEYWORD_RE.match(line)
         if (
-            keyword or _numbered(line) or any(p.match(line) for p in extra_patterns)
+            keyword or _numbered(line) or _pattern_match(extra_patterns, line)
         ) and _is_toc_entry(line):
             # A table-of-contents entry ('3 Payments ..... 6') is not the clause
             continue
@@ -379,7 +504,7 @@ def _scan(text: str, extra_patterns: Sequence[re.Pattern[str]]) -> list[_Candida
             # The Provider ...' the clause's text, not a heading
             if breaks and not rest[:1].islower() and (title or not rest):
                 keyword_rank = _KEYWORD_RANKS[keyword.group(1).lower()]
-                current = None
+                numbering.reset()
                 name = f"{keyword.group(1)} {keyword.group(2)}"
                 label = normalise_label(name)
                 add(_KEYWORD, (markup_level, keyword_rank, 0),
@@ -387,41 +512,23 @@ def _scan(text: str, extra_patterns: Sequence[re.Pattern[str]]) -> list[_Candida
                     label=label, title=title)
                 continue
 
-        matched_extra = False
-        for pattern in extra_patterns:
-            if m := pattern.match(line):
-                label = m.groupdict().get("label") or m.group(0)
-                add(_NUMBERED, (markup_level, keyword_rank, 1), line, offset,
-                    label=normalise_label(label), title=None, own_text=True)
-                current = None
-                matched_extra = True
-                break
-        if matched_extra:
+        if m := _pattern_match(extra_patterns, line):
+            label = m.groupdict().get("label") or m.group(0)
+            depth = numbering.enter_pattern_section()
+            add(_NUMBERED, (markup_level, keyword_rank, depth), line, offset,
+                label=normalise_label(label), title=None, own_text=True)
             continue
 
         numbered = _numbered(line)
         if numbered is None or _is_list_item(lines, i):
-            run_body = True
+            numbering.saw_text()
             continue
         parts, label, title, prose = numbered
-        # A first clause whose line reads as prose needs a blank line before it
-        if not breaks or (prose and current is None and not after_break):
-            run_body = True
+        depth = numbering.place(parts, breaks=breaks, can_start=not prose or after_break)
+        if depth is None:
             continue
-        if not _continues(parts, current):
-            if current is not None and not run_body and parts == run_first:
-                # The run so far was a table of contents without page numbers:
-                # the numbering starts again here
-                del found[run_start:]
-                current = None
-            else:
-                run_body = True
-                continue
-        if current is None:
-            run_start, run_first, run_body = len(found), parts, False
-        current = parts
         name = f"{label} {title}" if title else label
-        add(_NUMBERED, (markup_level, keyword_rank, len(parts)), name, offset,
+        add(_NUMBERED, (markup_level, keyword_rank, depth), name, offset,
             label=label, title=title, own_text=prose, clause=True)
 
     return found
@@ -430,26 +537,35 @@ def _scan(text: str, extra_patterns: Sequence[re.Pattern[str]]) -> list[_Candida
 def _drop_ordered_lists(candidates: list[_Candidate]) -> list[_Candidate]:
     """candidates without the runs of clauses that read as a Markdown ordered list.
 
-    A run is a stretch of consecutive dotted or statute clauses (any other
-    candidate ends it). A run whose clauses are all one level and all start
-    with a list marker ('1.', '2)') is an ordered list, not clauses.
+    A run is the dotted or statute clauses of one numbering: those with the
+    same nesting between two markup or keyword headings. An extra-pattern
+    section does not end the numbering around it ('4.' '4.1' 'AT-01' '5.' is
+    one run), but it ends a run nested inside the section before it, and so
+    does a clause of an outer numbering. A run whose clauses are all one
+    level and all start with a list marker ('1.', '2)') is an ordered list,
+    not clauses.
     """
-    kept: list[_Candidate] = []
-    run: list[_Candidate] = []
+    dropped: set[int] = set()
+    runs: dict[int, list[int]] = {}  # nesting -> indexes in candidates
 
-    def flush() -> None:
-        if not all(c.level[2] == 1 and c.list_marker for c in run):
-            kept.extend(run)
-        run.clear()
+    def flush(deeper_than: int) -> None:
+        for nest in [n for n in runs if n > deeper_than]:
+            run = runs.pop(nest)
+            if all(
+                candidates[k].level[2] - nest == 1 and candidates[k].list_marker for k in run
+            ):
+                dropped.update(run)
 
-    for cand in candidates:
+    for k, cand in enumerate(candidates):
         if cand.clause:
-            run.append(cand)
-            continue
-        flush()
-        kept.append(cand)
-    flush()
-    return kept
+            flush(cand.nest)
+            runs.setdefault(cand.nest, []).append(k)
+        elif cand.kind == _NUMBERED:
+            flush(0)
+        else:
+            flush(-1)
+    flush(-1)
+    return [cand for k, cand in enumerate(candidates) if k not in dropped]
 
 
 def _closes(new: _Candidate, open_: _Candidate) -> bool:
@@ -470,10 +586,12 @@ def detect_sections(
 ) -> list[Section]:
     """The structure map of text: its sections in order, with paths and spans.
 
-    extra_patterns are regular expressions matched at line starts (a named
-    group 'label' gives the label); each match starts a section one level
-    below the current heading. markdown is True for Markdown text, where a
-    run of one-level '1.' lines is an ordered list and gives no sections.
+    extra_patterns are regular expressions matched at line starts, past any
+    indent (a named group 'label' gives the label); each match starts a
+    section one level below the innermost open heading or clause, which the
+    next match or the next clause at that level or above ends. markdown is
+    True for Markdown text, where a run of one-level '1.' lines is an ordered
+    list and gives no sections.
     Returns [] when text has no structure.
     """
     patterns = [re.compile(p) if isinstance(p, str) else p for p in extra_patterns]

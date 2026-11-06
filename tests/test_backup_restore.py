@@ -11,6 +11,7 @@ import contextlib
 import gzip
 import importlib.util
 import io
+import json
 import os
 import re
 import subprocess
@@ -233,7 +234,8 @@ async def test_round_trip_keeps_tracking_and_text(db_url, tmp_path, cleanup):
     conn = await asyncpg.connect(db_url)
     try:
         await conn.execute(
-            "UPDATE strata_core.knowledge_layers SET answer_mode = 'extractive' WHERE name = $1",
+            "UPDATE strata_core.knowledge_layers SET answer_mode = 'extractive', "
+            "structure_patterns = '[\"^(?P<label>AT-\\\\d{2})\"]' WHERE name = $1",
             name)
         before = await _snapshot(conn, name)
         assert before["layer"]["origin"] == "folder" and before["layer"]["root_path"]
@@ -248,6 +250,7 @@ async def test_round_trip_keeps_tracking_and_text(db_url, tmp_path, cleanup):
 
     assert after == before
     assert after["layer"]["answer_mode"] == "extractive"
+    assert json.loads(after["layer"]["structure_patterns"]) == ["^(?P<label>AT-\\d{2})"]
 
     p = await add_folder.plan(db_url, root, Options(name=name))
     assert p.action == "sync"

@@ -73,14 +73,86 @@ def _keyword_labels(keyword: str, number: str) -> tuple[str, ...]:
     return (f"{name} {number}",)
 
 
+# A pattern's leading line-start anchor, after any global inline flags
+_LEADING_ANCHOR_RE = re.compile(r"^((?:\(\?[aiLmsux]+\))*)\^")
+
+
+def unanchored(pattern: str) -> str:
+    """A layer's structure pattern made to match anywhere in a question.
+
+    At ingest the pattern is matched at line starts ('^AT-\\d+'); in a
+    question the id stands mid-sentence ('show AT-44'), so a leading '^'
+    becomes a word start.
+    """
+    return _LEADING_ANCHOR_RE.sub(lambda m: m.group(1) + r"(?<!\w)", pattern, count=1)
+
+
+_LEADING_FLAGS_RE = re.compile(r"(?:\(\?[aiLmsux]+\))*")
+_LABEL_GROUP = "(?P<label>"
+
+
+def _label_group(pattern: str) -> str | None:
+    """The source of pattern's named group 'label', parentheses included."""
+    start = pattern.find(_LABEL_GROUP)
+    if start < 0:
+        return None
+    depth = 0
+    in_class = False
+    i = start
+    while i < len(pattern):
+        ch = pattern[i]
+        if ch == "\\":
+            i += 2
+            continue
+        if in_class:
+            in_class = ch != "]"
+        elif ch == "[":
+            in_class = True
+            # A ']' right after '[' or '[^' is a literal
+            i += 1 if pattern[i + 1:i + 2] == "^" else 0
+            i += 1 if pattern[i + 1:i + 2] == "]" else 0
+        elif ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                return pattern[start:i + 1]
+        i += 1
+    return None
+
+
+def question_pattern(pattern: str) -> str:
+    """A layer's structure pattern made to find its ids in a question.
+
+    At ingest the pattern may need the text around the id
+    ('^Identification:\\s*(?P<label>AT-\\d+)'); a question names the id
+    alone, anywhere ('show AT-44'). So only the named group 'label' is
+    looked for, as a whole word. A pattern without one is used whole, its
+    leading '^' read as a word start.
+    """
+    group = _label_group(pattern)
+    if group is None:
+        return unanchored(pattern)
+    flags = _LEADING_FLAGS_RE.match(pattern).group(0)
+    return rf"{flags}(?<!\w){group}(?!\w)"
+
+
+def _compile_for_questions(pattern: str) -> re.Pattern[str]:
+    try:
+        return re.compile(question_pattern(pattern))
+    except re.error:
+        # The label group alone does not compile (it refers to another group)
+        return re.compile(unanchored(pattern))
+
+
 def find_references(
     question: str, extra_patterns: Iterable[str | re.Pattern[str]] = ()
 ) -> list[Reference]:
     """The clause and section references in question, in order, without repeats.
 
-    extra_patterns are a layer's id patterns (a named group 'label' gives the
-    label, as in structure.detect_sections); each match anywhere in the
-    question is a reference.
+    extra_patterns are a layer's structure patterns (a named group 'label'
+    gives the label, as in structure.detect_sections); each match of
+    question_pattern anywhere in the question is a reference.
     """
     found: list[tuple[int, Reference]] = []
     covered: list[tuple[int, int]] = []
@@ -96,7 +168,7 @@ def find_references(
         found.append((m.start(), Reference(m.group(0), (normalise_label(m.group(1)),))))
 
     for pattern in extra_patterns:
-        compiled = re.compile(pattern) if isinstance(pattern, str) else pattern
+        compiled = _compile_for_questions(pattern) if isinstance(pattern, str) else pattern
         for m in compiled.finditer(question):
             if not m.group(0):
                 continue

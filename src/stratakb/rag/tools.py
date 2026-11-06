@@ -60,6 +60,20 @@ async def _detect_layers(database_url: str, query: str, learning_enabled: bool) 
     )
 
 
+async def _exact_clauses(
+    database_url: str, question: str, layers: list[str] | None, budget: int
+) -> list[dict[str, Any]]:
+    """The sections question names, looked up with the searched layers' structure patterns."""
+    from stratakb.knowledge.layers import get_structure_patterns
+
+    try:
+        patterns = await get_structure_patterns(database_url, layers)
+    except Exception as e:
+        logger.warning("structure_patterns_unavailable", error_type=type(e).__name__)
+        patterns = []
+    return await lookup_clauses(database_url, question, layers, budget, patterns)
+
+
 def _routing_fallback_reason(
     result_count: int, top_k: int, confidence: dict[str, Any]
 ) -> str | None:
@@ -295,7 +309,7 @@ def register_rag_tools(
                     confidence = _search_confidence(results)
 
             # A clause or section the query names comes first, verbatim
-            exact = await lookup_clauses(
+            exact = await _exact_clauses(
                 database_url, query, layers, _settings.answer_token_budget
             )
             found = [
@@ -478,7 +492,7 @@ def register_rag_tools(
                     layers = None
             # A clause or section the question names comes first, verbatim,
             # looked up in the layers searched; retrieved chunks inside it go
-            exact = await lookup_clauses(
+            exact = await _exact_clauses(
                 database_url, question, layers, _settings.answer_token_budget
             )
             # The best chunks that fit the answer budget; confidence is judged

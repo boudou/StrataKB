@@ -31,6 +31,13 @@ routing_patterns:
   - '\brulebooks?\b'
   - '\b(reject|return|refund|recall)\s+(reason\s+)?codes?\b'
 
+# EPC rulebooks define each attribute as "Identification: AT-R051", followed
+# by its name and description. Such a line starts a section labelled by the
+# attribute, next to the usual headings and numbered clauses, so "show AT-R051"
+# finds the definition. Table rows that merely mention an attribute stay put.
+structure_patterns:
+  - '^Identification:\s*(?P<label>AT-[A-Z]?\d{1,3})\b'
+
 sources:
   - name: rulebooks
     path: rulebooks

@@ -402,6 +402,8 @@ async def ingest_documents(
     chunk_config = layer["chunk_config"]
     chunk_size = chunk_config.get("chunk_size", DEFAULT_CHUNK_SIZE)
     chunk_overlap = chunk_config.get("chunk_overlap", DEFAULT_CHUNK_OVERLAP)
+    # The layer's own section starts (set by a preset), compiled once per run
+    structure_patterns = [re.compile(p) for p in layer.get("structure_patterns") or []]
 
     # Step 2: Discover files
     source = Path(source_path)
@@ -542,6 +544,7 @@ async def ingest_documents(
                 layer_name=layer_name,
                 chunk_size=chunk_size,
                 chunk_overlap=chunk_overlap,
+                structure_patterns=structure_patterns,
             )
             if not doc_chunks:
                 await drop(relative_path, previous, "no_text")
@@ -747,19 +750,32 @@ class _DocumentMap:
     sections: list[Section]
 
 
-def _map_document(doc: ParsedDocument) -> _DocumentMap:
-    """Build doc's text (documents.build_document_text) and its structure map."""
+def _map_document(
+    doc: ParsedDocument, structure_patterns: Sequence[str | re.Pattern[str]] = ()
+) -> _DocumentMap:
+    """Build doc's text (documents.build_document_text) and its structure map.
+
+    structure_patterns are the layer's own section starts, matched at line
+    starts next to the generic detectors (structure.detect_sections).
+    """
     text, page_map = build_document_text(doc)
     fmt = FORMATS.get(Path(doc.source_file).suffix.lower())
     markdown = fmt is not None and fmt.doc_type == "markdown"
-    return _DocumentMap(text, page_map, detect_sections(text, markdown=markdown))
+    return _DocumentMap(
+        text, page_map, detect_sections(text, structure_patterns, markdown=markdown)
+    )
 
 
 def _map_and_chunk(
-    doc: ParsedDocument, *, layer_name: str, chunk_size: int, chunk_overlap: int
+    doc: ParsedDocument,
+    *,
+    layer_name: str,
+    chunk_size: int,
+    chunk_overlap: int,
+    structure_patterns: Sequence[str | re.Pattern[str]] = (),
 ) -> tuple[_DocumentMap, list[ChunkRecord]]:
     """doc's map and its chunks along it; sync, run in a worker thread."""
-    mapped = _map_document(doc)
+    mapped = _map_document(doc, structure_patterns)
     return mapped, _chunk_document(
         doc,
         layer_name=layer_name,
@@ -776,13 +792,14 @@ def _chunk_document(
     chunk_size: int,
     chunk_overlap: int,
     mapped: _DocumentMap | None = None,
+    structure_patterns: Sequence[str | re.Pattern[str]] = (),
 ) -> list[ChunkRecord]:
     """Split a parsed document into chunks along its structure map.
 
     mapped is the document's text and structure map (_map_document, built
-    here when None). The text is cut at every section and page start, and a
-    chunk carries the clause_path of the section it lies in. Without
-    sections, each page is split by size alone.
+    here with structure_patterns when None). The text is cut at every
+    section and page start, and a chunk carries the clause_path of the
+    section it lies in. Without sections, each page is split by size alone.
 
     Each chunk gets char_start and char_end into the document text (see
     documents.build_document_text).
@@ -793,7 +810,7 @@ def _chunk_document(
     doc_type = fmt.doc_type if fmt is not None else ext.lstrip(".") or "unknown"
 
     if mapped is None:
-        mapped = _map_document(doc)
+        mapped = _map_document(doc, structure_patterns)
     text, sections = mapped.text, mapped.sections
     starts = page_starts(doc)
 

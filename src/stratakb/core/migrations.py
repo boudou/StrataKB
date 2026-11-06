@@ -276,6 +276,18 @@ MIGRATIONS: list[Migration] = [
         ),
     ),
     Migration(
+        11,
+        "11_structure_patterns.sql",
+        """
+        SELECT EXISTS (
+            SELECT 1 FROM information_schema.columns
+            WHERE table_schema = 'strata_core'
+              AND table_name = 'knowledge_layers'
+              AND column_name = 'structure_patterns'
+        )
+        """,
+    ),
+    Migration(
         12,
         "12_answer_mode.sql",
         """

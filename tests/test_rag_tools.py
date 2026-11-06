@@ -652,6 +652,9 @@ class TestAskDomainContext:
         with (
             patch("stratakb.config.get_settings", return_value=settings),
             patch("stratakb.knowledge.layers.get_layer_routing", routing),
+            # The clause lookup reads the layer routing too: only the domain
+            # context fetch is counted here
+            patch("stratakb.knowledge.layers.get_structure_patterns", AsyncMock(return_value=[])),
             patch("stratakb.rag.retriever.search_chunks", AsyncMock(return_value=[])),
             patch("stratakb.rag.tools.write_audit_log", AsyncMock()),
             patch("openai.AsyncOpenAI", return_value=client) as openai_cls,

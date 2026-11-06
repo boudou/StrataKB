@@ -501,6 +501,37 @@ async def test_applies_missing_05(db_url, restore_schema):
     assert await _recorded(db_url) == ALL_VERSIONS
 
 
+async def test_applies_missing_11_existing_layers_have_no_patterns(db_url, restore_schema):
+    await _owner_execute(
+        db_url,
+        """
+        DELETE FROM strata_core.knowledge_layers WHERE name = 'test_mig_structure';
+        ALTER TABLE strata_core.knowledge_layers DROP COLUMN structure_patterns;
+        DELETE FROM strata_core.schema_migrations WHERE version = 11;
+        INSERT INTO strata_core.knowledge_layers (name, display_name)
+        VALUES ('test_mig_structure', 'Older layer');
+        """,
+    )
+    try:
+        await migrations.ensure_schema(db_url)
+
+        conn = await asyncpg.connect(db_url)
+        try:
+            patterns = await conn.fetchval(
+                "SELECT structure_patterns::text FROM strata_core.knowledge_layers "
+                "WHERE name = 'test_mig_structure'"
+            )
+        finally:
+            await conn.close()
+        assert patterns == "[]"
+        assert await _recorded(db_url) == ALL_VERSIONS
+    finally:
+        await _owner_execute(
+            db_url,
+            "DELETE FROM strata_core.knowledge_layers WHERE name = 'test_mig_structure'",
+        )
+
+
 async def test_applies_missing_12_existing_layers_read_grounded(db_url, restore_schema):
     await _owner_execute(
         db_url,

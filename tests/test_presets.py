@@ -36,6 +36,7 @@ def _stored_layer(preset, **overrides) -> dict:
         "metadata_schema": preset.metadata_schema,
         "chunk_config": preset.chunk_config,
         "routing_patterns": preset.routing_patterns,
+        "structure_patterns": preset.structure_patterns,
         "answer_mode": "grounded",
         **overrides,
     }
@@ -104,6 +105,40 @@ class TestLoadPreset:
             "  - {name: docs, path: docs}\n"
         ))
         with pytest.raises(LayerValidationError, match="routing pattern"):
+            load_preset(path)
+
+    def test_structure_patterns_loaded(self, tmp_path):
+        assert load_preset(SEPA_PRESET).structure_patterns == [
+            "^Identification:\\s*(?P<label>AT-[A-Z]?\\d{1,3})\\b",
+        ]
+        assert load_preset(ISO_PRESET).structure_patterns == [
+            "^(?P<label>(?:pain|pacs|camt)\\.\\d{3}\\.\\d{3}\\.\\d{2})\\b",
+        ]
+        path = _write_preset(tmp_path, (
+            "name: runbooks\n"
+            "display_name: Ops Runbooks\n"
+            "sources:\n"
+            "  - {name: docs, path: docs}\n"
+        ))
+        assert load_preset(path).structure_patterns == []
+
+    @pytest.mark.parametrize("pattern, message", [
+        ("'(unclosed'", "structure pattern"),
+        ("'\\s*'", "empty line"),
+        ("42", "list of strings"),
+        # Nested unbounded repeats could stall an ingest on a long line
+        ("'^(?P<label>(AT-\\d+)+)'", "repeats a repeated part"),
+        ("'^(\\w+\\s?)*:'", "repeats a repeated part"),
+    ])
+    def test_invalid_structure_pattern_refused(self, tmp_path, pattern, message):
+        path = _write_preset(tmp_path, (
+            "name: runbooks\n"
+            "display_name: Ops Runbooks\n"
+            f"structure_patterns: [{pattern}]\n"
+            "sources:\n"
+            "  - {name: docs, path: docs}\n"
+        ))
+        with pytest.raises(LayerValidationError, match=message):
             load_preset(path)
 
     def test_source_without_path_rejected(self, tmp_path):
@@ -294,6 +329,46 @@ class TestCreatePresetLayer:
 
         assert result == {"status": "created", "layer": {"name": "sepa"}, "changes": []}
         assert mock_create.call_args.kwargs["answer_mode"] == "grounded"
+        assert mock_create.call_args.kwargs["structure_patterns"] == preset.structure_patterns
+
+    async def test_structure_patterns_stored(self, tmp_path):
+        import contextlib
+
+        from stratakb.config import get_settings
+        from stratakb.knowledge.layers import (
+            LayerNotFoundError,
+            delete_layer,
+            get_layer_status,
+            list_layers,
+        )
+
+        db_url = get_settings().database_url
+        name = "test_preset_structure"
+        body = (
+            f"name: {name}\n"
+            "display_name: Structure\n"
+            "structure_patterns: [{patterns}]\n"
+            "sources:\n"
+            "  - {{name: docs, path: docs}}\n"
+        )
+        path = _write_preset(tmp_path, body.format(patterns="'(?P<label>AT-\\d+)\\b'"))
+        with contextlib.suppress(LayerNotFoundError):
+            await delete_layer(db_url, name=name)
+        try:
+            result = await create_preset_layer(db_url, load_preset(path))
+            assert result["layer"]["structure_patterns"] == ["(?P<label>AT-\\d+)\\b"]
+            listed = next(layer for layer in await list_layers(db_url) if layer["name"] == name)
+            assert listed["structure_patterns"] == ["(?P<label>AT-\\d+)\\b"]
+
+            # Applying the preset again brings the patterns up to the YAML
+            _write_preset(tmp_path, body.format(patterns="'(?P<label>DS-\\d+)\\b'"))
+            again = await create_preset_layer(db_url, load_preset(path))
+            assert again["changes"] == ["structure_patterns"]
+            stored = await get_layer_status(db_url, name=name)
+            assert stored["structure_patterns"] == ["(?P<label>DS-\\d+)\\b"]
+        finally:
+            with contextlib.suppress(LayerNotFoundError):
+                await delete_layer(db_url, name=name)
 
     async def _create_existing(self, existing_origin, existing_mode="grounded", preset=None,
                                update_error=None, **stored):
@@ -577,6 +652,7 @@ class TestPresetLayerChanges:
         ("metadata_schema", {"old": True}),
         ("chunk_config", {"chunk_size": 1, "chunk_overlap": 0, "splitting_strategy": "x"}),
         ("routing_patterns", ["old"]),
+        ("structure_patterns", []),
     ])
     def test_one_setting_changed(self, key, stored):
         from stratakb.knowledge.presets import preset_layer_changes

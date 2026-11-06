@@ -175,7 +175,8 @@ EXPORT_TABLES: list[tuple[str, tuple[str, ...]]] = [
     ("strata_core.knowledge_layers", (
         "id", "name", "display_name", "description", "metadata_schema", "chunk_config",
         "routing_patterns", "status", "doc_count", "chunk_count", "last_ingested",
-        "created_at", "updated_at", "origin", "owner", "root_path", "answer_mode")),
+        "created_at", "updated_at", "origin", "owner", "root_path", "answer_mode",
+        "structure_patterns")),
     ("strata_core.ingestion_runs", (
         "id", "layer_id", "source_path", "status", "docs_processed", "docs_failed",
         "chunks_created", "error_log", "started_at", "completed_at")),

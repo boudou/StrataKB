@@ -10,6 +10,8 @@ from __future__ import annotations
 import json
 import re
 import time
+from re import _constants as _sre
+from re import _parser as _sre_parser
 from typing import Literal, get_args
 
 import asyncpg
@@ -42,11 +44,11 @@ _ROOT_PATH_INDEX = "knowledge_layers_root_path_key"
 _LAYER_COLUMNS = (
     "id, name, display_name, description, metadata_schema, chunk_config, "
     "routing_patterns, status, doc_count, chunk_count, last_ingested, "
-    "created_at, updated_at, origin, owner, root_path, answer_mode"
+    "created_at, updated_at, origin, owner, root_path, answer_mode, structure_patterns"
 )
 
 # asyncpg returns jsonb as text (the pool sets no JSON codec): decoded by _decode_jsonb
-_JSONB_COLUMNS = ("metadata_schema", "chunk_config", "routing_patterns")
+_JSONB_COLUMNS = ("metadata_schema", "chunk_config", "routing_patterns", "structure_patterns")
 
 # The only columns _write_columns puts into SQL
 _LayerColumn = Literal[
@@ -55,6 +57,7 @@ _LayerColumn = Literal[
     "metadata_schema",
     "chunk_config",
     "routing_patterns",
+    "structure_patterns",
     "answer_mode",
     "origin",
     "root_path",
@@ -119,16 +122,82 @@ def _validate_name(name: str) -> None:
         )
 
 
-def _validate_routing_patterns(patterns: list[str]) -> list[str]:
-    """Validate routing patterns: a list of compilable regular expressions."""
+_REPEATS = (_sre.MAX_REPEAT, _sre.MIN_REPEAT, _sre.POSSESSIVE_REPEAT)
+
+
+def _subpatterns(value: object):
+    """The parsed subpatterns inside a node's argument, at any depth."""
+    if isinstance(value, _sre_parser.SubPattern):
+        yield value
+    elif isinstance(value, (tuple, list)):
+        for item in value:
+            yield from _subpatterns(item)
+
+
+def _nested_repeat(items, unbounded_outside: bool = False) -> bool:
+    """True when a variable repeat of more than one sits inside an unbounded repeat.
+
+    Such a pattern ('(a+)+', '(\\w+\\s?)*') can backtrack exponentially on a
+    line it almost matches; a fixed count inside ('(\\d{3})+') cannot.
+    """
+    for op, av in items:
+        if op in _REPEATS:
+            lo, hi, body = av
+            if unbounded_outside and hi > 1 and lo != hi:
+                return True
+            if _nested_repeat(body, unbounded_outside or hi == _sre.MAXREPEAT):
+                return True
+            continue
+        for sub in _subpatterns(av):
+            if _nested_repeat(sub, unbounded_outside):
+                return True
+    return False
+
+
+def _validate_patterns(
+    key: str, patterns: list[str], *, line_starts: bool = False
+) -> list[str]:
+    """Validate a list of regular expressions stored under key.
+
+    With line_starts the patterns mark section starts, matched at the start
+    of every line of every document ingested: one must not match an empty
+    line (every line would be a section) nor nest an unbounded repeat around
+    another one (exponential backtracking would stall the ingest).
+    """
     if not isinstance(patterns, list) or not all(isinstance(p, str) for p in patterns):
-        raise LayerValidationError("routing_patterns must be a list of strings.")
+        raise LayerValidationError(f"{key} must be a list of strings.")
+    kind = key.removesuffix("_patterns")
     for pattern in patterns:
         try:
-            re.compile(pattern)
+            compiled = re.compile(pattern)
         except re.error as e:
-            raise LayerValidationError(f"Invalid routing pattern '{pattern}': {e}")
+            raise LayerValidationError(f"Invalid {kind} pattern '{pattern}': {e}") from e
+        if not line_starts:
+            continue
+        if compiled.match(""):
+            raise LayerValidationError(
+                f"Invalid {kind} pattern '{pattern}': it matches an empty line."
+            )
+        if _nested_repeat(_sre_parser.parse(pattern)):
+            raise LayerValidationError(
+                f"Invalid {kind} pattern '{pattern}': it repeats a repeated part, "
+                "which can take very long on some lines."
+            )
     return patterns
+
+
+def _validate_routing_patterns(patterns: list[str]) -> list[str]:
+    """Validate routing patterns: a list of compilable regular expressions."""
+    return _validate_patterns("routing_patterns", patterns)
+
+
+def _validate_structure_patterns(patterns: list[str]) -> list[str]:
+    """Validate structure patterns: regular expressions that start a section.
+
+    Each is matched at the start of a line (a named group 'label' gives the
+    section's label, else the whole match does).
+    """
+    return _validate_patterns("structure_patterns", patterns, line_starts=True)
 
 
 def _validate_chunk_config(chunk_config: dict) -> dict:
@@ -220,10 +289,12 @@ async def create_layer(
     owner: str | None = None,
     root_path: str | None = None,
     answer_mode: str = DEFAULT_ANSWER_MODE,
+    structure_patterns: list[str] | None = None,
 ) -> dict:
     """Create a new knowledge layer.
 
     root_path is stored as given: callers pass Path(p).resolve().as_posix().
+    structure_patterns mark extra section starts at ingestion (set by presets).
 
     Returns the created layer record.
     Raises LayerExistsError if name already taken.
@@ -236,6 +307,7 @@ async def create_layer(
     chunk_cfg = _validate_chunk_config(chunk_config or {})
     routing = _validate_routing_patterns(routing_patterns or [])
     mode = _validate_answer_mode(answer_mode)
+    structure = _validate_structure_patterns(structure_patterns or [])
     _validate_length("origin", origin, MAX_ORIGIN_LENGTH)
     _validate_length("owner", owner, MAX_OWNER_LENGTH)
 
@@ -246,8 +318,10 @@ async def create_layer(
             f"""
             INSERT INTO strata_core.knowledge_layers
                 (name, display_name, description, metadata_schema, chunk_config,
-                 routing_patterns, origin, owner, root_path, answer_mode)
-            VALUES ($1, $2, $3, $4::jsonb, $5::jsonb, $6::jsonb, $7, $8, $9, $10)
+                 routing_patterns, origin, owner, root_path, answer_mode,
+                 structure_patterns)
+            VALUES ($1, $2, $3, $4::jsonb, $5::jsonb, $6::jsonb, $7, $8, $9, $10,
+                    $11::jsonb)
             RETURNING {_LAYER_COLUMNS}
             """,
             name,
@@ -260,6 +334,7 @@ async def create_layer(
             owner,
             root_path,
             mode,
+            json.dumps(structure),
         )
     except asyncpg.UniqueViolationError as e:
         _raise_if_root_taken(e, root_path)
@@ -303,7 +378,7 @@ async def get_layer_status(database_url: str, *, name: str) -> dict:
                kl.status, kl.doc_count, kl.chunk_count, kl.last_ingested,
                kl.chunk_config, kl.metadata_schema, kl.routing_patterns,
                kl.created_at, kl.updated_at, kl.origin, kl.owner, kl.root_path,
-               kl.answer_mode,
+               kl.answer_mode, kl.structure_patterns,
                (SELECT count(*) FROM strata_core.ingestion_runs ir
                 WHERE ir.layer_id = kl.id) AS ingestion_run_count,
                (SELECT max(ir.completed_at) FROM strata_core.ingestion_runs ir
@@ -555,6 +630,7 @@ async def update_layer(
     chunk_config: dict | None = None,
     routing_patterns: list[str] | None = None,
     answer_mode: str | None = None,
+    structure_patterns: list[str] | None = None,
     claim_origin: str | None = None,
 ) -> dict:
     """Set the given settings of a layer in one UPDATE; None leaves a setting as it is.
@@ -581,6 +657,8 @@ async def update_layer(
         values["routing_patterns"] = _validate_routing_patterns(routing_patterns)
     if answer_mode is not None:
         values["answer_mode"] = _validate_answer_mode(answer_mode)
+    if structure_patterns is not None:
+        values["structure_patterns"] = _validate_structure_patterns(structure_patterns)
     if claim_origin is not None:
         _validate_length("origin", claim_origin, MAX_ORIGIN_LENGTH)
 
@@ -631,10 +709,11 @@ async def delete_layer(database_url: str, *, name: str) -> dict:
 
 
 async def get_layer_routing(database_url: str) -> dict:
-    """Return routing patterns and descriptions for all active layers.
+    """Return routing patterns, descriptions and structure patterns for all active layers.
 
     Returns:
-        {"patterns": {layer: [regex, ...]}, "descriptions": {layer: "Display: description"}}
+        {"patterns": {layer: [regex, ...]}, "descriptions": {layer: "Display: description"},
+         "structure": {layer: [regex, ...]}}
     """
     await _maybe_clear(database_url)
     cached = _routing_cache.get("routing")
@@ -644,17 +723,20 @@ async def get_layer_routing(database_url: str) -> dict:
     pool = await get_pool(database_url)
     rows = await pool.fetch(
         """
-        SELECT name, display_name, description, routing_patterns
+        SELECT name, display_name, description, routing_patterns, structure_patterns
         FROM strata_core.knowledge_layers
         WHERE status = 'active'
         ORDER BY name
         """
     )
-    routing: dict = {"patterns": {}, "descriptions": {}}
+    routing: dict = {"patterns": {}, "descriptions": {}, "structure": {}}
     for row in rows:
         patterns = _decode_jsonb(row["routing_patterns"])
         if patterns:
             routing["patterns"][row["name"]] = patterns
+        structure = _decode_jsonb(row["structure_patterns"])
+        if structure:
+            routing["structure"][row["name"]] = structure
         description = row["description"] or ""
         routing["descriptions"][row["name"]] = (
             f"{row['display_name']}: {description}" if description else row["display_name"]
@@ -662,6 +744,19 @@ async def get_layer_routing(database_url: str) -> dict:
 
     _routing_cache["routing"] = routing
     return routing
+
+
+async def get_structure_patterns(database_url: str, layers: list[str] | None) -> list[str]:
+    """The structure patterns of the given active layers (all when None), deduplicated.
+
+    Read from the cached layer routing, so a search does not query for them.
+    """
+    by_layer = (await get_layer_routing(database_url))["structure"]
+    patterns: list[str] = []
+    for name, layer_patterns in by_layer.items():
+        if layers is None or name in layers:
+            patterns.extend(p for p in layer_patterns if p not in patterns)
+    return patterns
 
 
 async def _maybe_clear(database_url: str) -> None:
