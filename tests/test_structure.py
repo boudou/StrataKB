@@ -304,6 +304,12 @@ def test_front_matter_is_not_a_heading():
     assert [s.path for s in sections] == ["Intro"]
 
 
+def test_front_matter_key_with_spaces_is_not_a_heading():
+    t = "---\ntitle: x\ndate created: 2024\n---\n# H\n\nbody\n"
+    assert [s.path for s in detect_sections(t)] == ["H"]
+    assert [s.path for s in detect_sections(t, markdown=True)] == ["H"]
+
+
 def test_underline_right_after_front_matter():
     # The closing '---' is not an overline: the section starts at 'Intro'
     t = "---\ntitle: Foo\n---\nIntro\n-----\n\nText.\n"

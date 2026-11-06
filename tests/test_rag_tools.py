@@ -251,6 +251,71 @@ class TestConfidenceScoring:
         assert similarity_or_zero(-0.2) == -0.2
         assert similarity_or_zero(0.7) == 0.7
 
+    @pytest.mark.parametrize(
+        ("top_score", "basis", "expected"),
+        [
+            (0.6, "similarity", "found"),
+            # Rounded to 4 places, as score_confidence reports it
+            (0.59996, "similarity", "found"),
+            (0.5999, "similarity", "partly_found"),
+            (0.45, "similarity", "partly_found"),
+            (0.4499, "similarity", "not_found"),
+            (0.0, "similarity", "not_found"),
+            (0.8, "rerank", "found"),
+            (0.79, "rerank", "partly_found"),
+            (0.5, "rerank", "partly_found"),
+            (0.49, "rerank", "not_found"),
+            (0.0, "rerank", "not_found"),
+        ],
+    )
+    def test_answer_status(self, top_score, basis, expected):
+        from stratakb.rag.confidence import answer_status
+
+        assert answer_status(top_score, basis) == expected
+
+
+class TestSearchItem:
+    _KEYS = [
+        "chunk_id", "content", "score", "layer", "source_file", "section",
+        "doc_type", "metadata", "similarity",
+    ]
+
+    def test_retrieved_chunk(self):
+        from stratakb.rag.retriever import SearchResult
+        from stratakb.rag.tools import _ask_chunk, _search_item
+
+        r = SearchResult(
+            chunk_id="c1", content="text", score=0.7, layer_name="docs",
+            source_file="a.md", source_section="Intro", doc_type="markdown",
+            metadata={"k": "v"}, similarity=0.6, document_id=3, char_start=0, char_end=4,
+        )
+
+        item = _search_item(_ask_chunk(r, r.score))
+
+        assert list(item) == self._KEYS
+        assert item == {
+            "chunk_id": "c1", "content": "text", "score": 0.7, "layer": "docs",
+            "source_file": "a.md", "section": "Intro", "doc_type": "markdown",
+            "metadata": {"k": "v"}, "similarity": 0.6,
+        }
+
+    def test_exact_chunk_marked_last(self):
+        from stratakb.rag.clause_lookup import _exact_chunk
+        from stratakb.rag.tools import _search_item
+
+        row = {
+            "layer_name": "docs", "source_file": "a.md", "path": "7 > 7.2",
+            "doc_type": "markdown", "document_id": 3, "char_start": 10,
+        }
+
+        item = _search_item(_exact_chunk(row, "7.2 clause text"))
+
+        assert list(item) == [*self._KEYS, "match"]
+        assert item["chunk_id"] is None
+        assert item["similarity"] is None
+        assert item["score"] == 1.0
+        assert item["match"] == "exact"
+
 
 # ==========================================
 # Query rewriter tests
@@ -397,6 +462,17 @@ async def _rewrite_with_reply(provider: str, reply, question: str = "q") -> list
 
 
 class TestOpenAICompatibleRewriter:
+    def test_rewrite_provider_table(self):
+        """Every provider name has one table entry, keyed by its own name."""
+        import typing
+
+        from stratakb.core.egress import RewriteProviderName
+        from stratakb.rag.query_rewriter import REWRITE_PROVIDERS
+
+        assert set(typing.get_args(RewriteProviderName)) == set(REWRITE_PROVIDERS)
+        for name, p in REWRITE_PROVIDERS.items():
+            assert name == p.name
+
     @pytest.mark.asyncio
     async def test_openai_compatible_rewrite(self, no_sdk_env):
         from stratakb.rag.query_rewriter import build_domain_context, rewrite_query

@@ -11,6 +11,8 @@ Tests cover:
 
 from __future__ import annotations
 
+import contextlib
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -701,14 +703,17 @@ class TestVectorSearchIntegration:
         monkeypatch.setattr("stratakb.config.get_settings", lambda: vector_only)
         monkeypatch.setattr("stratakb.rag.retriever._get_cache", lambda: None)
 
+        original = retriever._search_fetch
+
         async def _fetch_without_index(pool, settings, sql, params):
-            # The HNSW index never returns a NULL vector; a sequential scan does
-            timeout = retriever._SEARCH_TIMEOUT
-            async with pool.acquire() as conn, conn.transaction():
-                await conn.execute(f"SET LOCAL hnsw.ef_search = {settings.hnsw_ef_search}")
-                await conn.execute(f"SET LOCAL statement_timeout = '{timeout}s'")
-                await conn.execute("SET LOCAL enable_indexscan = off")
-                return await conn.fetch(sql, *params)
+            async with pool.acquire() as conn:
+                # The HNSW index never returns a NULL vector; a sequential scan does
+                await conn.execute("SET enable_indexscan = off")
+                try:
+                    one_conn = SimpleNamespace(acquire=lambda: contextlib.nullcontext(conn))
+                    return await original(one_conn, settings, sql, params)
+                finally:
+                    await conn.execute("RESET enable_indexscan")
 
         monkeypatch.setattr("stratakb.rag.retriever._search_fetch", _fetch_without_index)
 

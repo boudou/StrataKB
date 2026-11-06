@@ -77,8 +77,8 @@ flowchart LR
     x --> k
 ```
 
-- Milestone 1 comes first because nobody reaches the other features without it. Shipped so far: #3, #4, #6, #7, #37, #38, #40, #48–#62, #70 and `stratakb db up` (#79); left: the umbrella #1 and #2, and the bug follow-ups. #9 and #11 shipped alongside it.
-- Milestone 2 ships `strata_verify` first (#72 → #63 → #23 → #66 → #67): it needs no calibration. #72, #63, #73, #78, #10, #23, #64, #66, #67, #65 and #76 have shipped; #10 put confidence on a meaningful scale with provisional thresholds. Next are the answer contract (#69) and `stratakb receipt` (#77). #8 runs alongside, and extractive answers (#68) follow once #8 calibrates the "not found" threshold. #73–#78 are small slices next to their parents; #78 can start any time, and #77 waits for the `stratakb` command (#70).
+- Milestone 1 comes first because nobody reaches the other features without it. Shipped so far: #3, #4, #6, #7, #37, #38, #40, #48–#62, #70 and `stratakb db up` (#79); left: the umbrella #1 and #2. #9 and #11 shipped alongside it.
+- Milestone 2 ships `strata_verify` first (#72 → #63 → #23 → #66 → #67): it needs no calibration. #72, #63, #73, #78, #10, #23, #64, #66, #67, #65, #76 and `stratakb receipt` (#77) have shipped; #10 put confidence on a meaningful scale with provisional thresholds. Next are PDF and Word structure (#74), clause patterns in presets (#75) and the answer contract (#69). #8 runs alongside, and extractive answers (#68) follow once #8 calibrates the "not found" threshold. #73–#78 are small slices next to their parents; all but #74 and #75 have shipped.
 - #8 also needs an abstention set and verify-rate and faithfulness metrics for milestone 2.
 - #16 comes before #17, because the SDK 2.x line brings the auth support.
 

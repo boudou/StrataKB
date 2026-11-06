@@ -133,7 +133,6 @@ def register_knowledge_tools(
             )
             await write_audit_log(
                 database_url,
-                user_id=user_id,
                 action="create",
                 tool_name="strata_create_knowledge_layer",
                 parameters={"name": name, "display_name": display_name},
@@ -175,12 +174,10 @@ def register_knowledge_tools(
         Args:
             name: The layer name to delete (e.g., "iso20022", "runbooks").
         """
-        user_id, _ = get_current_user()
         try:
             result = await delete_layer(database_url, name=name)
             await write_audit_log(
                 database_url,
-                user_id=user_id,
                 action="delete",
                 tool_name="strata_delete_knowledge_layer",
                 parameters={"name": name},
@@ -242,7 +239,6 @@ def register_knowledge_tools(
         if err := embedding_key_error(_settings, openai_api_key):
             return {"status": "error", "error": err}
 
-        user_id, _ = get_current_user()
         try:
             result = await ingest_documents(
                 database_url,
@@ -253,7 +249,6 @@ def register_knowledge_tools(
             )
             await write_audit_log(
                 database_url,
-                user_id=user_id,
                 action="ingest",
                 tool_name="strata_ingest_documents",
                 parameters={
@@ -378,7 +373,6 @@ def register_knowledge_tools(
         if err := embedding_key_error(_settings, openai_api_key):
             return {"status": "error", "error": err}
 
-        user_id, _ = get_current_user()
         try:
             layer_result = await create_preset_layer(database_url, preset)
             error = layer_result["message"] if layer_result["status"] == "refused" else None
@@ -389,17 +383,16 @@ def register_knowledge_tools(
             return {"status": "error", "error": error}
         ingest_result = await ingest_preset(database_url, openai_api_key, preset, root)
 
+        layer_text = f"Layer '{preset.name}': {layer_result['status']}"
+        if layer_result["changes"]:
+            layer_text += f" ({', '.join(layer_result['changes'])})"
         await write_audit_log(
             database_url,
-            user_id=user_id,
             action="apply_preset",
             tool_name="strata_apply_preset",
             parameters={"preset_path": preset_path, "docs_root": docs_root},
             result_summary=(
-                f"Layer '{preset.name}': {layer_result['status']}"
-                + (f" ({', '.join(layer_result['changes'])})" if layer_result["changes"] else "")
-                + ", "
-                f"ingested {ingest_result['total_docs']} docs, "
+                f"{layer_text}, ingested {ingest_result['total_docs']} docs, "
                 f"{ingest_result['total_chunks']} chunks"
             ),
         )

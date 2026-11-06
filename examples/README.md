@@ -24,6 +24,8 @@ git -C examples/peps/source sparse-checkout set --no-cone /peps/pep-0008.rst /pe
 
 In Git Bash on Windows, put `MSYS_NO_PATHCONV=1` in front of the `sparse-checkout` command; otherwise Git Bash rewrites the `/peps/...` paths and nothing is checked out.
 
+The list of PEPs is kept in `peps/peps.txt`. To change it, edit that file and the `sparse-checkout` commands here, in the main README and in `.github/workflows/ci.yml`; the tests fail while they differ.
+
 **All PEPs:** `git -C examples/peps/source sparse-checkout set peps`. That is about 770 files and 12,000 chunks, which take a while to embed on a CPU.
 
 **Build the layer:**

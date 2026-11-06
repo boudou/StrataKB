@@ -116,25 +116,24 @@ async def test_lifespan_does_not_wait_for_embedding_model(db_ok, local_backend, 
 
 
 async def test_preload_failure_is_logged(db_ok, local_backend, settings, server):
-    done = threading.Event()
+    real = mcp_server._preload_embedding_model_sync
+    finished = threading.Event()
 
-    def failing_load(model_name):
-        done.set()
-        raise OSError("model not cached")
+    def preload(model_name):
+        # Set once the real preload has returned, so its log call has run
+        try:
+            real(model_name)
+        finally:
+            finished.set()
 
-    load = MagicMock(side_effect=failing_load)
+    load = MagicMock(side_effect=OSError("model not cached"))
     with (
+        patch("stratakb.mcp_server._preload_embedding_model_sync", preload),
         patch("stratakb.knowledge.embeddings._get_local_model", load),
         capture_logs() as logs,
     ):
         async with mcp_server._lifespan(server, settings):
-            assert done.wait(5.0)
-            # The thread logs right after the load raises
-            deadline = time.monotonic() + 5.0
-            while time.monotonic() < deadline and not any(
-                e["event"] == "embedding_preload_failed" for e in logs
-            ):
-                time.sleep(0.01)
+            assert await asyncio.to_thread(finished.wait, 5.0)
 
     failed = [e for e in logs if e["event"] == "embedding_preload_failed"]
     assert len(failed) == 1

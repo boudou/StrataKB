@@ -339,9 +339,10 @@ async def create_preset_layer(database_url: str, preset: LayerPreset) -> dict:
             )
             return decision
 
+        status = decision["status"]
         changes = decision["changes"]
         # Already this preset's and up to date: no write (it would bump updated_at)
-        if changes or existing.get("origin") is None:
+        if status != "unchanged":
             settings = _preset_settings(preset)
             try:
                 await update_layer(
@@ -354,7 +355,7 @@ async def create_preset_layer(database_url: str, preset: LayerPreset) -> dict:
                 # Another origin was written after the read above
                 logger.warning("preset_layer_refused", preset=preset.name, origin=e.origin)
                 return _refused(e.origin, preset)
-        if not changes:
+        if status != "would_update":
             return {
                 "status": "exists",
                 "changes": [],

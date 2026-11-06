@@ -55,9 +55,22 @@ def _slug(title: str) -> str:
 def _section(lines: list[str], title: str) -> tuple[int, int]:
     """Start and end line index of a `## ` section."""
     tops = [i for i, line in _headings(lines) if line.startswith("## ")]
-    start = next(i for i in tops if lines[i] == f"## {title}")
+    matches = [i for i in tops if lines[i] == f"## {title}"]
+    assert matches, f"README.md has no '## {title}' section"
+    start = matches[0]
     end = next((i for i in tops if i > start), len(lines))
     return start, end
+
+
+def _mermaid_block(lines: list[str], start: int, end: int) -> list[str] | None:
+    """Lines of the first Mermaid block between start and end, or None."""
+    for i in range(start, end):
+        if lines[i].strip() == "```mermaid":
+            close = next(
+                (j for j in range(i + 1, end) if lines[j].startswith("```")), end
+            )
+            return lines[i + 1 : close]
+    return None
 
 
 def test_quick_start_is_first_section():
@@ -69,6 +82,15 @@ def test_quick_start_is_first_section():
         line[4:] for i, line in _headings(lines) if start < i < end and line.startswith("### ")
     ]
     assert steps == ["1. Install", "2. Add a folder", "3. Connect your client", "4. Ask"]
+
+
+def test_quick_start_has_the_diagram():
+    lines = _lines()
+    start, end = _section(lines, "Quick start")
+    block = _mermaid_block(lines, start, end)
+    assert block is not None, "the Quick start has no Mermaid diagram"
+    nodes = re.findall(r'\w+\["([^"]+)"\]', "\n".join(block))
+    assert nodes == ["Install", "Start the database", "Add a folder", "Connect your client", "Ask"]
 
 
 def test_top_has_no_retrieval_terms():

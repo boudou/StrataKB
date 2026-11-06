@@ -29,25 +29,25 @@ EXTENSIONS = list(FORMATS)
 
 def test_table_matches_previous_values():
     table = {
-        ext: (row.parser, row.doc_type, row.binary, row.scanned_check)
+        ext: (row.parser, row.doc_type, row.binary)
         for ext, row in FORMATS.items()
     }
     assert table == {
-        ".pdf": (parse_pdf, "pdf", True, True),
-        ".docx": (parse_docx, "docx", True, False),
-        ".yaml": (parse_yaml, "yaml", False, False),
-        ".yml": (parse_yaml, "yaml", False, False),
-        ".csv": (parse_csv, "csv", False, False),
-        ".xml": (parse_xml, "xml", False, False),
-        ".xsd": (parse_xml, "xsd", False, False),
-        ".json": (parse_json, "json", False, False),
-        ".md": (parse_markdown, "markdown", False, False),
-        ".markdown": (parse_markdown, "markdown", False, False),
-        ".html": (parse_html, "html", False, False),
-        ".htm": (parse_html, "html", False, False),
-        ".txt": (parse_text, "text", False, False),
-        ".rst": (parse_text, "rst", False, False),
-        ".adoc": (parse_text, "adoc", False, False),
+        ".pdf": (parse_pdf, "pdf", True),
+        ".docx": (parse_docx, "docx", True),
+        ".yaml": (parse_yaml, "yaml", False),
+        ".yml": (parse_yaml, "yaml", False),
+        ".csv": (parse_csv, "csv", False),
+        ".xml": (parse_xml, "xml", False),
+        ".xsd": (parse_xml, "xsd", False),
+        ".json": (parse_json, "json", False),
+        ".md": (parse_markdown, "markdown", False),
+        ".markdown": (parse_markdown, "markdown", False),
+        ".html": (parse_html, "html", False),
+        ".htm": (parse_html, "html", False),
+        ".txt": (parse_text, "text", False),
+        ".rst": (parse_text, "rst", False),
+        ".adoc": (parse_text, "adoc", False),
     }
 
 

@@ -12,22 +12,22 @@ import structlog
 from mcp.server.fastmcp import FastMCP
 
 from stratakb.core.audit import write_audit_log
-from stratakb.core.auth import get_current_user, require_role
+from stratakb.core.auth import require_role
 from stratakb.core.logging import log_tool_call
 from stratakb.learning.pii import scrub_query
 from stratakb.rag.clause_lookup import in_exact_span, without_exact_spans
 from stratakb.rag.clause_lookup import lookup as lookup_clauses
 from stratakb.rag.confidence import answer_status, score_confidence, similarity_or_zero
 from stratakb.rag.passages import (
-    RESPONSE_FORMATS,
+    AskResult,
+    ResponseFormat,
     ask_chunk,
     build_passages,
-    next_step,
     pack_passages,
-    shape_ask_response,
 )
 
 if TYPE_CHECKING:
+    from stratakb.config import Settings
     from stratakb.rag.retriever import SearchResult
 
 logger = structlog.get_logger()
@@ -96,12 +96,7 @@ def _fuse_query_results(
     rank_lists: list[list[tuple[str, int]]] = []
     for results in batch_results:
         rank_lists.append([(r.chunk_id, rank) for rank, r in enumerate(results, start=1)])
-        seen: set[str] = set()
         for r in results:
-            # Like fuse_rrf, only a chunk's first copy in each search counts
-            if r.chunk_id in seen:
-                continue
-            seen.add(r.chunk_id)
             current = best.get(r.chunk_id)
             if current is None or (
                 similarity_or_zero(r.similarity) > similarity_or_zero(current.similarity)
@@ -119,11 +114,15 @@ def _fuse_query_results(
 
 
 class _Collected(NamedTuple):
-    """One strata_ask retrieval: candidates found, chunks kept, their confidence."""
+    """One strata_ask retrieval: candidates found, chunks kept, their confidence.
+
+    basis names the scale the chunks were judged on: similarity or rerank.
+    """
 
     candidate_count: int
     chunks: list[dict[str, Any]]
     confidence: dict[str, Any]
+    basis: str
 
 
 def _ask_chunk(r: SearchResult, score: float) -> dict[str, Any]:
@@ -172,9 +171,12 @@ async def _cited_documents(
 
 
 def _search_item(chunk: dict[str, Any]) -> dict[str, Any]:
-    """An exact clause chunk as a strata_search result, marked exact."""
-    return {
-        "chunk_id": None,
+    """A chunk in the strata_ask shape as a strata_search result.
+
+    An exact clause chunk keeps its "match": "exact" marker, last.
+    """
+    item = {
+        "chunk_id": chunk["chunk_id"],
         "content": chunk["content"],
         "score": chunk["score"],
         "layer": chunk["layer"],
@@ -182,9 +184,11 @@ def _search_item(chunk: dict[str, Any]) -> dict[str, Any]:
         "section": chunk["section"],
         "doc_type": chunk["doc_type"],
         "metadata": chunk["metadata"],
-        "similarity": None,
-        "match": "exact",
+        "similarity": chunk["similarity"],
     }
+    if "match" in chunk:
+        item["match"] = chunk["match"]
+    return item
 
 
 def _basis_score(chunk: dict[str, Any], basis: str) -> float:
@@ -212,19 +216,28 @@ def _search_confidence(results: list[SearchResult]) -> dict[str, Any]:
 
 
 def register_rag_tools(
-    mcp: FastMCP, database_url: str, openai_api_key: str = ""
+    mcp: FastMCP,
+    database_url: str,
+    openai_api_key: str = "",
+    *,
+    settings: Settings | None = None,
 ) -> None:
-    """Register RAG search tools on the MCP server."""
+    """Register RAG search tools on the MCP server.
+
+    `settings` are the server's; without them the tracker uses the
+    environment's settings, read once here.
+    """
 
     # Initialize learning tracker
     _tracker = None
     try:
-        from stratakb.config import get_settings
-        _s = get_settings()
-        if _s.learning_enabled:
+        if settings is None:
+            from stratakb.config import get_settings
+            settings = get_settings()
+        if settings.learning_enabled:
             from stratakb.learning.store import LearningStore
             from stratakb.learning.tracker import Tracker
-            _tracker = Tracker(LearningStore(database_url))
+            _tracker = Tracker(LearningStore(database_url), settings)
     except Exception:
         pass
 
@@ -286,27 +299,15 @@ def register_rag_tools(
                 database_url, query, layers, _settings.answer_token_budget
             )
             found = [
-                {
-                    "chunk_id": r.chunk_id,
-                    "content": r.content,
-                    "score": r.score,
-                    "layer": r.layer_name,
-                    "source_file": r.source_file,
-                    "section": r.source_section,
-                    "doc_type": r.doc_type,
-                    "metadata": r.metadata,
-                    "similarity": r.similarity,
-                }
+                _search_item(_ask_chunk(r, r.score))
                 for r in results
                 if not in_exact_span(r.document_id, r.char_start, r.char_end, exact)
             ]
             items = [_search_item(e) for e in exact] + found
             items = items[: max(top_k, len(exact))]
 
-            user_id, _ = get_current_user()
             await write_audit_log(
                 database_url,
-                user_id=user_id,
                 action="search",
                 tool_name="strata_search",
                 parameters={
@@ -377,8 +378,11 @@ def register_rag_tools(
         layers: list[str] | None,
         include_sources: bool,
         top_k: int,
-    ) -> dict:
-        """Run strata_ask; the tool below documents the arguments."""
+    ) -> AskResult | dict:
+        """Run strata_ask; the tool below documents the arguments.
+
+        An error comes back as {"status": "error", "error": ...}.
+        """
         from stratakb.config import get_settings
         from stratakb.rag.query_rewriter import (
             build_domain_context,
@@ -461,7 +465,7 @@ def register_rag_tools(
                 confidence = score_confidence(
                     [_basis_score(c, basis) for c in chunks], basis=basis
                 )
-                return _Collected(len(candidates), chunks, confidence)
+                return _Collected(len(candidates), chunks, confidence, basis)
 
             collected = await _collect(layers)
             fallback_reason = None
@@ -484,15 +488,15 @@ def register_rag_tools(
                 _settings.answer_token_budget,
             )
             confidence = collected.confidence
-            basis = confidence["basis"]
+            basis = collected.basis
             passages = build_passages(chunks, await _cited_documents(database_url, chunks))
             status = answer_status(
-                score_confidence([_basis_score(c, basis) for c in chunks], basis=basis),
-                len(passages),
+                max((_basis_score(c, basis) for c in chunks), default=0.0), basis
             )
 
-            sources = []
+            sources = None
             if include_sources:
+                sources = []
                 seen_sources = set()
                 for c in chunks:
                     source_key = f"{c['layer']}:{c['source_file']}:{c['section']}"
@@ -503,14 +507,12 @@ def register_rag_tools(
                             "file": c["source_file"],
                             "section": c["section"],
                             "doc_type": c["doc_type"],
-                            "relevance_score": _basis_score(c, confidence["basis"]),
+                            "relevance_score": _basis_score(c, basis),
                         })
 
             # Audit
-            user_id, _ = get_current_user()
             await write_audit_log(
                 database_url,
-                user_id=user_id,
                 action="ask",
                 tool_name="strata_ask",
                 parameters={
@@ -526,31 +528,17 @@ def register_rag_tools(
                 ),
             )
 
-            response: dict = {
-                "status": "ok",
-                "question": question,
-                "queries_used": queries,
-                "confidence": confidence,
-                "retrieved_chunks": chunks,
-                "total_chunks": len(chunks),
-                "answer_status": status,
-                # Extractive answers (the document's own sentences) come later
-                "mode": "grounded",
-                "passages": passages,
-            }
-            if step := next_step(status):
-                response["next_step"] = step
-
-            if include_sources:
-                response["sources"] = sources
-            if detected:
-                response["auto_detected_layers"] = detected
-            if fallback_reason:
-                response["routing_fallback"] = {
-                    "reason": fallback_reason, "searched_layers": "all",
-                }
-
-            return response
+            return AskResult(
+                question=question,
+                queries_used=queries,
+                confidence=confidence,
+                chunks=chunks,
+                passages=passages,
+                status=status,
+                sources=sources,
+                auto_detected_layers=detected,
+                routing_fallback=fallback_reason,
+            )
 
         except Exception as e:
             return {"status": "error", "error": str(e)}
@@ -563,7 +551,7 @@ def register_rag_tools(
         layers: list[str] | None = None,
         include_sources: bool = True,
         top_k: int = 10,
-        response_format: str = "concise",
+        response_format: ResponseFormat = "concise",
     ) -> dict:
         """Ask a question of the knowledge base and get cited passages to answer from.
 
@@ -598,13 +586,11 @@ def register_rag_tools(
             response_format: "concise" (default) or "detailed", which adds scores,
                     confidence, query variants, chunk ids and metadata.
         """
-        if response_format not in RESPONSE_FORMATS:
-            return {
-                "status": "error",
-                "error": f"response_format must be one of {', '.join(RESPONSE_FORMATS)}.",
-            }
         if _tracker:
-            full = await _tracker.track_ask(_ask, question, layers, include_sources, top_k)
+            result = await _tracker.track_ask(_ask, question, layers, include_sources, top_k)
         else:
-            full = await _ask(question, layers, include_sources, top_k)
-        return shape_ask_response(full, response_format)
+            result = await _ask(question, layers, include_sources, top_k)
+        if not isinstance(result, AskResult):
+            # The error dict, returned as it is
+            return result
+        return result.detailed() if response_format == "detailed" else result.concise()

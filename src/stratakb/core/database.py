@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 from datetime import datetime
+from urllib.parse import urlsplit
 
 import asyncpg
 import structlog
@@ -13,8 +14,20 @@ logger = structlog.get_logger()
 
 # One pool per URL: the SQL tools may connect as a separate read-only role
 _pools: dict[str, asyncpg.Pool] = {}
-# One lock per URL, so concurrent first calls share a single creation
+# One lock per URL: concurrent first calls wait their turn, and each re-checks _pools,
+# so only one pool is made per URL (after a failed creation the next caller tries again)
 _locks: dict[str, asyncio.Lock] = {}
+
+
+def url_host_port(database_url: str) -> str:
+    """host:port of a database URL, never its user, password or database name."""
+    try:
+        parts = urlsplit(database_url)
+        host = parts.hostname or "localhost"
+        port = parts.port or 5432
+    except ValueError:
+        return "localhost:5432"
+    return f"{host}:{port}"
 
 
 async def get_pool(database_url: str) -> asyncpg.Pool:

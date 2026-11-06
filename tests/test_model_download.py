@@ -4,6 +4,9 @@ Tests cover:
 - A cached model loads from local files only, with one load
 - A cache miss loads the model again with the network, so it downloads
 - With STRATA_LOCAL_ONLY on, a cache miss fails and never loads online
+- A folder that is missing or holds no model fails with a message naming it
+- The reranker hint names the cross-encoder repository of a bare name
+- With HF_HUB_OFFLINE set, a cache miss fails with a message naming it
 - Importing the embeddings module leaves the Hugging Face offline flags alone
 
 No model is needed: the sentence-transformers classes are patched.
@@ -76,6 +79,7 @@ def test_embedding_model_cache_miss_downloads(embeddings):
     fake = SimpleNamespace(SentenceTransformer=model_cls)
     with (
         patch("stratakb.config.get_settings", return_value=_settings()),
+        patch("huggingface_hub.constants.is_offline_mode", return_value=False),
         patch.dict(sys.modules, {"sentence_transformers": fake}),
     ):
         assert embeddings._get_local_model(_EMBEDDING) is model
@@ -104,6 +108,7 @@ def test_reranker_cache_miss_downloads(reranker):
     fake = SimpleNamespace(CrossEncoder=model_cls)
     with (
         patch("stratakb.config.get_settings", return_value=_settings()),
+        patch("huggingface_hub.constants.is_offline_mode", return_value=False),
         patch.dict(sys.modules, {"sentence_transformers": fake}),
     ):
         assert reranker._get_reranker(_RERANKER) is model
@@ -128,6 +133,95 @@ def test_local_only_cache_miss_never_loads_online(embeddings, reranker, attr):
             reranker._get_reranker(_RERANKER)
     model_cls.assert_called_once()
     assert model_cls.call_args.kwargs == {"local_files_only": True}
+
+
+@pytest.mark.parametrize("folder", [r"C:\no\such\models\mpnet", "/no/such/models/mpnet"])
+@pytest.mark.parametrize("local_only", [False, True])
+def test_missing_folder_names_the_folder(embeddings, folder, local_only):
+    model_cls = _miss_then_load(SimpleNamespace())
+    fake = SimpleNamespace(SentenceTransformer=model_cls)
+    with (
+        patch(
+            "stratakb.config.get_settings",
+            return_value=_settings(strata_local_only=local_only),
+        ),
+        patch.dict(sys.modules, {"sentence_transformers": fake}),
+        pytest.raises(RuntimeError) as raised,
+    ):
+        embeddings._get_local_model(folder)
+    message = str(raised.value)
+    assert folder in message
+    assert "EMBEDDING_MODEL" in message
+    assert "does not exist" in message
+    assert "hf download" not in message
+    model_cls.assert_called_once_with(folder, local_files_only=True)
+
+
+def test_empty_folder_holds_no_model(embeddings, tmp_path):
+    model_cls = _miss_then_load(SimpleNamespace())
+    fake = SimpleNamespace(SentenceTransformer=model_cls)
+    with (
+        patch("stratakb.config.get_settings", return_value=_settings()),
+        patch.dict(sys.modules, {"sentence_transformers": fake}),
+        pytest.raises(RuntimeError, match="holds no embedding model that can be loaded"),
+    ):
+        embeddings._get_local_model(str(tmp_path))
+    model_cls.assert_called_once()
+
+
+@pytest.mark.parametrize(
+    "name, repo",
+    [
+        ("ms-marco-MiniLM-L-6-v2", "cross-encoder/ms-marco-MiniLM-L-6-v2"),
+        (_RERANKER, _RERANKER),
+    ],
+)
+def test_reranker_hint_uses_cross_encoder_repo(reranker, name, repo):
+    model_cls = _miss_then_load(SimpleNamespace())
+    fake = SimpleNamespace(CrossEncoder=model_cls)
+    with (
+        patch("stratakb.config.get_settings", return_value=_settings(strata_local_only=True)),
+        patch.dict(sys.modules, {"sentence_transformers": fake}),
+        pytest.raises(RuntimeError) as raised,
+    ):
+        reranker._get_reranker(name)
+    message = str(raised.value)
+    assert f"`uv run hf download {repo}`" in message
+    assert message.endswith("or set RERANKING_ENABLED=false.")
+    assert "RERANKING_MODEL" in message
+
+
+@pytest.mark.parametrize("attr", ["embedding", "reranker"])
+def test_offline_flag_cache_miss_names_the_variable(embeddings, reranker, attr):
+    model_cls = _miss_then_load(SimpleNamespace())
+    fake = SimpleNamespace(SentenceTransformer=model_cls, CrossEncoder=model_cls)
+    with (
+        patch("stratakb.config.get_settings", return_value=_settings()),
+        patch("huggingface_hub.constants.is_offline_mode", return_value=True),
+        patch.dict(sys.modules, {"sentence_transformers": fake}),
+        pytest.raises(RuntimeError, match="HF_HUB_OFFLINE"),
+    ):
+        if attr == "embedding":
+            embeddings._get_local_model(_EMBEDDING)
+        else:
+            reranker._get_reranker(_RERANKER)
+    model_cls.assert_called_once()
+    assert model_cls.call_args.kwargs == {"local_files_only": True}
+
+
+def test_cached_load_builds_no_message(embeddings, reranker):
+    model_cls = MagicMock(return_value=SimpleNamespace())
+    fake = SimpleNamespace(SentenceTransformer=model_cls, CrossEncoder=model_cls)
+    unexpected = MagicMock(side_effect=AssertionError("message built on success"))
+    with (
+        patch("stratakb.config.get_settings", return_value=_settings()),
+        patch.object(embeddings, "_missing_model_error", unexpected),
+        patch.object(embeddings, "_offline_error", unexpected),
+        patch.dict(sys.modules, {"sentence_transformers": fake}),
+    ):
+        embeddings._get_local_model(_EMBEDDING)
+        reranker._get_reranker(_RERANKER)
+    unexpected.assert_not_called()
 
 
 def test_import_leaves_offline_flags_alone():

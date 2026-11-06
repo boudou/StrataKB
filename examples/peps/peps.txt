@@ -1,0 +1,11 @@
+# The PEPs fetched for the example, one file name per line. The sparse-checkout
+# commands in README.md, examples/README.md and .github/workflows/ci.yml repeat
+# this list; tests/test_example_peps.py fails when one of them differs.
+pep-0008.rst
+pep-0020.rst
+pep-0257.rst
+pep-0484.rst
+pep-0572.rst
+pep-0634.rst
+pep-0695.rst
+pep-0723.rst

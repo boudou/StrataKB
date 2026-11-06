@@ -7,10 +7,25 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Literal
 
 import structlog
 
 logger = structlog.get_logger()
+
+# Below this many extracted characters per page on average, a PDF is probably scanned
+_SCANNED_MIN_CHARS_PER_PAGE = 200
+
+FlagReason = Literal["probably_scanned", "truncated"]
+
+
+@dataclass(frozen=True)
+class ParserFlag:
+    """Why a parsed file is stored but flagged, and how many items a limit left
+    out (None when nothing was counted)."""
+
+    reason: FlagReason
+    count: int | None = None
 
 
 @dataclass
@@ -32,8 +47,26 @@ class ParsedDocument:
     pages: list[ParsedPage] = field(default_factory=list)
     total_pages: int = 0
     error: str | None = None
-    # Rows a row-limited parser (CSV) did not read; 0 for other formats
-    rows_left_out: int = 0
+    # Set by a parser that stored only part of a file or found it probably scanned; None otherwise
+    flag: ParserFlag | None = None
+
+
+def scanned_flag(doc: ParsedDocument) -> ParserFlag | None:
+    """Flag a parsed PDF as probably scanned: under half its pages have text, or
+    under _SCANNED_MIN_CHARS_PER_PAGE characters per page on average.
+
+    parse_pdf keeps only pages with text, so len(doc.pages) counts those and
+    total_pages counts all pages. A document with no text pages is not flagged
+    (ingestion skips it as no_text).
+    """
+    if doc.total_pages <= 0 or not doc.pages:
+        return None
+    if (
+        2 * len(doc.pages) < doc.total_pages
+        or sum(len(p.text) for p in doc.pages) / doc.total_pages < _SCANNED_MIN_CHARS_PER_PAGE
+    ):
+        return ParserFlag("probably_scanned")
+    return None
 
 
 def parse_pdf(file_path: str | Path) -> ParsedDocument:
@@ -79,11 +112,13 @@ def parse_pdf(file_path: str | Path) -> ParsedDocument:
             pages_with_text=len(pages),
         )
 
-        return ParsedDocument(
+        doc = ParsedDocument(
             source_file=source,
             pages=pages,
             total_pages=len(reader.pages),
         )
+        doc.flag = scanned_flag(doc)
+        return doc
 
     except Exception as e:
         logger.error("pdf_parse_error", file=source, error_type=type(e).__name__)

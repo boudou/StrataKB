@@ -9,6 +9,10 @@ cross-encoder's relevance probability ("rerank").
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Literal
+
+# What strata_ask reports about its passages
+AnswerStatus = Literal["found", "partly_found", "not_found"]
 
 
 @dataclass(frozen=True)
@@ -89,16 +93,16 @@ def score_confidence(scores: list[float], *, basis: str) -> dict:
     return result
 
 
-def answer_status(confidence: dict, passage_count: int) -> str:
+def answer_status(top_score: float, basis: str) -> AnswerStatus:
     """found, partly_found or not_found, judged on the best passage's score.
 
-    The best passage clearing the high threshold is found, the medium one
-    partly found; anything below, or no passage at all, is not found.
+    top_score is on the scale named by basis and rounded as score_confidence
+    rounds it. The best passage clearing the high threshold is found, the
+    medium one partly found; anything below is not found. No passage at all
+    has a top score of 0.0, below every threshold.
     """
-    if passage_count == 0:
-        return "not_found"
-    thresholds = _BASIS_THRESHOLDS[confidence["basis"]]
-    top_score = confidence["top_score"]
+    thresholds = _BASIS_THRESHOLDS[basis]
+    top_score = round(top_score, 4)
     if top_score >= thresholds.high_score:
         return "found"
     if top_score >= thresholds.medium_score:

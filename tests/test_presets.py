@@ -26,6 +26,21 @@ def _write_preset(tmp_path: Path, body: str) -> Path:
     return path
 
 
+def _stored_layer(preset, **overrides) -> dict:
+    """A stored layer whose settings match the preset, except for `overrides`."""
+    return {
+        "name": preset.name,
+        "origin": None,
+        "display_name": preset.display_name,
+        "description": preset.description,
+        "metadata_schema": preset.metadata_schema,
+        "chunk_config": preset.chunk_config,
+        "routing_patterns": preset.routing_patterns,
+        "answer_mode": "grounded",
+        **overrides,
+    }
+
+
 class TestLoadPreset:
     @pytest.mark.parametrize("path", [SEPA_PRESET, ISO_PRESET, PEPS_PRESET])
     def test_example_presets_load(self, path):
@@ -286,17 +301,9 @@ class TestCreatePresetLayer:
         from stratakb.knowledge.layers import LayerExistsError
 
         preset = preset or load_preset(SEPA_PRESET)
-        existing = {
-            "name": preset.name,
-            "origin": existing_origin,
-            "display_name": preset.display_name.strip(),
-            "description": preset.description,
-            "metadata_schema": preset.metadata_schema,
-            "chunk_config": preset.chunk_config,
-            "routing_patterns": preset.routing_patterns,
-            "answer_mode": existing_mode,
-            **stored,
-        }
+        existing = _stored_layer(
+            preset, origin=existing_origin, answer_mode=existing_mode, **stored
+        )
         with (
             patch(
                 "stratakb.knowledge.presets.create_layer",
@@ -558,23 +565,11 @@ class TestReapplyPresetIntegration:
 class TestPresetLayerChanges:
     """preset_layer_changes compares stored settings with the preset (no database)."""
 
-    @staticmethod
-    def _stored(preset, **overrides):
-        return {
-            "display_name": preset.display_name,
-            "description": preset.description,
-            "metadata_schema": preset.metadata_schema,
-            "chunk_config": preset.chunk_config,
-            "routing_patterns": preset.routing_patterns,
-            "answer_mode": "grounded",
-            **overrides,
-        }
-
     def test_nothing_changed(self):
         from stratakb.knowledge.presets import preset_layer_changes
 
         preset = load_preset(SEPA_PRESET)
-        assert preset_layer_changes(self._stored(preset), preset) == []
+        assert preset_layer_changes(_stored_layer(preset), preset) == []
 
     @pytest.mark.parametrize("key, stored", [
         ("display_name", "Old name"),
@@ -587,7 +582,7 @@ class TestPresetLayerChanges:
         from stratakb.knowledge.presets import preset_layer_changes
 
         preset = load_preset(SEPA_PRESET)
-        assert preset_layer_changes(self._stored(preset, **{key: stored}), preset) == [key]
+        assert preset_layer_changes(_stored_layer(preset, **{key: stored}), preset) == [key]
 
     def test_display_name_compared_stripped(self, tmp_path):
         from stratakb.knowledge.presets import preset_layer_changes
@@ -599,7 +594,7 @@ class TestPresetLayerChanges:
             "  - {name: docs, path: docs}\n"
         ))
         preset = load_preset(path)
-        stored = self._stored(preset, display_name="Ops Runbooks")
+        stored = _stored_layer(preset, display_name="Ops Runbooks")
         assert preset_layer_changes(stored, preset) == []
 
     def test_answer_mode_none_never_reported(self):
@@ -607,7 +602,7 @@ class TestPresetLayerChanges:
 
         preset = load_preset(SEPA_PRESET)
         assert preset.answer_mode is None
-        stored = self._stored(preset, answer_mode="extractive")
+        stored = _stored_layer(preset, answer_mode="extractive")
         assert preset_layer_changes(stored, preset) == []
         preset.answer_mode = "grounded"
         assert preset_layer_changes(stored, preset) == ["answer_mode"]
@@ -749,15 +744,9 @@ class TestApplyPresetTool:
 
     async def test_dry_run_would_update(self):
         preset = load_preset(SEPA_PRESET)
-        stored = {
-            "origin": "preset:sepa",
-            "display_name": preset.display_name,
-            "description": "Old",
-            "metadata_schema": preset.metadata_schema,
-            "chunk_config": preset.chunk_config,
-            "routing_patterns": ["old"],
-            "answer_mode": "grounded",
-        }
+        stored = _stored_layer(
+            preset, origin="preset:sepa", description="Old", routing_patterns=["old"]
+        )
         result = await self._dry_run(stored)
 
         assert result["status"] == "dry_run_complete"
@@ -765,35 +754,22 @@ class TestApplyPresetTool:
             "status": "would_update", "changes": ["description", "routing_patterns"],
         }
 
-    @staticmethod
-    def _matching(preset, **overrides):
-        return {
-            "origin": None,
-            "display_name": preset.display_name,
-            "description": preset.description,
-            "metadata_schema": preset.metadata_schema,
-            "chunk_config": preset.chunk_config,
-            "routing_patterns": preset.routing_patterns,
-            "answer_mode": "grounded",
-            **overrides,
-        }
-
     async def test_dry_run_would_claim(self):
         # The real run writes the origin of a matching layer that has none
         preset = load_preset(SEPA_PRESET)
-        result = await self._dry_run(self._matching(preset))
+        result = await self._dry_run(_stored_layer(preset))
 
         assert result["layer_check"] == {"status": "would_claim", "changes": []}
 
     async def test_dry_run_unclaimed_would_update(self):
         preset = load_preset(SEPA_PRESET)
-        result = await self._dry_run(self._matching(preset, description="Old"))
+        result = await self._dry_run(_stored_layer(preset, description="Old"))
 
         assert result["layer_check"] == {"status": "would_update", "changes": ["description"]}
 
     async def test_dry_run_own_layer_unchanged(self):
         preset = load_preset(SEPA_PRESET)
-        result = await self._dry_run(self._matching(preset, origin="preset:sepa"))
+        result = await self._dry_run(_stored_layer(preset, origin="preset:sepa"))
 
         assert result["layer_check"] == {"status": "unchanged", "changes": []}
 

@@ -167,68 +167,189 @@ def cmd_stats(args):
 
 # ── export-layer ──────────────────────────────────────────────────────
 
+# The tables a layer export copies, in an order the foreign keys allow, with
+# every column the import writes back. chunks.tsv (generated) and
+# document_sections.id (identity) are left out: the target regenerates them.
+EXPORT_FORMAT = "2"
+EXPORT_TABLES: list[tuple[str, tuple[str, ...]]] = [
+    ("strata_core.knowledge_layers", (
+        "id", "name", "display_name", "description", "metadata_schema", "chunk_config",
+        "routing_patterns", "status", "doc_count", "chunk_count", "last_ingested",
+        "created_at", "updated_at", "origin", "owner", "root_path", "answer_mode")),
+    ("strata_core.ingestion_runs", (
+        "id", "layer_id", "source_path", "status", "docs_processed", "docs_failed",
+        "chunks_created", "error_log", "started_at", "completed_at")),
+    ("strata_core.ingested_files", (
+        "id", "layer_id", "source_root", "relative_path", "content_hash", "size_bytes",
+        "chunk_count", "ingested_at")),
+    ("strata_vectors.documents", (
+        "id", "layer_id", "file_id", "source_root", "relative_path", "version", "text",
+        "sha256", "page_map", "text_origin", "ingested_at")),
+    ("strata_vectors.document_sections", (
+        "document_id", "label", "title", "path", "depth", "char_start", "char_end")),
+    ("strata_vectors.chunks", (
+        "id", "layer_name", "content", "embedding", "metadata", "source_file",
+        "source_section", "doc_type", "version", "created_at", "file_id", "document_id",
+        "char_start", "char_end", "clause_path")),
+]
+
+
+def _sql_str(value: str) -> str:
+    """A SQL string literal."""
+    return "'" + value.replace("'", "''") + "'"
+
+
+def export_queries(layer: str) -> list[str]:
+    """One SELECT per EXPORT_TABLES entry, limited to the layer."""
+    name = _sql_str(layer)
+    layer_id = f"(SELECT id FROM strata_core.knowledge_layers WHERE name = {name})"
+    where = {
+        "strata_core.knowledge_layers": f"name = {name}",
+        "strata_core.ingestion_runs": f"layer_id = {layer_id}",
+        "strata_core.ingested_files": f"layer_id = {layer_id}",
+        "strata_vectors.documents": f"layer_id = {layer_id}",
+        "strata_vectors.document_sections": (
+            f"document_id IN (SELECT id FROM strata_vectors.documents "
+            f"WHERE layer_id = {layer_id})"),
+        "strata_vectors.chunks": f"layer_name = {name}",
+    }
+    return [f"SELECT {', '.join(cols)} FROM {table} WHERE {where[table]}"
+            for table, cols in EXPORT_TABLES]
+
+
+def copy_out_script(queries: list[str]) -> str:
+    """A psql script printing each query as COPY text, each part ended by a line `\\.`.
+
+    All reads share one read-only snapshot, so an ingestion running meanwhile
+    cannot leave chunks whose file or document is missing from the export.
+    """
+    lines = ["BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY;"]
+    for q in queries:
+        lines.append(f"COPY ({q}) TO STDOUT;")
+        lines.append("\\echo '\\\\.'")
+    lines.append("COMMIT;")
+    return "\n".join(lines) + "\n"
+
+
+def split_copy_output(stdout: bytes, n: int) -> list[bytes]:
+    """Split copy_out_script output into its n COPY parts.
+
+    Splits on whole lines equal to `\\.`: COPY text escapes a backslash, so a
+    data line can end with `\\.` but never equal it.
+    """
+    parts: list[bytes] = []
+    current: list[bytes] = []
+    lines = stdout.split(b"\n")
+    tail = lines.pop()
+    for line in lines:
+        if line == b"\\.":
+            parts.append(b"".join(row + b"\n" for row in current))
+            current = []
+        else:
+            current.append(line)
+    if current or tail or len(parts) != n:
+        raise ValueError(f"expected {n} COPY parts, got {len(parts)} and trailing data "
+                         f"{bool(current or tail)}")
+    return parts
+
+
+def build_layer_export(layer: str, chunk_count: str, parts: list[bytes]) -> bytes:
+    """The import script: replaces the layer in one transaction.
+
+    Document ids are numbered per database, so documents are staged and
+    inserted with new ids, and sections and chunks are remapped to them
+    through the documents' natural key. Layer, file and chunk ids are UUIDs
+    and are kept.
+    """
+    (layers_t, layer_cols), (runs_t, run_cols), (files_t, file_cols), \
+        (docs_t, doc_cols), (sections_t, section_cols), (chunks_t, chunk_cols) = EXPORT_TABLES
+    name = _sql_str(layer)
+
+    def cols(names, prefix=""):
+        return ", ".join(prefix + c for c in names)
+
+    doc_data_cols = [c for c in doc_cols if c != "id"]
+    section_select = ", ".join("m.new_id" if c == "document_id" else f"s.{c}"
+                               for c in section_cols)
+    chunk_select = ", ".join("m.new_id" if c == "document_id" else f"c.{c}"
+                             for c in chunk_cols)
+
+    out: list[bytes] = []
+
+    def sql(text: str):
+        out.append(text.encode("utf-8") + b"\n")
+
+    def copy_block(table: str, names, part: bytes):
+        sql(f"COPY {table} ({cols(names)}) FROM stdin;")
+        out.append(part)
+        out.append(b"\\.\n")
+
+    sql("-- StrataKB Layer Export")
+    sql(f"-- Format: {EXPORT_FORMAT}")
+    sql(f"-- Layer: {layer}")
+    sql(f"-- Date: {datetime.now().isoformat()}")
+    sql(f"-- Chunks: {chunk_count}")
+    sql("BEGIN;")
+    # Chunks first: chunks.document_id has no ON DELETE. Deleting the layer
+    # row cascades to its runs, files, documents and their sections.
+    sql(f"DELETE FROM {chunks_t} WHERE layer_name = {name};")
+    sql(f"DELETE FROM {layers_t} WHERE name = {name};")
+    copy_block(layers_t, layer_cols, parts[0])
+    copy_block(runs_t, run_cols, parts[1])
+    copy_block(files_t, file_cols, parts[2])
+    sql(f"CREATE TEMP TABLE _layer_documents ON COMMIT DROP AS "
+        f"SELECT {cols(doc_cols)} FROM {docs_t} WITH NO DATA;")
+    copy_block("_layer_documents", doc_cols, parts[3])
+    sql(f"INSERT INTO {docs_t} ({cols(doc_data_cols)}) "
+        f"SELECT {cols(doc_data_cols)} FROM _layer_documents;")
+    sql(f"CREATE TEMP TABLE _layer_document_ids ON COMMIT DROP AS "
+        f"SELECT o.id AS old_id, d.id AS new_id FROM _layer_documents o "
+        f"JOIN {docs_t} d ON d.layer_id = o.layer_id AND d.source_root = o.source_root "
+        f"AND d.relative_path = o.relative_path AND d.version = o.version;")
+    sql(f"CREATE TEMP TABLE _layer_sections ON COMMIT DROP AS "
+        f"SELECT {cols(section_cols)} FROM {sections_t} WITH NO DATA;")
+    copy_block("_layer_sections", section_cols, parts[4])
+    sql(f"INSERT INTO {sections_t} ({cols(section_cols)}) SELECT {section_select} "
+        f"FROM _layer_sections s JOIN _layer_document_ids m ON m.old_id = s.document_id;")
+    sql(f"CREATE TEMP TABLE _layer_chunks ON COMMIT DROP AS "
+        f"SELECT {cols(chunk_cols)} FROM {chunks_t} WITH NO DATA;")
+    copy_block("_layer_chunks", chunk_cols, parts[5])
+    sql(f"INSERT INTO {chunks_t} ({cols(chunk_cols)}) SELECT {chunk_select} "
+        f"FROM _layer_chunks c LEFT JOIN _layer_document_ids m ON m.old_id = c.document_id;")
+    sql("COMMIT;")
+    return b"".join(out)
+
+
 def cmd_export_layer(args):
-    """Export a single layer (config + chunks) using COPY for speed."""
+    """Export a single layer (config, file tracking, stored text, chunks) using COPY."""
     BACKUP_DIR.mkdir(exist_ok=True)
     layer = args.layer_name
     out = Path(args.output) if args.output else BACKUP_DIR / f"layer_{layer}_{_timestamp()}.sql.gz"
 
     # Verify layer exists and get count
-    r = _psql(f"SELECT chunk_count FROM strata_core.knowledge_layers WHERE name = '{layer}'",
-              args=["-t", "-A"])
+    r = _psql("SELECT chunk_count FROM strata_core.knowledge_layers "
+              f"WHERE name = {_sql_str(layer)}", args=["-t", "-A"])
     count = r.stdout.decode().strip() if r.returncode == 0 else ""
     if not count:
         print(f"Layer '{layer}' not found."); sys.exit(1)
     print(f"Exporting layer '{layer}' ({count} chunks)...")
 
-    # Build export SQL that outputs a self-contained restore script
-    # Uses COPY TO/FROM for maximum speed with binary-safe data
-    export_script = f"""
-\\pset tuples_only on
-\\pset format unaligned
-
--- Header
-\\echo '-- StrataKB Layer Export'
-\\echo '-- Layer: {layer}'
-\\echo '-- Date: {datetime.now().isoformat()}'
-\\echo '-- Chunks: {count}'
-\\echo ''
-\\echo 'BEGIN;'
-\\echo ''
-\\echo '-- Clean existing data for this layer'
-\\echo 'DELETE FROM strata_vectors.chunks WHERE layer_name = ''{layer}'';'
-\\echo 'DELETE FROM strata_core.ingestion_runs WHERE layer_id IN (SELECT id FROM strata_core.knowledge_layers WHERE name = ''{layer}'');'
-\\echo 'DELETE FROM strata_core.knowledge_layers WHERE name = ''{layer}'';'
-\\echo ''
-
--- Layer config as COPY block
-\\echo 'COPY strata_core.knowledge_layers (id, name, display_name, description, metadata_schema, chunk_config, routing_patterns, status, doc_count, chunk_count, last_ingested, created_at, updated_at) FROM stdin;'
-COPY (SELECT id, name, display_name, description, metadata_schema, chunk_config, routing_patterns, status, doc_count, chunk_count, last_ingested, created_at, updated_at FROM strata_core.knowledge_layers WHERE name = '{layer}') TO STDOUT;
-\\echo '\\\\.'
-\\echo ''
-
--- Ingestion runs as COPY block
-\\echo 'COPY strata_core.ingestion_runs (id, layer_id, source_path, status, docs_processed, docs_failed, chunks_created, error_log, started_at, completed_at) FROM stdin;'
-COPY (SELECT ir.id, ir.layer_id, ir.source_path, ir.status, ir.docs_processed, ir.docs_failed, ir.chunks_created, ir.error_log, ir.started_at, ir.completed_at FROM strata_core.ingestion_runs ir JOIN strata_core.knowledge_layers kl ON ir.layer_id = kl.id WHERE kl.name = '{layer}') TO STDOUT;
-\\echo '\\\\.'
-\\echo ''
-
--- Chunks with embeddings as COPY block (this is the big one)
-\\echo 'COPY strata_vectors.chunks (id, layer_name, content, embedding, metadata, source_file, source_section, doc_type, version, created_at) FROM stdin;'
-COPY (SELECT id, layer_name, content, embedding, metadata, source_file, source_section, doc_type, version, created_at FROM strata_vectors.chunks WHERE layer_name = '{layer}') TO STDOUT;
-\\echo '\\\\.'
-\\echo ''
-\\echo 'COMMIT;'
-"""
-
-    r = _psql(stdin=export_script.encode("utf-8"))
+    queries = export_queries(layer)
+    r = _psql(args=["-q", "-X", "-v", "ON_ERROR_STOP=1"],
+              stdin=copy_out_script(queries).encode("utf-8"))
     if r.returncode != 0:
         print(f"Export failed:\n{r.stderr.decode(errors='replace')}", file=sys.stderr)
         sys.exit(1)
+    try:
+        parts = split_copy_output(r.stdout, len(queries))
+    except ValueError as e:
+        print(f"Export failed: {e}", file=sys.stderr)
+        sys.exit(1)
+    data = build_layer_export(layer, count, parts)
 
-    raw = len(r.stdout)
+    raw = len(data)
     with gzip.open(out, "wb", compresslevel=6) as f:
-        f.write(r.stdout)
+        f.write(data)
     compressed = out.stat().st_size
 
     print(f"Done: {out}")
@@ -251,6 +372,17 @@ def cmd_import_layer(args):
         sql = f.read()
     print(f"Importing {len(sql) / 1024 / 1024:.1f} MB...")
 
+    if f"-- Format: {EXPORT_FORMAT}".encode() in sql[:1024].split(b"\n")[:6]:
+        r = _psql(args=["-q", "-X", "-v", "ON_ERROR_STOP=1"], stdin=sql)
+        if r.returncode != 0:
+            print(r.stderr.decode(errors="replace"), file=sys.stderr)
+            print("Import failed: nothing was changed.", file=sys.stderr)
+            sys.exit(1)
+        print("Import complete.")
+        return
+
+    print("This export was made by an older version: it has no file tracking, origin or "
+          "stored text, so the next ingestion rebuilds the layer.")
     r = _psql(args=["-v", "ON_ERROR_STOP=0"], stdin=sql)
     _report_errors(r)
     print("Import complete.")

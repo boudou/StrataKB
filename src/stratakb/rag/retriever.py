@@ -12,11 +12,11 @@ import time
 import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass, field
-from datetime import datetime
 
 import structlog
 
 from stratakb.core.database import fetch_layers_stamp, get_pool
+from stratakb.core.stamp_watcher import StampWatcher
 from stratakb.knowledge.embeddings import embed_texts
 from stratakb.rag.cache import QueryCache
 
@@ -43,32 +43,21 @@ def _get_cache() -> QueryCache | None:
     return None
 
 
-# The layers stamp is read at most this often (seconds) per database URL
-_STAMP_INTERVAL = 2.0
-_stamps: dict[str, tuple[int, datetime | None]] = {}
-_checked_at: dict[str, float] = {}
+_watcher = StampWatcher("query_cache")
+_stamps = _watcher.stamps
+_checked_at = _watcher.checked_at
+
+
+def _clear_cache() -> None:
+    if _cache is not None:
+        _cache.clear()
 
 
 async def _maybe_clear(database_url: str) -> None:
     """Clear the query cache when any process has changed the layers."""
-    now = time.monotonic()
-    last = _checked_at.get(database_url)
-    if last is not None and now - last < _STAMP_INTERVAL:
-        return
-    # Set before the await: concurrent searches skip, a failing DB is retried every 2 s
-    _checked_at[database_url] = now
-    try:
-        stamp = await fetch_layers_stamp(database_url)
-    except Exception as e:
-        logger.warning("query_cache_stamp_failed", error_type=type(e).__name__)
-        return
-    previous = _stamps.get(database_url)
-    _stamps[database_url] = stamp
-    if previous is not None and stamp != previous:
-        cache = _get_cache()
-        if cache:
-            cache.clear()
-        logger.info("query_cache_cleared")
+    await _watcher.check(
+        database_url, _clear_cache, now=time.monotonic(), fetch=fetch_layers_stamp
+    )
 
 
 @dataclass
@@ -148,12 +137,11 @@ async def search_chunks(
             cache.put(query, layers, top_k, results, metadata_filter)
         return results
 
-    # A chunk without an embedding has no cosine distance: leave it out
-    # ($1 = embedding, $2 = top_k)
+    # $1 = embedding, $2 = top_k
     conditions, filter_params = _filter_conditions(layers, metadata_filter, 3)
     params: list[object] = [query_vector, top_k, *filter_params]
 
-    where_clause = "WHERE " + " AND ".join(["embedding IS NOT NULL", *conditions])
+    where_clause = _semantic_where(conditions)
 
     sql = f"""
         SELECT
@@ -219,6 +207,15 @@ def _filter_conditions(
             params.append(value)
             idx += 1
     return conditions, params
+
+
+def _semantic_where(conditions: list[str]) -> str:
+    """WHERE clause for cosine ranking, with the shared filter conditions.
+
+    A chunk without an embedding has no cosine distance, so cosine ranking
+    leaves it out (keyword search still finds it).
+    """
+    return "WHERE " + " AND ".join(["embedding IS NOT NULL", *conditions])
 
 
 def _supports_iterative_scan(extversion: object) -> bool:
@@ -340,28 +337,6 @@ def fuse_rrf(
     return sorted(scores.items(), key=lambda x: x[1], reverse=True)
 
 
-def _fuse_rrf(
-    semantic: list[tuple[str, int]],
-    keyword: list[tuple[str, int]],
-    k: int = 60,
-    sem_weight: float = 0.7,
-    kw_weight: float = 0.3,
-) -> list[tuple[str, float]]:
-    """Reciprocal Rank Fusion of semantic and keyword result ranks.
-
-    Args:
-        semantic: List of (chunk_id, rank) from vector search.
-        keyword: List of (chunk_id, rank) from full-text search.
-        k: RRF constant (default 60).
-        sem_weight: Weight for semantic results.
-        kw_weight: Weight for keyword results.
-
-    Returns:
-        Sorted list of (chunk_id, fused_score) highest first.
-    """
-    return fuse_rrf([semantic, keyword], k=k, weights=[sem_weight, kw_weight])
-
-
 def _reserve_keyword_slots(
     fused: list[tuple[str, float]],
     keyword: list[tuple[str, int]],
@@ -408,8 +383,7 @@ def _build_hybrid_sql(
     params: list = [query_vector, over_retrieve, *filter_params]
     param_idx = 3 + len(filter_params)
 
-    # Only the semantic leg skips chunks without an embedding; keyword search still finds them
-    where = "WHERE " + " AND ".join(["embedding IS NOT NULL", *conditions])
+    where = _semantic_where(conditions)
 
     params.append(query_text)
     if _WEBSEARCH_SYNTAX.search(query_text):
@@ -460,11 +434,10 @@ async def _hybrid_search(
     semantic_ranks = [(str(r["id"]), r["rank"]) for r in rows if r["source"] == "semantic"]
     keyword_ranks = [(str(r["id"]), r["rank"]) for r in rows if r["source"] == "fulltext"]
 
-    fused = _fuse_rrf(
-        semantic_ranks, keyword_ranks,
+    fused = fuse_rrf(
+        [semantic_ranks, keyword_ranks],
         k=settings.hybrid_rrf_k,
-        sem_weight=settings.hybrid_semantic_weight,
-        kw_weight=settings.hybrid_keyword_weight,
+        weights=[settings.hybrid_semantic_weight, settings.hybrid_keyword_weight],
     )
 
     kept = _reserve_keyword_slots(fused, keyword_ranks, top_k, settings.hybrid_keyword_slots)

@@ -5,17 +5,11 @@ The parser tests need no database; TestIngestTextFormats needs it (embeddings mo
 
 from __future__ import annotations
 
-import contextlib
-from pathlib import Path
-from unittest.mock import AsyncMock, patch
-from uuid import uuid4
-
 import pytest
 
 from stratakb.knowledge.parsers.registry import FORMATS, extensions_for
 from stratakb.knowledge.parsers.text_parser import parse_text
-
-FAKE_EMBEDDING = [0.01] * 768
+from tests.helpers import ingest
 
 
 def test_text_with_content(tmp_path):
@@ -111,40 +105,6 @@ def test_chunk_doc_types(tmp_path, name, doc_type):
 # --- Database-backed ingest ---
 
 
-@pytest.fixture
-def db_url():
-    from stratakb.config import get_settings
-    return get_settings().database_url
-
-
-@pytest.fixture
-async def layer(db_url):
-    """A fresh layer with a unique name, deleted afterwards."""
-    from stratakb.knowledge.layers import LayerNotFoundError, create_layer, delete_layer
-
-    name = f"test_text_{uuid4().hex[:10]}"
-    await create_layer(
-        db_url,
-        name=name,
-        display_name="Test Text",
-        chunk_config={"chunk_size": 500, "chunk_overlap": 50},
-    )
-    yield name
-    with contextlib.suppress(LayerNotFoundError):
-        await delete_layer(db_url, name=name)
-
-
-async def _ingest(db_url: str, layer: str, source: Path, **kwargs):
-    """Run ingest_documents with mocked embeddings."""
-    from stratakb.knowledge.ingestion import ingest_documents
-
-    with patch("stratakb.knowledge.ingestion.embed_texts", new_callable=AsyncMock) as mock:
-        mock.side_effect = lambda texts, **_: [FAKE_EMBEDDING for _ in texts]
-        return await ingest_documents(
-            db_url, "fake-key", layer_name=layer, source_path=str(source), **kwargs
-        )
-
-
 class TestIngestTextFormats:
     async def test_ingest_text_formats(self, db_url, layer, tmp_path):
         from stratakb.core.database import get_pool
@@ -154,7 +114,7 @@ class TestIngestTextFormats:
         (tmp_path / "manual.adoc").write_text("= Manual\n\nSome manual text.\n", encoding="utf-8")
         (tmp_path / "blank.txt").write_text("  \n\t\n", encoding="utf-8")
 
-        result = await _ingest(db_url, layer, tmp_path)
+        result = await ingest(db_url, layer, tmp_path)
 
         outcomes = {f.relative_path: (f.outcome, f.reason) for f in result.files}
         assert outcomes["notes.txt"] == ("added", None)

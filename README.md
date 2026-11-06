@@ -83,7 +83,7 @@ The reference below explains how StrataKB works, every tool and every setting; t
 - **Knowledge layers**: create a layer per domain at runtime, each with its own chunking and routing rules; no code changes to add a new domain
 - **Layer presets**: describe a layer and its source folders in one YAML file, then build or rebuild it in one call
 - **Hybrid retrieval**: pgvector HNSW similarity plus PostgreSQL full-text search, fused with Reciprocal Rank Fusion, then reranked by a cross-encoder
-- **Query routing**: when no layers are given, questions are routed to the right layers by each layer's patterns. A routed search that finds fewer results than asked for, or only low-confidence ones, runs again across all layers, and the result says so (`routing_fallback`, with the reason). Layers you name yourself are never broadened
+- **Query routing**: when no layers are given, questions are routed to the right layers by each layer's patterns. A routed search that finds fewer results than asked for, or only low-confidence ones, runs again across all layers, and the result says so (`routing_fallback`, with the reason; in `strata_ask` only with `response_format: "detailed"`). Layers you name yourself are never broadened
 - **Query rewriting** (optional): with an Anthropic API key or any OpenAI-compatible endpoint (including a local Ollama), `strata_ask` expands a question into several searches in the knowledge base's own terminology
 - **Learns from use**: records searches, detects rephrased questions and layer switches, and takes explicit feedback on each result's `interaction_id`. It then learns synonyms, query rewrites that worked (a proven rewrite skips the LLM call) and which layers a question belongs to
 - **Many formats**: PDF, DOCX, Markdown, HTML, plain text, reStructuredText, AsciiDoc, CSV (up to 10,000 rows per file), JSON, XML/XSD and OpenAPI/AsyncAPI YAML, each split along its natural structure
@@ -146,7 +146,7 @@ Every file gets an outcome, and most outcomes a reason. `stratakb add --json` li
 | `removed` | `deleted`, `not_selected`, `secret`, `no_text` |
 | `failed`: keeps its earlier chunks | `read_error` (could not be read), `parse_error` (the parser rejected it), `embed_error` (embedding or storing failed) |
 
-Each stored chunk is the document's own text as its parser extracted it (for Markdown and plain text, the file's characters; for PDF, HTML and other formats, the extracted text): search results quote that text exactly, and a Markdown or HTML section holds its own heading once. Where the chunk sits (`[layer > file > headings]` for Markdown and HTML, `[layer > file > Page N]` otherwise) is added only to the text that is embedded, so semantic search keeps that context; the heading path is also in the chunk's metadata as `section_path`. In Markdown, the front matter (a leading `---` block of `key: value` lines) is never part of the text, `#` lines inside code fences (```` ``` ```` or `~~~`) are not headings, so a shell comment does not split a code block, and headings may be indented up to three spaces or underlined with `===` / `---`. An HTML page's first `<title>` outside an inline `<svg>` is not part of the text: it is the section path of text that sits under no heading (the whole page, when it has no headings), while an SVG's `<title>` stays in the text. Keyword search matches the chunk text, not layer or file names. Chunks stored by earlier versions keep their bracketed prefix until their file is ingested again.
+Each stored chunk is the document's own text as its parser extracted it (for Markdown and plain text, the file's characters; for PDF, HTML and other formats, the extracted text): search results quote that text exactly, and a Markdown or HTML section holds its own heading once. Where the chunk sits (`[layer > file > headings]` for Markdown and HTML, `[layer > file > Page N]` otherwise) is added only to the text that is embedded, so semantic search keeps that context; the heading path is also in the chunk's metadata as `section_path`. In Markdown, the front matter (a leading `---` block of `key: value` lines) is never part of the text, `#` lines inside code fences (```` ``` ```` or `~~~`) are not headings, so a shell comment does not split a code block, and headings may be indented up to three spaces or underlined with `===` / `---`. An HTML page's first `<title>` outside an inline `<svg>` is not part of the text: it is the section path of text that sits under no heading (the whole page, when it has no headings), while an SVG's `<title>` stays in the text (inside a heading it is left out of the heading, as an icon's label). Keyword search matches the chunk text, not layer or file names. Chunks stored by earlier versions keep their bracketed prefix until their file is ingested again.
 
 Each file's extracted text is stored once as a document, and every chunk records where in that text it sits (a character range, from which the page and the line range follow), so a passage can be located and checked against its source. Lines count from the start of the page for PDFs and from the start of the document for other formats. When a file's text changes, the next ingest stores it as a new version; versions that no chunk and no receipt uses any more are removed. Chunks ingested before this was added have no position until their file changes or the layer is rebuilt (`replace_all=True`).
 
@@ -276,7 +276,7 @@ Then ask from your client, for example *"How long should a line of Python be?"*.
 | `strata_search` | viewer | Hybrid search for exact terms and identifiers, with optional layer and metadata filters, and a confidence level; a clause or section the query names (`clause 7.2`) comes first, verbatim |
 | `strata_list_knowledge_layers` | viewer | Lists layers with document and chunk counts |
 | `strata_get_layer_status` | viewer | One layer's configuration and ingestion history |
-| `strata_get_receipt` | viewer | Opens a receipt (`rcpt_…`, also the resource `strata://receipts/{receipt_id}`): the stored quotes of an answer, each in its surrounding document text, flagged when its source changed since. Open to whoever asked and to anyone who may read every cited layer, for `RECEIPT_RETENTION_DAYS` (90 by default). Receipts are issued by `strata_verify`; extractive answers will issue them too ([roadmap](#roadmap)) |
+| `strata_get_receipt` | viewer | Opens a receipt (`rcpt_…`, also the resource `strata://receipts/{receipt_id}`): the stored quotes of an answer, each in its surrounding document text, marked current, changed (with the newer version) or gone (its file was removed from its folder or its layer was deleted). Open to whoever asked, to admins, and to anyone who may read every cited layer, for `RECEIPT_RETENTION_DAYS` (90 by default). From the command line: `stratakb receipt <id>`. Receipts are issued by `strata_verify`; extractive answers will issue them too ([roadmap](#roadmap)) |
 | `strata_feedback` | viewer | Rates a result as helpful or not, per answer or per passage (`S1`) or chunk |
 | `strata_learning_stats` | viewer | What the learning system has recorded and learned |
 | `strata_whoami` | viewer | Your identity and role |
@@ -303,7 +303,7 @@ The `stratakb add` command has no role check: whoever can reach the database wit
 
 `strata_search` and `strata_ask` each write one audit entry with the first 200 characters of the query or question, with IBANs, BICs and account numbers replaced by placeholders (`[IBAN_REDACTED]`, `[BIC_REDACTED]`, `[ACCT_REDACTED]`), plus the layers searched and whether routing fell back. `AUDIT_STORE_RAW_QUERIES=true` keeps the question as written; `LEARNING_STORE_RAW_QUERIES` has no effect on the audit log.
 
-`strata_feedback` and `strata_reset_learning` each write one audit entry. A feedback entry holds the interaction id and the rating, not the suggested query or layer; a reset entry names the layer, or says it reset everything.
+`strata_feedback` and `strata_reset_learning` each write one audit entry. A feedback entry holds the interaction id and the rating, not the suggested query or layer, and names only the extras (layer correction, better query, chunk ratings) that were stored; a reset entry names the layer, or says it reset everything. A reset runs as one transaction: if it fails in the database, nothing is deleted, and the tool returns an error and writes no audit entry. An empty `layer` is refused; omit it for a global reset.
 
 Each `strata_apply_preset` run writes one audit entry with the layer, whether it was created, updated or already up to date, the names of the settings that changed (never their values) and the number of documents and chunks ingested. A refused run writes none.
 
@@ -368,11 +368,20 @@ flowchart LR
 - Both checks run in Python, without a model: nothing leaves the machine. They catch a changed quote, number, date, amount, code or clause, not a paraphrase that changes the meaning without changing a fact. For layers where that is not acceptable, use `answer_mode: extractive` ([roadmap](#roadmap)).
 - Each call writes one audit entry (`verify`) with counts and, when verified, the receipt id; never the draft.
 
+To check an answer outside the chat, open its receipt from the command line:
+
+```bash
+uv run stratakb receipt rcpt_…          # each quote marked >>> <<< in its context, with current, changed or gone
+uv run stratakb receipt rcpt_… --json   # the same data as strata_get_receipt
+```
+
+It makes the same access check as `strata_get_receipt`, with `STRATA_USER` and `STRATA_ROLE` as on stdio, and writes the same audit entry with the tool name `cli:receipt`. An unknown receipt, or one you may not open, exits with code `1` and one line on stderr; an unreachable database exits with `3`. The text form shows control characters from documents, file names, questions and drafts as escapes such as `\x1b`, so a document cannot hide or rewrite what your terminal shows.
+
 ## Configuration
 
 Settings come from four sources, each overriding the one before: the defaults below, the user-level `config.env`, the file named by `STRATAKB_CONFIG`, then environment variables. The user-level file is `%APPDATA%\stratakb\config.env` on Windows, and `$XDG_CONFIG_HOME/stratakb/config.env`, else `~/.config/stratakb/config.env`, elsewhere. Copy `.env.example` there to start.
 
-`./.env` is not read unless you set `STRATAKB_CONFIG=.env`; when the server finds one it does not read, it logs a warning at startup. A `STRATAKB_CONFIG` that names a missing file is logged and skipped. Keys the server does not know, such as `DB_PASSWORD`, are ignored, so one file can serve both. `docker compose` still reads `./.env` itself for its own variables.
+`./.env` is not read unless you set `STRATAKB_CONFIG=.env`; when the server finds one it does not read, it logs a warning at startup. A `STRATAKB_CONFIG` that names a missing file is logged and skipped by the server; `stratakb add` and `stratakb receipt` refuse with exit `2` and say to fix the path or unset it. Keys the server does not know, such as `DB_PASSWORD`, are ignored, so one file can serve both. `docker compose` still reads `./.env` itself for its own variables.
 
 ```mermaid
 flowchart LR
@@ -405,7 +414,7 @@ flowchart LR
 | `RERANKING_MODEL` | `cross-encoder/ms-marco-MiniLM-L-6-v2` | Reranker |
 | `RERANKING_CANDIDATE_MULTIPLIER` | `3` | `strata_ask` reranks `top_k` times this many candidates |
 | `ANSWER_TOKEN_BUDGET` | `1500` | How much text `strata_ask` returns: the best passages that fit this many tokens (about four characters each), citations included; the first passage always comes back |
-| `CACHE_ENABLED`, `CACHE_TTL_SECONDS` | `true`, `600` | Query result cache, cleared per layer on ingestion |
+| `CACHE_ENABLED`, `CACHE_TTL_SECONDS` | `true`, `600` | Query result cache, cleared whole when any server process changes a layer (checked at most every 2 seconds) |
 | `CACHE_MAXSIZE` | `500` | Query results kept in the cache |
 | `LEARNING_ENABLED` | `true` | Record interactions and learn from them |
 | `LEARNING_STORE_RAW_QUERIES` | `false` | Store queries without scrubbing personal data |
@@ -446,11 +455,11 @@ Every layer shares the one vector column, so `vector_store.re_embed_layer()` re-
 
 `stratakb db up` runs the container `stratakb-db` from the image `pgvector/pgvector:pg16`, with its data in the Docker volume `stratakb-data`. It binds to `127.0.0.1` only, connects as the user `strata` with the default password, and brings the schema up to date before it returns. `--port` picks another host port when the container is created; an existing container keeps its port. `stratakb db down` stops the container and keeps the volume. The container starts again with Docker until `stratakb db down` stops it. It creates no `strata_readonly` role, so the SQL tools stay off until `db/03_readonly_role.sql` is applied (see `READONLY_DATABASE_URL`). With no `docker` on `PATH`, or the Docker daemon not running, it exits with code 3 and says which.
 
-Any empty PostgreSQL 16 database with pgvector works as well: `stratakb add` and the server create the schema on first use, as long as the user in `DATABASE_URL` may create the `vector` and `pg_trgm` extensions. Use pgvector 0.8 or later for complete results: older versions still work, but a search can return fewer results than it asks for, and the server logs `hnsw_iterative_scan_unavailable`. After upgrading the image of an existing database, run `ALTER EXTENSION vector UPDATE;`.
+Any empty PostgreSQL 16 database with pgvector works as well: `stratakb add` and the server create the schema on first use, as long as the user in `DATABASE_URL` may create the `vector` and `pg_trgm` extensions. Before it creates anything, it names the database it sets up as `host:port/database` (never the user or password): in the server log (`setting_up_database`) and on stderr in `stratakb add`. It refuses to set up in `postgres` or in a database whose name starts with `template`, which usually means `DATABASE_URL` points at the wrong database: create one for StrataKB (`CREATE DATABASE strata;`) and point `DATABASE_URL` at it. A StrataKB schema already in such a database keeps working. Use pgvector 0.8 or later for complete results: older versions still work, but a search can return fewer results than it asks for, and the server logs `hnsw_iterative_scan_unavailable`. After upgrading the image of an existing database, run `ALTER EXTENSION vector UPDATE;`.
 
 A schema update waits at most 30 seconds for a lock that another process holds (another StrataKB process updating the schema, or a session using a table the update changes), then stops and says which lock it waited on. A user that is neither the database owner nor a superuser can use a schema that is current; when an update is due, they are told which file to apply as the owner (`psql -f`). A user without `USAGE` on the StrataKB schemas is told which privilege is missing.
 
-The server answers its client at once and, with the default `local` backend, loads the embedding model in the background; a search sent before the model is ready waits for it. The first start downloads the embedding model (about 420 MB) and the first `strata_ask` downloads the reranker (about 90 MB), both into your Hugging Face cache. After that, both load from the cache without contacting Hugging Face. With `STRATA_LOCAL_ONLY=true` nothing is downloaded; see [Where your data goes](#where-your-data-goes).
+The server answers its client at once and, with the default `local` backend, loads the embedding model in the background; a search sent before the model is ready waits for it. The first start downloads the embedding model (about 420 MB) and the first `strata_ask` downloads the reranker (about 90 MB), both into your Hugging Face cache. After that, both load from the cache without contacting Hugging Face. With `STRATA_LOCAL_ONLY=true` nothing is downloaded; see [Where your data goes](#where-your-data-goes). A model setting that names a folder (`EMBEDDING_MODEL=C:\models\mpnet`, `RERANKING_MODEL=/opt/models/reranker`) loads from that folder only: a folder that is missing or holds no model fails with a message naming the setting and the folder, and nothing is downloaded. With `HF_HUB_OFFLINE` or `TRANSFORMERS_OFFLINE` set, a model missing from the Hugging Face cache fails with a message naming that variable.
 
 ### Embeddings from a model server
 
@@ -576,7 +585,7 @@ uv run stratakb --help         # the commands and their flags
 
 Without a running database, the integration tests fail with a connection error and the rest pass. `docker compose` and `stratakb db up` both use port 5433, so run one at a time, or pass `--port` to `stratakb db up`. Both containers (`strata-postgres` and `stratakb-db`) start again with Docker unless they were stopped, so on a machine with both on 5433 they race for the port at every Docker start. Stop the one you don't use (`stratakb db down` or `docker compose stop`) and it stays stopped, or give `stratakb db up --port` another port when it creates the container.
 
-`scripts/backup_restore.py` backs up the whole database or exports and imports a single layer, through `docker exec` in the `strata-postgres` container; `DB_CONTAINER=stratakb-db` points it at the `stratakb db up` database. A layer export holds its configuration and chunks but not its file tracking, so the first ingestion after an import rebuilds the layer.
+`scripts/backup_restore.py` backs up the whole database or exports and imports a single layer, through `docker exec` in the `strata-postgres` container; `DB_CONTAINER=stratakb-db` points it at the `stratakb db up` database. A layer export holds its configuration, file tracking, stored document text and chunks, so adding the same folder again after an import finds its files unchanged; receipts are only in a full backup.
 
 ## Roadmap
 

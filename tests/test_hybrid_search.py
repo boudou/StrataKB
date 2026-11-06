@@ -9,7 +9,6 @@ from structlog.testing import capture_logs
 from stratakb.rag.retriever import (
     _build_hybrid_sql,
     _filter_conditions,
-    _fuse_rrf,
     _hybrid_search,
     _reserve_keyword_slots,
     _search_fetch,
@@ -23,7 +22,7 @@ def test_rrf_fusion_combines_scores():
     semantic = [("id1", 1), ("id2", 2), ("id3", 3)]
     keyword = [("id2", 1), ("id4", 2), ("id1", 3)]
 
-    fused = _fuse_rrf(semantic, keyword, k=60, sem_weight=0.7, kw_weight=0.3)
+    fused = fuse_rrf([semantic, keyword], k=60, weights=[0.7, 0.3])
 
     ids = [f[0] for f in fused]
     # id1: sem rank 1 (0.7/61) + kw rank 3 (0.3/63) = highest combined
@@ -37,7 +36,7 @@ def test_rrf_fusion_semantic_only():
     """When keyword returns nothing, semantic results should still work."""
     semantic = [("id1", 1), ("id2", 2)]
     keyword = []
-    fused = _fuse_rrf(semantic, keyword, k=60, sem_weight=0.7, kw_weight=0.3)
+    fused = fuse_rrf([semantic, keyword], k=60, weights=[0.7, 0.3])
     assert len(fused) == 2
     assert fused[0][0] == "id1"
 
@@ -414,15 +413,6 @@ def test_fuse_rrf_counts_repeated_id_once_per_list():
 def test_fuse_rrf_weights_length_mismatch_raises():
     with pytest.raises(ValueError):
         fuse_rrf([[("a", 1)], [("b", 1)]], k=60, weights=[1.0])
-
-
-def test_fuse_rrf_matches_two_leg_wrapper():
-    semantic = [("id1", 1), ("id2", 2), ("id3", 3)]
-    keyword = [("id2", 1), ("id4", 2), ("id1", 3)]
-
-    assert _fuse_rrf(semantic, keyword, k=60, sem_weight=0.7, kw_weight=0.3) == fuse_rrf(
-        [semantic, keyword], k=60, weights=[0.7, 0.3]
-    )
 
 
 def test_fuse_rrf_ties_keep_first_seen_order():

@@ -284,7 +284,21 @@ async def test_presence_true_on_current_schema(db_url):
 async def fresh_url(db_url):
     """URL of a new, empty database next to db_url, dropped afterwards."""
     parts = urlsplit(db_url)
-    name = f"{parts.path.lstrip('/')}_fresh"
+    async for url in _new_database(db_url, f"{parts.path.lstrip('/')}_fresh"):
+        yield url
+
+
+@pytest.fixture
+async def reserved_url(db_url):
+    """URL of a new, empty database named template_<db_url's database>, dropped afterwards."""
+    parts = urlsplit(db_url)
+    async for url in _new_database(db_url, f"template_{parts.path.lstrip('/')}"):
+        yield url
+
+
+async def _new_database(db_url: str, name: str):
+    """Yield the URL of a new, empty database name next to db_url, then drop it."""
+    parts = urlsplit(db_url)
     try:
         await _owner_execute(db_url, f'DROP DATABASE IF EXISTS "{name}" WITH (FORCE)')
         await _owner_execute(db_url, f'CREATE DATABASE "{name}"')
@@ -347,6 +361,77 @@ async def test_builds_an_empty_database(fresh_url):
     with capture_logs() as logs:
         await migrations.ensure_schema(fresh_url)
     assert not [entry for entry in logs if entry["event"] == "applying_migration"]
+
+
+def _target(url: str) -> str:
+    parts = urlsplit(url)
+    return f"{parts.hostname}:{parts.port or 5432}{parts.path}"
+
+
+async def test_setting_up_names_the_database(fresh_url):
+    parts = urlsplit(fresh_url)
+    seen: list[str] = []
+    with capture_logs() as logs:
+        await migrations.ensure_schema(fresh_url, on_setup=seen.append)
+
+    setup = [entry for entry in logs if entry["event"] == "setting_up_database"]
+    assert [entry["target"] for entry in setup] == [_target(fresh_url)]
+    assert seen == [_target(fresh_url)]
+    logged = repr(logs)
+    assert parts.password not in logged
+    assert f"{parts.username}:" not in logged
+    assert f"{parts.username}@" not in logged
+
+    migrations._checked.clear()
+    with capture_logs() as logs:
+        await migrations.ensure_schema(fresh_url, on_setup=seen.append)
+    assert not [entry for entry in logs if entry["event"] == "setting_up_database"]
+    assert len(seen) == 1
+
+
+async def test_refuses_to_set_up_a_template_database(reserved_url):
+    seen: list[str] = []
+    with pytest.raises(migrations.MigrationError) as excinfo:
+        await migrations.ensure_schema(reserved_url, on_setup=seen.append)
+
+    message = str(excinfo.value)
+    assert _target(reserved_url) in message
+    assert "CREATE DATABASE" in message
+    assert urlsplit(reserved_url).password not in message
+    assert seen == []
+    assert reserved_url not in migrations._checked
+    conn = await asyncpg.connect(reserved_url)
+    try:
+        for schema in ("strata_core", "strata_vectors", "strata_learning"):
+            assert await conn.fetchval("SELECT to_regnamespace($1)", schema) is None, schema
+    finally:
+        await conn.close()
+
+
+async def test_updates_an_existing_schema_in_a_reserved_database(reserved_url):
+    await _owner_execute(reserved_url, "CREATE SCHEMA strata_core")
+    with capture_logs() as logs:
+        await migrations.ensure_schema(reserved_url)
+
+    assert await _recorded(reserved_url) == ALL_VERSIONS
+    assert not [entry for entry in logs if entry["event"] == "setting_up_database"]
+
+
+@pytest.mark.parametrize(
+    ("name", "kind"),
+    [
+        ("postgres", "maintenance database"),
+        ("template0", "template database"),
+        ("template1", "template database"),
+        ("template_x", "template database"),
+        ("strata", None),
+        ("postgres2", None),
+        ("my_template", None),
+        ("Postgres", None),
+    ],
+)
+def test_reserved_database_names(name, kind):
+    assert migrations._reserved_database(name) == kind
 
 
 async def test_records_01_and_02_on_an_existing_database(db_url, restore_schema):

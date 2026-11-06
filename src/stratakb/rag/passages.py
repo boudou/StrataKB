@@ -15,12 +15,16 @@ from __future__ import annotations
 import json
 import math
 import re
-from dataclasses import dataclass
-from typing import Any
+from dataclasses import dataclass, field
+from typing import Any, Literal
 
 from stratakb.knowledge.documents import locate
+from stratakb.rag.confidence import AnswerStatus
 
-RESPONSE_FORMATS = ("concise", "detailed")
+ResponseFormat = Literal["concise", "detailed"]
+
+# Extractive answers (the document's own sentences) come later
+MODE = "grounded"
 
 # The most passages an answer returns, and results the learning loop stores
 MAX_PASSAGES = 50
@@ -205,23 +209,63 @@ def next_step(status: str) -> str | None:
     return _NEXT_STEPS.get(status)
 
 
-def shape_ask_response(full: dict[str, Any], response_format: str) -> dict[str, Any]:
-    """The strata_ask response in the requested format.
+@dataclass
+class AskResult:
+    """One strata_ask answer, from which both response formats are built.
 
-    detailed returns everything, scores and chunk metadata included.
-    concise keeps the answer status, the mode, the passages, the next step
-    when there is one, and the interaction_id for strata_feedback. An error
-    is returned as it is.
+    confidence is judged on the retrieved chunks before the budget; status
+    on the passages returned. sources is None when they were not asked for.
+    The learning tracker sets interaction_id.
     """
-    if full.get("status") != "ok" or response_format == "detailed":
-        return full
-    shaped: dict[str, Any] = {
-        "status": full["answer_status"],
-        "mode": full["mode"],
-        "passages": full["passages"],
-    }
-    if "next_step" in full:
-        shaped["next_step"] = full["next_step"]
-    if "interaction_id" in full:
-        shaped["interaction_id"] = full["interaction_id"]
-    return shaped
+
+    question: str
+    queries_used: list[str]
+    confidence: dict[str, Any]
+    chunks: list[dict[str, Any]]
+    passages: list[dict[str, Any]]
+    status: AnswerStatus
+    sources: list[dict[str, Any]] | None = None
+    auto_detected_layers: list[str] = field(default_factory=list)
+    routing_fallback: str | None = None
+    interaction_id: str | None = None
+
+    def concise(self) -> dict[str, Any]:
+        """The answer status, the mode, the passages, the next step when there
+        is one, and the interaction_id for strata_feedback."""
+        response: dict[str, Any] = {
+            "status": self.status,
+            "mode": MODE,
+            "passages": self.passages,
+        }
+        if step := next_step(self.status):
+            response["next_step"] = step
+        if self.interaction_id is not None:
+            response["interaction_id"] = self.interaction_id
+        return response
+
+    def detailed(self) -> dict[str, Any]:
+        """Everything, scores and chunk metadata included."""
+        response: dict[str, Any] = {
+            "status": "ok",
+            "question": self.question,
+            "queries_used": self.queries_used,
+            "confidence": self.confidence,
+            "retrieved_chunks": self.chunks,
+            "total_chunks": len(self.chunks),
+            "answer_status": self.status,
+            "mode": MODE,
+            "passages": self.passages,
+        }
+        if step := next_step(self.status):
+            response["next_step"] = step
+        if self.sources is not None:
+            response["sources"] = self.sources
+        if self.auto_detected_layers:
+            response["auto_detected_layers"] = self.auto_detected_layers
+        if self.routing_fallback:
+            response["routing_fallback"] = {
+                "reason": self.routing_fallback, "searched_layers": "all",
+            }
+        if self.interaction_id is not None:
+            response["interaction_id"] = self.interaction_id
+        return response

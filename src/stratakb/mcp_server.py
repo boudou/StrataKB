@@ -12,14 +12,13 @@ import contextlib
 import functools
 import threading
 from contextlib import asynccontextmanager
-from dataclasses import asdict
 
 import structlog
 from mcp.server.fastmcp import FastMCP
 
 from stratakb.config import Settings, config_file_missing, dotenv_warning, get_settings
 from stratakb.core.audit import query_audit_log, write_audit_log
-from stratakb.core.auth import get_current_user, require_role
+from stratakb.core.auth import require_role
 from stratakb.core.database import check_connection, close_pool, get_pool
 from stratakb.core.egress import enforce_local_only, outbound_providers
 from stratakb.core.local_db import START_HINT
@@ -169,7 +168,9 @@ def build_server(settings: Settings) -> FastMCP:
 
     # Register module tools
     register_knowledge_tools(mcp, settings.database_url, settings.openai_api_key)
-    register_rag_tools(mcp, settings.database_url, settings.openai_api_key)
+    register_rag_tools(
+        mcp, settings.database_url, settings.openai_api_key, settings=settings
+    )
     register_receipt_tools(mcp, settings.database_url)
     register_verify_tools(mcp, settings.database_url)
     register_database_tools(mcp, settings.database_url, settings.readonly_database_url)
@@ -226,7 +227,7 @@ def _register_admin_tools(mcp: FastMCP, settings: Settings) -> None:
 
         # Where data goes (host names and setting names only, never values)
         result["local_only"] = current.strata_local_only
-        result["outbound"] = [asdict(p) for p in outbound_providers(current)]
+        result["outbound"] = [p.report() for p in outbound_providers(current)]
 
         # SQL tools: on only with a safe READONLY_DATABASE_URL role
         result["sql_tools"] = sql_tools_status()
@@ -342,10 +343,8 @@ def _register_admin_tools(mcp: FastMCP, settings: Settings) -> None:
             )
 
             # Audit log
-            admin_id, _ = get_current_user()
             await write_audit_log(
                 settings.database_url,
-                user_id=admin_id,
                 action="update_role",
                 tool_name="strata_admin_update_role",
                 parameters={"target_user": user_external_id, "new_role": new_role},

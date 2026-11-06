@@ -11,7 +11,7 @@ from __future__ import annotations
 import ipaddress
 import os
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 from urllib.parse import urlsplit
 
 import structlog
@@ -26,21 +26,39 @@ _ANTHROPIC_DEFAULT_URL = "https://api.anthropic.com"
 # Satisfies the SDK's construction check; never sent, see keyless_request_options
 PLACEHOLDER_API_KEY = "unused"
 
+# The QUERY_REWRITE_PROVIDER values; each has one entry in
+# stratakb.rag.query_rewriter.REWRITE_PROVIDERS
+RewriteProviderName = Literal["anthropic", "openai_compatible"]
+ProviderKind = Literal[RewriteProviderName, "embeddings"]
+
 
 @dataclass(frozen=True)
 class OutboundProvider:
     """A provider that receives content from this machine."""
 
-    provider: str  # "anthropic", "openai_compatible" or "embeddings"
+    provider: ProviderKind
     purpose: str
     sends: str
     destination: str  # host name only
-    setting: str  # the setting that turns it on, as NAME or NAME=value
+    setting_name: str  # the setting that turns it on, and the one to unset
+    setting_value: str = ""  # shown with the name when the value turns it on
 
     @property
-    def setting_name(self) -> str:
-        """The name of the setting to unset, without its value."""
-        return self.setting.split("=", 1)[0]
+    def setting(self) -> str:
+        """The setting that turns it on, as NAME or NAME=value."""
+        if self.setting_value:
+            return f"{self.setting_name}={self.setting_value}"
+        return self.setting_name
+
+    def report(self) -> dict[str, str]:
+        """Describe the provider for strata_admin_health."""
+        return {
+            "provider": self.provider,
+            "purpose": self.purpose,
+            "sends": self.sends,
+            "destination": self.destination,
+            "setting": self.setting,
+        }
 
 
 def _host(url: str) -> str:
@@ -73,42 +91,9 @@ def _embedding_url(settings: Settings) -> str:
     )
 
 
-def _anthropic_url() -> str:
+def anthropic_url() -> str:
     """The URL query rewriting sends to (the Anthropic SDK reads ANTHROPIC_BASE_URL)."""
     return os.environ.get("ANTHROPIC_BASE_URL") or _ANTHROPIC_DEFAULT_URL
-
-
-def anthropic_provider(
-    settings: Settings, api_key: str | None = None
-) -> OutboundProvider | None:
-    """Return query rewriting as a provider when it would leave this machine, else None.
-
-    Args:
-        settings: The settings to check.
-        api_key: The key the rewrite would use; defaults to ANTHROPIC_API_KEY.
-    """
-    key = settings.anthropic_api_key if api_key is None else api_key
-    url = _anthropic_url()
-    if not key or is_loopback(url):
-        return None
-    return OutboundProvider(
-        provider="anthropic",
-        purpose="query rewriting",
-        sends="questions and layer descriptions",
-        destination=_host(url) or "unknown host",
-        setting="ANTHROPIC_API_KEY",
-    )
-
-
-def rewrite_model_unset(model: str) -> bool:
-    """True when an OpenAI-compatible rewrite has no model of its own.
-
-    The QUERY_REWRITE_MODEL default is an Anthropic model name, which the
-    endpoint would not know, so the rewrite is skipped and sends nothing.
-    """
-    from stratakb.config import Settings
-
-    return model == Settings.model_fields["query_rewrite_model"].default
 
 
 def openai_compatible_client(api_key: str, base_url: str, **options):
@@ -174,32 +159,34 @@ def rewrite_provider(
 ) -> OutboundProvider | None:
     """Return query rewriting as a provider when it would leave this machine, else None.
 
-    Follows QUERY_REWRITE_PROVIDER: "anthropic" sends to the Anthropic API,
-    "openai_compatible" to QUERY_REWRITE_BASE_URL, but only once a model is
-    set (see rewrite_model_unset). Any other value rewrites nothing, so it is
-    not outbound.
+    Follows the QUERY_REWRITE_PROVIDER entry in REWRITE_PROVIDERS
+    (stratakb.rag.query_rewriter): the rewrite is outbound when that entry
+    would ask a model (its skip_reason is None) at a URL that is not
+    loopback. A value with no entry rewrites nothing, so it is not outbound.
 
     Args:
         settings: The settings to check.
         api_key: The Anthropic key the rewrite would use; defaults to ANTHROPIC_API_KEY.
         model: The model the rewrite would use; defaults to QUERY_REWRITE_MODEL.
     """
-    provider = settings.query_rewrite_provider
-    if provider == "anthropic":
-        return anthropic_provider(settings, api_key)
-    if provider != "openai_compatible":
+    # Here, not at the top: query_rewriter imports this module
+    from stratakb.rag.query_rewriter import REWRITE_PROVIDERS
+
+    key = settings.anthropic_api_key if api_key is None else api_key
+    entry = REWRITE_PROVIDERS.get(settings.query_rewrite_provider)
+    if entry is None:
         return None
-    if rewrite_model_unset(model or settings.query_rewrite_model):
+    if entry.skip_reason(settings, key, model or settings.query_rewrite_model) is not None:
         return None
-    url = settings.query_rewrite_base_url
-    if not url or is_loopback(url):
+    url = entry.url(settings)
+    if is_loopback(url):
         return None
     return OutboundProvider(
-        provider="openai_compatible",
+        provider=entry.name,
         purpose="query rewriting",
-        sends="questions and layer descriptions",
+        sends=entry.sends,
         destination=_host(url) or "unknown host",
-        setting="QUERY_REWRITE_BASE_URL",
+        setting_name=entry.setting,
     )
 
 
@@ -219,26 +206,20 @@ def embedding_provider(settings: Settings, backend: str = "") -> OutboundProvide
     url = _embedding_url(settings)
     if is_loopback(url):
         return None
+    by_url = bool(settings.embedding_base_url)
     return OutboundProvider(
         provider="embeddings",
         purpose="embedding",
         sends="documents and questions",
         destination=_host(url) or "unknown host",
-        setting=(
-            "EMBEDDING_BASE_URL"
-            if settings.embedding_base_url
-            else f"EMBEDDING_BACKEND={backend}"
-        ),
+        setting_name="EMBEDDING_BASE_URL" if by_url else "EMBEDDING_BACKEND",
+        setting_value="" if by_url else backend,
     )
 
 
-def outbound_providers(settings: Settings, backend: str = "") -> list[OutboundProvider]:
+def outbound_providers(settings: Settings) -> list[OutboundProvider]:
     """List the providers that would receive content with these settings."""
-    return [
-        p
-        for p in (rewrite_provider(settings), embedding_provider(settings, backend))
-        if p
-    ]
+    return [p for p in (rewrite_provider(settings), embedding_provider(settings)) if p]
 
 
 def refusal_line(p: OutboundProvider) -> str:

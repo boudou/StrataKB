@@ -17,7 +17,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Literal, get_args
 
 import asyncpg
 import structlog
@@ -38,7 +38,7 @@ from stratakb.knowledge.layers import (
     LayerNotFoundError,
     get_layer_status,
 )
-from stratakb.knowledge.parsers.pdf_parser import ParsedDocument
+from stratakb.knowledge.parsers.pdf_parser import FlagReason, ParsedDocument
 from stratakb.knowledge.parsers.registry import FORMATS, Format
 from stratakb.knowledge.policy import is_secret_name
 from stratakb.knowledge.structure import (
@@ -57,9 +57,6 @@ logger = structlog.get_logger()
 
 EMBED_BATCH_SIZE = 100
 
-# A PDF averaging fewer characters per page than this probably holds scanned images
-_SCANNED_MIN_CHARS_PER_PAGE = 200
-
 # The longest error message recorded for one file
 _ERROR_MAX_CHARS = 300
 
@@ -77,7 +74,7 @@ REASONS: dict[str, frozenset[str | None]] = {
     "unchanged": frozenset({None}),
     "removed": frozenset({"deleted", "not_selected", "secret", "no_text"}),
     "skipped": frozenset({"secret", "no_text"}),
-    "flagged": frozenset({"probably_scanned", "truncated"}),
+    "flagged": frozenset(get_args(FlagReason)),
     "failed": frozenset({"read_error", "parse_error", "embed_error"}),
 }
 
@@ -94,16 +91,24 @@ class FileOutcome:
     and counted as added or updated) or failed ("read_error" when it could not
     be read, "parse_error", "embed_error"); None otherwise. REASONS holds the
     allowed pairs; any other pair raises ValueError.
+    count: how many items (rows) the parser's limit left out of a flagged
+    file; None when not counted. A count on any other outcome, or below 1,
+    raises ValueError.
     """
 
     relative_path: str
     outcome: Outcome
     reason: Reason | None = None
+    count: int | None = None
 
     def __post_init__(self) -> None:
         if self.reason not in REASONS.get(self.outcome, frozenset()):
             raise ValueError(
                 f"Not an ingest outcome and reason: {self.outcome!r}, {self.reason!r}"
+            )
+        if self.count is not None and (self.outcome != "flagged" or self.count < 1):
+            raise ValueError(
+                f"Not a count for this outcome: {self.outcome!r}, {self.count!r}"
             )
 
 
@@ -121,7 +126,7 @@ class IngestionResult:
     files_unchanged: int = 0
     files_removed: int = 0
     files_skipped: int = 0  # secret-looking names and files without text, not tracked
-    # PDFs that look scanned and CSVs cut at the row limit; also counted as added or updated
+    # Files their parser flagged; also counted as added or updated
     files_flagged: int = 0
     # True when chunks from before per-file tracking were dropped and the layer rebuilt
     rebuilt_legacy: bool = False
@@ -243,6 +248,26 @@ async def _remove_files(
         )
 
 
+async def tracked_files(
+    database_url: str, layer_id: UUID, source_root: str
+) -> dict[str, asyncpg.Record]:
+    """The tracked files of a layer and root, keyed by relative path.
+
+    Each row holds id, relative_path and content_hash. The caller has
+    already run ensure_schema.
+    """
+    pool = await get_pool(database_url)
+    rows = await pool.fetch(
+        """
+        SELECT id, relative_path, content_hash FROM strata_core.ingested_files
+        WHERE layer_id = $1 AND source_root = $2
+        """,
+        layer_id,
+        source_root,
+    )
+    return {r["relative_path"]: r for r in rows}
+
+
 async def clear_layer(database_url: str, layer_name: str) -> None:
     """Delete every chunk and ingested_files row of a layer, and its unreferenced documents."""
     await ensure_schema(database_url)
@@ -298,9 +323,9 @@ async def ingest_documents(
     A file whose name looks like a secret (see policy.is_secret_name) is
     never read: it is skipped, or removed when it was tracked. A file without
     text (0 bytes, whitespace only, or a parse that yields nothing) is not a
-    failure: it is skipped, or removed when it was tracked. A PDF that looks
-    scanned (see _probably_scanned) is stored for the text it has and flagged;
-    so is a CSV cut at the parser's row limit (stored for the rows read).
+    failure: it is skipped, or removed when it was tracked. A file its parser
+    flags (a PDF that looks scanned, a CSV cut at its row limit) is stored for
+    the text it has and flagged, with the parser's count.
     Every file gets a FileOutcome in result.files.
 
     With files, source_path is the root folder and the list is the full
@@ -416,15 +441,7 @@ async def ingest_documents(
                 result.rebuilt_legacy = True
                 logger.info("legacy_chunks_removed", layer=layer_name, count=legacy_count)
 
-        rows = await pool.fetch(
-            """
-            SELECT id, relative_path, content_hash FROM strata_core.ingested_files
-            WHERE layer_id = $1 AND source_root = $2
-            """,
-            layer_id,
-            source_root,
-        )
-        tracked = {r["relative_path"]: r for r in rows}
+        tracked = await tracked_files(database_url, layer_id, source_root)
 
         # A file list may be empty: it then removes everything tracked
         if files is None and not work and (single_file or not tracked):
@@ -569,14 +586,14 @@ async def ingest_documents(
                 fail(relative_path, file_path, str(e), "embed_error")
                 continue
 
-            flag = _flag_reason(fmt, parsed)
+            flag = parsed.flag
             if previous is None:
                 result.files_added += 1
             else:
                 result.files_updated += 1
             if flag is not None:
                 result.files_flagged += 1
-                outcome = FileOutcome(relative_path, "flagged", flag)
+                outcome = FileOutcome(relative_path, "flagged", flag.reason, flag.count)
             else:
                 outcome = FileOutcome(relative_path, "added" if previous is None else "updated")
             result.files.append(outcome)
@@ -702,19 +719,6 @@ def _parse_file(file_path: Path) -> ParsedDocument:
     return fmt.parser(file_path)
 
 
-def _probably_scanned(doc: ParsedDocument) -> bool:
-    """Whether a parsed document looks scanned: under half its pages have
-    text, or too few characters per page on average. Called only for formats
-    whose FORMATS row sets scanned_check; the PDF parser keeps only pages with
-    text, so len(doc.pages) counts those."""
-    if doc.total_pages <= 0 or not doc.pages:
-        return False
-    return (
-        2 * len(doc.pages) < doc.total_pages
-        or sum(len(p.text) for p in doc.pages) / doc.total_pages < _SCANNED_MIN_CHARS_PER_PAGE
-    )
-
-
 def _matches_tracked(content_hash: str | None, previous) -> bool:
     """Whether a file's hash equals the hash tracked for it (so it is unchanged)."""
     return (
@@ -732,16 +736,6 @@ def _has_no_text(fmt: Format | None, data: bytes) -> bool:
         (fmt is None or not fmt.binary)
         and not data.decode("utf-8-sig", errors="replace").strip()
     )
-
-
-def _flag_reason(fmt: Format | None, parsed: ParsedDocument) -> Reason | None:
-    """Why a stored file is flagged: it looks scanned, or its parser cut rows
-    at a limit; None when it is not flagged."""
-    if fmt is not None and fmt.scanned_check and _probably_scanned(parsed):
-        return "probably_scanned"
-    if parsed.rows_left_out:
-        return "truncated"
-    return None
 
 
 @dataclass(frozen=True)

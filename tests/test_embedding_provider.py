@@ -5,48 +5,31 @@ Tests cover:
 - Request shape: model, dimensions and encoding_format per endpoint
 - Default model resolution for each backend
 - Vectors of the wrong length are refused on both backends
-- strata_search and strata_ingest_documents need no OpenAI key with a base URL
+- strata_search, strata_ingest_documents and strata_apply_preset need no OpenAI key
+  with a base URL
 - is_model_cached needs config.json and the weights, and never downloads
+- The OpenAI path refuses an empty key without a base URL, whatever the backend name
 """
 
 from __future__ import annotations
 
 from pathlib import Path
-from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from stratakb.config import Settings
 from stratakb.core.egress import PLACEHOLDER_API_KEY
+from tests.helpers import fake_openai_client, openai_settings
 
 BASE_URL = "http://127.0.0.1:11434/v1"
-
-
-def _settings(**overrides) -> Settings:
-    values = {
-        "embedding_backend": "openai",
-        "embedding_dimensions": 768,
-        "strata_user": "test",
-        "strata_role": "admin",
-    }
-    values.update(overrides)
-    return Settings(_env_file=None, **values)
-
-
-def _fake_client(n: int = 768) -> MagicMock:
-    client = MagicMock()
-    client.embeddings.create = AsyncMock(
-        return_value=SimpleNamespace(data=[SimpleNamespace(index=0, embedding=[0.1] * n)])
-    )
-    return client
 
 
 async def _embed(settings: Settings, api_key: str = "", n: int = 768):
     """Run embed_texts(["x"]) and return (client_kwargs, create_kwargs, vectors)."""
     from stratakb.knowledge.embeddings import embed_texts
 
-    client = _fake_client(n)
+    client = fake_openai_client(n)
     with (
         patch("stratakb.config.get_settings", return_value=settings),
         patch("openai.AsyncOpenAI", return_value=client) as client_cls,
@@ -59,7 +42,7 @@ class TestCustomEndpoint:
     @pytest.mark.asyncio
     async def test_custom_endpoint_uses_base_url_and_embedding_key(self):
         client_kwargs, create_kwargs, vectors = await _embed(
-            _settings(embedding_base_url=BASE_URL, embedding_model="nomic-embed-text"),
+            openai_settings(embedding_base_url=BASE_URL, embedding_model="nomic-embed-text"),
             api_key="sk-openai",
         )
         import openai
@@ -84,7 +67,7 @@ class TestCustomEndpoint:
         assert len(vectors[0]) == 768
 
         client_kwargs, create_kwargs, _ = await _embed(
-            _settings(
+            openai_settings(
                 embedding_base_url=BASE_URL,
                 embedding_model="nomic-embed-text",
                 embedding_api_key="k",
@@ -97,7 +80,7 @@ class TestCustomEndpoint:
     @pytest.mark.asyncio
     async def test_custom_endpoint_never_receives_openai_key(self):
         client_kwargs, _, _ = await _embed(
-            _settings(
+            openai_settings(
                 embedding_base_url=BASE_URL,
                 embedding_model="nomic-embed-text",
                 openai_api_key="sk-openai",
@@ -108,7 +91,7 @@ class TestCustomEndpoint:
 
     @pytest.mark.asyncio
     async def test_openai_default_model_and_dimensions(self):
-        client_kwargs, create_kwargs, _ = await _embed(_settings(), api_key="sk-openai")
+        client_kwargs, create_kwargs, _ = await _embed(openai_settings(), api_key="sk-openai")
         assert client_kwargs == {"api_key": "sk-openai", "base_url": None}
         assert create_kwargs == {
             "input": ["x"],
@@ -119,7 +102,7 @@ class TestCustomEndpoint:
     @pytest.mark.asyncio
     async def test_text_embedding_3_on_custom_endpoint_gets_dimensions(self):
         _, create_kwargs, _ = await _embed(
-            _settings(embedding_base_url=BASE_URL, embedding_model="text-embedding-3-small")
+            openai_settings(embedding_base_url=BASE_URL, embedding_model="text-embedding-3-small")
         )
         assert create_kwargs["dimensions"] == 768
         assert create_kwargs["encoding_format"] == "float"
@@ -129,10 +112,33 @@ class TestCustomEndpoint:
         from stratakb.knowledge.embeddings import embed_texts
 
         with (
-            patch("stratakb.config.get_settings", return_value=_settings()),
+            patch("stratakb.config.get_settings", return_value=openai_settings()),
             pytest.raises(ValueError, match="API key"),
         ):
             await embed_texts(["x"], api_key="", backend="openai")
+
+    @pytest.mark.asyncio
+    async def test_embed_openai_refuses_empty_key_without_base_url(self):
+        from stratakb.knowledge.embeddings import _embed_openai
+
+        with (
+            patch("openai.AsyncOpenAI") as client_cls,
+            pytest.raises(ValueError, match="API key"),
+        ):
+            await _embed_openai(["x"], "", "m", 768)
+        client_cls.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_misspelt_backend_without_key_is_refused(self):
+        from stratakb.knowledge.embeddings import embed_texts
+
+        with (
+            patch("stratakb.config.get_settings", return_value=openai_settings()),
+            patch("openai.AsyncOpenAI") as client_cls,
+            pytest.raises(ValueError, match="API key"),
+        ):
+            await embed_texts(["x"], api_key="", backend="opnai")
+        client_cls.assert_not_called()
 
 
 class TestDimensionCheck:
@@ -140,7 +146,7 @@ class TestDimensionCheck:
     async def test_dimension_mismatch_refused_openai(self):
         with pytest.raises(ValueError) as exc:
             await _embed(
-                _settings(embedding_base_url=BASE_URL, embedding_model="mxbai-embed-large"),
+                openai_settings(embedding_base_url=BASE_URL, embedding_model="mxbai-embed-large"),
                 n=1024,
             )
         message = str(exc.value)
@@ -155,7 +161,7 @@ class TestDimensionCheck:
         with (
             patch(
                 "stratakb.config.get_settings",
-                return_value=_settings(embedding_backend="local"),
+                return_value=openai_settings(embedding_backend="local"),
             ),
             patch(
                 "stratakb.knowledge.embeddings._embed_local",
@@ -202,7 +208,7 @@ class TestToolKeyChecks:
         with (
             patch(
                 "stratakb.config.get_settings",
-                return_value=_settings(embedding_base_url=BASE_URL, learning_enabled=False),
+                return_value=openai_settings(embedding_base_url=BASE_URL, learning_enabled=False),
             ),
             patch("stratakb.rag.retriever.search_chunks", search),
             patch("stratakb.rag.tools.write_audit_log", AsyncMock()),
@@ -215,7 +221,7 @@ class TestToolKeyChecks:
         with (
             patch(
                 "stratakb.config.get_settings",
-                return_value=_settings(learning_enabled=False),
+                return_value=openai_settings(learning_enabled=False),
             ),
             patch("stratakb.rag.retriever.search_chunks", search),
         ):
@@ -235,7 +241,7 @@ class TestToolKeyChecks:
         with (
             patch(
                 "stratakb.config.get_settings",
-                return_value=_settings(embedding_base_url=BASE_URL),
+                return_value=openai_settings(embedding_base_url=BASE_URL),
             ),
             patch("stratakb.knowledge.ingestion.ingest_documents", ingest),
             patch("stratakb.knowledge.tools.write_audit_log", AsyncMock()),
@@ -244,10 +250,45 @@ class TestToolKeyChecks:
         assert result["status"] == "completed"
         ingest.assert_awaited_once()
 
-        with patch("stratakb.config.get_settings", return_value=_settings()):
+        with patch("stratakb.config.get_settings", return_value=openai_settings()):
             result = await fn(layer_name="docs", source_path="/tmp/docs")
         assert result["status"] == "error"
         assert "API key" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_apply_preset_needs_no_openai_key_with_base_url(self):
+        from stratakb.knowledge.tools import register_knowledge_tools
+
+        fn = _capture_tools(register_knowledge_tools, "postgresql://test", "")[
+            "strata_apply_preset"
+        ]
+        preset = str(Path(__file__).parent.parent / "examples" / "sepa" / "preset.yaml")
+        create = AsyncMock(return_value={"status": "created", "changes": [], "message": ""})
+        ingest = AsyncMock(return_value={"total_docs": 0, "total_chunks": 0})
+        with (
+            patch(
+                "stratakb.config.get_settings",
+                return_value=openai_settings(embedding_base_url=BASE_URL),
+            ),
+            patch("stratakb.knowledge.presets.create_preset_layer", create),
+            patch("stratakb.knowledge.presets.ingest_preset", ingest),
+            patch("stratakb.knowledge.tools.write_audit_log", AsyncMock()),
+        ):
+            result = await fn(preset_path=preset)
+        assert result["status"] == "completed"
+        create.assert_awaited_once()
+
+        create.reset_mock()
+        with (
+            patch("stratakb.config.get_settings", return_value=openai_settings()),
+            patch("stratakb.knowledge.presets.create_preset_layer", create),
+            patch("stratakb.knowledge.presets.ingest_preset", ingest),
+        ):
+            result = await fn(preset_path=preset)
+        assert result["status"] == "error"
+        assert "API key" in result["error"]
+        # The key is checked before anything is written
+        create.assert_not_awaited()
 
 
 # ── is_model_cached ──────────────────────────────────────
@@ -295,6 +336,16 @@ def test_is_model_cached_accepts_a_local_folder(tmp_path):
     from stratakb.knowledge.embeddings import is_model_cached
 
     assert is_model_cached(str(tmp_path)) is True
+
+
+@pytest.mark.parametrize("folder", [r"C:\no\such\folder", "/no/such/folder", "./mpnet"])
+def test_is_model_cached_counts_a_folder_path(folder):
+    from stratakb.knowledge.embeddings import is_model_cached
+
+    lookup = MagicMock(side_effect=AssertionError("a folder path looked up the hub cache"))
+    with patch("huggingface_hub.try_to_load_from_cache", lookup):
+        assert is_model_cached(folder) is True
+    lookup.assert_not_called()
 
 
 def test_is_model_cached_uses_the_default_cache_without_the_variable(monkeypatch):

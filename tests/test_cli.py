@@ -145,13 +145,19 @@ def test_usage_error_exits_2(capsys):
 
 @pytest.mark.parametrize("size", ["inf", "-inf", "nan", "0", "-2"])
 def test_max_file_size_must_be_finite_and_positive(capsys, size):
+    # One argument, so argparse cannot read "-inf" as an option of its own
+    flag = f"--max-file-size={size}"
     plan_mock = AsyncMock()
     with patch.object(add_folder, "plan", plan_mock):
-        assert cli.main(["add", ROOT, "--max-file-size", size]) == 2
-        assert "--max-file-size" in capsys.readouterr().err
+        assert cli.main(["add", ROOT, flag]) == 2
+        err = capsys.readouterr().err
+        assert "--max-file-size" in err
+        assert "finite number above 0" in err
 
-        assert cli.main(["add", ROOT, "--max-file-size", size, "--json"]) == 2
-        data = json.loads(capsys.readouterr().out)
+        assert cli.main(["add", ROOT, flag, "--json"]) == 2
+        captured = capsys.readouterr()
+        assert "finite number above 0" in captured.err
+        data = json.loads(captured.out)
     assert data["reason"] == "usage_error"
     assert data["exit_code"] == 2
     plan_mock.assert_not_called()
@@ -221,6 +227,22 @@ def test_exit_3_when_the_database_is_unreachable(cli_env, capsys):
     ) in captured.err
     assert captured.err.rstrip().endswith("Run stratakb db up to start a local database.")
     assert "secret_pw" not in captured.err
+
+
+@pytest.mark.parametrize("json_flag", [[], ["--json"]])
+def test_add_names_the_database_it_sets_up(cli_env, capsys, json_flag):
+    async def set_up(url, *, on_setup=None):
+        on_setup("db.example:5433/strata")
+
+    cli_env["schema"].side_effect = set_up
+    code, _, _ = _run(["add", ROOT, *json_flag])
+    assert code == 0
+    captured = capsys.readouterr()
+    line = "Setting up StrataKB in the empty database at db.example:5433/strata."
+    assert line in captured.err
+    assert line not in captured.out
+    if json_flag:
+        json.loads(captured.out)
 
 
 def test_unreachable_json_hint_names_db_up(cli_env, capsys):

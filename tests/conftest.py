@@ -3,22 +3,62 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
+from typing import TYPE_CHECKING
+from uuid import uuid4
 
 import asyncpg
 import pytest
 
+if TYPE_CHECKING:
+    from mcp.server.fastmcp import FastMCP
 
-@pytest.fixture(scope="session", autouse=True)
-def _import_settings_readers():
-    """Import the module that binds get_settings at import, with no patch active.
+# Asserts in the shared helpers report like asserts in a test module.
+pytest.register_assert_rewrite("tests.helpers")
 
-    stratakb.learning.tracker does `from stratakb.config import get_settings`.
-    If its first import happened inside a test that patches
-    stratakb.config.get_settings, the patch would stay in it for every later
-    test. Session fixtures are set up before any function fixture, so this
-    import always comes first.
+
+async def call_tool(server: FastMCP, name: str, /, **arguments) -> dict:
+    """Call tool `name` on a built server, through its role and logging decorators."""
+    return await server._tool_manager.get_tool(name).fn(**arguments)
+
+
+@pytest.fixture
+def server():
+    """A StrataKB server built from the environment's settings."""
+    from stratakb.config import get_settings
+    from stratakb.mcp_server import build_server
+
+    return build_server(get_settings())
+
+
+@pytest.fixture
+def db_url():
+    """The test database URL from the environment's settings.
+
+    A module may define its own `db_url` fixture, which overrides this one.
     """
-    import stratakb.learning.tracker  # noqa: F401
+    from stratakb.config import get_settings
+    return get_settings().database_url
+
+
+@pytest.fixture
+async def layer(db_url):
+    """A fresh layer with a unique name and 500/50 chunking, deleted afterwards.
+
+    A module may define its own `layer` fixture, which overrides this one.
+    """
+    from stratakb.knowledge.layers import LayerNotFoundError, create_layer, delete_layer
+
+    name = f"test_layer_{uuid4().hex[:10]}"
+    await create_layer(
+        db_url,
+        name=name,
+        display_name="Test Layer",
+        chunk_config={"chunk_size": 500, "chunk_overlap": 50},
+    )
+    yield name
+    with contextlib.suppress(LayerNotFoundError):
+        await delete_layer(db_url, name=name)
 
 
 @pytest.fixture(scope="session", autouse=True)

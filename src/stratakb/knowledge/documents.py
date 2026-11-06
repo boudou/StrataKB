@@ -179,6 +179,15 @@ async def prune_documents(
 
     Without source_root and relative_paths the whole layer is swept; with
     them, only those files' versions. Pass both or neither.
+
+    Two statements, because a lone DELETE that waits on an uncommitted
+    reference still deletes once it commits: its checks keep the snapshot taken
+    before the wait, and the foreign key's cascade would remove the new
+    reference. So the candidates are locked first, in id order (FOR UPDATE
+    conflicts with the FOR KEY SHARE a reference takes), and the delete checks
+    again with a new snapshot. Nothing can start referencing a locked row in
+    between. The function opens its own transaction (a savepoint inside the
+    caller's), so the locks hold until the outermost one ends.
     """
     if (source_root is None) != (relative_paths is None):
         raise ValueError("Pass both source_root and relative_paths, or neither")
@@ -187,19 +196,33 @@ async def prune_documents(
     if source_root is not None:
         scope = "AND d.source_root = $2 AND d.relative_path = ANY($3::text[])"
         args += [source_root, list(relative_paths)]
-    result = await conn.execute(
-        f"""
-        DELETE FROM strata_vectors.documents d
-        WHERE d.layer_id = $1 {scope}
+    unreferenced = """
           AND NOT EXISTS (
               SELECT 1 FROM strata_vectors.chunks c WHERE c.document_id = d.id
           )
           AND NOT EXISTS (
               SELECT 1 FROM strata_core.receipt_documents r WHERE r.document_id = d.id
           )
-        """,
-        *args,
-    )
+    """
+    async with conn.transaction():
+        rows = await conn.fetch(
+            f"""
+            SELECT d.id FROM strata_vectors.documents d
+            WHERE d.layer_id = $1 {scope} {unreferenced}
+            ORDER BY d.id
+            FOR UPDATE OF d
+            """,
+            *args,
+        )
+        if not rows:
+            return 0
+        result = await conn.execute(
+            f"""
+            DELETE FROM strata_vectors.documents d
+            WHERE d.id = ANY($1::bigint[]) {unreferenced}
+            """,
+            [row["id"] for row in rows],
+        )
     return int(result.split()[-1])
 
 

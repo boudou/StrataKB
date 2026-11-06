@@ -13,12 +13,12 @@ from pathlib import Path
 
 import structlog
 
-from stratakb.knowledge.parsers.pdf_parser import ParsedDocument, ParsedPage
+from stratakb.knowledge.parsers.pdf_parser import ParsedDocument, ParsedPage, ParserFlag
 
 logger = structlog.get_logger()
 
 # Maximum rows to parse (safety limit); rows past it are counted, not read,
-# and ingestion reports the file as flagged ("truncated")
+# and the result is flagged "truncated" with that count
 MAX_ROWS = 10_000
 
 # Common naming columns: the first one with a value is the chunk title
@@ -29,7 +29,7 @@ def parse_csv(file_path: str | Path) -> ParsedDocument:
     """Parse a CSV file into searchable text chunks.
 
     Each row becomes a page, formatted with the column headers as labels.
-    Rows past MAX_ROWS are not read; their count is in rows_left_out.
+    Rows past MAX_ROWS are not read; the result is flagged truncated with their count.
 
     Args:
         file_path: Path to the CSV file.
@@ -99,7 +99,7 @@ def parse_csv(file_path: str | Path) -> ParsedDocument:
         source_file=source,
         pages=pages,
         total_pages=len(pages),
-        rows_left_out=rows_left_out,
+        flag=ParserFlag("truncated", rows_left_out) if rows_left_out else None,
     )
 
 

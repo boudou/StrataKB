@@ -33,7 +33,7 @@ The repository is public, so commits, pull requests and docs follow three rules:
 - No absolute paths into your home folder (`C:\Users\<you>\…`, `/home/<you>/…`, `/Users/<you>/…`). Write paths relative to the repository, or use a placeholder.
 - No personal data or names of private projects.
 
-The `repo-rules` check enforces the first two on every pull request, reading the commit messages, the title and description, and the lines you add. Run it locally before you push:
+The `repo-rules` check enforces the first two, and flags the private terms listed in its `STRATA_PRIVATE_TERMS` secret, on every pull request, reading the commit messages, the title and description, and the lines you add. Run it locally before you push:
 
 ```bash
 python scripts/check_repo_rules.py origin/main
@@ -56,7 +56,7 @@ flowchart LR
 - **e2e:** embeds eight PEPs with the real embedding and reranking models and asks `strata_search` and `strata_ask` about them. Locally: `STRATA_E2E=1 uv run pytest tests/test_e2e_real_model.py` with the PEPs fetched (see `examples/README.md`) and the database up. The first run downloads the models.
 - **lint:** `ruff check` findings on the lines you changed (older findings elsewhere in a file do not fail it; `python scripts/ruff_changed_lines.py origin/main` runs the same check locally), and LF line endings on every file you changed.
 - **dependency-review:** fails when a pull request adds or bumps a dependency with a known high-severity vulnerability.
-- **docs:** renders every Mermaid diagram (`npx @mermaid-js/mermaid-cli -i README.md -o out.md`) and checks relative links and anchors between the repository's files ([lychee](https://lychee.cli.rs/) with `--offline --include-fragments`).
+- **docs:** renders every Mermaid diagram in every Markdown file (locally, per file: `npx @mermaid-js/mermaid-cli -i README.md -o out.md`) and checks relative links and anchors between the repository's files ([lychee](https://lychee.cli.rs/) with `--offline --include-fragments`).
 - **links (weekly):** external links in the repository and the wiki. It only reports.
 
 ## Reporting bugs

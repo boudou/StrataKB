@@ -5,39 +5,14 @@ All tests need the database; embeddings are mocked.
 
 from __future__ import annotations
 
-import contextlib
 import json
 import sys
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
-from uuid import uuid4
 
 import pytest
 
-from tests.test_ingestion_sync import FAKE_EMBEDDING, _ingest, _outcomes, _write
-
-
-@pytest.fixture
-def db_url():
-    from stratakb.config import get_settings
-    return get_settings().database_url
-
-
-@pytest.fixture
-async def layer(db_url):
-    """A fresh layer with a unique name, deleted afterwards."""
-    from stratakb.knowledge.layers import LayerNotFoundError, create_layer, delete_layer
-
-    name = f"test_errors_{uuid4().hex[:10]}"
-    await create_layer(
-        db_url,
-        name=name,
-        display_name="Test Errors",
-        chunk_config={"chunk_size": 500, "chunk_overlap": 50},
-    )
-    yield name
-    with contextlib.suppress(LayerNotFoundError):
-        await delete_layer(db_url, name=name)
+from tests.helpers import FAKE_EMBEDDING, file_outcomes, ingest, write_file
 
 
 def _denied_read_bytes(name: str):
@@ -56,8 +31,8 @@ def _denied_read_bytes(name: str):
 async def test_tool_reports_read_error(layer, tmp_path):
     from stratakb.mcp_server import mcp
 
-    _write(tmp_path / "locked.md", "# Locked\n\nLocked content.\n")
-    _write(tmp_path / "a.md", "# Alpha\n\nAlpha content.\n")
+    write_file(tmp_path / "locked.md", "# Locked\n\nLocked content.\n")
+    write_file(tmp_path / "a.md", "# Alpha\n\nAlpha content.\n")
     with (
         patch("stratakb.core.auth.get_current_user", return_value=("tester", "admin")),
         patch("stratakb.knowledge.tools.get_current_user", return_value=("tester", "admin")),
@@ -98,10 +73,10 @@ async def _last_error_log(db_url: str, layer: str) -> list:
 
 class TestErrorsWithoutAbsolutePaths:
     async def test_read_error_names_the_relative_path(self, db_url, layer, tmp_path):
-        _write(tmp_path / "sub" / "locked.md", "# Locked\n\nLocked content.\n")
+        write_file(tmp_path / "sub" / "locked.md", "# Locked\n\nLocked content.\n")
 
         with patch.object(Path, "read_bytes", _denied_read_bytes("locked.md")):
-            result, _ = await _ingest(db_url, layer, tmp_path)
+            result = await ingest(db_url, layer, tmp_path)
 
         expected = [{
             "file": "sub/locked.md",
@@ -114,7 +89,7 @@ class TestErrorsWithoutAbsolutePaths:
     async def test_parse_error_names_the_relative_path(self, db_url, layer, tmp_path):
         from stratakb.knowledge.parsers.pdf_parser import ParsedDocument
 
-        _write(tmp_path / "bad.md", "# Bad\n\nBad content.\n")
+        write_file(tmp_path / "bad.md", "# Bad\n\nBad content.\n")
         root = tmp_path.resolve()
 
         def failing_parse(file_path):
@@ -124,7 +99,7 @@ class TestErrorsWithoutAbsolutePaths:
             )
 
         with patch("stratakb.knowledge.ingestion._parse_file", side_effect=failing_parse):
-            result, _ = await _ingest(db_url, layer, tmp_path)
+            result = await ingest(db_url, layer, tmp_path)
 
         assert result.errors == [
             {"file": "bad.md", "error": "Not readable: bad.md (under .)", "reason": "parse_error"}
@@ -134,14 +109,14 @@ class TestErrorsWithoutAbsolutePaths:
     async def test_long_error_is_cut(self, db_url, layer, tmp_path):
         from stratakb.knowledge.ingestion import _ERROR_MAX_CHARS
 
-        _write(tmp_path / "a.md", "# Alpha\n\nAlpha content.\n")
+        write_file(tmp_path / "a.md", "# Alpha\n\nAlpha content.\n")
 
         with patch(
             "stratakb.knowledge.ingestion._store_file",
             new_callable=AsyncMock,
             side_effect=RuntimeError("x" * 1000),
         ):
-            result, _ = await _ingest(db_url, layer, tmp_path)
+            result = await ingest(db_url, layer, tmp_path)
 
         error = result.errors[0]["error"]
         assert len(error) == _ERROR_MAX_CHARS
@@ -155,8 +130,8 @@ class TestErrorsWithoutAbsolutePaths:
         from stratakb.knowledge import ingestion
 
         marker = "distinctive-7f3a-exception-text"
-        _write(tmp_path / "a.md", "# Alpha\n\nAlpha content.\n")
-        _write(tmp_path / "b.md", "# Beta\n\nBeta content.\n")
+        write_file(tmp_path / "a.md", "# Alpha\n\nAlpha content.\n")
+        write_file(tmp_path / "b.md", "# Beta\n\nBeta content.\n")
         original_store = ingestion._store_file
 
         async def failing_store(*args, **kwargs):
@@ -178,7 +153,7 @@ class TestErrorsWithoutAbsolutePaths:
                 db_url, "fake-key", layer_name=layer, source_path=str(tmp_path)
             )
 
-        assert _outcomes(result) == {
+        assert file_outcomes(result) == {
             "a.md": ("failed", "embed_error"), "b.md": ("failed", "embed_error"),
         }
         failed = [e for e in logs if e["event"] == "file_ingestion_failed"]
@@ -232,14 +207,14 @@ class TestLogsWithoutExceptionText:
         from structlog.testing import capture_logs
 
         from stratakb.knowledge.embeddings import embed_texts
-        from tests.test_embedding_provider import _fake_client, _settings
+        from tests.helpers import fake_openai_client, openai_settings
 
         marker = "distinctive-91c2-provider-text"
-        client = _fake_client()
+        client = fake_openai_client()
         client.embeddings.create = AsyncMock(side_effect=RuntimeError(marker))
         with (
             capture_logs() as logs,
-            patch("stratakb.config.get_settings", return_value=_settings()),
+            patch("stratakb.config.get_settings", return_value=openai_settings()),
             patch("openai.AsyncOpenAI", return_value=client),
             pytest.raises(RuntimeError),
         ):

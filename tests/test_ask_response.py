@@ -13,10 +13,12 @@ from unittest.mock import AsyncMock, patch
 from uuid import uuid4
 
 import pytest
+from mcp.server.fastmcp.exceptions import ToolError
 
 from stratakb.rag.passages import (
     MAX_PASSAGES,
     RESPONSE_SLACK_TOKENS,
+    AskResult,
     ChunkRef,
     DocumentRef,
     build_passages,
@@ -72,7 +74,6 @@ def server(settings):
 
     with (
         patch("stratakb.config.get_settings", return_value=settings),
-        patch("stratakb.learning.tracker.get_settings", return_value=settings),
         patch("stratakb.rag.tools.write_audit_log", AsyncMock()),
         patch("stratakb.learning.tools.write_audit_log", AsyncMock()),
         patch(
@@ -251,6 +252,80 @@ class TestRefAndCitation:
         }
 
 
+def _answer(**fields) -> AskResult:
+    defaults = {
+        "question": "q",
+        "queries_used": ["q"],
+        "confidence": {"level": "high", "top_score": 0.9, "basis": "similarity"},
+        "chunks": [{"chunk_id": "c1"}],
+        "passages": [{"id": "S1"}],
+        "status": "found",
+    }
+    return AskResult(**{**defaults, **fields})
+
+
+class TestAskResultShapes:
+    def test_detailed_key_order(self):
+        answer = _answer(
+            status="partly_found",
+            sources=[{"file": "a.md"}],
+            auto_detected_layers=["sepa"],
+            routing_fallback="low_confidence",
+            interaction_id="int-1",
+        )
+
+        response = answer.detailed()
+
+        assert list(response) == [
+            "status", "question", "queries_used", "confidence", "retrieved_chunks",
+            "total_chunks", "answer_status", "mode", "passages", "next_step",
+            "sources", "auto_detected_layers", "routing_fallback", "interaction_id",
+        ]
+        assert response["status"] == "ok"
+        assert response["answer_status"] == "partly_found"
+        assert response["mode"] == "grounded"
+        assert response["total_chunks"] == 1
+        assert response["routing_fallback"] == {
+            "reason": "low_confidence", "searched_layers": "all",
+        }
+
+    def test_detailed_leaves_out_what_is_unset(self):
+        response = _answer().detailed()
+
+        assert list(response) == [
+            "status", "question", "queries_used", "confidence", "retrieved_chunks",
+            "total_chunks", "answer_status", "mode", "passages",
+        ]
+
+    def test_no_sources_asked_differs_from_none_found(self):
+        assert "sources" not in _answer(sources=None).detailed()
+        assert _answer(sources=[]).detailed()["sources"] == []
+
+    def test_concise_keys(self):
+        assert list(_answer().concise()) == ["status", "mode", "passages"]
+        assert list(_answer(status="not_found", interaction_id="int-1").concise()) == [
+            "status", "mode", "passages", "next_step", "interaction_id",
+        ]
+        assert _answer(status="not_found").concise()["status"] == "not_found"
+
+    @pytest.mark.parametrize(
+        ("status", "has_step"),
+        [("found", False), ("partly_found", True), ("not_found", True)],
+    )
+    def test_next_step_only_when_not_fully_found(self, status, has_step):
+        answer = _answer(status=status)
+
+        assert ("next_step" in answer.concise()) is has_step
+        assert ("next_step" in answer.detailed()) is has_step
+
+    def test_interaction_id_in_both_shapes(self):
+        answer = _answer()
+        answer.interaction_id = "int-7"
+
+        assert answer.concise()["interaction_id"] == "int-7"
+        assert answer.detailed()["interaction_id"] == "int-7"
+
+
 class TestAskResponse:
     async def test_concise_shape(self, server, settings, document):
         layer, document_id = document
@@ -342,10 +417,15 @@ class TestAskResponse:
         await _delete_interaction(settings.database_url, response["interaction_id"])
 
     async def test_unknown_response_format_refused(self, server):
-        response = await _ask(server, [], layers=["docs"], response_format="full")
+        with pytest.raises(ToolError, match="concise"):
+            await _ask(server, [], layers=["docs"], response_format="full")
 
-        assert response["status"] == "error"
-        assert "concise" in response["error"]
+    async def test_response_format_listed_as_enum(self, server):
+        tools = {t.name: t for t in await server.list_tools()}
+
+        prop = tools["strata_ask"].inputSchema["properties"]["response_format"]
+        assert prop["enum"] == ["concise", "detailed"]
+        assert prop["default"] == "concise"
 
     async def test_tracker_sees_chunks(self, server, settings):
         settings.answer_token_budget = 250

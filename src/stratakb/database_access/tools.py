@@ -15,7 +15,7 @@ from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.exceptions import ToolError
 
 from stratakb.core.audit import write_audit_log
-from stratakb.core.auth import get_current_user, require_role
+from stratakb.core.auth import require_role
 from stratakb.core.logging import log_tool_call
 
 logger = structlog.get_logger()
@@ -312,6 +312,7 @@ def register_database_tools(mcp: FastMCP, database_url: str, query_database_url:
         for the strata_vectors.chunks table.
         """
         from stratakb.core.database import get_pool
+        from stratakb.knowledge.vector_store import _vector_column_size
 
         pool = await get_pool(database_url)
 
@@ -346,10 +347,7 @@ def register_database_tools(mcp: FastMCP, database_url: str, query_database_url:
             total = await pool.fetchval("SELECT count(*) FROM strata_vectors.chunks")
 
             # Embedding dimensions
-            dim = await pool.fetchval(
-                "SELECT atttypmod FROM pg_attribute "
-                "WHERE attrelid = 'strata_vectors.chunks'::regclass AND attname = 'embedding'"
-            )
+            dim = await _vector_column_size(pool)
 
             # Indexes
             indexes = await pool.fetch(
@@ -499,10 +497,8 @@ def _register_sql_tools(mcp: FastMCP, database_url: str, query_database_url: str
             truncated = len(rows) > _MAX_ROWS
 
             # Audit log
-            user_id, _ = get_current_user()
             await write_audit_log(
                 database_url,
-                user_id=user_id,
                 action="query",
                 tool_name="strata_db_query",
                 parameters={"sql": sql[:500]},

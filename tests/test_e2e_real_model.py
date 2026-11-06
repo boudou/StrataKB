@@ -1,6 +1,6 @@
 """End-to-end search and ask with the real embedding and reranking models.
 
-Nothing is patched: the eight example PEPs are embedded with the configured
+Nothing is patched: the example PEPs are embedded with the configured
 local model, and strata_search and strata_ask run through the MCP tools. The
 models are large, so these tests run only with STRATA_E2E=1 (the CI e2e job
 sets it), the PEPs fetched (see examples/README.md) and the database up.
@@ -16,7 +16,7 @@ from uuid import uuid4
 
 import pytest
 
-from tests.test_example_peps import CLONE_HINT, EIGHT_PEPS, PEPS_PRESET, PEPS_SOURCE
+from tests.test_example_peps import CLONE_HINT, EXAMPLE_PEPS, PEPS_PRESET, PEPS_SOURCE
 
 pytestmark = pytest.mark.skipif(
     os.environ.get("STRATA_E2E") != "1",
@@ -40,8 +40,8 @@ def _payload(result) -> dict:
 
 @pytest.fixture
 async def peps_layer(tmp_path):
-    """A layer holding the eight PEPs, embedded for real; deleted afterwards."""
-    if not all((PEPS_SOURCE / name).is_file() for name in EIGHT_PEPS):
+    """A layer holding the example PEPs, embedded for real; deleted afterwards."""
+    if not all((PEPS_SOURCE / name).is_file() for name in EXAMPLE_PEPS):
         pytest.skip(CLONE_HINT)
 
     from stratakb.config import get_settings
@@ -51,7 +51,7 @@ async def peps_layer(tmp_path):
     db_url = get_settings().database_url
     docs = tmp_path / "source" / "peps"
     docs.mkdir(parents=True)
-    for name in EIGHT_PEPS:
+    for name in EXAMPLE_PEPS:
         shutil.copy2(PEPS_SOURCE / name, docs / name)
 
     preset = load_preset(PEPS_PRESET)
@@ -60,7 +60,7 @@ async def peps_layer(tmp_path):
         created = await create_preset_layer(db_url, preset)
         assert created["status"] == "created"
         result = await ingest_preset(db_url, "", preset, tmp_path)
-        assert result["total_docs"] == 8
+        assert result["total_docs"] == len(EXAMPLE_PEPS)
         assert result["total_errors"] == 0
         yield preset.name
     finally:

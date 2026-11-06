@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import io
 import logging
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 import structlog
@@ -132,6 +132,38 @@ class TestConfigureLogging:
         configure_logging("INVALID")
         log = structlog.get_logger()
         assert log is not None
+
+
+class TestMainLogging:
+    def test_main_configures_logging_before_building_the_server(self, capsys, monkeypatch):
+        """main() configures logging before the first registration logs.
+
+        So the first log line goes to stderr and nothing reaches stdout.
+        """
+        from mcp.server.fastmcp import FastMCP
+
+        from stratakb import mcp_server
+        from stratakb.config import Settings
+
+        saved = structlog.get_config()
+        # Start unconfigured: earlier tests leave structlog writing to stderr
+        structlog.reset_defaults()
+        monkeypatch.setattr(FastMCP, "run", MagicMock())
+        try:
+            mcp_server.main(
+                Settings(
+                    _env_file=None,
+                    readonly_database_url="",
+                    strata_local_only=False,
+                    log_level="INFO",
+                )
+            )
+        finally:
+            structlog.configure(**saved)
+
+        captured = capsys.readouterr()
+        assert "sql_tools_disabled" in captured.err
+        assert "sql_tools_disabled" not in captured.out
 
 
 # ==========================================
