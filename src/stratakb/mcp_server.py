@@ -169,7 +169,9 @@ def build_server(settings: Settings) -> FastMCP:
 
     # Register module tools
     register_knowledge_tools(mcp, settings.database_url, settings.openai_api_key)
-    register_rag_tools(mcp, settings.database_url, settings.openai_api_key)
+    register_rag_tools(
+        mcp, settings.database_url, settings.openai_api_key, settings=settings
+    )
     register_receipt_tools(mcp, settings.database_url)
     register_verify_tools(mcp, settings.database_url)
     register_database_tools(mcp, settings.database_url, settings.readonly_database_url)

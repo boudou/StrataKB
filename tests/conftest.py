@@ -9,19 +9,6 @@ import pytest
 
 
 @pytest.fixture(scope="session", autouse=True)
-def _import_settings_readers():
-    """Import the module that binds get_settings at import, with no patch active.
-
-    stratakb.learning.tracker does `from stratakb.config import get_settings`.
-    If its first import happened inside a test that patches
-    stratakb.config.get_settings, the patch would stay in it for every later
-    test. Session fixtures are set up before any function fixture, so this
-    import always comes first.
-    """
-    import stratakb.learning.tracker  # noqa: F401
-
-
-@pytest.fixture(scope="session", autouse=True)
 def _migrate_test_db():
     """Bring the test database up to the current schema once per session.
 

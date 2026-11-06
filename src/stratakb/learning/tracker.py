@@ -12,7 +12,7 @@ from dataclasses import dataclass
 
 import structlog
 
-from stratakb.config import get_settings
+from stratakb.config import Settings
 from stratakb.learning.pii import scrub_query
 from stratakb.learning.signals import detect_reformulation, detect_layer_switch, detect_follow_up
 from stratakb.learning.store import LearningStore
@@ -35,11 +35,11 @@ _SEARCH = _TrackedTool("strata_search", "results")
 
 
 class Tracker:
-    """Wraps RAG tool calls with interaction recording."""
+    """Wraps RAG tool calls with interaction recording, using the settings it was given."""
 
-    def __init__(self, store: LearningStore):
+    def __init__(self, store: LearningStore, settings: Settings):
         self.store = store
-        self._settings = get_settings()
+        self._settings = settings
         self._interaction_count = 0
 
     async def track_ask(

@@ -28,6 +28,7 @@ from stratakb.rag.passages import (
 )
 
 if TYPE_CHECKING:
+    from stratakb.config import Settings
     from stratakb.rag.retriever import SearchResult
 
 logger = structlog.get_logger()
@@ -212,19 +213,28 @@ def _search_confidence(results: list[SearchResult]) -> dict[str, Any]:
 
 
 def register_rag_tools(
-    mcp: FastMCP, database_url: str, openai_api_key: str = ""
+    mcp: FastMCP,
+    database_url: str,
+    openai_api_key: str = "",
+    *,
+    settings: Settings | None = None,
 ) -> None:
-    """Register RAG search tools on the MCP server."""
+    """Register RAG search tools on the MCP server.
+
+    `settings` are the server's; without them the tracker uses the
+    environment's settings, read once here.
+    """
 
     # Initialize learning tracker
     _tracker = None
     try:
-        from stratakb.config import get_settings
-        _s = get_settings()
-        if _s.learning_enabled:
+        if settings is None:
+            from stratakb.config import get_settings
+            settings = get_settings()
+        if settings.learning_enabled:
             from stratakb.learning.store import LearningStore
             from stratakb.learning.tracker import Tracker
-            _tracker = Tracker(LearningStore(database_url))
+            _tracker = Tracker(LearningStore(database_url), settings)
     except Exception:
         pass
 

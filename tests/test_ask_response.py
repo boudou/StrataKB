@@ -72,7 +72,6 @@ def server(settings):
 
     with (
         patch("stratakb.config.get_settings", return_value=settings),
-        patch("stratakb.learning.tracker.get_settings", return_value=settings),
         patch("stratakb.rag.tools.write_audit_log", AsyncMock()),
         patch("stratakb.learning.tools.write_audit_log", AsyncMock()),
         patch(

@@ -8,7 +8,7 @@ Questions carry a unique tag so tests don't see each other's data.
 from __future__ import annotations
 
 import uuid
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -47,8 +47,7 @@ def _tracker(store):
         learning_session_timeout_minutes=30,
         learning_promote_every_n_queries=1000,
     )
-    with patch("stratakb.learning.tracker.get_settings", return_value=settings):
-        return Tracker(store)
+    return Tracker(store, settings)
 
 
 def _ask_returning(queries, level, layers=None):
