@@ -193,12 +193,6 @@ class TestQueryError:
 
 
 @pytest.fixture
-def db_url():
-    from stratakb.config import get_settings
-    return get_settings().database_url
-
-
-@pytest.fixture
 def query_db_url():
     from stratakb.config import get_settings
     settings = get_settings()

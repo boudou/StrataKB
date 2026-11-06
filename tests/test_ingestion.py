@@ -163,12 +163,6 @@ class TestEmbeddings:
 # ==========================================
 
 
-@pytest.fixture
-def db_url():
-    from stratakb.config import get_settings
-    return get_settings().database_url
-
-
 class TestVectorStore:
     @pytest.mark.asyncio
     async def test_insert_and_delete_chunks(self, db_url):

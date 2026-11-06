@@ -55,12 +55,6 @@ def test_clone_hint_has_the_git_bash_note():
     assert "MSYS_NO_PATHCONV=1" in CLONE_HINT
 
 
-@pytest.fixture
-def db_url():
-    from stratakb.config import get_settings
-    return get_settings().database_url
-
-
 def test_checkout_dry_run_parses_everything():
     if not PEPS_SOURCE.is_dir():
         pytest.skip(CLONE_HINT)

@@ -530,18 +530,9 @@ RUNBOOKS_YAML = (
 class TestReapplyPresetIntegration:
     """Applying a preset again brings its layer up to the YAML (require database)."""
 
-    @pytest.fixture
-    async def db_url(self):
-        import contextlib
-
-        from stratakb.config import get_settings
-        from stratakb.knowledge.layers import LayerNotFoundError, delete_layer
-
-        db_url = get_settings().database_url
-        yield db_url
-        for name in ("test_preset_reapply", "test_preset_manual", "test_preset_race"):
-            with contextlib.suppress(LayerNotFoundError):
-                await delete_layer(db_url, name=name)
+    @pytest.fixture(autouse=True)
+    def _delete_named_layers(self, cleanup):
+        cleanup.extend(("test_preset_reapply", "test_preset_manual", "test_preset_race"))
 
     async def test_reapply_updates_stored_settings(self, db_url, tmp_path):
         import contextlib

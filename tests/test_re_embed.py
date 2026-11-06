@@ -25,12 +25,6 @@ LAYERS = ("test_re_embed_a", "test_re_embed_b")
 LATE = "test_re_embed_late"
 
 
-@pytest.fixture
-def db_url():
-    from stratakb.config import get_settings
-    return get_settings().database_url
-
-
 def _fake_embed(value: float):
     """An embed_texts stub that returns vectors of `value` at the requested size."""
     return lambda texts, **kw: [[value] * kw["dimensions"] for _ in texts]

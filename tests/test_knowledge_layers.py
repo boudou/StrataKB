@@ -120,13 +120,6 @@ class TestToolRegistration:
 # ==========================================
 
 
-@pytest.fixture
-def db_url():
-    """Database URL from settings."""
-    from stratakb.config import get_settings
-    return get_settings().database_url
-
-
 class TestLayerCRUDIntegration:
     """Integration tests that require a running PostgreSQL database.
 
@@ -886,12 +879,12 @@ class TestUpdateLayer:
         with pytest.raises(LayerNotFoundError):
             await get_layer(db_url, name="test_get_layer_missing")
 
-    async def test_set_description_rejects_non_string(self, db_url):
+    async def test_set_description_rejects_non_string(self):
         from stratakb.knowledge.layers import set_description
 
         for value in (None, 5):
             with pytest.raises(LayerValidationError, match="description"):
-                await set_description(db_url, "test_any_layer", value)
+                await set_description("postgresql://unused", "test_any_layer", value)
 
 
 class TestWriteColumns:

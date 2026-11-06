@@ -33,12 +33,6 @@ ALL_VERSIONS = {m.version for m in migrations.MIGRATIONS}
 
 
 @pytest.fixture
-def db_url():
-    from stratakb.config import get_settings
-    return get_settings().database_url
-
-
-@pytest.fixture
 def readonly_url(db_url):
     """READONLY_DATABASE_URL, only when it points at the same database as db_url."""
     from stratakb.config import get_settings

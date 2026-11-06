@@ -11,6 +11,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock, MagicMock, patch
+from uuid import uuid4
 
 if TYPE_CHECKING:
     from mcp.server.fastmcp import FastMCP
@@ -117,11 +118,37 @@ async def call_health(settings: Settings) -> dict:
         return await call_tool(build_server(settings), "strata_admin_health")
 
 
-def write_file(path: Path, text: str) -> Path:
+def write_file(path: Path, text: str = "# Doc\n\nSome text about the topic.\n") -> Path:
     """Write text to path, creating its parent folders; return path."""
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(text, encoding="utf-8")
     return path
+
+
+def docs_folder(tmp_path: Path) -> Path:
+    """A docs folder under tmp_path: three documents, a code file and a secret file."""
+    root = tmp_path / "docs"
+    write_file(root / "README.md", "# Team Docs\n\nHow the team works.\n")
+    write_file(
+        root / "guide" / "setup.md",
+        "# Setup\n\n## 1. Install\n\nRun the installer.\n\n## 2. Configure\n\nSet it up.\n",
+    )
+    write_file(root / "notes.md", "# Notes\n\nMeeting notes.\n")
+    write_file(root / "tool.py", "print('code')\n")
+    write_file(root / "client_secret.json", '{"key": "x"}\n')
+    return root
+
+
+def unique_layer_name() -> str:
+    return f"test_folder_{uuid4().hex[:10]}"
+
+
+def folder_settings(user: str | None = None, *, key: str = "fake-key") -> SimpleNamespace:
+    """The settings add_folder reads; no user means STRATA_USER was not set."""
+    fields = {"strata_user"} if user is not None else set()
+    return SimpleNamespace(
+        strata_user=user or "developer", model_fields_set=fields, openai_api_key=key
+    )
 
 
 def fake_embed(texts, **_) -> list[list[float]]:

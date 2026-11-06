@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import os
+from unittest.mock import patch
 from urllib.parse import urlsplit, urlunsplit
 from uuid import uuid4
 
@@ -41,12 +43,39 @@ def server():
 
 @pytest.fixture
 def db_url():
-    """The test database URL from the environment's settings.
-
-    A module may define its own `db_url` fixture, which overrides this one.
-    """
+    """The test database URL from the environment's settings."""
     from stratakb.config import get_settings
     return get_settings().database_url
+
+
+@pytest.fixture
+def folder_db_url(db_url):
+    """db_url, for a test that adds a tmp_path folder.
+
+    tmp_path can sit under a system folder (%LOCALAPPDATA%): treat it as normal.
+    """
+    with patch("stratakb.knowledge.add_folder.broad_reason", return_value=None):
+        yield db_url
+
+
+@pytest.fixture
+async def cleanup(db_url):
+    """Layer names to delete after the test."""
+    from stratakb.knowledge.layers import LayerNotFoundError, delete_layer
+
+    names: list[str] = []
+    yield names
+    for name in names:
+        with contextlib.suppress(LayerNotFoundError):
+            await delete_layer(db_url, name=name)
+
+
+@pytest.fixture
+def isolated_git(monkeypatch, tmp_path):
+    """Keep the machine's git config and any repository above tmp_path out of the tests."""
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", os.devnull)
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path.parent))
 
 
 @pytest.fixture

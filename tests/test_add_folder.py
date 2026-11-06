@@ -8,9 +8,7 @@ from __future__ import annotations
 
 import contextlib
 import json
-import os
 from pathlib import Path
-from types import SimpleNamespace
 from typing import NamedTuple
 from unittest.mock import AsyncMock, patch
 from uuid import uuid4
@@ -28,35 +26,16 @@ from stratakb.knowledge.add_folder import (
     resolve_owner,
     slugify,
 )
-from tests.helpers import FAKE_EMBEDDING, ingest
+from tests.helpers import (
+    docs_folder,
+    fake_embed,
+    folder_settings,
+    ingest,
+    unique_layer_name,
+    write_file,
+)
 
-
-@pytest.fixture(autouse=True)
-def isolated_git(monkeypatch, tmp_path):
-    """Keep the machine's git config and any repository above tmp_path out of the tests."""
-    monkeypatch.setenv("GIT_CONFIG_GLOBAL", os.devnull)
-    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
-    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path.parent))
-
-
-@pytest.fixture
-def not_broad():
-    """tmp_path can sit under a system folder (%LOCALAPPDATA%): treat it as normal."""
-    with patch("stratakb.knowledge.add_folder.broad_reason", return_value=None):
-        yield
-
-
-def _write(path: Path, text: str = "# Doc\n\nSome text about the topic.\n") -> Path:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(text, encoding="utf-8")
-    return path
-
-
-def _settings(user: str | None = None, *, key: str = "fake-key") -> SimpleNamespace:
-    fields = {"strata_user"} if user is not None else set()
-    return SimpleNamespace(
-        strata_user=user or "developer", model_fields_set=fields, openai_api_key=key
-    )
+pytestmark = pytest.mark.usefixtures("isolated_git")
 
 
 # --- slugify ---------------------------------------------------------------
@@ -143,7 +122,7 @@ def test_broad_normal_folder(monkeypatch, fake_home):
 
 
 def test_description_skips_badges(tmp_path):
-    _write(
+    write_file(
         tmp_path / "README.md",
         "# My Project\n\n[![CI](https://x/badge.svg)](https://x)\n\n"
         "A tool for [teams](https://example.com) that\nship docs.\n",
@@ -158,7 +137,7 @@ def test_description_without_readme(tmp_path):
 
 
 def test_description_cut_at_300(tmp_path):
-    _write(tmp_path / "readme.md", "# Title\n\n" + "word " * 80 + "\n")
+    write_file(tmp_path / "readme.md", "# Title\n\n" + "word " * 80 + "\n")
     description = derive_description(str(tmp_path))
     assert len(description) <= 300
     assert description.endswith("…")
@@ -167,7 +146,7 @@ def test_description_cut_at_300(tmp_path):
 
 
 def test_description_html_block_then_title(tmp_path):
-    _write(
+    write_file(
         tmp_path / "README.md",
         '<div align="center">\n\n# StrataKB\n\n**A knowledge base.**\nFor teams.\n\n</div>\n',
     )
@@ -175,13 +154,13 @@ def test_description_html_block_then_title(tmp_path):
 
 
 def test_description_rst_title(tmp_path):
-    _write(tmp_path / "README.rst", "=======\nProject\n=======\n\nThe body text.\n")
+    write_file(tmp_path / "README.rst", "=======\nProject\n=======\n\nThe body text.\n")
     assert derive_description(str(tmp_path)) == "Project: The body text."
 
 
 def test_description_not_in_allowed(tmp_path):
     folder = tmp_path / "notes"
-    _write(folder / "README.md", "# Secret plans\n\nDo not share.\n")
+    write_file(folder / "README.md", "# Secret plans\n\nDo not share.\n")
     assert derive_description(str(folder), allowed={"other.md"}) == "Documents from notes"
     assert derive_description(str(folder), allowed={"README.md"}) == (
         "Secret plans: Do not share."
@@ -192,7 +171,7 @@ def test_description_not_in_allowed(tmp_path):
 
 
 def test_owner_from_strata_user():
-    assert resolve_owner(_settings("alice")) == "alice"
+    assert resolve_owner(folder_settings("alice")) == "alice"
 
 
 def test_owner_from_settings_object(monkeypatch):
@@ -207,9 +186,9 @@ def test_owner_from_settings_object(monkeypatch):
 
 def test_owner_from_login():
     with patch("stratakb.knowledge.add_folder.getpass.getuser", return_value="dave"):
-        assert resolve_owner(_settings()) == "os:dave"
+        assert resolve_owner(folder_settings()) == "os:dave"
     with patch("stratakb.knowledge.add_folder.getpass.getuser", side_effect=KeyError("x")):
-        assert resolve_owner(_settings()) == "os:unknown"
+        assert resolve_owner(folder_settings()) == "os:unknown"
 
 
 def test_db_target_hides_credentials():
@@ -233,50 +212,14 @@ def test_refused_report_shape():
 # --- plan and apply (database) -----------------------------------------------
 
 
-@pytest.fixture
-def db_url(not_broad):
-    from stratakb.config import get_settings
-    return get_settings().database_url
-
-
-@pytest.fixture
-async def cleanup(db_url):
-    """Layer names to delete after the test."""
-    from stratakb.knowledge.layers import LayerNotFoundError, delete_layer
-
-    names: list[str] = []
-    yield names
-    for name in names:
-        with contextlib.suppress(LayerNotFoundError):
-            await delete_layer(db_url, name=name)
-
-
-def _name() -> str:
-    return f"test_add_{uuid4().hex[:10]}"
-
-
-def _docs(tmp_path: Path) -> Path:
-    root = tmp_path / "docs"
-    _write(root / "README.md", "# Team Docs\n\nHow the team works.\n")
-    _write(root / "guide" / "setup.md")
-    _write(root / "notes.md", "# Notes\n\nMeeting notes.\n")
-    _write(root / "tool.py", "print('code')\n")
-    _write(root / "client_secret.json", '{"key": "x"}\n')
-    return root
-
-
-def _fake_embed(texts, **_):
-    return [FAKE_EMBEDDING for _ in texts]
-
-
 async def _run(db_url, root, options, *, settings=None, confirmed=frozenset()):
     """plan() then apply() with mocked embeddings."""
     p = await add_folder.plan(db_url, root, options)
     assert p.refusal is None, p.refusal
     with patch("stratakb.knowledge.ingestion.embed_texts", new_callable=AsyncMock) as mock:
-        mock.side_effect = _fake_embed
+        mock.side_effect = fake_embed
         report = await add_folder.apply(
-            db_url, settings or _settings("tester"), p, confirmed=set(confirmed)
+            db_url, settings or folder_settings("tester"), p, confirmed=set(confirmed)
         )
     return p, report
 
@@ -301,15 +244,15 @@ async def _audit_rows(db_url, root):
     )
 
 
-async def test_first_add(db_url, tmp_path, cleanup):
-    root = _docs(tmp_path)
-    name = _name()
+async def test_first_add(folder_db_url, tmp_path, cleanup):
+    root = docs_folder(tmp_path)
+    name = unique_layer_name()
     cleanup.append(name)
 
-    p, report = await _run(db_url, root, Options(name=name))
+    p, report = await _run(folder_db_url, root, Options(name=name))
 
     assert p.action == "create" and p.layer == name
-    layer = await _layer(db_url, name)
+    layer = await _layer(folder_db_url, name)
     assert layer["origin"] == "folder"
     assert layer["owner"] == "tester"
     assert layer["root_path"] == root.resolve().as_posix()
@@ -330,9 +273,9 @@ async def test_first_add(db_url, tmp_path, cleanup):
     json.dumps(report.as_dict())
 
 
-async def test_unreadable_file_is_read_error(db_url, tmp_path, cleanup):
-    root = _docs(tmp_path)
-    name = _name()
+async def test_unreadable_file_is_read_error(folder_db_url, tmp_path, cleanup):
+    root = docs_folder(tmp_path)
+    name = unique_layer_name()
     cleanup.append(name)
     original_read = Path.read_bytes
 
@@ -342,7 +285,7 @@ async def test_unreadable_file_is_read_error(db_url, tmp_path, cleanup):
         return original_read(self)
 
     with patch.object(Path, "read_bytes", locked_read):
-        _, report = await _run(db_url, root, Options(name=name))
+        _, report = await _run(folder_db_url, root, Options(name=name))
 
     assert _outcomes(report)["notes.md"] == ("failed", "read_error")
     assert report.counts["failed"] == 1
@@ -351,29 +294,29 @@ async def test_unreadable_file_is_read_error(db_url, tmp_path, cleanup):
     )
 
 
-async def test_default_name_is_the_folder_slug(db_url, tmp_path, cleanup):
+async def test_default_name_is_the_folder_slug(folder_db_url, tmp_path, cleanup):
     folder = f"Add-Test {uuid4().hex[:8]}"
     root = tmp_path / folder
-    _write(root / "a.md")
+    write_file(root / "a.md")
     expected = slugify(folder)
     cleanup.append(expected)
 
-    p, report = await _run(db_url, root, Options())
+    p, report = await _run(folder_db_url, root, Options())
 
     assert p.layer == expected and report.layer == expected
-    assert (await _layer(db_url, expected))["display_name"] == folder
+    assert (await _layer(folder_db_url, expected))["display_name"] == folder
 
 
-async def test_quiet_rerun(db_url, tmp_path, cleanup):
-    root = _docs(tmp_path)
-    name = _name()
+async def test_quiet_rerun(folder_db_url, tmp_path, cleanup):
+    root = docs_folder(tmp_path)
+    name = unique_layer_name()
     cleanup.append(name)
-    await _run(db_url, root, Options(name=name))
+    await _run(folder_db_url, root, Options(name=name))
 
     from stratakb.knowledge import embeddings
 
     model_before = embeddings._local_model
-    p = await add_folder.plan(db_url, root, Options(name=name))
+    p = await add_folder.plan(folder_db_url, root, Options(name=name))
     assert p.action == "sync"
     assert p.planned == {"added": 0, "updated": 0, "unchanged": 3, "removed": 0}
     assert p.work_files == 0 and p.work_bytes == 0
@@ -382,7 +325,9 @@ async def test_quiet_rerun(db_url, tmp_path, cleanup):
         patch("stratakb.knowledge.ingestion.embed_texts", new_callable=AsyncMock) as embed,
         patch.object(embeddings, "_get_local_model", side_effect=AssertionError("loaded")),
     ):
-        report = await add_folder.apply(db_url, _settings("tester"), p, confirmed=set())
+        report = await add_folder.apply(
+            folder_db_url, folder_settings("tester"), p, confirmed=set()
+        )
     embed.assert_not_called()
     assert embeddings._local_model is model_before
     assert report.counts["unchanged"] == 3
@@ -390,15 +335,15 @@ async def test_quiet_rerun(db_url, tmp_path, cleanup):
     assert report.created is False and report.exit_code == 0
 
 
-async def test_edit_and_delete(db_url, tmp_path, cleanup):
-    root = _docs(tmp_path)
-    name = _name()
+async def test_edit_and_delete(folder_db_url, tmp_path, cleanup):
+    root = docs_folder(tmp_path)
+    name = unique_layer_name()
     cleanup.append(name)
-    await _run(db_url, root, Options(name=name))
+    await _run(folder_db_url, root, Options(name=name))
 
-    _write(root / "notes.md", "# Notes\n\nChanged meeting notes.\n")
+    write_file(root / "notes.md", "# Notes\n\nChanged meeting notes.\n")
     (root / "guide" / "setup.md").unlink()
-    p, report = await _run(db_url, root, Options(name=name))
+    p, report = await _run(folder_db_url, root, Options(name=name))
 
     assert p.planned == {"added": 0, "updated": 1, "unchanged": 1, "removed": 1}
     assert p.removals == {"guide/setup.md": "deleted"}
@@ -408,15 +353,15 @@ async def test_edit_and_delete(db_url, tmp_path, cleanup):
     assert report.counts["updated"] == 1 and report.counts["removed"] == 1
 
 
-async def test_removed_with_skip_or_exclusion_reason(db_url, tmp_path, cleanup):
-    root = _docs(tmp_path)
-    _write(root / "big.md", "# Big\n\n" + "x" * 3000 + "\n")
-    name = _name()
+async def test_removed_with_skip_or_exclusion_reason(folder_db_url, tmp_path, cleanup):
+    root = docs_folder(tmp_path)
+    write_file(root / "big.md", "# Big\n\n" + "x" * 3000 + "\n")
+    name = unique_layer_name()
     cleanup.append(name)
-    await _run(db_url, root, Options(name=name))
+    await _run(folder_db_url, root, Options(name=name))
 
-    _write(root / ".strataignore", "notes.md\n")
-    p, report = await _run(db_url, root, Options(name=name, max_file_size_mb=0.002))
+    write_file(root / ".strataignore", "notes.md\n")
+    p, report = await _run(folder_db_url, root, Options(name=name, max_file_size_mb=0.002))
 
     assert p.removals == {"big.md": "too_large", "notes.md": "ignored_by_strataignore"}
     outcomes = _outcomes(report)
@@ -425,18 +370,18 @@ async def test_removed_with_skip_or_exclusion_reason(db_url, tmp_path, cleanup):
     assert all(f["reason"] != "not_selected" for f in report.files)
 
 
-async def test_sync_sets_description_only_when_given(db_url, tmp_path, cleanup):
-    root = _docs(tmp_path)
-    name = _name()
+async def test_sync_sets_description_only_when_given(folder_db_url, tmp_path, cleanup):
+    root = docs_folder(tmp_path)
+    name = unique_layer_name()
     cleanup.append(name)
-    await _run(db_url, root, Options(name=name))
-    _write(root / "README.md", "# Renamed\n\nNew text.\n")
+    await _run(folder_db_url, root, Options(name=name))
+    write_file(root / "README.md", "# Renamed\n\nNew text.\n")
 
-    await _run(db_url, root, Options(name=name))
-    assert (await _layer(db_url, name))["description"] == "Team Docs: How the team works."
+    await _run(folder_db_url, root, Options(name=name))
+    assert (await _layer(folder_db_url, name))["description"] == "Team Docs: How the team works."
 
-    await _run(db_url, root, Options(name=name, description="Hand-written"))
-    assert (await _layer(db_url, name))["description"] == "Hand-written"
+    await _run(folder_db_url, root, Options(name=name, description="Hand-written"))
+    assert (await _layer(folder_db_url, name))["description"] == "Hand-written"
 
 
 class Snapshot(NamedTuple):
@@ -461,141 +406,143 @@ async def _snapshot(db_url, root, name) -> Snapshot:
 async def _assert_nothing_written(db_url, p, name, *, before=_NOTHING):
     """apply() refuses the plan, and the layer row and audit rows stay as before."""
     with pytest.raises(ValueError):
-        await add_folder.apply(db_url, _settings("tester"), p, confirmed={"broad_path"})
+        await add_folder.apply(db_url, folder_settings("tester"), p, confirmed={"broad_path"})
     assert await _snapshot(db_url, p.root, name) == before
 
 
-async def test_name_taken(db_url, tmp_path, cleanup):
+async def test_name_taken(folder_db_url, tmp_path, cleanup):
     from stratakb.knowledge.layers import create_layer
 
-    name = _name()
+    name = unique_layer_name()
     cleanup.append(name)
-    await create_layer(db_url, name=name, display_name="Manual")
+    await create_layer(folder_db_url, name=name, display_name="Manual")
     other = tmp_path / "other"
-    _write(other / "x.md")
-    await ingest(db_url, name, other)
+    write_file(other / "x.md")
+    await ingest(folder_db_url, name, other)
 
-    root = _docs(tmp_path)
-    before = await _snapshot(db_url, root.resolve().as_posix(), name)
+    root = docs_folder(tmp_path)
+    before = await _snapshot(folder_db_url, root.resolve().as_posix(), name)
     assert before.layer is not None and before.layer["root_path"] is None
-    p = await add_folder.plan(db_url, root, Options(name=name))
+    p = await add_folder.plan(folder_db_url, root, Options(name=name))
     assert p.refusal is not None and p.refusal[0] == "name_taken"
     assert p.layer == name and p.action is None
-    await _assert_nothing_written(db_url, p, name, before=before)
+    await _assert_nothing_written(folder_db_url, p, name, before=before)
 
 
-async def test_root_taken(db_url, tmp_path, cleanup):
-    root = _docs(tmp_path)
-    name = _name()
+async def test_root_taken(folder_db_url, tmp_path, cleanup):
+    root = docs_folder(tmp_path)
+    name = unique_layer_name()
     cleanup.append(name)
-    await _run(db_url, root, Options(name=name))
-    other = _name()
-    before = await _snapshot(db_url, root.resolve().as_posix(), other)
+    await _run(folder_db_url, root, Options(name=name))
+    other = unique_layer_name()
+    before = await _snapshot(folder_db_url, root.resolve().as_posix(), other)
     assert before.layer is None and len(before.audit_rows) == 1
 
-    p = await add_folder.plan(db_url, root, Options(name=other))
+    p = await add_folder.plan(folder_db_url, root, Options(name=other))
     assert p.refusal is not None and p.refusal[0] == "root_taken"
     assert name in p.refusal[1]
-    await _assert_nothing_written(db_url, p, other, before=before)
+    await _assert_nothing_written(folder_db_url, p, other, before=before)
 
 
-async def test_overlapping_root(db_url, tmp_path, cleanup):
-    root = _docs(tmp_path)
-    name = _name()
+async def test_overlapping_root(folder_db_url, tmp_path, cleanup):
+    root = docs_folder(tmp_path)
+    name = unique_layer_name()
     cleanup.append(name)
-    await _run(db_url, root, Options(name=name))
-    _write(tmp_path / "top.md")
+    await _run(folder_db_url, root, Options(name=name))
+    write_file(tmp_path / "top.md")
 
     for path in (tmp_path, root / "guide"):
-        other = _name()
-        p = await add_folder.plan(db_url, path, Options(name=other))
+        other = unique_layer_name()
+        p = await add_folder.plan(folder_db_url, path, Options(name=other))
         assert p.refusal is not None and p.refusal[0] == "overlapping_root", path
-        await _assert_nothing_written(db_url, p, other)
+        await _assert_nothing_written(folder_db_url, p, other)
 
 
-async def test_overlapping_root_case_only(db_url, tmp_path, cleanup, monkeypatch):
+async def test_overlapping_root_case_only(folder_db_url, tmp_path, cleanup, monkeypatch):
     from stratakb.knowledge.layers import create_layer
 
-    root = _docs(tmp_path)
+    root = docs_folder(tmp_path)
     resolved = root.resolve().as_posix()
     stored = resolved[:-4] + "DOCS"
-    name = _name()
+    name = unique_layer_name()
     cleanup.append(name)
-    await create_layer(db_url, name=name, display_name="Upper", root_path=stored)
+    await create_layer(folder_db_url, name=name, display_name="Upper", root_path=stored)
     monkeypatch.setattr("sys.platform", "win32")
 
-    other = _name()
-    p = await add_folder.plan(db_url, root, Options(name=other))
+    other = unique_layer_name()
+    p = await add_folder.plan(folder_db_url, root, Options(name=other))
     assert p.refusal is not None and p.refusal[0] == "overlapping_root"
     assert stored in p.refusal[1]
-    await _assert_nothing_written(db_url, p, other)
+    await _assert_nothing_written(folder_db_url, p, other)
 
 
-async def test_preset_layer(db_url, tmp_path, cleanup):
+async def test_preset_layer(folder_db_url, tmp_path, cleanup):
     from stratakb.knowledge.layers import create_layer
 
-    name = _name()
+    name = unique_layer_name()
     cleanup.append(name)
-    await create_layer(db_url, name=name, display_name="Preset", origin="preset:x")
-    root = _docs(tmp_path)
-    before = await _snapshot(db_url, root.resolve().as_posix(), name)
+    await create_layer(folder_db_url, name=name, display_name="Preset", origin="preset:x")
+    root = docs_folder(tmp_path)
+    before = await _snapshot(folder_db_url, root.resolve().as_posix(), name)
     assert before.layer is not None and before.audit_rows == []
 
-    p = await add_folder.plan(db_url, root, Options(name=name))
+    p = await add_folder.plan(folder_db_url, root, Options(name=name))
     assert p.refusal is not None and p.refusal[0] == "preset_layer"
-    await _assert_nothing_written(db_url, p, name, before=before)
+    await _assert_nothing_written(folder_db_url, p, name, before=before)
 
 
-async def test_nothing_to_add(db_url, tmp_path):
+async def test_nothing_to_add(folder_db_url, tmp_path):
     root = tmp_path / "code_only"
-    _write(root / "a.py", "x = 1\n")
-    _write(root / "b.py", "y = 2\n")
-    name = _name()
-    p = await add_folder.plan(db_url, root, Options(name=name))
+    write_file(root / "a.py", "x = 1\n")
+    write_file(root / "b.py", "y = 2\n")
+    name = unique_layer_name()
+    p = await add_folder.plan(folder_db_url, root, Options(name=name))
     assert p.refusal is not None and p.refusal[0] == "nothing_to_add"
-    await _assert_nothing_written(db_url, p, name)
+    await _assert_nothing_written(folder_db_url, p, name)
 
 
-async def test_usage_and_path_refusals(db_url, tmp_path):
-    root = _docs(tmp_path)
-    p = await add_folder.plan(db_url, root, Options(name="Bad-Name"))
+async def test_usage_and_path_refusals(folder_db_url, tmp_path):
+    root = docs_folder(tmp_path)
+    p = await add_folder.plan(folder_db_url, root, Options(name="Bad-Name"))
     assert p.refusal is not None and p.refusal[0] == "usage_error"
     assert p.layer is None
-    await _assert_nothing_written(db_url, p, None)
+    await _assert_nothing_written(folder_db_url, p, None)
 
-    p = await add_folder.plan(db_url, tmp_path / "missing", Options())
+    p = await add_folder.plan(folder_db_url, tmp_path / "missing", Options())
     assert p.refusal is not None and p.refusal[0] == "path_not_found"
-    await _assert_nothing_written(db_url, p, None)
+    await _assert_nothing_written(folder_db_url, p, None)
 
-    p = await add_folder.plan(db_url, root / "notes.md", Options())
+    p = await add_folder.plan(folder_db_url, root / "notes.md", Options())
     assert p.refusal is not None and p.refusal[0] == "not_a_folder"
-    await _assert_nothing_written(db_url, p, None)
+    await _assert_nothing_written(folder_db_url, p, None)
 
 
 @pytest.mark.parametrize("size", [0, -1, float("nan"), float("inf"), float("-inf")])
-async def test_max_file_size_must_be_finite_and_positive(db_url, tmp_path, size):
-    name = _name()
-    p = await add_folder.plan(db_url, _docs(tmp_path), Options(name=name, max_file_size_mb=size))
+async def test_max_file_size_must_be_finite_and_positive(folder_db_url, tmp_path, size):
+    name = unique_layer_name()
+    p = await add_folder.plan(
+        folder_db_url, docs_folder(tmp_path), Options(name=name, max_file_size_mb=size)
+    )
     assert p.refusal is not None and p.refusal[0] == "usage_error"
     assert "--max-file-size" in p.refusal[1]
-    await _assert_nothing_written(db_url, p, name)
+    await _assert_nothing_written(folder_db_url, p, name)
 
 
-async def test_adopt_manual_layer(db_url, tmp_path, cleanup):
+async def test_adopt_manual_layer(folder_db_url, tmp_path, cleanup):
     from stratakb.knowledge.layers import create_layer
 
-    root = _docs(tmp_path)
-    name = _name()
+    root = docs_folder(tmp_path)
+    name = unique_layer_name()
     cleanup.append(name)
-    await create_layer(db_url, name=name, display_name="Manual", description="Kept")
+    await create_layer(folder_db_url, name=name, display_name="Manual", description="Kept")
     (root / "client_secret.json").unlink()
-    await ingest(db_url, name, root.resolve())
+    await ingest(folder_db_url, name, root.resolve())
 
-    p, report = await _run(db_url, root, Options(name=name))
+    p, report = await _run(folder_db_url, root, Options(name=name))
 
     assert p.action == "adopt"
     assert report.created is False
-    layer = await _layer(db_url, name)
+    layer = await _layer(folder_db_url, name)
     assert layer["root_path"] == root.resolve().as_posix()
     assert layer["description"] == "Kept"
     assert layer["origin"] is None
@@ -603,46 +550,46 @@ async def test_adopt_manual_layer(db_url, tmp_path, cleanup):
     assert report.counts["unchanged"] == 3 and report.counts["added"] == 0
 
 
-async def test_large_run_from_file_count(db_url, tmp_path, cleanup, monkeypatch):
-    root = _docs(tmp_path)
+async def test_large_run_from_file_count(folder_db_url, tmp_path, cleanup, monkeypatch):
+    root = docs_folder(tmp_path)
     monkeypatch.setattr(add_folder, "LARGE_RUN_FILES", 2)
-    p = await add_folder.plan(db_url, root, Options(name=_name()))
+    p = await add_folder.plan(folder_db_url, root, Options(name=unique_layer_name()))
     assert p.needs == {"large_run"}
     with pytest.raises(ValueError):
-        await add_folder.apply(db_url, _settings("tester"), p, confirmed=set())
+        await add_folder.apply(folder_db_url, folder_settings("tester"), p, confirmed=set())
 
-    name = _name()
+    name = unique_layer_name()
     cleanup.append(name)
     monkeypatch.setattr(add_folder, "LARGE_RUN_FILES", 2000)
-    await _run(db_url, root, Options(name=name), confirmed={"large_run"})
+    await _run(folder_db_url, root, Options(name=name), confirmed={"large_run"})
 
 
-async def test_large_run_from_removals(db_url, tmp_path, cleanup, monkeypatch):
+async def test_large_run_from_removals(folder_db_url, tmp_path, cleanup, monkeypatch):
     root = tmp_path / "many"
     for i in range(5):
-        _write(root / f"doc{i}.md", f"# Doc {i}\n\nText {i}.\n")
-    name = _name()
+        write_file(root / f"doc{i}.md", f"# Doc {i}\n\nText {i}.\n")
+    name = unique_layer_name()
     cleanup.append(name)
-    await _run(db_url, root, Options(name=name))
+    await _run(folder_db_url, root, Options(name=name))
     monkeypatch.setattr(add_folder, "LARGE_REMOVAL_MIN", 3)
 
     for i in range(2):
         (root / f"doc{i}.md").unlink()
-    p = await add_folder.plan(db_url, root, Options(name=name))
+    p = await add_folder.plan(folder_db_url, root, Options(name=name))
     assert p.planned["removed"] == 2 and "large_run" not in p.needs
 
     (root / "doc2.md").unlink()
-    p = await add_folder.plan(db_url, root, Options(name=name))
+    p = await add_folder.plan(folder_db_url, root, Options(name=name))
     assert p.planned["removed"] == 3 and p.tracked == 5
     assert "large_run" in p.needs
 
 
-async def test_secret_never_hashed(db_url, tmp_path):
-    root = _docs(tmp_path)
+async def test_secret_never_hashed(folder_db_url, tmp_path):
+    root = docs_folder(tmp_path)
     with patch(
         "stratakb.knowledge.add_folder._sha256_file", wraps=add_folder._sha256_file
     ) as spy:
-        p = await add_folder.plan(db_url, root, Options(name=_name()))
+        p = await add_folder.plan(folder_db_url, root, Options(name=unique_layer_name()))
     hashed = {Path(call.args[0]).name for call in spy.call_args_list}
     assert "client_secret.json" not in hashed
     assert "tool.py" not in hashed
@@ -650,38 +597,40 @@ async def test_secret_never_hashed(db_url, tmp_path):
     assert all(e.sha256 for e in p.entries)
 
 
-async def test_owner_from_login_on_create(db_url, tmp_path, cleanup):
-    root = _docs(tmp_path)
-    name = _name()
+async def test_owner_from_login_on_create(folder_db_url, tmp_path, cleanup):
+    root = docs_folder(tmp_path)
+    name = unique_layer_name()
     cleanup.append(name)
     with patch("stratakb.knowledge.add_folder.getpass.getuser", return_value="erin"):
-        await _run(db_url, root, Options(name=name), settings=_settings())
-    assert (await _layer(db_url, name))["owner"] == "os:erin"
+        await _run(folder_db_url, root, Options(name=name), settings=folder_settings())
+    assert (await _layer(folder_db_url, name))["owner"] == "os:erin"
 
 
-async def test_long_owner_on_sync_refused_before_writing(db_url, tmp_path, cleanup):
+async def test_long_owner_on_sync_refused_before_writing(folder_db_url, tmp_path, cleanup):
     from stratakb.knowledge.layers import LayerValidationError
 
-    root = _docs(tmp_path)
-    name = _name()
+    root = docs_folder(tmp_path)
+    name = unique_layer_name()
     cleanup.append(name)
-    await _run(db_url, root, Options(name=name))
-    before = len(await _audit_rows(db_url, root.resolve().as_posix()))
+    await _run(folder_db_url, root, Options(name=name))
+    before = len(await _audit_rows(folder_db_url, root.resolve().as_posix()))
 
-    p = await add_folder.plan(db_url, root, Options(name=name, description="New"))
+    p = await add_folder.plan(folder_db_url, root, Options(name=name, description="New"))
     with pytest.raises(LayerValidationError):
-        await add_folder.apply(db_url, _settings("u" * 201), p, confirmed=set())
-    assert (await _layer(db_url, name))["description"] != "New"
-    assert len(await _audit_rows(db_url, p.root)) == before
+        await add_folder.apply(folder_db_url, folder_settings("u" * 201), p, confirmed=set())
+    assert (await _layer(folder_db_url, name))["description"] != "New"
+    assert len(await _audit_rows(folder_db_url, p.root)) == before
 
 
-async def test_audit_entry(db_url, tmp_path, cleanup):
-    root = _docs(tmp_path)
-    name = _name()
+async def test_audit_entry(folder_db_url, tmp_path, cleanup):
+    root = docs_folder(tmp_path)
+    name = unique_layer_name()
     cleanup.append(name)
-    p, report = await _run(db_url, root, Options(name=name), settings=_settings("auditor"))
+    p, report = await _run(
+        folder_db_url, root, Options(name=name), settings=folder_settings("auditor")
+    )
 
-    rows = await _audit_rows(db_url, p.root)
+    rows = await _audit_rows(folder_db_url, p.root)
     assert len(rows) == 1
     row = rows[0]
     assert row["user_id"] == "auditor"
@@ -703,27 +652,29 @@ async def test_audit_entry(db_url, tmp_path, cleanup):
         assert file_name not in text
 
 
-async def test_concurrent_create_raises(db_url, tmp_path, cleanup):
+async def test_concurrent_create_raises(folder_db_url, tmp_path, cleanup):
     from stratakb.knowledge.layers import LayerExistsError, create_layer
 
-    root = _docs(tmp_path)
-    name = _name()
+    root = docs_folder(tmp_path)
+    name = unique_layer_name()
     cleanup.append(name)
-    p = await add_folder.plan(db_url, root, Options(name=name))
+    p = await add_folder.plan(folder_db_url, root, Options(name=name))
     assert p.action == "create"
-    await create_layer(db_url, name=name, display_name="Raced")
+    await create_layer(folder_db_url, name=name, display_name="Raced")
     with pytest.raises(LayerExistsError):
-        await add_folder.apply(db_url, _settings("tester"), p, confirmed=set())
+        await add_folder.apply(folder_db_url, folder_settings("tester"), p, confirmed=set())
 
 
-async def test_failed_file_note_once(db_url, tmp_path, cleanup):
-    root = _docs(tmp_path)
-    name = _name()
+async def test_failed_file_note_once(folder_db_url, tmp_path, cleanup):
+    root = docs_folder(tmp_path)
+    name = unique_layer_name()
     cleanup.append(name)
-    p = await add_folder.plan(db_url, root, Options(name=name))
+    p = await add_folder.plan(folder_db_url, root, Options(name=name))
     with patch("stratakb.knowledge.ingestion.embed_texts", new_callable=AsyncMock) as mock:
         mock.side_effect = RuntimeError("no embedder configured")
-        report = await add_folder.apply(db_url, _settings("tester"), p, confirmed=set())
+        report = await add_folder.apply(
+            folder_db_url, folder_settings("tester"), p, confirmed=set()
+        )
     assert report.exit_code == 1
     assert report.counts["failed"] == 3
     assert [n for n in report.notes if "no embedder" in n] == [

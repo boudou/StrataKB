@@ -100,12 +100,6 @@ class TestAuditText:
         assert len(stored) <= 200
 
 
-@pytest.fixture
-def db_url():
-    from stratakb.config import get_settings
-    return get_settings().database_url
-
-
 class TestStoredEntry:
     @pytest.mark.asyncio
     async def test_audit_log_row_holds_placeholder(self, monkeypatch, db_url):

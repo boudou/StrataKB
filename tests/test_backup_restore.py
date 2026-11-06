@@ -8,7 +8,6 @@ Embeddings are mocked.
 
 from __future__ import annotations
 
-import contextlib
 import gzip
 import importlib.util
 import io
@@ -19,13 +18,19 @@ import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
-from uuid import uuid4
 
 import asyncpg
 import pytest
 
 from stratakb.knowledge import add_folder
 from stratakb.knowledge.add_folder import Options
+from tests.helpers import (
+    docs_folder,
+    fake_embed,
+    folder_settings,
+    unique_layer_name,
+    write_file,
+)
 
 _spec = importlib.util.spec_from_file_location(
     "backup_restore", Path(__file__).parent.parent / "scripts" / "backup_restore.py"
@@ -33,15 +38,7 @@ _spec = importlib.util.spec_from_file_location(
 br = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(br)
 
-FAKE_EMBEDDING = [0.01] * 768
-
-
-@pytest.fixture(autouse=True)
-def isolated_git(monkeypatch, tmp_path):
-    """Keep the machine's git config and any repository above tmp_path out of the tests."""
-    monkeypatch.setenv("GIT_CONFIG_GLOBAL", os.devnull)
-    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
-    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path.parent))
+pytestmark = pytest.mark.usefixtures("isolated_git")
 
 
 # --- pure functions -----------------------------------------------------------
@@ -223,47 +220,12 @@ def test_import_exit_codes(tmp_path, monkeypatch, capsys):
 # --- database -----------------------------------------------------------------
 
 
-@pytest.fixture
-def db_url():
-    from stratakb.config import get_settings
-    with patch("stratakb.knowledge.add_folder.broad_reason", return_value=None):
-        yield get_settings().database_url
-
-
-@pytest.fixture
-async def cleanup(db_url):
-    """Layer names to delete after the test."""
-    from stratakb.knowledge.layers import LayerNotFoundError, delete_layer
-
-    names: list[str] = []
-    yield names
-    for name in names:
-        with contextlib.suppress(LayerNotFoundError):
-            await delete_layer(db_url, name=name)
-
-
-def _write(path: Path, text: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(text, encoding="utf-8")
-
-
-def _docs(tmp_path: Path) -> Path:
-    root = tmp_path / "docs"
-    _write(root / "README.md", "# Team Docs\n\nHow the team works.\n")
-    _write(root / "guide" / "setup.md",
-           "# Setup\n\n## 1. Install\n\nRun the installer.\n\n## 2. Configure\n\nSet it up.\n")
-    _write(root / "notes.md", "# Notes\n\nMeeting notes.\n")
-    return root
-
-
 async def _add(db_url, root, name):
     p = await add_folder.plan(db_url, root, Options(name=name))
     assert p.refusal is None, p.refusal
     with patch("stratakb.knowledge.ingestion.embed_texts", new_callable=AsyncMock) as mock:
-        mock.side_effect = lambda texts, **_: [FAKE_EMBEDDING for _ in texts]
-        settings = SimpleNamespace(strata_user="tester", model_fields_set={"strata_user"},
-                                   openai_api_key="fake-key")
-        await add_folder.apply(db_url, settings, p, confirmed=set())
+        mock.side_effect = fake_embed
+        await add_folder.apply(db_url, folder_settings("tester"), p, confirmed=set())
 
 
 async def _export(conn, layer: str) -> list:
@@ -319,19 +281,15 @@ async def _snapshot(conn, layer: str) -> dict:
     }
 
 
-def _name() -> str:
-    return f"test_br_{uuid4().hex[:10]}"
-
-
-async def test_round_trip_keeps_tracking_and_text(db_url, tmp_path, cleanup):
+async def test_round_trip_keeps_tracking_and_text(folder_db_url, tmp_path, cleanup):
     from stratakb.knowledge.layers import delete_layer
 
-    root = _docs(tmp_path)
-    name = _name()
+    root = docs_folder(tmp_path)
+    name = unique_layer_name()
     cleanup.append(name)
-    await _add(db_url, root, name)
+    await _add(folder_db_url, root, name)
 
-    conn = await asyncpg.connect(db_url)
+    conn = await asyncpg.connect(folder_db_url)
     try:
         await conn.execute(
             "UPDATE strata_core.knowledge_layers SET answer_mode = 'extractive', "
@@ -342,7 +300,7 @@ async def test_round_trip_keeps_tracking_and_text(db_url, tmp_path, cleanup):
         assert len(before["files"]) == 3 and before["documents"] and before["sections"]
         assert all(c[10] is not None and c[14] is not None for c in before["chunks"])
         data = await _export(conn, name)
-        await delete_layer(db_url, name=name)
+        await delete_layer(folder_db_url, name=name)
         await _apply(conn, data)
         after = await _snapshot(conn, name)
     finally:
@@ -352,35 +310,35 @@ async def test_round_trip_keeps_tracking_and_text(db_url, tmp_path, cleanup):
     assert after["layer"]["answer_mode"] == "extractive"
     assert json.loads(after["layer"]["structure_patterns"]) == ["^(?P<label>AT-\\d{2})"]
 
-    p = await add_folder.plan(db_url, root, Options(name=name))
+    p = await add_folder.plan(folder_db_url, root, Options(name=name))
     assert p.action == "sync"
     assert p.planned == {"added": 0, "updated": 0, "unchanged": 3, "removed": 0}
     with patch("stratakb.knowledge.ingestion.embed_texts", new_callable=AsyncMock) as embed:
-        settings = SimpleNamespace(strata_user="tester", model_fields_set={"strata_user"},
-                                   openai_api_key="fake-key")
-        report = await add_folder.apply(db_url, settings, p, confirmed=set())
+        report = await add_folder.apply(
+            folder_db_url, folder_settings("tester"), p, confirmed=set()
+        )
     embed.assert_not_called()
     assert report.counts["unchanged"] == 3
 
 
-async def test_import_remaps_colliding_document_ids(db_url, tmp_path, cleanup):
+async def test_import_remaps_colliding_document_ids(folder_db_url, tmp_path, cleanup):
     from stratakb.knowledge.layers import create_layer, delete_layer
 
-    root = _docs(tmp_path)
-    name_a, name_b = _name(), _name()
+    root = docs_folder(tmp_path)
+    name_a, name_b = unique_layer_name(), unique_layer_name()
     cleanup.extend([name_a, name_b])
-    await _add(db_url, root, name_a)
+    await _add(folder_db_url, root, name_a)
 
-    conn = await asyncpg.connect(db_url)
+    conn = await asyncpg.connect(folder_db_url)
     try:
         before = await _snapshot(conn, name_a)
         old_ids = [r["id"] for r in await conn.fetch(
             "SELECT d.id FROM strata_vectors.documents d JOIN strata_core.knowledge_layers l "
             "ON l.id = d.layer_id WHERE l.name = $1", name_a)]
         data = await _export(conn, name_a)
-        await delete_layer(db_url, name=name_a)
+        await delete_layer(folder_db_url, name=name_a)
 
-        layer_b = await create_layer(db_url, name=name_b, display_name="B")
+        layer_b = await create_layer(folder_db_url, name=name_b, display_name="B")
         await conn.execute(
             "INSERT INTO strata_vectors.documents (id, layer_id, source_root, relative_path, "
             "version, text, sha256) OVERRIDING SYSTEM VALUE "
@@ -401,9 +359,9 @@ async def test_import_remaps_colliding_document_ids(db_url, tmp_path, cleanup):
     assert old_ids[0] not in new_ids
 
 
-async def test_export_covers_every_column(db_url):
+async def test_export_covers_every_column(folder_db_url):
     skipped = {("strata_vectors.chunks", "tsv"), ("strata_vectors.document_sections", "id")}
-    conn = await asyncpg.connect(db_url)
+    conn = await asyncpg.connect(folder_db_url)
     try:
         for table in br.EXPORT_TABLES:
             schema, _, name = table.name.partition(".")
@@ -423,9 +381,7 @@ async def _assert_folder_unchanged(db_url, root: Path, name: str) -> None:
     assert p.action == "sync"
     assert p.planned == {"added": 0, "updated": 0, "unchanged": 3, "removed": 0}
     with patch("stratakb.knowledge.ingestion.embed_texts", new_callable=AsyncMock) as embed:
-        settings = SimpleNamespace(strata_user="tester", model_fields_set={"strata_user"},
-                                   openai_api_key="fake-key")
-        report = await add_folder.apply(db_url, settings, p, confirmed=set())
+        report = await add_folder.apply(db_url, folder_settings("tester"), p, confirmed=set())
     embed.assert_not_called()
     assert report.counts["unchanged"] == 3
 
@@ -438,23 +394,23 @@ def _moved_steps(steps: list, name: str, old_root: str, new_root: str) -> list:
     return [*moved[:-1], *br.source_root_statements(name, old_root, new_root), moved[-1]]
 
 
-async def test_new_root_moves_the_layer(db_url, tmp_path, cleanup):
+async def test_new_root_moves_the_layer(folder_db_url, tmp_path, cleanup):
     from stratakb.knowledge.layers import create_layer, delete_layer, get_layer
 
-    root = _docs(tmp_path)
+    root = docs_folder(tmp_path)
     old_root = root.resolve().as_posix()
     moved = tmp_path / "elsewhere" / "docs"
     moved.parent.mkdir()
-    name, holder = _name(), _name()
+    name, holder = unique_layer_name(), unique_layer_name()
     cleanup.extend([name, holder])
-    await _add(db_url, root, name)
+    await _add(folder_db_url, root, name)
 
-    conn = await asyncpg.connect(db_url)
+    conn = await asyncpg.connect(folder_db_url)
     try:
         steps = await _export(conn, name)
-        await delete_layer(db_url, name=name)
+        await delete_layer(folder_db_url, name=name)
         # The folder the file records belongs to another layer by now
-        await create_layer(db_url, name=holder, display_name="Holder", root_path=old_root)
+        await create_layer(folder_db_url, name=holder, display_name="Holder", root_path=old_root)
         root.rename(moved)
         new_root = moved.resolve().as_posix()
         await _apply(conn, _moved_steps(steps, name, old_root, new_root))
@@ -467,18 +423,18 @@ async def test_new_root_moves_the_layer(db_url, tmp_path, cleanup):
     finally:
         await conn.close()
 
-    assert (await get_layer(db_url, name=name))["root_path"] == new_root
-    await _assert_folder_unchanged(db_url, moved, name)
+    assert (await get_layer(folder_db_url, name=name))["root_path"] == new_root
+    await _assert_folder_unchanged(folder_db_url, moved, name)
 
 
-async def test_root_holder_query(db_url, tmp_path, cleanup):
-    root = _docs(tmp_path)
-    name = _name()
+async def test_root_holder_query(folder_db_url, tmp_path, cleanup):
+    root = docs_folder(tmp_path)
+    name = unique_layer_name()
     cleanup.append(name)
-    await _add(db_url, root, name)
+    await _add(folder_db_url, root, name)
     root_path = root.resolve().as_posix()
 
-    conn = await asyncpg.connect(db_url)
+    conn = await asyncpg.connect(folder_db_url)
     try:
         assert await conn.fetchval(br.root_holder_query(root_path, "another_layer")) == name
         assert await conn.fetchval(br.root_holder_query(root_path, name)) is None
@@ -512,15 +468,15 @@ def _export_through_psql(tmp_path, name: str) -> Path:
     return out
 
 
-async def test_real_psql_round_trip(db_url, real_psql, tmp_path, cleanup):
+async def test_real_psql_round_trip(folder_db_url, real_psql, tmp_path, cleanup):
     from stratakb.knowledge.layers import delete_layer
 
-    root = _docs(tmp_path)
-    name = _name()
+    root = docs_folder(tmp_path)
+    name = unique_layer_name()
     cleanup.append(name)
-    await _add(db_url, root, name)
+    await _add(folder_db_url, root, name)
 
-    conn = await asyncpg.connect(db_url)
+    conn = await asyncpg.connect(folder_db_url)
     try:
         # Characters COPY text escapes, and a line that looks like the end of a block
         await conn.execute(
@@ -529,7 +485,7 @@ async def test_real_psql_round_trip(db_url, real_psql, tmp_path, cleanup):
             "WHERE layer_name = $1", name)
         before = await _snapshot(conn, name)
         src = _export_through_psql(tmp_path, name)
-        await delete_layer(db_url, name=name)
+        await delete_layer(folder_db_url, name=name)
         br.cmd_import_layer(SimpleNamespace(input=str(src), yes=True, root=None))
         after = await _snapshot(conn, name)
     finally:
@@ -537,33 +493,33 @@ async def test_real_psql_round_trip(db_url, real_psql, tmp_path, cleanup):
 
     assert after == before
     assert "back\\slash\n\\.\nend" in after["chunks"][0][2]
-    await _assert_folder_unchanged(db_url, root, name)
+    await _assert_folder_unchanged(folder_db_url, root, name)
 
 
-async def test_real_psql_import_onto_a_moved_folder(db_url, real_psql, tmp_path, cleanup):
-    root = _docs(tmp_path)
+async def test_real_psql_import_onto_a_moved_folder(folder_db_url, real_psql, tmp_path, cleanup):
+    root = docs_folder(tmp_path)
     moved = tmp_path / "elsewhere" / "docs"
     moved.parent.mkdir()
-    name = _name()
+    name = unique_layer_name()
     cleanup.append(name)
-    await _add(db_url, root, name)
+    await _add(folder_db_url, root, name)
 
     src = _export_through_psql(tmp_path, name)
     root.rename(moved)
     br.cmd_import_layer(SimpleNamespace(input=str(src), yes=True, root=str(moved)))
-    await _assert_folder_unchanged(db_url, moved, name)
+    await _assert_folder_unchanged(folder_db_url, moved, name)
 
 
 async def test_real_psql_root_conflict_names_the_layer(
-    db_url, real_psql, tmp_path, cleanup, capsys
+    folder_db_url, real_psql, tmp_path, cleanup, capsys
 ):
-    root = _docs(tmp_path)
+    root = docs_folder(tmp_path)
     other_root = tmp_path / "other"
-    _write(other_root / "a.md", "# Other\n\nOther text.\n")
-    name, other = _name(), _name()
+    write_file(other_root / "a.md", "# Other\n\nOther text.\n")
+    name, other = unique_layer_name(), unique_layer_name()
     cleanup.extend([name, other])
-    await _add(db_url, root, name)
-    await _add(db_url, other_root, other)
+    await _add(folder_db_url, root, name)
+    await _add(folder_db_url, other_root, other)
 
     src = _export_through_psql(tmp_path, name)
     capsys.readouterr()
@@ -575,22 +531,22 @@ async def test_real_psql_root_conflict_names_the_layer(
 
     # Nothing was changed: the file's own folder still imports
     br.cmd_import_layer(SimpleNamespace(input=str(src), yes=True, root=None))
-    await _assert_folder_unchanged(db_url, root, name)
+    await _assert_folder_unchanged(folder_db_url, root, name)
 
 
 async def test_real_psql_root_moves_off_a_folder_another_layer_holds(
-    db_url, real_psql, tmp_path, cleanup, capsys
+    folder_db_url, real_psql, tmp_path, cleanup, capsys
 ):
     from stratakb.knowledge.layers import delete_layer, get_layer
 
-    root = _docs(tmp_path)
+    root = docs_folder(tmp_path)
     moved = tmp_path / "elsewhere" / "docs"
-    name, holder = _name(), _name()
+    name, holder = unique_layer_name(), unique_layer_name()
     cleanup.extend([name, holder])
-    await _add(db_url, root, name)
+    await _add(folder_db_url, root, name)
     src = _export_through_psql(tmp_path, name)
-    await delete_layer(db_url, name=name)
-    await _add(db_url, root, holder)
+    await delete_layer(folder_db_url, name=name)
+    await _add(folder_db_url, root, holder)
     shutil.copytree(root, moved)
 
     capsys.readouterr()
@@ -600,20 +556,20 @@ async def test_real_psql_root_moves_off_a_folder_another_layer_holds(
     assert f"'{holder}'" in err and "--root" in err and "duplicate key" not in err
 
     br.cmd_import_layer(SimpleNamespace(input=str(src), yes=True, root=str(moved)))
-    assert (await get_layer(db_url, name=name))["root_path"] == moved.resolve().as_posix()
-    assert (await get_layer(db_url, name=holder))["root_path"] == root.resolve().as_posix()
-    await _assert_folder_unchanged(db_url, moved, name)
+    assert (await get_layer(folder_db_url, name=name))["root_path"] == moved.resolve().as_posix()
+    assert (await get_layer(folder_db_url, name=holder))["root_path"] == root.resolve().as_posix()
+    await _assert_folder_unchanged(folder_db_url, moved, name)
 
 
 async def test_real_psql_failed_import_changes_nothing(
-    db_url, real_psql, tmp_path, cleanup, capsys
+    folder_db_url, real_psql, tmp_path, cleanup, capsys
 ):
-    root = _docs(tmp_path)
-    name = _name()
+    root = docs_folder(tmp_path)
+    name = unique_layer_name()
     cleanup.append(name)
-    await _add(db_url, root, name)
+    await _add(folder_db_url, root, name)
 
-    conn = await asyncpg.connect(db_url)
+    conn = await asyncpg.connect(folder_db_url)
     try:
         before = await _snapshot(conn, name)
         src = _export_through_psql(tmp_path, name)
