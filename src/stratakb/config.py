@@ -21,6 +21,9 @@ LOCAL_DB_PORT = 5433
 # An Anthropic model name, so an openai_compatible rewrite with it counts as "model not set"
 DEFAULT_QUERY_REWRITE_MODEL = "claude-haiku-5-5"
 
+# A local model name, so the openai backend with it counts as "model not set"
+DEFAULT_EMBEDDING_MODEL = "all-mpnet-base-v2"
+
 
 def local_database_url(port: int = LOCAL_DB_PORT) -> str:
     return f"postgresql://{LOCAL_DB_USER}:{LOCAL_DB_PASSWORD}@127.0.0.1:{port}/{LOCAL_DB_NAME}"
@@ -60,7 +63,7 @@ class Settings(BaseSettings):
     # "local", or "openai" (OpenAI or an OpenAI-compatible server)
     embedding_backend: str = "local"
     # local: sentence-transformers model; openai: text-embedding-3-large unless set
-    embedding_model: str = "all-mpnet-base-v2"
+    embedding_model: str = DEFAULT_EMBEDDING_MODEL
     embedding_dimensions: int = 768  # must match model output
     # openai backend: an OpenAI-compatible server, e.g. http://127.0.0.1:11434/v1;
     # empty = OpenAI

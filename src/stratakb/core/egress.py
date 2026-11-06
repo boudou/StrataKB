@@ -253,8 +253,8 @@ def rewrite_provider(settings: Settings) -> OutboundProvider | None:
 def embedding_provider(settings: Settings, backend: str = "") -> OutboundProvider | None:
     """Return embedding as a provider when it would leave this machine, else None.
 
-    Any backend other than "local" goes down the OpenAI path, so a misspelt
-    EMBEDDING_BACKEND is outbound too.
+    Any backend other than "local" counts, so a misspelt EMBEDDING_BACKEND is
+    reported as outbound too, even though embedding_key_error refuses it.
 
     Args:
         settings: The settings to check.

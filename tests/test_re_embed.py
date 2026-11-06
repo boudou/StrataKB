@@ -17,7 +17,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import asyncpg
 import pytest
 
-from stratakb.knowledge.vector_store import _vector_column_size
+from stratakb.knowledge.vector_store import vector_column_size
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
 EMBED_TEXTS = "stratakb.knowledge.embeddings.embed_texts"
@@ -49,7 +49,7 @@ async def _restoring_size(db_url, pool, size, layers):
             await re_embed_all_layers(db_url, new_dimensions=size)
         for layer in layers:
             await delete_layer_chunks(db_url, layer)
-    assert await _vector_column_size(pool) == size
+    assert await vector_column_size(pool) == size
 
 
 async def _staging_tables(pool) -> int:
@@ -122,7 +122,7 @@ class TestReEmbed:
 
         layer = "test_re_embed_prefix"
         pool = await get_pool(db_url)
-        dims = await _vector_column_size(pool)
+        dims = await vector_column_size(pool)
         doc = parse_markdown(FIXTURES_DIR / "test_document.md")
         new_chunks = _chunk_document(doc, layer_name=layer, chunk_size=500, chunk_overlap=50)
         old_content = f"[{layer} > legacy > Page 1]\nOld chunk text"
@@ -157,7 +157,7 @@ class TestReEmbed:
         from stratakb.knowledge.vector_store import delete_layer_chunks, re_embed_layer
 
         pool = await get_pool(db_url)
-        size = await _vector_column_size(pool)
+        size = await vector_column_size(pool)
         try:
             await _insert_two_layers(db_url, LAYERS, size)
             before = {layer: await _vectors(pool, layer) for layer in LAYERS}
@@ -170,7 +170,7 @@ class TestReEmbed:
             assert "every layer shares it" in str(exc.value)
             assert "re_embed_all_layers" in str(exc.value)
             mock.assert_not_awaited()
-            assert await _vector_column_size(pool) == size
+            assert await vector_column_size(pool) == size
             assert {layer: await _vectors(pool, layer) for layer in LAYERS} == before
         finally:
             for layer in LAYERS:
@@ -183,7 +183,7 @@ class TestReEmbed:
         from stratakb.knowledge.vector_store import re_embed_all_layers
 
         pool = await get_pool(db_url)
-        size = await _vector_column_size(pool)
+        size = await vector_column_size(pool)
         new = size + 8
         async with _restoring_size(db_url, pool, size, LAYERS):
             await _insert_two_layers(db_url, LAYERS, size)
@@ -196,7 +196,7 @@ class TestReEmbed:
             assert stats["dimensions"] == new
             assert stats["layers"][LAYERS[0]] == 2
             assert stats["layers"][LAYERS[1]] == 2
-            assert await _vector_column_size(pool) == new
+            assert await vector_column_size(pool) == new
             dims = await pool.fetch(
                 "SELECT DISTINCT vector_dims(embedding) AS d FROM strata_vectors.chunks "
                 "WHERE layer_name = ANY($1::text[])",
@@ -218,7 +218,7 @@ class TestReEmbed:
         from stratakb.knowledge.vector_store import delete_layer_chunks, re_embed_all_layers
 
         pool = await get_pool(db_url)
-        size = await _vector_column_size(pool)
+        size = await vector_column_size(pool)
         calls = 0
 
         def fail_second(texts, **kwargs):
@@ -239,7 +239,7 @@ class TestReEmbed:
                 await re_embed_all_layers(db_url, batch_size=1, new_dimensions=size + 8)
 
             assert calls == 2
-            assert await _vector_column_size(pool) == size
+            assert await vector_column_size(pool) == size
             assert await _vectors(pool, LAYERS[0]) == before
             assert await _staging_tables(pool) == 0
         finally:
@@ -261,7 +261,7 @@ class TestReEmbed:
 
         layer = "test_re_embed_batches"
         pool = await get_pool(db_url)
-        size = await _vector_column_size(pool)
+        size = await vector_column_size(pool)
         fetched: list[int] = []
         original = vector_store._fetch_chunk_batch
 
@@ -305,7 +305,7 @@ class TestReEmbed:
         from stratakb.knowledge.vector_store import re_embed_all_layers
 
         pool = await get_pool(db_url)
-        size = await _vector_column_size(pool)
+        size = await vector_column_size(pool)
         locks: list[int] = []
 
         async def embed(texts, **kw):
@@ -328,7 +328,7 @@ class TestReEmbed:
         from stratakb.knowledge.vector_store import delete_layer_chunks, re_embed_all_layers
 
         pool = await get_pool(db_url)
-        size = await _vector_column_size(pool)
+        size = await vector_column_size(pool)
         new = size + 8
         calls = 0
         late_locks: list[int] = []
@@ -377,7 +377,7 @@ class TestReEmbed:
         from stratakb.knowledge.vector_store import delete_layer_chunks, re_embed_all_layers
 
         pool = await get_pool(db_url)
-        size = await _vector_column_size(pool)
+        size = await vector_column_size(pool)
         new = size + 8
         locks: list[int] = []
 
@@ -411,7 +411,7 @@ class TestReEmbed:
         from stratakb.knowledge.vector_store import re_embed_all_layers
 
         pool = await get_pool(db_url)
-        size = await _vector_column_size(pool)
+        size = await vector_column_size(pool)
         short_pool = "stratakb.knowledge.vector_store.get_pool"
 
         async def block(blocker) -> None:
@@ -444,14 +444,14 @@ class TestReEmbed:
                     stats = await re_embed_all_layers(db_url, new_dimensions=size + 8)
                     await asyncio.wait_for(release, 10)
                     assert stats["resized"] is True
-                    assert await _vector_column_size(pool) == size + 8
+                    assert await vector_column_size(pool) == size + 8
 
                     # (b) With a short locked_timeout the ALTER gives up and nothing changes
                     await block(blocker)
                     with pytest.raises(TimeoutError, match="locked_timeout"):
                         await re_embed_all_layers(db_url, new_dimensions=size, locked_timeout=0.5)
                     await blocker.execute("ROLLBACK")
-                assert await _vector_column_size(pool) == size + 8
+                assert await vector_column_size(pool) == size + 8
                 assert await _staging_tables(pool) == 0
             finally:
                 if not blocker.is_closed():
@@ -467,7 +467,7 @@ class TestReEmbed:
         from stratakb.knowledge.vector_store import delete_layer_chunks, re_embed_all_layers
 
         pool = await get_pool(db_url)
-        size = await _vector_column_size(pool)
+        size = await vector_column_size(pool)
         try:
             await _insert_two_layers(db_url, LAYERS, size)
             before = await _vectors(pool, LAYERS[0])
@@ -482,7 +482,7 @@ class TestReEmbed:
                 mock.side_effect = _fake_embed(0.2)
                 await re_embed_all_layers(db_url, new_dimensions=size + 8)
 
-            assert await _vector_column_size(pool) == size
+            assert await vector_column_size(pool) == size
             assert await _vectors(pool, LAYERS[0]) == before
             assert await _staging_tables(pool) == 0
         finally:
@@ -525,7 +525,7 @@ class TestReEmbed:
         from stratakb.knowledge.vector_store import re_embed_layer
 
         pool = await get_pool(db_url)
-        size = await _vector_column_size(pool)
+        size = await vector_column_size(pool)
 
         async def embed(texts, **kw):
             # What an all-layer resize does between this run's read and its write
@@ -543,7 +543,7 @@ class TestReEmbed:
             ):
                 mock.side_effect = embed
                 await re_embed_layer(db_url, LAYERS[0], new_dimensions=size)
-            assert await _vector_column_size(pool) == size + 8
+            assert await vector_column_size(pool) == size + 8
 
     @pytest.mark.asyncio
     async def test_re_embed_all_layers_refuses_over_index_limit(self, db_url):
@@ -551,11 +551,11 @@ class TestReEmbed:
         from stratakb.knowledge.vector_store import re_embed_all_layers
 
         pool = await get_pool(db_url)
-        size = await _vector_column_size(pool)
+        size = await vector_column_size(pool)
         with (
             patch(EMBED_TEXTS, new_callable=AsyncMock) as mock,
             pytest.raises(ValueError, match="2000"),
         ):
             await re_embed_all_layers(db_url, new_dimensions=2001)
         mock.assert_not_awaited()
-        assert await _vector_column_size(pool) == size
+        assert await vector_column_size(pool) == size

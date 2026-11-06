@@ -27,7 +27,7 @@ from stratakb.core.egress import (
 )
 from stratakb.core.terminal_text import printable_only
 from stratakb.knowledge.embeddings import embedding_local_only_error, resolve_embedding_model
-from stratakb.knowledge.vector_store import _vector_column_size
+from stratakb.knowledge.vector_store import vector_column_size
 
 logger = structlog.get_logger()
 
@@ -150,7 +150,7 @@ async def check_vector_column(database_url: str, dimensions: int) -> dict:
     """Compare the vector column's declared size with EMBEDDING_DIMENSIONS."""
     try:
         pool = await get_pool(database_url)
-        size = await asyncio.wait_for(_vector_column_size(pool), _TIMEOUT_SECONDS)
+        size = await asyncio.wait_for(vector_column_size(pool), _TIMEOUT_SECONDS)
     except Exception as e:
         return _unchecked("vector_column_unchecked", f"{_COLUMN_UNREAD}: {type(e).__name__}")
 

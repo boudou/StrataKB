@@ -9,7 +9,14 @@ import threading
 
 import structlog
 
+from stratakb.knowledge.embeddings import ModelKind, load_cached_first
+
 logger = structlog.get_logger()
+
+# CrossEncoder puts "cross-encoder/" before a bare model name
+_RERANKING_MODEL_KIND = ModelKind(
+    "reranking", "RERANKING_MODEL", "cross-encoder", "set RERANKING_ENABLED=false"
+)
 
 _reranker = None
 _reranker_lock = threading.Lock()
@@ -25,14 +32,8 @@ def _get_reranker(model_name: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"):
             return _reranker
         from sentence_transformers import CrossEncoder
 
-        from stratakb.knowledge.embeddings import ModelKind, load_cached_first
-
         logger.info("loading_reranker_model", model=model_name)
-        # CrossEncoder puts "cross-encoder/" before a bare model name
-        kind = ModelKind(
-            "reranking", "RERANKING_MODEL", "cross-encoder", "set RERANKING_ENABLED=false"
-        )
-        _reranker = load_cached_first(CrossEncoder, model_name, kind)
+        _reranker = load_cached_first(CrossEncoder, model_name, _RERANKING_MODEL_KIND)
         logger.info("reranker_model_loaded", model=model_name)
     return _reranker
 

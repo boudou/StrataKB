@@ -310,7 +310,7 @@ def register_database_tools(mcp: FastMCP, database_url: str, query_database_url:
         for the strata_vectors.chunks table.
         """
         from stratakb.core.database import get_pool
-        from stratakb.knowledge.vector_store import _vector_column_size
+        from stratakb.knowledge.vector_store import vector_column_size
 
         pool = await get_pool(database_url)
 
@@ -345,7 +345,7 @@ def register_database_tools(mcp: FastMCP, database_url: str, query_database_url:
             total = await pool.fetchval("SELECT count(*) FROM strata_vectors.chunks")
 
             # Embedding dimensions
-            dim = await _vector_column_size(pool)
+            dim = await vector_column_size(pool)
 
             # Indexes
             indexes = await pool.fetch(

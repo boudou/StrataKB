@@ -397,7 +397,7 @@ flowchart LR
 | `DATABASE_URL` | `postgresql://strata:…@127.0.0.1:5433/strata` | PostgreSQL connection |
 | `READONLY_DATABASE_URL` | | Connection for `strata_db_query` and `strata_db_explain`; point it at the `strata_readonly` role from `db/03_readonly_role.sql`. Empty means the two tools are off; a superuser, or a member of a superuser or server-access role (such as the Docker `strata` user) is refused |
 | `STRATA_USER`, `STRATA_ROLE` | `developer`, `viewer` | Identity and role on stdio |
-| `EMBEDDING_BACKEND` | `local` | `local` (sentence-transformers) or `openai` (OpenAI, or the OpenAI-compatible server in `EMBEDDING_BASE_URL`) |
+| `EMBEDDING_BACKEND` | `local` | `local` (sentence-transformers) or `openai` (OpenAI, or the OpenAI-compatible server in `EMBEDDING_BASE_URL`); searches and ingests refuse any other value |
 | `EMBEDDING_MODEL` | `all-mpnet-base-v2` | Embedding model; the `openai` backend uses `text-embedding-3-large` unless set |
 | `EMBEDDING_DIMENSIONS` | `768` | Must match the model and the `vector(…)` column; vectors of another length are refused, and `strata_admin_health` reports a column of another size |
 | `EMBEDDING_BASE_URL` | | `openai` backend: an OpenAI-compatible server, ending in `/v1` (for example `http://127.0.0.1:11434/v1`); empty means OpenAI |

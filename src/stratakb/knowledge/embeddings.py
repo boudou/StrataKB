@@ -20,13 +20,16 @@ from dataclasses import dataclass
 
 import structlog
 
-from stratakb.config import Settings
+from stratakb.config import DEFAULT_EMBEDDING_MODEL, Settings
 from stratakb.core.egress import embedding_provider, refusal_line
 
 logger = structlog.get_logger()
 
 # OpenAI batch limit
 MAX_BATCH_SIZE = 100
+
+# The EMBEDDING_BACKEND values; embedding_key_error refuses any other
+_EMBEDDING_BACKENDS = ("local", "openai")
 
 # Model used by the openai backend when EMBEDDING_MODEL is unset or left at
 # the local default
@@ -61,7 +64,7 @@ EMBEDDING_MODEL_KIND = ModelKind("embedding", "EMBEDDING_MODEL", "sentence-trans
 _DRIVE_PREFIX = re.compile(r"^[A-Za-z]:[\\/]")
 
 
-def _hub_repo(model_name: str, organization: str = "sentence-transformers") -> str:
+def _hub_repo(model_name: str, organization: str) -> str:
     """The Hugging Face repository of a sentence-transformers model name."""
     return model_name if "/" in model_name else f"{organization}/{model_name}"
 
@@ -83,44 +86,63 @@ def _is_folder_path(model_name: str) -> bool:
     )
 
 
-def _missing_model_error(model_name: str, kind: ModelKind) -> str:
-    """Explain a model that cannot load: a bad folder, or a local-only miss."""
+def _folder_error(model_name: str, kind: ModelKind) -> str:
+    """Explain a model folder that is missing or holds no model."""
     alt = f", or {kind.fallback}" if kind.fallback else ""
-    if _is_folder_path(model_name):
-        state = (
-            f"holds no {kind.label} model that can be loaded"
-            if os.path.isdir(model_name)
-            else "does not exist"
-        )
-        return (
-            f"{kind.setting} is set to the folder {model_name}, which {state}. "
-            f"Set {kind.setting} to a folder that holds the {kind.label} model, "
-            f"or to a Hugging Face model name{alt}."
-        )
-    repo = _hub_repo(model_name, kind.organization)
-    folder = f"set {kind.setting} to a folder that holds the model"
-    ways_out = f"{folder}, or {kind.fallback}" if kind.fallback else f"or {folder}"
+    state = (
+        f"holds no {kind.label} model that can be loaded"
+        if os.path.isdir(model_name)
+        else "does not exist"
+    )
     return (
-        f"STRATA_LOCAL_ONLY is on and the {kind.label} model {model_name} "
-        f"is not installed on this machine, so it cannot be downloaded. "
-        f"On a machine that may download, run `uv run hf download {repo}`, {ways_out}."
+        f"{kind.setting} is set to the folder {model_name}, which {state}. "
+        f"Set {kind.setting} to a folder that holds the {kind.label} model, "
+        f"or to a Hugging Face model name{alt}."
+    )
+
+
+def _download_blocked_error(
+    model_name: str, kind: ModelKind, blocker: str, absent_from: str, first_way_out: str
+) -> str:
+    """Explain a cache miss while a switch forbids the download."""
+    ways_out = [first_way_out, f"set {kind.setting} to a folder that holds the model"]
+    if kind.fallback:
+        ways_out.append(kind.fallback)
+    return (
+        f"{blocker} and the {kind.label} model {model_name} is not {absent_from}, "
+        f"so it cannot be downloaded. {', '.join(ways_out[:-1])}, or {ways_out[-1]}."
+    )
+
+
+def _download_command(model_name: str, kind: ModelKind) -> str:
+    """The command that puts a model into the Hugging Face cache."""
+    return f"`uv run hf download {_hub_repo(model_name, kind.organization)}`"
+
+
+def _local_only_error(model_name: str, kind: ModelKind) -> str:
+    """Explain a cache miss while STRATA_LOCAL_ONLY is on."""
+    return _download_blocked_error(
+        model_name,
+        kind,
+        "STRATA_LOCAL_ONLY is on",
+        "installed on this machine",
+        f"On a machine that may download, run {_download_command(model_name, kind)}",
     )
 
 
 def _offline_error(model_name: str, kind: ModelKind) -> str:
     """Explain a cache miss while the Hugging Face offline switches are set."""
-    alt = f", or {kind.fallback}" if kind.fallback else ""
-    repo = _hub_repo(model_name, kind.organization)
-    return (
-        f"HF_HUB_OFFLINE or TRANSFORMERS_OFFLINE is set and the {kind.label} model "
-        f"{model_name} is not in the Hugging Face cache, so it cannot be downloaded. "
-        f"Unset both to let StrataKB download it, run `uv run hf download {repo}` on "
-        f"a machine that may download, or set {kind.setting} to a folder that holds "
-        f"the model{alt}."
+    return _download_blocked_error(
+        model_name,
+        kind,
+        "HF_HUB_OFFLINE or TRANSFORMERS_OFFLINE is set",
+        "in the Hugging Face cache",
+        f"Unset both to let StrataKB download it, run {_download_command(model_name, kind)} "
+        "on a machine that may download",
     )
 
 
-def is_model_cached(model_name: str) -> bool:
+def is_model_cached(model_name: str, kind: ModelKind) -> bool:
     """True when the model can load without a download. Never downloads.
 
     A folder path counts as cached: a folder is never downloaded, and the
@@ -134,7 +156,7 @@ def is_model_cached(model_name: str) -> bool:
             return True
         from huggingface_hub import try_to_load_from_cache
 
-        repo = _hub_repo(model_name)
+        repo = _hub_repo(model_name, kind.organization)
         cache_dir = os.environ.get("SENTENCE_TRANSFORMERS_HOME") or None
 
         def cached(filename: str) -> bool:
@@ -162,8 +184,10 @@ def load_cached_first[T](model_cls: Callable[..., T], model_name: str, kind: Mod
     try:
         return model_cls(model_name, local_files_only=True)
     except Exception as e:
-        if _is_folder_path(model_name) or get_settings().strata_local_only:
-            raise RuntimeError(_missing_model_error(model_name, kind)) from e
+        if _is_folder_path(model_name):
+            raise RuntimeError(_folder_error(model_name, kind)) from e
+        if get_settings().strata_local_only:
+            raise RuntimeError(_local_only_error(model_name, kind)) from e
         # Imported here: huggingface_hub reads the offline flags once, at
         # import, and STRATA_LOCAL_ONLY must be able to set them first
         from huggingface_hub import constants as hf_constants
@@ -250,14 +274,20 @@ async def embed_texts(
 def embedding_key_error(
     settings: Settings, openai_api_key: str, backend: str = ""
 ) -> str | None:
-    """Return why embedding cannot run (a missing key or the local-only switch), or None.
+    """Return why embedding cannot run, or None.
 
+    The reasons: an unknown backend, a missing key or the local-only switch.
     The openai backend needs OPENAI_API_KEY unless EMBEDDING_BASE_URL points
     it at an OpenAI-compatible server, whose key is optional. The local
     backend needs no key. With STRATA_LOCAL_ONLY on, only a server on this
     machine may receive the texts.
     """
     backend = backend or settings.embedding_backend
+    if backend not in _EMBEDDING_BACKENDS:
+        return (
+            f"Unknown embedding backend {backend}. Set EMBEDDING_BACKEND to local, or to "
+            "openai (OpenAI, or the OpenAI-compatible server in EMBEDDING_BASE_URL)."
+        )
     if backend == "openai" and not openai_api_key and not settings.embedding_base_url:
         return _MISSING_KEY_ERROR
     return embedding_local_only_error(settings, backend)
@@ -281,10 +311,9 @@ def resolve_embedding_model(backend: str, configured: str) -> str:
     (all-mpnet-base-v2) as "not set", so settings that only flip
     EMBEDDING_BACKEND keep working.
     """
-    local_default = Settings.model_fields["embedding_model"].default
     if backend == "local":
-        return configured or local_default
-    if not configured or configured == local_default:
+        return configured or DEFAULT_EMBEDDING_MODEL
+    if not configured or configured == DEFAULT_EMBEDDING_MODEL:
         return _OPENAI_DEFAULT_MODEL
     return configured
 

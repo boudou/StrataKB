@@ -560,10 +560,14 @@ def _model_notice(plan: Plan, settings: Any) -> None:
         return
     if not plan.added_or_updated:
         return
-    from stratakb.knowledge.embeddings import is_model_cached, resolve_embedding_model
+    from stratakb.knowledge.embeddings import (
+        EMBEDDING_MODEL_KIND,
+        is_model_cached,
+        resolve_embedding_model,
+    )
 
     model = resolve_embedding_model("local", settings.embedding_model)
-    if not is_model_cached(model):
+    if not is_model_cached(model, EMBEDDING_MODEL_KIND):
         _err(f"Downloading the embedding model {model} (first run only)…")
 
 
