@@ -13,9 +13,12 @@ from typing import Any
 import structlog
 import yaml
 
-from stratakb.knowledge.parsers.pdf_parser import ParsedDocument, ParsedPage
+from stratakb.knowledge.parsers.pdf_parser import ParsedDocument, ParsedPage, ParserFlag
 
 logger = structlog.get_logger()
+
+# Properties listed per schema; the rest are counted and the file is flagged
+MAX_SCHEMA_PROPERTIES = 15
 
 
 def parse_yaml(file_path: str | Path) -> ParsedDocument:
@@ -67,34 +70,46 @@ def _extract_info(spec: dict) -> tuple[str, str, str]:
     return title, description, version
 
 
-def _schema_summary(schema: dict | None, depth: int = 0) -> str:
-    """Generate a human-readable summary of a JSON schema."""
+def _schema_summary(schema: dict | None, depth: int = 0) -> tuple[str, int]:
+    """Generate a human-readable summary of a JSON schema.
+
+    Returns the summary text and the number of properties left out of it
+    (those past MAX_SCHEMA_PROPERTIES, nested summaries included).
+    """
     if not schema or depth > 2:
-        return ""
+        return "", 0
 
     if "$ref" in schema:
         ref = schema["$ref"]
         name = ref.split("/")[-1]
-        return name
+        return name, 0
 
     schema_type = schema.get("type", "object")
     props = schema.get("properties", {})
     if not props:
-        return schema_type
+        return schema_type, 0
 
     lines = []
-    for prop_name, prop_schema in list(props.items())[:15]:
-        prop_type = prop_schema.get("type", _schema_summary(prop_schema, depth + 1))
+    left_out = 0
+    for prop_name, prop_schema in list(props.items())[:MAX_SCHEMA_PROPERTIES]:
+        # Summarize the nested schema only when its text is used, so its cut
+        # properties are counted only when they would have been listed
+        prop_type = prop_schema.get("type")
+        if prop_type is None:
+            prop_type, nested_cut = _schema_summary(prop_schema, depth + 1)
+            left_out += nested_cut
         desc = prop_schema.get("description", "")
         if desc:
             lines.append(f"  - {prop_name} ({prop_type}): {desc}")
         else:
             lines.append(f"  - {prop_name} ({prop_type})")
 
-    if len(props) > 15:
-        lines.append(f"  ... and {len(props) - 15} more properties")
+    if len(props) > MAX_SCHEMA_PROPERTIES:
+        cut = len(props) - MAX_SCHEMA_PROPERTIES
+        lines.append(f"  ... and {cut} more properties")
+        left_out += cut
 
-    return "\n".join(lines)
+    return "\n".join(lines), left_out
 
 
 def _resolve_ref(spec: dict, ref: str) -> dict:
@@ -119,6 +134,8 @@ def _parse_openapi(spec: dict, source: str) -> ParsedDocument:
 
     # Collect operation names for summary
     operation_names: list[str] = []
+    # Schema properties left out of the summaries, over the whole file
+    properties_left_out = 0
 
     paths = spec.get("paths", {})
     if not isinstance(paths, dict):
@@ -176,7 +193,8 @@ def _parse_openapi(spec: dict, source: str) -> ParsedDocument:
                 content = req_body.get("content", {})
                 for media_type, media_schema in content.items():
                     schema = media_schema.get("schema", {})
-                    schema_text = _schema_summary(schema)
+                    schema_text, cut = _schema_summary(schema)
+                    properties_left_out += cut
                     if schema_text:
                         lines.append(f"\n**Request Body** ({media_type}):\n{schema_text}")
 
@@ -192,7 +210,8 @@ def _parse_openapi(spec: dict, source: str) -> ParsedDocument:
                 content = success_resp.get("content", {})
                 for media_type, media_schema in content.items():
                     schema = media_schema.get("schema", {})
-                    schema_text = _schema_summary(schema)
+                    schema_text, cut = _schema_summary(schema)
+                    properties_left_out += cut
                     if schema_text:
                         lines.append(f"**Response Schema** ({media_type}):\n{schema_text}")
 
@@ -232,12 +251,14 @@ def _parse_openapi(spec: dict, source: str) -> ParsedDocument:
         service_domain=title,
         version=version,
         operations=len(operation_names),
+        properties_left_out=properties_left_out,
     )
 
     return ParsedDocument(
         source_file=source,
         pages=all_pages,
         total_pages=len(all_pages),
+        flag=ParserFlag("truncated", properties_left_out) if properties_left_out else None,
     )
 
 

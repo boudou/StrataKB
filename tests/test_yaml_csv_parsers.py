@@ -163,6 +163,76 @@ class TestAsyncAPIParser:
         assert "receive" in op_page.text
 
 
+def _write_openapi(path: Path, schema: dict) -> Path:
+    """Write an OpenAPI file with one operation whose request body is schema."""
+    import yaml
+
+    spec = {
+        "openapi": "3.0.0",
+        "info": {"title": "Cut API", "version": "1.0"},
+        "paths": {"/items": {"post": {
+            "operationId": "createItem",
+            "requestBody": {"content": {"application/json": {"schema": schema}}},
+            "responses": {"200": {"description": "OK"}},
+        }}},
+    }
+    path.write_text(yaml.safe_dump(spec, sort_keys=False), encoding="utf-8")
+    return path
+
+
+def _props(count: int, prefix: str = "p") -> dict:
+    return {f"{prefix}{i}": {"type": "string"} for i in range(count)}
+
+
+class TestOpenAPISchemaCut:
+    def test_schema_over_limit_flagged_with_count(self, tmp_path):
+        from structlog.testing import capture_logs
+
+        from stratakb.knowledge.parsers.pdf_parser import ParserFlag
+        from stratakb.knowledge.parsers.yaml_parser import parse_yaml
+
+        path = _write_openapi(tmp_path / "big.yaml", {"type": "object", "properties": _props(20)})
+        with capture_logs() as logs:
+            result = parse_yaml(path)
+        assert result.error is None
+        assert result.flag == ParserFlag("truncated", 5)
+        assert "... and 5 more properties" in result.pages[1].text
+        parsed = [e for e in logs if e["event"] == "openapi_parsed"]
+        assert parsed[0]["properties_left_out"] == 5
+
+    def test_cuts_summed_over_file(self, tmp_path):
+        from stratakb.knowledge.parsers.pdf_parser import ParserFlag
+        from stratakb.knowledge.parsers.yaml_parser import parse_yaml
+
+        nested = {"properties": _props(17, "n")}  # no type: its summary is listed
+        props = {"child": nested, **_props(19)}
+        path = _write_openapi(tmp_path / "nested.yaml", {"type": "object", "properties": props})
+        result = parse_yaml(path)
+        # 20 top-level properties (5 cut) plus 17 nested ones (2 cut)
+        assert result.flag == ParserFlag("truncated", 7)
+
+    def test_nested_schema_with_type_not_counted(self, tmp_path):
+        from stratakb.knowledge.parsers.yaml_parser import parse_yaml
+
+        # The parent property names its type, so the nested summary is never listed
+        nested = {"type": "object", "properties": _props(30, "n")}
+        path = _write_openapi(
+            tmp_path / "typed.yaml",
+            {"type": "object", "properties": {"child": nested, "name": {"type": "string"}}},
+        )
+        result = parse_yaml(path)
+        assert result.error is None
+        assert result.flag is None
+        assert "child (object)" in result.pages[1].text
+
+    def test_schemas_that_fit_not_flagged(self, tmp_path):
+        from stratakb.knowledge.parsers.yaml_parser import parse_yaml
+
+        path = _write_openapi(tmp_path / "fit.yaml", {"type": "object", "properties": _props(15)})
+        assert parse_yaml(path).flag is None
+        assert parse_yaml(TEST_OPENAPI).flag is None
+
+
 # ==========================================
 # YAML error handling tests
 # ==========================================
