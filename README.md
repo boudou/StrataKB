@@ -588,7 +588,9 @@ uv run stratakb --help         # the commands and their flags
 
 Without a running database, the integration tests fail with a connection error and the rest pass. `docker compose` and `stratakb db up` both use port 5433, so run one at a time, or pass `--port` to `stratakb db up`. Both containers (`strata-postgres` and `stratakb-db`) start again with Docker unless they were stopped, so on a machine with both on 5433 they race for the port at every Docker start. Stop the one you don't use (`stratakb db down` or `docker compose stop`) and it stays stopped, or give `stratakb db up --port` another port when it creates the container.
 
-`scripts/backup_restore.py` backs up the whole database or exports and imports a single layer, through `docker exec` in the `strata-postgres` container; `DB_CONTAINER=stratakb-db` points it at the `stratakb db up` database. A layer export holds its configuration, file tracking, stored document text and chunks, so adding the same folder again after an import finds its files unchanged; receipts are only in a full backup.
+`scripts/backup_restore.py` backs up the whole database or exports and imports a single layer, through `docker exec` in the `strata-postgres` container; `DB_CONTAINER=stratakb-db` points it at the `stratakb db up` database. A layer export holds its configuration, file tracking, stored document text and chunks, so adding the same folder again after an import finds its files unchanged; receipts are only in a full backup. An export keeps the folder's absolute path. When the folder sits elsewhere on the target machine, run `import-layer` there with `--root <folder>` so the layer points at the new path and its files still count as unchanged. An import stops, changing nothing, when another layer holds the folder it would use and names that layer (`--root` with a free folder gets past this), and when the file has a newer export format than the script reads.
+
+**Import only files you made or trust.** `restore` and `import-layer` feed the file to `psql` with the database owner's rights, so a crafted file can do anything in the database.
 
 ## Roadmap
 

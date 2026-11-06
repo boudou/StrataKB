@@ -1,8 +1,9 @@
 """Tests for scripts/backup_restore.py layer export and import.
 
-psql is not installed on the test machines, so the database tests read the
-export with asyncpg COPY and apply the import file with a small stand-in for
-psql (_apply). Embeddings are mocked.
+Most database tests read the export with asyncpg COPY and run the import steps
+through asyncpg (_apply), since psql is not on every machine. The tests at the
+end run the commands through real psql; they skip without it, and fail in CI.
+Embeddings are mocked.
 """
 
 from __future__ import annotations
@@ -13,7 +14,7 @@ import importlib.util
 import io
 import json
 import os
-import re
+import shutil
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
@@ -65,11 +66,129 @@ def test_queries_quote_the_layer_name():
     assert "\\pset" not in script
 
 
-def _import_args(tmp_path, data: bytes) -> SimpleNamespace:
+def _import_args(tmp_path, data: bytes, root=None) -> SimpleNamespace:
     src = tmp_path / "layer.sql.gz"
     with gzip.open(src, "wb") as f:
         f.write(data)
-    return SimpleNamespace(input=str(src), yes=True)
+    return SimpleNamespace(input=str(src), yes=True, root=root)
+
+
+def test_export_format_reads_the_header():
+    assert br.export_format(b"-- StrataKB Layer Export\n-- Format: 2\nBEGIN;\n") == 2
+    assert br.export_format(b"-- StrataKB Layer Export\n-- Format: 12\n") == 12
+    assert br.export_format(b"-- StrataKB Layer Export\n-- Layer: x\nBEGIN;\n") is None
+    assert br.export_format(b"1\n2\n3\n4\n5\n6\n-- Format: 2\n") is None
+    with pytest.raises(ValueError):
+        br.export_format(b"-- Format: two\n")
+
+
+def _layer_part(name="x", root="/old/docs") -> bytes:
+    """One knowledge_layers row in COPY text."""
+    values = {c: "\\N" for c in br.LAYERS.columns}
+    values.update(name=name, root_path=root if root is not None else "\\N")
+    return "\t".join(values[c] for c in br.LAYERS.columns).encode() + b"\n"
+
+
+def _export_file(layer_part: bytes = b"", name="x") -> bytes:
+    return br.build_layer_export(name, "0", [layer_part] + [b""] * (len(br.EXPORT_TABLES) - 1))
+
+
+def test_export_layer_row():
+    layer = br.export_layer_row(_export_file(_layer_part(root="/old/a\\\\b\\tc")))
+    assert layer == br.ExportedLayer("x", "/old/a\\b\tc")
+    assert br.export_layer_row(_export_file(_layer_part(root=None))).root_path is None
+    assert br.export_layer_row(_export_file(_layer_part(name="\\N"))) is None
+    assert br.export_layer_row(_export_file()) is None
+    assert br.export_layer_row(b"-- Layer: x\nBEGIN;\nCOMMIT;\n") is None
+
+
+@pytest.mark.parametrize("root", ["/plain/docs", "/a\\b\tc\nd\re", "\\N", "/ελληνικά/docs"])
+def test_row_with_root_writes_copy_text(root):
+    data = _export_file(_layer_part())
+    columns, start, end = br._layer_row_span(data)
+    moved = data[:start] + br.row_with_root(data[start:end], columns, root) + data[end:]
+    assert br.export_layer_row(moved) == br.ExportedLayer("x", root)
+
+
+def test_steps_serialize_to_what_psql_reads():
+    data = br.serialize_steps(["BEGIN;", br.CopyBlock("t", ("a", "b"), b"1\t2\n"), "COMMIT;"])
+    assert data == b"BEGIN;\nCOPY t (a, b) FROM stdin;\n1\t2\n\\.\nCOMMIT;\n"
+
+
+def _recording_psql(monkeypatch, stdout=b"", code=0):
+    """Patch _psql; the returned list collects (sql, args, stdin) of every call."""
+    calls = []
+
+    def fake(sql="", args=None, stdin=None):
+        calls.append((sql, args, stdin))
+        return subprocess.CompletedProcess(args, code, stdout, b"ERROR:  boom" if code else b"")
+
+    monkeypatch.setattr(br, "_psql", fake)
+    return calls
+
+
+@pytest.mark.parametrize("header", [b"-- Format: 3", b"-- Format: three"])
+def test_import_refuses_a_format_it_cannot_read(tmp_path, monkeypatch, capsys, header):
+    calls = _recording_psql(monkeypatch)
+    data = b"-- StrataKB Layer Export\n" + header + b"\n-- Layer: x\nBEGIN;\nCOMMIT;\n"
+    with pytest.raises(SystemExit) as e:
+        br.cmd_import_layer(_import_args(tmp_path, data))
+    assert e.value.code == 1
+    assert calls == []
+    out = capsys.readouterr()
+    assert "older version" not in out.out
+    assert "Import failed: nothing was changed." in out.err
+    assert ("export format 3" in out.err) if header.endswith(b"3") else ("format" in out.err)
+
+
+def test_import_names_the_layer_holding_the_root(tmp_path, monkeypatch, capsys):
+    calls = _recording_psql(monkeypatch, stdout=b"other_layer\n")
+    with pytest.raises(SystemExit) as e:
+        br.cmd_import_layer(_import_args(tmp_path, _export_file(_layer_part())))
+    assert e.value.code == 1
+    assert len(calls) == 1 and calls[0][2] is None
+    assert "'/old/docs'" in calls[0][0] and "name <> 'x'" in calls[0][0]
+    err = capsys.readouterr().err
+    assert "'other_layer'" in err and "/old/docs" in err
+    assert "Import failed: nothing was changed." in err
+
+
+def test_import_root_moves_the_layer_row_and_its_files(tmp_path, monkeypatch):
+    calls = _recording_psql(monkeypatch)
+    new_root = tmp_path / "moved"
+    new_root.mkdir()
+    br.cmd_import_layer(_import_args(tmp_path, _export_file(_layer_part()), root=str(new_root)))
+    (check_sql, _, _), (_, args, stdin) = calls
+    expected = new_root.resolve().as_posix()
+    assert f"'{expected}'" in check_sql and "'/old/docs'" not in check_sql
+    assert args == br.PSQL_STRICT
+    assert br.export_layer_row(stdin) == br.ExportedLayer("x", expected)
+    assert stdin.endswith(b"COMMIT;\n")
+    assert stdin.count(b"COMMIT;") == 1
+    assert stdin.count(f"SET source_root = '{expected}'".encode()) == 2
+    assert stdin.count(b"source_root = '/old/docs'") == 2
+
+
+@pytest.mark.parametrize("data", [
+    b"-- StrataKB Layer Export\n-- Layer: x\nBEGIN;\nCOMMIT;\n",
+    _export_file(_layer_part(root=None)),
+    _export_file(_layer_part()) + b"SELECT 1;\n",
+])
+def test_import_root_is_refused_where_it_cannot_apply(tmp_path, monkeypatch, capsys, data):
+    calls = _recording_psql(monkeypatch)
+    with pytest.raises(SystemExit):
+        br.cmd_import_layer(_import_args(tmp_path, data, root=str(tmp_path)))
+    assert calls == []
+    assert "--root" in capsys.readouterr().err
+
+
+def test_import_root_must_be_a_folder(tmp_path, monkeypatch, capsys):
+    calls = _recording_psql(monkeypatch)
+    missing = tmp_path / "missing"
+    with pytest.raises(SystemExit):
+        br.cmd_import_layer(_import_args(tmp_path, _export_file(_layer_part()), root=str(missing)))
+    assert calls == []
+    assert "must be a folder" in capsys.readouterr().err
 
 
 def test_import_exit_codes(tmp_path, monkeypatch, capsys):
@@ -147,46 +266,27 @@ async def _add(db_url, root, name):
         await add_folder.apply(db_url, settings, p, confirmed=set())
 
 
-async def _export(conn, layer: str) -> bytes:
-    """What cmd_export_layer writes, with asyncpg COPY in place of psql."""
-    count = await conn.fetchval(
-        "SELECT chunk_count FROM strata_core.knowledge_layers WHERE name = $1", layer)
+async def _export(conn, layer: str) -> list:
+    """The steps cmd_export_layer writes, with asyncpg COPY in place of psql."""
     parts = []
     async with conn.transaction(isolation="repeatable_read", readonly=True):
         for q in br.export_queries(layer):
             buf = io.BytesIO()
             await conn.copy_from_query(q, output=buf, format="text")
             parts.append(buf.getvalue())
-    return br.build_layer_export(layer, str(count), parts)
+    return br.layer_import_steps(layer, parts)
 
 
-_COPY_LINE = re.compile(r"COPY (\S+) \(([^)]*)\) FROM stdin;")
-
-
-async def _apply(conn, data: bytes) -> None:
-    """Run an import file the way psql does: SQL text, and COPY blocks ended by `\\.`."""
-    pending: list[str] = []
-    lines = iter(data.split(b"\n"))
-    for raw in lines:
-        line = raw.decode("utf-8")
-        m = _COPY_LINE.fullmatch(line)
-        if not m:
-            pending.append(line)
-            continue
-        if "".join(pending).strip():
-            await conn.execute("\n".join(pending))
-        pending = []
-        block = []
-        for row in lines:
-            if row == b"\\.":
-                break
-            block.append(row + b"\n")
-        schema, _, table = m.group(1).rpartition(".")
-        await conn.copy_to_table(
-            table, schema_name=schema or None, columns=m.group(2).split(", "),
-            source=io.BytesIO(b"".join(block)), format="text")
-    if "".join(pending).strip():
-        await conn.execute("\n".join(pending))
+async def _apply(conn, steps: list) -> None:
+    """Run import steps through asyncpg."""
+    for step in steps:
+        if isinstance(step, br.CopyBlock):
+            schema, _, table = step.table.rpartition(".")
+            await conn.copy_to_table(
+                table, schema_name=schema or None, columns=list(step.columns),
+                source=io.BytesIO(step.rows), format="text")
+        else:
+            await conn.execute(step)
 
 
 async def _snapshot(conn, layer: str) -> dict:
@@ -305,12 +405,224 @@ async def test_export_covers_every_column(db_url):
     skipped = {("strata_vectors.chunks", "tsv"), ("strata_vectors.document_sections", "id")}
     conn = await asyncpg.connect(db_url)
     try:
-        for table, cols in br.EXPORT_TABLES:
-            schema, _, name = table.partition(".")
+        for table in br.EXPORT_TABLES:
+            schema, _, name = table.name.partition(".")
             actual = {r["column_name"] for r in await conn.fetch(
                 "SELECT column_name FROM information_schema.columns "
                 "WHERE table_schema = $1 AND table_name = $2", schema, name)}
-            expected = actual - {c for t, c in skipped if t == table}
-            assert set(cols) == expected, table
+            expected = actual - {c for t, c in skipped if t == table.name}
+            assert set(table.columns) == expected, table.name
     finally:
         await conn.close()
+
+
+async def _assert_folder_unchanged(db_url, root: Path, name: str) -> None:
+    """Adding the folder again recognizes every file and embeds nothing."""
+    p = await add_folder.plan(db_url, root, Options(name=name))
+    assert p.refusal is None, p.refusal
+    assert p.action == "sync"
+    assert p.planned == {"added": 0, "updated": 0, "unchanged": 3, "removed": 0}
+    with patch("stratakb.knowledge.ingestion.embed_texts", new_callable=AsyncMock) as embed:
+        settings = SimpleNamespace(strata_user="tester", model_fields_set={"strata_user"},
+                                   openai_api_key="fake-key")
+        report = await add_folder.apply(db_url, settings, p, confirmed=set())
+    embed.assert_not_called()
+    assert report.counts["unchanged"] == 3
+
+
+def _moved_steps(steps: list, name: str, old_root: str, new_root: str) -> list:
+    """Import steps with the row and the statements _with_new_root writes into the file."""
+    moved = [step._replace(rows=br.row_with_root(step.rows[:-1], step.columns, new_root) + b"\n")
+             if isinstance(step, br.CopyBlock) and step.table == br.LAYERS.name else step
+             for step in steps]
+    return [*moved[:-1], *br.source_root_statements(name, old_root, new_root), moved[-1]]
+
+
+async def test_new_root_moves_the_layer(db_url, tmp_path, cleanup):
+    from stratakb.knowledge.layers import create_layer, delete_layer, get_layer
+
+    root = _docs(tmp_path)
+    old_root = root.resolve().as_posix()
+    moved = tmp_path / "elsewhere" / "docs"
+    moved.parent.mkdir()
+    name, holder = _name(), _name()
+    cleanup.extend([name, holder])
+    await _add(db_url, root, name)
+
+    conn = await asyncpg.connect(db_url)
+    try:
+        steps = await _export(conn, name)
+        await delete_layer(db_url, name=name)
+        # The folder the file records belongs to another layer by now
+        await create_layer(db_url, name=holder, display_name="Holder", root_path=old_root)
+        root.rename(moved)
+        new_root = moved.resolve().as_posix()
+        await _apply(conn, _moved_steps(steps, name, old_root, new_root))
+        for table in ("strata_core.ingested_files", "strata_vectors.documents"):
+            roots = {r[0] for r in await conn.fetch(f"SELECT DISTINCT source_root FROM {table} "
+                                                    "WHERE layer_id = (SELECT id FROM "
+                                                    "strata_core.knowledge_layers WHERE name = $1)",
+                                                    name)}
+            assert roots == {new_root}, table
+    finally:
+        await conn.close()
+
+    assert (await get_layer(db_url, name=name))["root_path"] == new_root
+    await _assert_folder_unchanged(db_url, moved, name)
+
+
+async def test_root_holder_query(db_url, tmp_path, cleanup):
+    root = _docs(tmp_path)
+    name = _name()
+    cleanup.append(name)
+    await _add(db_url, root, name)
+    root_path = root.resolve().as_posix()
+
+    conn = await asyncpg.connect(db_url)
+    try:
+        assert await conn.fetchval(br.root_holder_query(root_path, "another_layer")) == name
+        assert await conn.fetchval(br.root_holder_query(root_path, name)) is None
+    finally:
+        await conn.close()
+
+
+# --- real psql ----------------------------------------------------------------
+
+
+@pytest.fixture
+def real_psql(db_url, tmp_path, monkeypatch):
+    """Point the script's psql calls at the test database, without docker exec."""
+    psql = shutil.which("psql")
+    if psql is None:
+        if os.environ.get("CI"):
+            pytest.fail("CI must run the real psql tests: psql is not on the PATH")
+        pytest.skip("psql is not on the PATH")
+
+    def run(cmd, capture=False, stdin_data=None):
+        return subprocess.run([psql, *cmd[1:]], capture_output=capture, input=stdin_data)
+
+    monkeypatch.setattr(br, "_run_docker", run)
+    monkeypatch.setattr(br, "DB_NAME", db_url)
+    monkeypatch.setattr(br, "BACKUP_DIR", tmp_path / "backups")
+
+
+def _export_through_psql(tmp_path, name: str) -> Path:
+    out = tmp_path / f"{name}.sql.gz"
+    br.cmd_export_layer(SimpleNamespace(layer_name=name, output=str(out)))
+    return out
+
+
+async def test_real_psql_round_trip(db_url, real_psql, tmp_path, cleanup):
+    from stratakb.knowledge.layers import delete_layer
+
+    root = _docs(tmp_path)
+    name = _name()
+    cleanup.append(name)
+    await _add(db_url, root, name)
+
+    conn = await asyncpg.connect(db_url)
+    try:
+        # Characters COPY text escapes, and a line that looks like the end of a block
+        await conn.execute(
+            "UPDATE strata_vectors.chunks "
+            "SET content = E'tab\\there\\nback\\\\slash\\n\\\\.\\nend' "
+            "WHERE layer_name = $1", name)
+        before = await _snapshot(conn, name)
+        src = _export_through_psql(tmp_path, name)
+        await delete_layer(db_url, name=name)
+        br.cmd_import_layer(SimpleNamespace(input=str(src), yes=True, root=None))
+        after = await _snapshot(conn, name)
+    finally:
+        await conn.close()
+
+    assert after == before
+    assert "back\\slash\n\\.\nend" in after["chunks"][0][2]
+    await _assert_folder_unchanged(db_url, root, name)
+
+
+async def test_real_psql_import_onto_a_moved_folder(db_url, real_psql, tmp_path, cleanup):
+    root = _docs(tmp_path)
+    moved = tmp_path / "elsewhere" / "docs"
+    moved.parent.mkdir()
+    name = _name()
+    cleanup.append(name)
+    await _add(db_url, root, name)
+
+    src = _export_through_psql(tmp_path, name)
+    root.rename(moved)
+    br.cmd_import_layer(SimpleNamespace(input=str(src), yes=True, root=str(moved)))
+    await _assert_folder_unchanged(db_url, moved, name)
+
+
+async def test_real_psql_root_conflict_names_the_layer(
+    db_url, real_psql, tmp_path, cleanup, capsys
+):
+    root = _docs(tmp_path)
+    other_root = tmp_path / "other"
+    _write(other_root / "a.md", "# Other\n\nOther text.\n")
+    name, other = _name(), _name()
+    cleanup.extend([name, other])
+    await _add(db_url, root, name)
+    await _add(db_url, other_root, other)
+
+    src = _export_through_psql(tmp_path, name)
+    capsys.readouterr()
+    with pytest.raises(SystemExit) as e:
+        br.cmd_import_layer(SimpleNamespace(input=str(src), yes=True, root=str(other_root)))
+    assert e.value.code == 1
+    err = capsys.readouterr().err
+    assert f"'{other}'" in err and "already holds" in err
+
+    # Nothing was changed: the file's own folder still imports
+    br.cmd_import_layer(SimpleNamespace(input=str(src), yes=True, root=None))
+    await _assert_folder_unchanged(db_url, root, name)
+
+
+async def test_real_psql_root_moves_off_a_folder_another_layer_holds(
+    db_url, real_psql, tmp_path, cleanup, capsys
+):
+    from stratakb.knowledge.layers import delete_layer, get_layer
+
+    root = _docs(tmp_path)
+    moved = tmp_path / "elsewhere" / "docs"
+    name, holder = _name(), _name()
+    cleanup.extend([name, holder])
+    await _add(db_url, root, name)
+    src = _export_through_psql(tmp_path, name)
+    await delete_layer(db_url, name=name)
+    await _add(db_url, root, holder)
+    shutil.copytree(root, moved)
+
+    capsys.readouterr()
+    with pytest.raises(SystemExit):
+        br.cmd_import_layer(SimpleNamespace(input=str(src), yes=True, root=None))
+    err = capsys.readouterr().err
+    assert f"'{holder}'" in err and "--root" in err and "duplicate key" not in err
+
+    br.cmd_import_layer(SimpleNamespace(input=str(src), yes=True, root=str(moved)))
+    assert (await get_layer(db_url, name=name))["root_path"] == moved.resolve().as_posix()
+    assert (await get_layer(db_url, name=holder))["root_path"] == root.resolve().as_posix()
+    await _assert_folder_unchanged(db_url, moved, name)
+
+
+async def test_real_psql_failed_import_changes_nothing(
+    db_url, real_psql, tmp_path, cleanup, capsys
+):
+    root = _docs(tmp_path)
+    name = _name()
+    cleanup.append(name)
+    await _add(db_url, root, name)
+
+    conn = await asyncpg.connect(db_url)
+    try:
+        before = await _snapshot(conn, name)
+        src = _export_through_psql(tmp_path, name)
+        with gzip.open(src, "rb") as f:
+            data = f.read()
+        broken = data[:-len(b"COMMIT;\n")] + b"SELECT 1 / 0;\nCOMMIT;\n"
+        with pytest.raises(SystemExit):
+            br.cmd_import_layer(_import_args(tmp_path, broken))
+        assert await _snapshot(conn, name) == before
+    finally:
+        await conn.close()
+    assert "Import failed: nothing was changed." in capsys.readouterr().err

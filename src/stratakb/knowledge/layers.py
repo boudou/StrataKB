@@ -40,11 +40,14 @@ MAX_OWNER_LENGTH = 200
 # Partial unique index on root_path (core/sql/05_add_folder.sql)
 _ROOT_PATH_INDEX = "knowledge_layers_root_path_key"
 
-_LAYER_COLUMNS = (
-    "id, name, display_name, description, metadata_schema, chunk_config, "
-    "routing_patterns, status, doc_count, chunk_count, last_ingested, "
-    "created_at, updated_at, origin, owner, root_path, answer_mode, structure_patterns"
+# The layer table's columns, also what scripts/backup_restore.py exports
+LAYER_COLUMN_NAMES = (
+    "id", "name", "display_name", "description", "metadata_schema", "chunk_config",
+    "routing_patterns", "status", "doc_count", "chunk_count", "last_ingested",
+    "created_at", "updated_at", "origin", "owner", "root_path", "answer_mode",
+    "structure_patterns",
 )
+_LAYER_COLUMNS = ", ".join(LAYER_COLUMN_NAMES)
 
 # asyncpg returns jsonb as text (the pool sets no JSON codec): decoded by _decode_jsonb
 _JSONB_COLUMNS = ("metadata_schema", "chunk_config", "routing_patterns", "structure_patterns")
