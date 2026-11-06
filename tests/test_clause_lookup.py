@@ -102,6 +102,29 @@ class TestFindReferences:
         assert unanchored(r"AT-\d+") == r"AT-\d+"
         assert unanchored(r"a^b") == r"a^b"
 
+    def test_reference_past_the_cap_is_not_read(self):
+        pattern = [r"^(?P<label>AT-\d+)\b"]
+        assert _labels("filler " * 400 + "show AT-44", pattern) == []
+        assert _labels("show AT-44 " + "filler " * 400, pattern) == [("at-44",)]
+        # Characters 1998-2002 hold AT-44: the cut must not leave AT-4
+        question = "x" * 1997 + " AT-44 and more"
+        assert _labels(question, pattern) == []
+        assert _labels("clause 7.2 " + "filler " * 15_000) == [("7.2", "clause 7.2")]
+
+    def test_patterns_read_at_most_the_cap(self):
+        from stratakb.rag.layer_detect import MAX_PATTERN_QUESTION_CHARS
+
+        class Recorder:
+            lengths: list[int] = []
+
+            def finditer(self, text):
+                self.lengths.append(len(text))
+                return iter(())
+
+        recorder = Recorder()
+        assert find_references("word " * 20_000, [recorder]) == []
+        assert recorder.lengths and max(recorder.lengths) <= MAX_PATTERN_QUESTION_CHARS
+
     def test_year_is_not_a_reference(self):
         assert find_references("what changed in 2026") == []
         assert find_references("the 05.11.2026 release") == []

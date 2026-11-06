@@ -22,6 +22,7 @@ from typing import Any, NamedTuple
 import structlog
 
 from stratakb.knowledge.structure import normalise_label
+from stratakb.rag.layer_detect import pattern_text
 from stratakb.rag.passages import ask_chunk, passage_cost
 
 logger = structlog.get_logger()
@@ -152,8 +153,10 @@ def find_references(
 
     extra_patterns are a layer's structure patterns (a named group 'label'
     gives the label, as in structure.detect_sections); each match of
-    question_pattern anywhere in the question is a reference.
+    question_pattern anywhere in the question is a reference. Only the first
+    MAX_PATTERN_QUESTION_CHARS characters of the question are read.
     """
+    question = pattern_text(question)
     found: list[tuple[int, Reference]] = []
     covered: list[tuple[int, int]] = []
 

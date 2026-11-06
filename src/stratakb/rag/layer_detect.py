@@ -15,19 +15,47 @@ import re
 
 import structlog
 
+from stratakb.knowledge.layers import has_nested_repeat
+
 logger = structlog.get_logger()
+
+# Layer patterns (routing here, references in clause_lookup) read only the
+# start of a question, so a pattern that backtracks badly cannot stall a
+# search on a very long one. The full question still goes to the search.
+MAX_PATTERN_QUESTION_CHARS = 2000
+
+
+def pattern_text(question: str) -> str:
+    """The part of question that layer patterns run over.
+
+    At most MAX_PATTERN_QUESTION_CHARS characters; a word the cut falls
+    inside is dropped, so a cut id ('AT-4' from 'AT-44') never matches.
+    """
+    if len(question) <= MAX_PATTERN_QUESTION_CHARS:
+        return question
+    head = question[:MAX_PATTERN_QUESTION_CHARS]
+    if question[MAX_PATTERN_QUESTION_CHARS].isspace():
+        return head
+    match = re.search(r"\s\S*\Z", head)
+    return head[: match.start()] if match else head
 
 
 def compile_patterns(raw: dict[str, list[str]]) -> dict[str, list[re.Pattern[str]]]:
-    """Compile routing patterns per layer, dropping any that are invalid regex."""
+    """Compile routing patterns per layer, dropping any that are invalid regex
+    or repeat a repeated part (one stored before such patterns were refused)."""
     compiled: dict[str, list[re.Pattern[str]]] = {}
     for layer, patterns in raw.items():
         layer_patterns = []
         for pattern in patterns or []:
             try:
-                layer_patterns.append(re.compile(pattern, re.IGNORECASE))
+                compiled_pattern = re.compile(pattern, re.IGNORECASE)
             except re.error as e:
                 logger.warning("invalid_routing_pattern", layer=layer, pattern=pattern, error=str(e))
+                continue
+            if has_nested_repeat(pattern):
+                logger.warning("unsafe_routing_pattern", layer=layer, pattern=pattern)
+                continue
+            layer_patterns.append(compiled_pattern)
         if layer_patterns:
             compiled[layer] = layer_patterns
     return compiled
@@ -41,6 +69,7 @@ def detect_layers(
 
     Returns a list of layer names detected from the query text.
     Returns empty list if no specific layer is detected (search all).
+    Only the first MAX_PATTERN_QUESTION_CHARS characters are read.
 
     Args:
         query: The user's search query.
@@ -52,9 +81,10 @@ def detect_layers(
     if not query or not patterns:
         return []
 
+    text = pattern_text(query)
     detected = []
     for layer, layer_patterns in patterns.items():
-        if any(p.search(query) for p in layer_patterns):
+        if any(p.search(text) for p in layer_patterns):
             detected.append(layer)
 
     return detected

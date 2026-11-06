@@ -154,15 +154,24 @@ def _nested_repeat(items, unbounded_outside: bool = False) -> bool:
     return False
 
 
+def has_nested_repeat(pattern: str) -> bool:
+    """True when pattern nests a variable repeat inside an unbounded one.
+
+    Call it only on a pattern that compiles (parsing raises re.error otherwise).
+    """
+    return _nested_repeat(_sre_parser.parse(pattern))
+
+
 def _validate_patterns(
     key: str, patterns: list[str], *, line_starts: bool = False
 ) -> list[str]:
     """Validate a list of regular expressions stored under key.
 
-    With line_starts the patterns mark section starts, matched at the start
-    of every line of every document ingested: one must not match an empty
-    line (every line would be a section) nor nest an unbounded repeat around
-    another one (exponential backtracking would stall the ingest).
+    No pattern may nest an unbounded repeat around another one: exponential
+    backtracking would stall an ingest or a search. With line_starts the
+    patterns mark section starts, matched at the start of every line of
+    every document ingested, and one must not match an empty line either
+    (every line would be a section).
     """
     if not isinstance(patterns, list) or not all(isinstance(p, str) for p in patterns):
         raise LayerValidationError(f"{key} must be a list of strings.")
@@ -172,13 +181,11 @@ def _validate_patterns(
             compiled = re.compile(pattern)
         except re.error as e:
             raise LayerValidationError(f"Invalid {kind} pattern '{pattern}': {e}") from e
-        if not line_starts:
-            continue
-        if compiled.match(""):
+        if line_starts and compiled.match(""):
             raise LayerValidationError(
                 f"Invalid {kind} pattern '{pattern}': it matches an empty line."
             )
-        if _nested_repeat(_sre_parser.parse(pattern)):
+        if has_nested_repeat(pattern):
             raise LayerValidationError(
                 f"Invalid {kind} pattern '{pattern}': it repeats a repeated part, "
                 "which can take very long on some lines."
@@ -187,7 +194,8 @@ def _validate_patterns(
 
 
 def _validate_routing_patterns(patterns: list[str]) -> list[str]:
-    """Validate routing patterns: a list of compilable regular expressions."""
+    """Validate routing patterns: compilable regular expressions that do not
+    repeat a repeated part."""
     return _validate_patterns("routing_patterns", patterns)
 
 

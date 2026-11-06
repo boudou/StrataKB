@@ -108,6 +108,19 @@ class TestLoadPreset:
         with pytest.raises(LayerValidationError, match="routing pattern"):
             load_preset(path)
 
+    @pytest.mark.parametrize("pattern", ["'(\\w+\\s?)*'", "'\\b(a+)+\\b'"])
+    def test_nested_routing_pattern_refused(self, tmp_path, pattern):
+        # A nested unbounded repeat could stall a search on a long question
+        path = _write_preset(tmp_path, (
+            "name: runbooks\n"
+            "display_name: Ops Runbooks\n"
+            f"routing_patterns: [{pattern}]\n"
+            "sources:\n"
+            "  - {name: docs, path: docs}\n"
+        ))
+        with pytest.raises(LayerValidationError, match="routing pattern.*repeats a repeated part"):
+            load_preset(path)
+
     def test_structure_patterns_loaded(self, tmp_path):
         assert load_preset(SEPA_PRESET).structure_patterns == [
             "^Identification:\\s*(?P<label>AT-[A-Z]?\\d{1,3})\\b",

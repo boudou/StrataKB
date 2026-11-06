@@ -108,6 +108,48 @@ class TestLayerDetection:
         assert len(patterns["runbooks"]) == 1
         assert detect_layers("which runbook covers failover", patterns) == ["runbooks"]
 
+    def test_nested_repeat_pattern_is_dropped(self):
+        # A layer stored before such patterns were refused keeps its safe ones
+        from stratakb.rag.layer_detect import compile_patterns, detect_layers
+
+        patterns = compile_patterns({"runbooks": [r"(a+)+$", r"\brunbook\b"]})
+        assert len(patterns["runbooks"]) == 1
+        assert detect_layers("which runbook covers failover", patterns) == ["runbooks"]
+
+    def test_routing_word_past_the_cap_is_not_found(self):
+        from stratakb.rag.layer_detect import compile_patterns, detect_layers
+
+        patterns = compile_patterns({"runbooks": [r"\brunbook\b"]})
+        filler = "filler " * 400
+        assert detect_layers(filler + "runbook", patterns) == []
+        assert detect_layers("runbook " + filler, patterns) == ["runbooks"]
+
+    def test_patterns_read_at_most_the_cap(self):
+        from stratakb.rag.layer_detect import MAX_PATTERN_QUESTION_CHARS, detect_layers
+
+        class Recorder:
+            lengths: list[int] = []
+
+            def search(self, text):
+                self.lengths.append(len(text))
+                return None
+
+        recorder = Recorder()
+        assert detect_layers("word " * 20_000, {"runbooks": [recorder]}) == []
+        assert recorder.lengths and max(recorder.lengths) <= MAX_PATTERN_QUESTION_CHARS
+
+    def test_pattern_text_drops_a_cut_word(self):
+        from stratakb.rag.layer_detect import MAX_PATTERN_QUESTION_CHARS, pattern_text
+
+        short = "runbook " * 10
+        assert pattern_text(short) == short
+        cut = "x" * (MAX_PATTERN_QUESTION_CHARS - 3) + " AT-44 more"
+        assert pattern_text(cut) == "x" * (MAX_PATTERN_QUESTION_CHARS - 3)
+        at_space = "x" * (MAX_PATTERN_QUESTION_CHARS - 6) + " AT-4 more"
+        assert pattern_text(at_space).endswith(" AT-4")
+        one_word = "x" * (MAX_PATTERN_QUESTION_CHARS + 50)
+        assert pattern_text(one_word) == "x" * MAX_PATTERN_QUESTION_CHARS
+
     def test_layer_without_valid_patterns_is_omitted(self):
         from stratakb.rag.layer_detect import compile_patterns
 

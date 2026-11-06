@@ -268,6 +268,20 @@ class TestLayerCRUDIntegration:
         with pytest.raises(LayerValidationError, match="display_name"):
             await create_layer(db_url, name="valid_name", display_name="")
 
+    @pytest.mark.asyncio
+    async def test_create_with_nested_routing_pattern_raises(self, db_url):
+        """A routing pattern that repeats a repeated part is refused, nothing written."""
+        from stratakb.knowledge.layers import create_layer, get_layer_status
+
+        name = "test_nested_routing"
+        await _drop_layers(db_url, name)
+        with pytest.raises(LayerValidationError, match="repeats a repeated part"):
+            await create_layer(
+                db_url, name=name, display_name="Nested", routing_patterns=[r"(a+)+$"]
+            )
+        with pytest.raises(LayerNotFoundError):
+            await get_layer_status(db_url, name=name)
+
 
 # ==========================================
 # Layer origin, owner and root folder (require database)
@@ -777,7 +791,11 @@ class TestUpdateLayer:
                 )
             with pytest.raises(LayerValidationError):
                 await update_layer(db_url, name, routing_patterns=["(unclosed"])
-            assert (await get_layer_status(db_url, name=name))["description"] == "kept"
+            with pytest.raises(LayerValidationError, match="repeats a repeated part"):
+                await update_layer(db_url, name, routing_patterns=[r"(\w+\s?)*"])
+            status = await get_layer_status(db_url, name=name)
+            assert status["description"] == "kept"
+            assert status["routing_patterns"] == []
         finally:
             await _drop_layers(db_url, name)
 
