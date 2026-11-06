@@ -37,6 +37,7 @@ from stratakb.knowledge.embedding_checks import (
     reset_embedding_checks,
     run_embedding_checks,
 )
+from tests.conftest import call_tool
 
 BASE_URL = "http://127.0.0.1:11434/v1"
 
@@ -114,8 +115,7 @@ async def _health(settings: Settings) -> dict:
             AsyncMock(return_value={"status": "ok"}),
         ),
     ):
-        server = mcp_server.build_server(settings)
-        return await server._tool_manager.get_tool("strata_admin_health").fn()
+        return await call_tool(mcp_server.build_server(settings), "strata_admin_health")
 
 
 # ==========================================

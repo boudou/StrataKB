@@ -23,6 +23,7 @@ import pytest
 
 from stratakb.config import Settings
 from stratakb.core.egress import outbound_providers
+from tests.conftest import call_tool
 
 
 @pytest.fixture(autouse=True)
@@ -274,8 +275,7 @@ def test_main_leaves_env_when_off(server, monkeypatch):
 
 async def _health(mcp_server, settings: Settings) -> dict:
     """Call strata_admin_health on a server built from `settings`."""
-    server = mcp_server.build_server(settings)
-    return await server._tool_manager.get_tool("strata_admin_health").fn()
+    return await call_tool(mcp_server.build_server(settings), "strata_admin_health")
 
 
 @pytest.mark.asyncio

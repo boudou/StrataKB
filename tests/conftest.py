@@ -3,9 +3,27 @@
 from __future__ import annotations
 
 import asyncio
+from typing import TYPE_CHECKING
 
 import asyncpg
 import pytest
+
+if TYPE_CHECKING:
+    from mcp.server.fastmcp import FastMCP
+
+
+async def call_tool(server: FastMCP, name: str, /, **arguments) -> dict:
+    """Call tool `name` on a built server, through its role and logging decorators."""
+    return await server._tool_manager.get_tool(name).fn(**arguments)
+
+
+@pytest.fixture
+def server():
+    """A StrataKB server built from the environment's settings."""
+    from stratakb.config import get_settings
+    from stratakb.mcp_server import build_server
+
+    return build_server(get_settings())
 
 
 @pytest.fixture(scope="session", autouse=True)

@@ -6,6 +6,8 @@ from unittest.mock import AsyncMock, call, patch
 
 import pytest
 
+from tests.conftest import call_tool
+
 
 def test_settings_load():
     """Settings should load from defaults without .env file."""
@@ -16,12 +18,9 @@ def test_settings_load():
     assert settings.strata_role in ("viewer", "operator", "admin")
 
 
-def test_mcp_server_imports():
-    """MCP server module should import without errors."""
-    from stratakb.mcp_server import mcp
-
-    assert mcp is not None
-    assert mcp.name == "StrataKB"
+def test_build_server_names_the_server(server):
+    """A built server carries the StrataKB name."""
+    assert server.name == "StrataKB"
 
 
 def test_import_reads_no_settings():
@@ -84,8 +83,8 @@ async def test_two_servers_use_their_own_database_url():
 
     check = AsyncMock(return_value={"status": "ok"})
     with patch("stratakb.mcp_server.check_connection", check):
-        await server_a._tool_manager.get_tool("strata_admin_health").fn()
-        await server_b._tool_manager.get_tool("strata_admin_health").fn()
+        await call_tool(server_a, "strata_admin_health")
+        await call_tool(server_b, "strata_admin_health")
 
     assert check.await_args_list == [call(url_a), call(url_b)]
     admin_tools = {

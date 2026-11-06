@@ -16,6 +16,8 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from tests.conftest import call_tool
+
 
 # ==========================================
 # SQL Validation tests
@@ -511,22 +513,20 @@ class TestSqlToolsGate:
         assert _tool_names(server) == _FIXED_TOOLS
 
     @pytest.mark.asyncio
-    async def test_health_reports_sql_tools(self):
+    async def test_health_reports_sql_tools(self, server):
         from unittest.mock import patch
 
-        from stratakb import mcp_server
-        from stratakb.config import get_settings
         from stratakb.database_access import tools
 
-        # Building a server resets the SQL tools status, so build first
-        server = mcp_server.build_server(get_settings())
+        # The server fixture is built before the test body, which matters:
+        # building resets the SQL tools status
         tools._sql_tools.clear()
         tools._sql_tools.update(status="disabled", reason="READONLY_DATABASE_URL is not set")
         with patch(
             "stratakb.mcp_server.check_connection",
             AsyncMock(return_value={"status": "ok"}),
         ):
-            result = await server._tool_manager.get_tool("strata_admin_health").fn()
+            result = await call_tool(server, "strata_admin_health")
 
         assert result["sql_tools"] == {
             "status": "disabled",
