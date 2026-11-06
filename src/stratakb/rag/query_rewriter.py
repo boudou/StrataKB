@@ -128,13 +128,14 @@ async def _call_anthropic(request: RewriteRequest, system: str, query: str) -> s
     import anthropic
 
     client = anthropic.AsyncAnthropic(api_key=request.anthropic_api_key)
-    response = await client.messages.create(
-        model=request.model,
-        max_tokens=300,
-        system=system,
-        messages=[{"role": "user", "content": query}],
-    )
-    return response.content[0].text if response.content else None
+    async with client:
+        response = await client.messages.create(
+            model=request.model,
+            max_tokens=300,
+            system=system,
+            messages=[{"role": "user", "content": query}],
+        )
+        return response.content[0].text if response.content else None
 
 
 async def _call_openai_compatible(request: RewriteRequest, system: str, query: str) -> str | None:
@@ -146,18 +147,19 @@ async def _call_openai_compatible(request: RewriteRequest, system: str, query: s
         timeout=_OPENAI_COMPATIBLE_TIMEOUT,
         max_retries=0,
     )
-    response = await client.chat.completions.create(
-        model=request.model,
-        max_tokens=300,
-        messages=[
-            {"role": "system", "content": system},
-            {"role": "user", "content": query},
-        ],
-        **keyless_request_options(settings.query_rewrite_api_key),
-    )
-    if not response.choices:
-        return None
-    return response.choices[0].message.content
+    async with client:
+        response = await client.chat.completions.create(
+            model=request.model,
+            max_tokens=300,
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": query},
+            ],
+            **keyless_request_options(settings.query_rewrite_api_key),
+        )
+        if not response.choices:
+            return None
+        return response.choices[0].message.content
 
 
 class RewriteProvider(NamedTuple):

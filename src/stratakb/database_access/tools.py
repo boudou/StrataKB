@@ -118,12 +118,16 @@ def sql_tools_status() -> dict[str, str]:
     return dict(_sql_tools)
 
 
-def _set_sql_tools_status(status: str, reason: str | None = None) -> None:
-    """Record whether the SQL tools are on and, when off, why."""
+def _record_sql_tools_enabled() -> None:
+    """Record that the SQL tools are on."""
     _sql_tools.clear()
-    _sql_tools["status"] = status
-    if reason is not None:
-        _sql_tools["reason"] = reason
+    _sql_tools["status"] = "enabled"
+
+
+def _record_sql_tools_disabled(reason: str) -> None:
+    """Record that the SQL tools are off, and why."""
+    _sql_tools.clear()
+    _sql_tools.update(status="disabled", reason=reason)
 
 
 def _disable_sql_tools(mcp: FastMCP, reason: str) -> None:
@@ -132,7 +136,7 @@ def _disable_sql_tools(mcp: FastMCP, reason: str) -> None:
         # Not registered: no URL, or removed by an earlier check
         with contextlib.suppress(ToolError):
             mcp.remove_tool(name)
-    _set_sql_tools_status("disabled", reason)
+    _record_sql_tools_disabled(reason)
     logger.warning("sql_tools_disabled", reason=reason)
 
 
@@ -172,7 +176,7 @@ async def secure_sql_tools(mcp: FastMCP, query_database_url: str) -> None:
     if reason:
         _disable_sql_tools(mcp, reason)
         return
-    _set_sql_tools_status("enabled")
+    _record_sql_tools_enabled()
     logger.info("sql_tools_enabled")
 
 
@@ -427,7 +431,7 @@ def register_database_tools(mcp: FastMCP, database_url: str, query_database_url:
         _register_sql_tools(mcp, database_url, query_database_url)
     else:
         reason = "READONLY_DATABASE_URL is not set"
-        _set_sql_tools_status("disabled", reason)
+        _record_sql_tools_disabled(reason)
         logger.info("sql_tools_disabled", reason=reason)
 
 
@@ -436,7 +440,7 @@ def _register_sql_tools(mcp: FastMCP, database_url: str, query_database_url: str
 
     `database_url` serves only the audit log.
     """
-    _set_sql_tools_status("enabled")
+    _record_sql_tools_enabled()
 
     @mcp.tool()
     @require_role("operator")

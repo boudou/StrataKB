@@ -184,6 +184,13 @@ async def probe_url(db_url):
         await owner_execute(db_url, drop)
 
 
+@pytest.fixture
+def no_sdk_env(monkeypatch):
+    """Keep SDK keys and base-URL overrides from the shell out of the tests."""
+    for name in ("OPENAI_API_KEY", "OPENAI_BASE_URL", "ANTHROPIC_BASE_URL"):
+        monkeypatch.delenv(name, raising=False)
+
+
 @pytest.fixture(autouse=True)
 async def _reset_db_pool():
     """Reset the global connection pools after each test.

@@ -64,9 +64,9 @@ async def write_audit_log(
         result_summary: Brief description of the result.
     """
     if user_id is None:
-        # Imported here so tests that patch stratakb.core.auth.get_current_user
-        # take effect, and resolved outside the try so a failure is not
-        # swallowed as audit_log_failed.
+        # Resolved at call time and outside the try, so a failure is not
+        # swallowed as audit_log_failed. Imported here so tests that patch
+        # stratakb.core.auth.get_current_user take effect.
         from stratakb.core.auth import get_current_user
 
         user_id, _ = get_current_user()

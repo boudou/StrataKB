@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+from collections.abc import Iterable
 
 import structlog
 
@@ -77,7 +78,7 @@ def model_listed(model: str, ids: list[str] | set[str]) -> bool:
     return model in ids or f"{model}:latest" in ids
 
 
-def _shown_ids(ids) -> list[str]:
+def _shown_ids(ids: Iterable[object]) -> list[str]:
     """Return the model ids fit for the health report: printable, short, at most 20.
 
     The ids come from the model server and are shown to any viewer, so

@@ -4,21 +4,24 @@ Tests cover:
 - Layer detection (NLP)
 - Metadata hint extraction
 - Confidence scoring
-- Query rewriting (mocked), through Anthropic or an OpenAI-compatible endpoint
-- Lenient parsing of the rewrite reply
 - strata_ask tool integration
 - MCP tool registration
 """
 
 from __future__ import annotations
 
-from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from stratakb.core.egress import PLACEHOLDER_API_KEY
-from tests.helpers import ISO_PRESET, SEPA_PRESET, example_routing_patterns
+from tests.helpers import (
+    ISO_PRESET,
+    SEPA_PRESET,
+    compatible_rewrite_settings,
+    example_routing_patterns,
+    openai_reply_client,
+    rewrite_settings,
+)
 
 # ==========================================
 # Layer detection tests
@@ -350,304 +353,6 @@ class TestSearchItem:
         assert item["match"] == "exact"
 
 
-# ==========================================
-# Query rewriter tests
-# ==========================================
-
-
-class TestQueryRewriter:
-    @pytest.mark.asyncio
-    async def test_no_api_key_returns_original(self):
-        from stratakb.rag.query_rewriter import rewrite_query
-
-        result = await rewrite_query("How does payment work?", anthropic_api_key="")
-        assert result == ["How does payment work?"]
-
-    @pytest.mark.asyncio
-    async def test_rewrite_with_mocked_api(self):
-        from stratakb.rag.query_rewriter import rewrite_query
-
-        mock_response = AsyncMock()
-        mock_response.content = [
-            AsyncMock(text='["payment initiation pain.001 flow", "SEPA SCT payment flow"]')
-        ]
-
-        mock_client = AsyncMock()
-        mock_client.messages.create = AsyncMock(return_value=mock_response)
-
-        with patch("anthropic.AsyncAnthropic", return_value=mock_client):
-            result = await rewrite_query(
-                "How does payment work?",
-                anthropic_api_key="fake-key",
-                model="claude-haiku-5-5",
-            )
-
-        assert len(result) == 2
-        assert "pain.001" in result[0]
-
-    @pytest.mark.asyncio
-    async def test_rewrite_prompt_includes_domain_context(self):
-        from stratakb.rag.query_rewriter import build_domain_context, rewrite_query
-
-        mock_response = AsyncMock()
-        mock_response.content = [AsyncMock(text='["a", "b"]')]
-        mock_client = AsyncMock()
-        mock_client.messages.create = AsyncMock(return_value=mock_response)
-
-        context = build_domain_context({"sepa": "SEPA Payments: rulebooks"})
-        with patch("anthropic.AsyncAnthropic", return_value=mock_client):
-            await rewrite_query(
-                "How does payment work?",
-                anthropic_api_key="fake-key",
-                model="claude-haiku-5-5",
-                domain_context=context,
-            )
-
-        system = mock_client.messages.create.call_args.kwargs["system"]
-        assert "**sepa**: SEPA Payments: rulebooks" in system
-        assert "{domain_context}" not in system
-
-    def test_domain_context_without_layers(self):
-        from stratakb.rag.query_rewriter import build_domain_context
-
-        assert "documentation" in build_domain_context({})
-
-    @pytest.mark.asyncio
-    async def test_rewrite_api_error_fallback(self):
-        from stratakb.rag.query_rewriter import rewrite_query
-
-        with patch("anthropic.AsyncAnthropic", side_effect=Exception("API error")):
-            result = await rewrite_query(
-                "How does payment work?",
-                anthropic_api_key="fake-key",
-                model="claude-haiku-5-5",
-            )
-
-        assert result == ["How does payment work?"]
-
-
-# ==========================================
-# Query rewriting through an OpenAI-compatible endpoint
-# ==========================================
-
-_LOCAL_URL = "http://127.0.0.1:11434/v1"
-
-
-@pytest.fixture
-def no_sdk_env(monkeypatch):
-    """Keep SDK keys and base-URL overrides from the shell out of the tests."""
-    for name in ("OPENAI_API_KEY", "OPENAI_BASE_URL", "ANTHROPIC_BASE_URL"):
-        monkeypatch.delenv(name, raising=False)
-
-
-def _rewrite_settings(**overrides):
-    from stratakb.config import Settings
-
-    values = {"strata_user": "test", "strata_role": "viewer"}
-    values.update(overrides)
-    return Settings(_env_file=None, **values)
-
-
-def _compatible_settings(**overrides):
-    values = {
-        "query_rewrite_provider": "openai_compatible",
-        "query_rewrite_base_url": _LOCAL_URL,
-        "query_rewrite_model": "llama3.2",
-    }
-    values.update(overrides)
-    return _rewrite_settings(**values)
-
-
-def _openai_client(content):
-    """A mocked AsyncOpenAI client whose chat reply carries this content."""
-    response = SimpleNamespace(
-        choices=[SimpleNamespace(message=SimpleNamespace(content=content))]
-    )
-    client = MagicMock()
-    client.chat.completions.create = AsyncMock(return_value=response)
-    return client
-
-
-def _anthropic_client(text):
-    """A mocked AsyncAnthropic client whose reply carries this text."""
-    client = MagicMock()
-    client.messages.create = AsyncMock(
-        return_value=SimpleNamespace(content=[SimpleNamespace(text=text)])
-    )
-    return client
-
-
-async def _rewrite_with_reply(provider: str, reply, question: str = "q") -> list[str]:
-    """Run rewrite_query with the given provider answering with reply."""
-    from stratakb.rag.query_rewriter import rewrite_query
-
-    if provider == "openai_compatible":
-        settings = _compatible_settings()
-        target, client = "openai.AsyncOpenAI", _openai_client(reply)
-    else:
-        settings = _rewrite_settings()
-        target, client = "anthropic.AsyncAnthropic", _anthropic_client(reply)
-    with (
-        patch("stratakb.config.get_settings", return_value=settings),
-        patch(target, return_value=client),
-    ):
-        return await rewrite_query(question, anthropic_api_key="fake-key")
-
-
-class TestOpenAICompatibleRewriter:
-    def test_rewrite_provider_table(self):
-        """Every provider name has one table entry, keyed by its own name."""
-        import typing
-
-        from stratakb.core.egress import RewriteProviderName
-        from stratakb.rag.query_rewriter import REWRITE_PROVIDERS
-
-        assert set(typing.get_args(RewriteProviderName)) == set(REWRITE_PROVIDERS)
-        for name, p in REWRITE_PROVIDERS.items():
-            assert name == p.name
-
-    @pytest.mark.asyncio
-    async def test_openai_compatible_rewrite(self, no_sdk_env):
-        from stratakb.rag.query_rewriter import build_domain_context, rewrite_query
-
-        client = _openai_client('["payment rejection codes", "pacs.002 reject"]')
-        context = build_domain_context({"sepa": "SEPA Payments: rulebooks"})
-        with (
-            patch("stratakb.config.get_settings", return_value=_compatible_settings()),
-            patch("openai.AsyncOpenAI", return_value=client) as openai_cls,
-            patch("anthropic.AsyncAnthropic") as anthropic_cls,
-        ):
-            result = await rewrite_query("Why was it rejected?", domain_context=context)
-
-        assert result == ["payment rejection codes", "pacs.002 reject"]
-        openai_cls.assert_called_once()
-        kwargs = openai_cls.call_args.kwargs
-        assert kwargs["base_url"] == _LOCAL_URL
-        assert kwargs["api_key"] == PLACEHOLDER_API_KEY
-        assert kwargs["max_retries"] == 0
-        anthropic_cls.assert_not_called()
-
-        sent = client.chat.completions.create.call_args.kwargs
-        assert sent["model"] == "llama3.2"
-        system, user = sent["messages"]
-        assert system["role"] == "system"
-        assert "**sepa**: SEPA Payments: rulebooks" in system["content"]
-        assert user == {"role": "user", "content": "Why was it rejected?"}
-
-    @pytest.mark.asyncio
-    async def test_openai_compatible_ignores_openai_env(self, monkeypatch):
-        from stratakb.rag.query_rewriter import rewrite_query
-
-        monkeypatch.setenv("OPENAI_API_KEY", "sk-openai-secret")
-        monkeypatch.setenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
-        client = _openai_client('["a", "b"]')
-
-        with (
-            patch("stratakb.config.get_settings", return_value=_compatible_settings()),
-            patch("openai.AsyncOpenAI", return_value=client) as openai_cls,
-        ):
-            await rewrite_query("q")
-        kwargs = openai_cls.call_args.kwargs
-        assert kwargs["api_key"] == PLACEHOLDER_API_KEY
-        assert kwargs["base_url"] == _LOCAL_URL
-
-        settings = _compatible_settings(query_rewrite_api_key="endpoint-key")
-        with (
-            patch("stratakb.config.get_settings", return_value=settings),
-            patch("openai.AsyncOpenAI", return_value=client) as openai_cls,
-        ):
-            await rewrite_query("q")
-        assert openai_cls.call_args.kwargs["api_key"] == "endpoint-key"
-
-    @pytest.mark.asyncio
-    @pytest.mark.parametrize(
-        "overrides",
-        [
-            {"query_rewrite_base_url": ""},
-            {"query_rewrite_model": "claude-haiku-5-5"},
-            {"query_rewrite_provider": "ollama"},
-        ],
-        ids=["no_base_url", "default_model", "unknown_provider"],
-    )
-    async def test_incomplete_settings_skip(self, no_sdk_env, overrides):
-        from stratakb.rag.query_rewriter import rewrite_configured, rewrite_query
-
-        settings = _compatible_settings(**overrides)
-        with (
-            patch("stratakb.config.get_settings", return_value=settings),
-            patch("openai.AsyncOpenAI") as openai_cls,
-            patch("anthropic.AsyncAnthropic") as anthropic_cls,
-        ):
-            result = await rewrite_query("q", anthropic_api_key="fake-key")
-        assert result == ["q"]
-        openai_cls.assert_not_called()
-        anthropic_cls.assert_not_called()
-        assert rewrite_configured(settings, anthropic_api_key="fake-key") is False
-
-    def test_rewrite_configured(self):
-        from stratakb.rag.query_rewriter import rewrite_configured
-
-        assert rewrite_configured(_rewrite_settings()) is False
-        assert rewrite_configured(_rewrite_settings(anthropic_api_key="k")) is True
-        assert rewrite_configured(_compatible_settings()) is True
-
-    @pytest.mark.asyncio
-    @pytest.mark.parametrize("provider", ["anthropic", "openai_compatible"])
-    @pytest.mark.parametrize(
-        "reply",
-        [
-            'Sure! ["a", "b"] hope this helps',
-            '```json\n["a", "b"]\n```',
-            'Here:\n```\n["a","b"]\n```\nDone',
-            '[1] then ["a", " b ", ""]',
-        ],
-    )
-    async def test_lenient_json(self, no_sdk_env, provider, reply):
-        assert await _rewrite_with_reply(provider, reply) == ["a", "b"]
-
-    @pytest.mark.asyncio
-    @pytest.mark.parametrize("provider", ["anthropic", "openai_compatible"])
-    @pytest.mark.parametrize("reply", ["no array here", "[]", "[1, 2]", None])
-    async def test_parse_failure_is_counted(self, no_sdk_env, provider, reply):
-        from structlog.testing import capture_logs
-
-        with capture_logs() as logs:
-            first = await _rewrite_with_reply(provider, reply, "secret question")
-            second = await _rewrite_with_reply(provider, reply, "secret question")
-
-        assert first == second == ["secret question"]
-        errors = [e for e in logs if e["event"] == "query_rewrite_json_error"]
-        assert len(errors) == 2
-        assert errors[1]["failures"] == errors[0]["failures"] + 1
-        assert errors[0]["provider"] == provider
-        if reply:
-            assert all(reply not in str(e) for e in errors)
-
-    @pytest.mark.asyncio
-    async def test_openai_compatible_empty_choices(self, no_sdk_env):
-        from stratakb.rag.query_rewriter import rewrite_query
-
-        client = MagicMock()
-        client.chat.completions.create = AsyncMock(return_value=SimpleNamespace(choices=[]))
-        with (
-            patch("stratakb.config.get_settings", return_value=_compatible_settings()),
-            patch("openai.AsyncOpenAI", return_value=client),
-        ):
-            assert await rewrite_query("q") == ["q"]
-
-    @pytest.mark.asyncio
-    async def test_openai_compatible_error_fallback(self, no_sdk_env):
-        from stratakb.rag.query_rewriter import rewrite_query
-
-        client = MagicMock()
-        client.chat.completions.create = AsyncMock(side_effect=Exception("Connection error."))
-        with (
-            patch("stratakb.config.get_settings", return_value=_compatible_settings()),
-            patch("openai.AsyncOpenAI", return_value=client),
-        ):
-            assert await rewrite_query("q") == ["q"]
-
-
 def _capture_ask(settings):
     """Register the RAG tools on a mock server and return strata_ask."""
     from stratakb.rag.tools import register_rag_tools
@@ -675,13 +380,13 @@ class TestAskDomainContext:
     ):
         base = {"learning_enabled": False, "reranking_enabled": False}
         settings = (
-            _compatible_settings(**base) if configured else _rewrite_settings(**base)
+            compatible_rewrite_settings(**base) if configured else rewrite_settings(**base)
         )
         ask = _capture_ask(settings)
         routing = AsyncMock(
             return_value={"descriptions": {"sepa": "SEPA Payments: rulebooks"}, "patterns": {}}
         )
-        client = _openai_client('["sepa rejection", "pacs.002"]')
+        client = openai_reply_client('["sepa rejection", "pacs.002"]')
         with (
             patch("stratakb.config.get_settings", return_value=settings),
             patch("stratakb.knowledge.layers.get_layer_routing", routing),
@@ -737,7 +442,7 @@ class TestAskConfidence:
     @pytest.mark.asyncio
     async def test_hybrid_confidence_uses_similarity(self, no_sdk_env):
         """Without reranking, confidence reads the cosine similarity, not the fused score."""
-        settings = _rewrite_settings(learning_enabled=False, reranking_enabled=False)
+        settings = rewrite_settings(learning_enabled=False, reranking_enabled=False)
         ask = _capture_ask(settings)
         results = _search_results([1.0, 0.95, 0.9], [0.2, 0.15, 0.1])
         with (
@@ -759,7 +464,7 @@ class TestAskConfidence:
     @pytest.mark.asyncio
     async def test_rerank_confidence_uses_probabilities(self, no_sdk_env):
         """With reranking, confidence reads the cross-encoder's probabilities (0-1)."""
-        settings = _rewrite_settings(learning_enabled=False, reranking_enabled=True)
+        settings = rewrite_settings(learning_enabled=False, reranking_enabled=True)
         ask = _capture_ask(settings)
         results = _search_results([1.0, 0.95, 0.9], [0.2, 0.15, 0.1])
         with (
@@ -802,7 +507,7 @@ def _result(name, score, similarity, *, content=None, layer="docs"):
 
 async def _ask_with(by_query, *, reranking=False, logits=None):
     """Run strata_ask with the rewriter giving these queries and each query these results."""
-    settings = _rewrite_settings(learning_enabled=False, reranking_enabled=reranking)
+    settings = rewrite_settings(learning_enabled=False, reranking_enabled=reranking)
     ask = _capture_ask(settings)
 
     async def search(_db, _key, query, *, layers, top_k):

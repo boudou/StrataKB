@@ -161,6 +161,39 @@ def fake_openai_client(n: int = 768) -> MagicMock:
     return client
 
 
+# The query rewriter
+
+LOCAL_REWRITE_URL = "http://127.0.0.1:11434/v1"
+
+
+def rewrite_settings(**overrides) -> Settings:
+    from stratakb.config import Settings
+
+    values = {"strata_user": "test", "strata_role": "viewer"}
+    values.update(overrides)
+    return Settings(_env_file=None, **values)
+
+
+def compatible_rewrite_settings(**overrides) -> Settings:
+    values = {
+        "query_rewrite_provider": "openai_compatible",
+        "query_rewrite_base_url": LOCAL_REWRITE_URL,
+        "query_rewrite_model": "llama3.2",
+    }
+    values.update(overrides)
+    return rewrite_settings(**values)
+
+
+def openai_reply_client(content) -> MagicMock:
+    """A mocked AsyncOpenAI client whose chat reply carries this content."""
+    response = SimpleNamespace(
+        choices=[SimpleNamespace(message=SimpleNamespace(content=content))]
+    )
+    client = MagicMock()
+    client.chat.completions.create = AsyncMock(return_value=response)
+    return client
+
+
 async def wait_until_blocked_by(
     pool, blocker_pid: int, waiter: asyncio.Task | None = None, *, timeout: float = 10
 ) -> None:
