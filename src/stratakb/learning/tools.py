@@ -10,7 +10,7 @@ import re
 from mcp.server.fastmcp import FastMCP
 
 from stratakb.core.audit import write_audit_log
-from stratakb.core.auth import get_current_user, require_role
+from stratakb.core.auth import require_role
 from stratakb.core.logging import log_tool_call
 
 _PASSAGE_ID = re.compile(r"[Ss]([1-9][0-9]*)")
@@ -150,10 +150,8 @@ def register_learning_tools(mcp: FastMCP, database_url: str) -> None:
         summary = "Rated helpful" if helpful else "Rated not helpful"
         if extras:
             summary += ", with " + ", ".join(extras)
-        user_id, _ = get_current_user()
         await write_audit_log(
             database_url,
-            user_id=user_id,
             action="feedback",
             tool_name="strata_feedback",
             parameters={"interaction_id": interaction_id, "helpful": helpful},
@@ -221,10 +219,8 @@ def register_learning_tools(mcp: FastMCP, database_url: str) -> None:
                 "error": "Reset failed in the database; nothing was deleted. "
                 "Check the server log and retry.",
             }
-        user_id, _ = get_current_user()
         await write_audit_log(
             database_url,
-            user_id=user_id,
             action="reset_learning",
             tool_name="strata_reset_learning",
             parameters={"scope": "layer", "layer": layer} if layer else {"scope": "all"},

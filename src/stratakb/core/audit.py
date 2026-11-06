@@ -46,9 +46,9 @@ def redact_params(params: dict | None) -> dict | None:
 async def write_audit_log(
     database_url: str,
     *,
-    user_id: str,
     action: str,
     tool_name: str,
+    user_id: str | None = None,
     parameters: dict | None = None,
     result_summary: str | None = None,
 ) -> None:
@@ -56,12 +56,21 @@ async def write_audit_log(
 
     Args:
         database_url: PostgreSQL connection URL.
-        user_id: ID of the user performing the action.
         action: Action type (e.g., "create", "delete", "query", "ingest").
         tool_name: Name of the MCP tool invoked.
+        user_id: ID of the user performing the action; defaults to the
+            current user (STRATA_USER).
         parameters: Tool parameters (sensitive fields auto-redacted).
         result_summary: Brief description of the result.
     """
+    if user_id is None:
+        # Imported here so tests that patch stratakb.core.auth.get_current_user
+        # take effect, and resolved outside the try so a failure is not
+        # swallowed as audit_log_failed.
+        from stratakb.core.auth import get_current_user
+
+        user_id, _ = get_current_user()
+
     safe_params = redact_params(parameters)
 
     try:

@@ -34,10 +34,7 @@ def _tool(name: str, database_url: str = DB):
 
 @contextmanager
 def _admin():
-    with (
-        patch("stratakb.core.auth.get_current_user", return_value=("tester", "admin")),
-        patch("stratakb.learning.tools.get_current_user", return_value=("tester", "admin")),
-    ):
+    with patch("stratakb.core.auth.get_current_user", return_value=("tester", "admin")):
         yield
 
 
@@ -66,7 +63,7 @@ async def test_feedback_writes_one_audit_entry():
     assert result["status"] == "ok"
     audit.assert_awaited_once()
     kwargs = audit.await_args.kwargs
-    assert kwargs["user_id"] == "tester"
+    assert "user_id" not in kwargs  # write_audit_log takes the caller itself
     assert kwargs["action"] == "feedback"
     assert kwargs["tool_name"] == "strata_feedback"
     assert kwargs["parameters"] == {"interaction_id": "abc", "helpful": True}

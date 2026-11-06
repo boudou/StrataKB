@@ -18,7 +18,7 @@ from mcp.server.fastmcp import FastMCP
 
 from stratakb.config import Settings, config_file_missing, dotenv_warning, get_settings
 from stratakb.core.audit import query_audit_log, write_audit_log
-from stratakb.core.auth import get_current_user, require_role
+from stratakb.core.auth import require_role
 from stratakb.core.database import check_connection, close_pool, get_pool
 from stratakb.core.egress import enforce_local_only, outbound_providers
 from stratakb.core.local_db import START_HINT
@@ -343,10 +343,8 @@ def _register_admin_tools(mcp: FastMCP, settings: Settings) -> None:
             )
 
             # Audit log
-            admin_id, _ = get_current_user()
             await write_audit_log(
                 settings.database_url,
-                user_id=admin_id,
                 action="update_role",
                 tool_name="strata_admin_update_role",
                 parameters={"target_user": user_external_id, "new_role": new_role},

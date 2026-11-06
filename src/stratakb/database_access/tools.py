@@ -15,7 +15,7 @@ from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.exceptions import ToolError
 
 from stratakb.core.audit import write_audit_log
-from stratakb.core.auth import get_current_user, require_role
+from stratakb.core.auth import require_role
 from stratakb.core.logging import log_tool_call
 
 logger = structlog.get_logger()
@@ -497,10 +497,8 @@ def _register_sql_tools(mcp: FastMCP, database_url: str, query_database_url: str
             truncated = len(rows) > _MAX_ROWS
 
             # Audit log
-            user_id, _ = get_current_user()
             await write_audit_log(
                 database_url,
-                user_id=user_id,
                 action="query",
                 tool_name="strata_db_query",
                 parameters={"sql": sql[:500]},

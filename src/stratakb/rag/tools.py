@@ -12,7 +12,7 @@ import structlog
 from mcp.server.fastmcp import FastMCP
 
 from stratakb.core.audit import write_audit_log
-from stratakb.core.auth import get_current_user, require_role
+from stratakb.core.auth import require_role
 from stratakb.core.logging import log_tool_call
 from stratakb.learning.pii import scrub_query
 from stratakb.rag.clause_lookup import in_exact_span, without_exact_spans
@@ -306,10 +306,8 @@ def register_rag_tools(
             items = [_search_item(e) for e in exact] + found
             items = items[: max(top_k, len(exact))]
 
-            user_id, _ = get_current_user()
             await write_audit_log(
                 database_url,
-                user_id=user_id,
                 action="search",
                 tool_name="strata_search",
                 parameters={
@@ -513,10 +511,8 @@ def register_rag_tools(
                         })
 
             # Audit
-            user_id, _ = get_current_user()
             await write_audit_log(
                 database_url,
-                user_id=user_id,
                 action="ask",
                 tool_name="strata_ask",
                 parameters={

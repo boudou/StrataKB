@@ -235,6 +235,36 @@ class TestAuditLogDB:
         assert params["password"] == "***REDACTED***"
 
     @pytest.mark.asyncio
+    async def test_user_defaults_to_current_user(self, db_url):
+        from uuid import uuid4
+
+        from stratakb.core.audit import query_audit_log, write_audit_log
+
+        caller = f"audit_default_{uuid4().hex[:8]}"
+        with patch("stratakb.core.auth.get_current_user", return_value=(caller, "admin")):
+            await write_audit_log(db_url, action="test_action", tool_name="test_tool_default")
+
+        entries = await query_audit_log(db_url, user_id=caller, tool_name="test_tool_default")
+        assert len(entries) == 1
+        assert entries[0]["user_id"] == caller
+
+    @pytest.mark.asyncio
+    async def test_explicit_user_wins_over_current_user(self, db_url):
+        from uuid import uuid4
+
+        from stratakb.core.audit import query_audit_log, write_audit_log
+
+        explicit = f"audit_explicit_{uuid4().hex[:8]}"
+        with patch("stratakb.core.auth.get_current_user", return_value=("someone_else", "admin")):
+            await write_audit_log(
+                db_url, user_id=explicit, action="test_action", tool_name="test_tool_explicit"
+            )
+
+        entries = await query_audit_log(db_url, user_id=explicit, tool_name="test_tool_explicit")
+        assert len(entries) == 1
+        assert entries[0]["user_id"] == explicit
+
+    @pytest.mark.asyncio
     async def test_query_with_date_filter(self, db_url):
         from stratakb.core.audit import query_audit_log
 
