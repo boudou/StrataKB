@@ -11,9 +11,16 @@ from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock, MagicMock, patch
 
 if TYPE_CHECKING:
+    from mcp.server.fastmcp import FastMCP
+
     from stratakb.config import Settings
 
 FAKE_EMBEDDING = [0.01] * 768
+
+
+async def call_tool(server: FastMCP, name: str, /, **arguments) -> dict:
+    """Call tool `name` on a built server, through its role and logging decorators."""
+    return await server._tool_manager.get_tool(name).fn(**arguments)
 
 
 def write_file(path: Path, text: str) -> Path:

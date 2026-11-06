@@ -37,7 +37,7 @@ from stratakb.knowledge.embedding_checks import (
     reset_embedding_checks,
     run_embedding_checks,
 )
-from tests.conftest import call_tool
+from tests.helpers import call_tool
 
 BASE_URL = "http://127.0.0.1:11434/v1"
 

@@ -13,6 +13,7 @@ from stratakb.knowledge.presets import (
     dry_run_parse,
     load_preset,
 )
+from tests.helpers import call_tool
 
 EXAMPLES_DIR = Path(__file__).parent.parent / "examples"
 SEPA_PRESET = EXAMPLES_DIR / "sepa" / "preset.yaml"
@@ -694,13 +695,7 @@ class TestApplyPresetTool:
             patch("stratakb.knowledge.tools.get_current_user", return_value=("tester", "admin")),
         )
 
-    async def _call(self, **kwargs):
-        from stratakb.mcp_server import mcp
-
-        tool = mcp._tool_manager.get_tool("strata_apply_preset")
-        return await tool.fn(preset_path=str(SEPA_PRESET), **kwargs)
-
-    async def test_other_origin_returns_error_without_ingest(self):
+    async def test_other_origin_returns_error_without_ingest(self, server):
         auth, tools_auth = self._admin()
         with (
             auth, tools_auth,
@@ -713,13 +708,13 @@ class TestApplyPresetTool:
             patch("stratakb.knowledge.presets.ingest_preset", new_callable=AsyncMock) as ingest,
             patch("stratakb.knowledge.tools.write_audit_log", new_callable=AsyncMock) as audit,
         ):
-            result = await self._call()
+            result = await call_tool(server, "strata_apply_preset", preset_path=str(SEPA_PRESET))
 
         assert result == {"status": "error", "error": "not ours"}
         ingest.assert_not_awaited()
         audit.assert_not_awaited()
 
-    async def test_layer_error_returns_error(self):
+    async def test_layer_error_returns_error(self, server):
         auth, tools_auth = self._admin()
         with (
             auth, tools_auth,
@@ -732,13 +727,13 @@ class TestApplyPresetTool:
             patch("stratakb.knowledge.presets.ingest_preset", new_callable=AsyncMock) as ingest,
             patch("stratakb.knowledge.tools.write_audit_log", new_callable=AsyncMock) as audit,
         ):
-            result = await self._call()
+            result = await call_tool(server, "strata_apply_preset", preset_path=str(SEPA_PRESET))
 
         assert result == {"status": "error", "error": "display_name is required."}
         ingest.assert_not_awaited()
         audit.assert_not_awaited()
 
-    async def test_real_run_reports_layer_changes(self):
+    async def test_real_run_reports_layer_changes(self, server):
         auth, tools_auth = self._admin()
         with (
             auth, tools_auth,
@@ -755,13 +750,13 @@ class TestApplyPresetTool:
             ),
             patch("stratakb.knowledge.tools.write_audit_log", new_callable=AsyncMock),
         ):
-            result = await self._call()
+            result = await call_tool(server, "strata_apply_preset", preset_path=str(SEPA_PRESET))
 
         assert result["status"] == "completed"
         assert result["layer"] == "updated"
         assert result["layer_changes"] == ["description"]
 
-    async def _audited_run(self, layer_result):
+    async def _audited_run(self, server, layer_result):
         auth, tools_auth = self._admin()
         with (
             auth, tools_auth,
@@ -778,22 +773,24 @@ class TestApplyPresetTool:
             ),
             patch("stratakb.knowledge.tools.write_audit_log", new_callable=AsyncMock) as audit,
         ):
-            await self._call()
+            await call_tool(server, "strata_apply_preset", preset_path=str(SEPA_PRESET))
         audit.assert_awaited_once()
         return audit.await_args.kwargs["result_summary"]
 
-    async def test_audit_names_changed_settings(self):
+    async def test_audit_names_changed_settings(self, server):
         summary = await self._audited_run(
+            server,
             {"status": "updated", "changes": ["description", "routing_patterns"], "message": ""}
         )
         assert summary == (
             "Layer 'sepa': updated (description, routing_patterns), ingested 4 docs, 31 chunks"
         )
 
-    async def test_audit_has_no_setting_values(self):
+    async def test_audit_has_no_setting_values(self, server):
         description = load_preset(SEPA_PRESET).description
         assert description
         summary = await self._audited_run(
+            server,
             {"status": "updated", "changes": ["description"], "message": "ZZ-old-description-7f3"}
         )
         assert "(description)" in summary
@@ -801,11 +798,11 @@ class TestApplyPresetTool:
         assert description not in summary
 
     @pytest.mark.parametrize("status", ["created", "exists"])
-    async def test_audit_unchanged_without_changes(self, status):
-        summary = await self._audited_run({"status": status, "changes": [], "message": ""})
+    async def test_audit_unchanged_without_changes(self, server, status):
+        summary = await self._audited_run(server, {"status": status, "changes": [], "message": ""})
         assert summary == f"Layer 'sepa': {status}, ingested 4 docs, 31 chunks"
 
-    async def _dry_run(self, stored=None, side_effect=None):
+    async def _dry_run(self, server, stored=None, side_effect=None):
         auth, tools_auth = self._admin()
         with (
             auth, tools_auth,
@@ -816,58 +813,60 @@ class TestApplyPresetTool:
                 side_effect=side_effect,
             ),
         ):
-            return await self._call(dry_run=True)
+            return await call_tool(
+                server, "strata_apply_preset", preset_path=str(SEPA_PRESET), dry_run=True
+            )
 
-    async def test_dry_run_would_update(self):
+    async def test_dry_run_would_update(self, server):
         preset = load_preset(SEPA_PRESET)
         stored = _stored_layer(
             preset, origin="preset:sepa", description="Old", routing_patterns=["old"]
         )
-        result = await self._dry_run(stored)
+        result = await self._dry_run(server, stored)
 
         assert result["status"] == "dry_run_complete"
         assert result["layer_check"] == {
             "status": "would_update", "changes": ["description", "routing_patterns"],
         }
 
-    async def test_dry_run_would_claim(self):
+    async def test_dry_run_would_claim(self, server):
         # The real run writes the origin of a matching layer that has none
         preset = load_preset(SEPA_PRESET)
-        result = await self._dry_run(_stored_layer(preset))
+        result = await self._dry_run(server, _stored_layer(preset))
 
         assert result["layer_check"] == {"status": "would_claim", "changes": []}
 
-    async def test_dry_run_unclaimed_would_update(self):
+    async def test_dry_run_unclaimed_would_update(self, server):
         preset = load_preset(SEPA_PRESET)
-        result = await self._dry_run(_stored_layer(preset, description="Old"))
+        result = await self._dry_run(server, _stored_layer(preset, description="Old"))
 
         assert result["layer_check"] == {"status": "would_update", "changes": ["description"]}
 
-    async def test_dry_run_own_layer_unchanged(self):
+    async def test_dry_run_own_layer_unchanged(self, server):
         preset = load_preset(SEPA_PRESET)
-        result = await self._dry_run(_stored_layer(preset, origin="preset:sepa"))
+        result = await self._dry_run(server, _stored_layer(preset, origin="preset:sepa"))
 
         assert result["layer_check"] == {"status": "unchanged", "changes": []}
 
-    async def test_dry_run_would_create(self):
+    async def test_dry_run_would_create(self, server):
         from stratakb.knowledge.layers import LayerNotFoundError
 
-        result = await self._dry_run(side_effect=LayerNotFoundError("missing"))
+        result = await self._dry_run(server, side_effect=LayerNotFoundError("missing"))
 
         assert result["layer_check"] == {"status": "would_create", "changes": []}
 
-    async def test_dry_run_refused(self):
-        result = await self._dry_run({"origin": "manual"})
+    async def test_dry_run_refused(self, server):
+        result = await self._dry_run(server, {"origin": "manual"})
 
         assert result["layer_check"]["status"] == "refused"
         assert result["layer_check"]["changes"] == []
 
-    async def test_dry_run_unknown_when_lookup_fails(self):
-        result = await self._dry_run(side_effect=OSError("connection refused"))
+    async def test_dry_run_unknown_when_lookup_fails(self, server):
+        result = await self._dry_run(server, side_effect=OSError("connection refused"))
 
         assert result["layer_check"] == {"status": "unknown", "changes": []}
 
-    async def test_dry_run_check_times_out(self):
+    async def test_dry_run_check_times_out(self, server):
         import asyncio
         import time
 
@@ -876,7 +875,7 @@ class TestApplyPresetTool:
 
         with patch("stratakb.knowledge.tools._LAYER_CHECK_TIMEOUT_S", 0.05):
             started = time.monotonic()
-            result = await self._dry_run(side_effect=hang)
+            result = await self._dry_run(server, side_effect=hang)
             elapsed = time.monotonic() - started
 
         assert result["layer_check"] == {"status": "unknown", "changes": []}
@@ -933,9 +932,7 @@ class TestApplyPresetScript:
 
 
 class TestPresetToolRegistration:
-    def test_apply_preset_tool_registered(self):
-        from stratakb.mcp_server import mcp
-
-        tool_names = [t.name for t in mcp._tool_manager.list_tools()]
+    def test_apply_preset_tool_registered(self, server):
+        tool_names = [t.name for t in server._tool_manager.list_tools()]
         assert "strata_apply_preset" in tool_names
         assert "strata_setup_sepa_layer" not in tool_names

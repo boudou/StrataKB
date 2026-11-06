@@ -23,7 +23,7 @@ import pytest
 
 from stratakb.config import Settings
 from stratakb.core.egress import outbound_providers
-from tests.conftest import call_tool
+from tests.helpers import call_tool
 
 
 @pytest.fixture(autouse=True)
@@ -165,7 +165,7 @@ def test_anthropic_key_unused_with_openai_compatible():
 
 
 @pytest.fixture
-def server(monkeypatch):
+def main_server(monkeypatch):
     """The server module, local-only settings for main(), FastMCP.run patched.
 
     main() builds its server inside the call, so run is patched on the class.
@@ -190,8 +190,8 @@ def server(monkeypatch):
     return mcp_server, settings, run
 
 
-def test_main_refuses_with_named_settings(server, monkeypatch):
-    mcp_server, settings, run = server
+def test_main_refuses_with_named_settings(main_server, monkeypatch):
+    mcp_server, settings, run = main_server
     monkeypatch.setattr(settings, "anthropic_api_key", "sk-ant-test-123")
     with pytest.raises(SystemExit) as exc:
         mcp_server.main(settings)
@@ -208,16 +208,16 @@ def test_main_refuses_with_named_settings(server, monkeypatch):
     run.assert_not_called()
 
 
-def test_main_refusal_hides_key_value(server, monkeypatch):
-    mcp_server, settings, _ = server
+def test_main_refusal_hides_key_value(main_server, monkeypatch):
+    mcp_server, settings, _ = main_server
     monkeypatch.setattr(settings, "anthropic_api_key", "sk-ant-test-123")
     with pytest.raises(SystemExit) as exc:
         mcp_server.main(settings)
     assert "sk-ant-test-123" not in str(exc.value)
 
 
-def test_main_refuses_remote_rewrite_endpoint(server, monkeypatch):
-    mcp_server, settings, run = server
+def test_main_refuses_remote_rewrite_endpoint(main_server, monkeypatch):
+    mcp_server, settings, run = main_server
     monkeypatch.setattr(settings, "query_rewrite_provider", "openai_compatible")
     monkeypatch.setattr(
         settings, "query_rewrite_base_url", "http://user:pw@gpu-box:11434/v1"
@@ -232,16 +232,16 @@ def test_main_refuses_remote_rewrite_endpoint(server, monkeypatch):
     run.assert_not_called()
 
 
-def test_main_starts_with_remote_rewrite_endpoint_without_model(server, monkeypatch):
-    mcp_server, settings, run = server
+def test_main_starts_with_remote_rewrite_endpoint_without_model(main_server, monkeypatch):
+    mcp_server, settings, run = main_server
     monkeypatch.setattr(settings, "query_rewrite_provider", "openai_compatible")
     monkeypatch.setattr(settings, "query_rewrite_base_url", "http://gpu-box:11434/v1")
     mcp_server.main(settings)
     run.assert_called_once()
 
 
-def test_main_starts_with_loopback_rewrite_endpoint(server, monkeypatch):
-    mcp_server, settings, run = server
+def test_main_starts_with_loopback_rewrite_endpoint(main_server, monkeypatch):
+    mcp_server, settings, run = main_server
     monkeypatch.setattr(settings, "query_rewrite_provider", "openai_compatible")
     monkeypatch.setattr(settings, "query_rewrite_base_url", "http://127.0.0.1:11434/v1")
     monkeypatch.setattr(settings, "anthropic_api_key", "sk-ant-test-123")
@@ -249,8 +249,8 @@ def test_main_starts_with_loopback_rewrite_endpoint(server, monkeypatch):
     run.assert_called_once()
 
 
-def test_main_forces_hf_offline(server, monkeypatch):
-    mcp_server, settings, run = server
+def test_main_forces_hf_offline(main_server, monkeypatch):
+    mcp_server, settings, run = main_server
     monkeypatch.setenv("HF_HUB_OFFLINE", "0")
     mcp_server.main(settings)
     run.assert_called_once()
@@ -258,8 +258,8 @@ def test_main_forces_hf_offline(server, monkeypatch):
     assert os.environ["TRANSFORMERS_OFFLINE"] == "1"
 
 
-def test_main_leaves_env_when_off(server, monkeypatch):
-    mcp_server, settings, run = server
+def test_main_leaves_env_when_off(main_server, monkeypatch):
+    mcp_server, settings, run = main_server
     monkeypatch.setattr(settings, "strata_local_only", False)
     monkeypatch.setattr(settings, "anthropic_api_key", "sk-ant-test-123")
     mcp_server.main(settings)

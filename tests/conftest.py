@@ -4,27 +4,22 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-from typing import TYPE_CHECKING
 from uuid import uuid4
 
 import asyncpg
 import pytest
 
-if TYPE_CHECKING:
-    from mcp.server.fastmcp import FastMCP
-
 # Asserts in the shared helpers report like asserts in a test module.
 pytest.register_assert_rewrite("tests.helpers")
 
 
-async def call_tool(server: FastMCP, name: str, /, **arguments) -> dict:
-    """Call tool `name` on a built server, through its role and logging decorators."""
-    return await server._tool_manager.get_tool(name).fn(**arguments)
-
-
 @pytest.fixture
 def server():
-    """A StrataKB server built from the environment's settings."""
+    """A StrataKB server built from the environment's settings.
+
+    Call its tools with `tests.helpers.call_tool`. A module may define its own
+    `server` fixture, which overrides this one; it must also yield a built server.
+    """
     from stratakb.config import get_settings
     from stratakb.mcp_server import build_server
 

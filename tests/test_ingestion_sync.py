@@ -11,7 +11,13 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from tests.helpers import FAKE_EMBEDDING, file_outcomes, ingest_with_texts, write_file
+from tests.helpers import (
+    FAKE_EMBEDDING,
+    call_tool,
+    file_outcomes,
+    ingest_with_texts,
+    write_file,
+)
 
 
 async def _chunks(db_url: str, layer: str) -> list:
@@ -613,9 +619,8 @@ async def test_parser_flag_reaches_the_outcome(db_url, layer, tmp_path):
     assert result.files_added == 1
 
 
-async def test_tool_returns_files_skipped():
+async def test_tool_returns_files_skipped(server):
     from stratakb.knowledge.ingestion import IngestionResult
-    from stratakb.mcp_server import mcp
 
     fake = IngestionResult(layer_name="x", status="completed", files_skipped=2)
     with (
@@ -628,16 +633,16 @@ async def test_tool_returns_files_skipped():
         ),
         patch("stratakb.knowledge.tools.write_audit_log", new_callable=AsyncMock),
     ):
-        tool = mcp._tool_manager.get_tool("strata_ingest_documents")
-        result = await tool.fn(layer_name="x", source_path="y")
+        result = await call_tool(
+            server, "strata_ingest_documents", layer_name="x", source_path="y"
+        )
 
     assert result["status"] == "completed"
     assert result["files_skipped"] == 2
 
 
-async def test_tool_returns_files_flagged():
+async def test_tool_returns_files_flagged(server):
     from stratakb.knowledge.ingestion import IngestionResult
-    from stratakb.mcp_server import mcp
 
     fake = IngestionResult(layer_name="x", status="completed", files_added=1, files_flagged=1)
     with (
@@ -650,8 +655,9 @@ async def test_tool_returns_files_flagged():
         ),
         patch("stratakb.knowledge.tools.write_audit_log", new_callable=AsyncMock),
     ):
-        tool = mcp._tool_manager.get_tool("strata_ingest_documents")
-        result = await tool.fn(layer_name="x", source_path="y")
+        result = await call_tool(
+            server, "strata_ingest_documents", layer_name="x", source_path="y"
+        )
 
     assert result["status"] == "completed"
     assert result["files_flagged"] == 1
@@ -922,9 +928,10 @@ class TestFileList:
         assert file_outcomes(result)["a.md"] == ("failed", "embed_error")
         assert result.status == "failed"
 
-    async def test_root_form_matches_mcp_route(self, db_url, layer, tmp_path, monkeypatch):
+    async def test_root_form_matches_mcp_route(
+        self, server, db_url, layer, tmp_path, monkeypatch
+    ):
         from stratakb.knowledge.selection import select_files
-        from stratakb.mcp_server import mcp
 
         monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path.parent))
         write_file(tmp_path / "a.md", "# Alpha\n\nAlpha content.\n")
@@ -940,8 +947,9 @@ class TestFileList:
                 side_effect=lambda texts, **_: [FAKE_EMBEDDING for _ in texts],
             ),
         ):
-            tool = mcp._tool_manager.get_tool("strata_ingest_documents")
-            first = await tool.fn(layer_name=layer, source_path=str(tmp_path))
+            first = await call_tool(
+                server, "strata_ingest_documents", layer_name=layer, source_path=str(tmp_path)
+            )
         assert first["files_added"] == 2
 
         result, embedded = await ingest_with_texts(

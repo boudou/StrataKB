@@ -497,8 +497,6 @@ class TestContextualChunkEnrichment:
 
 
 class TestIngestionToolRegistration:
-    def test_ingest_tool_registered(self):
-        from stratakb.mcp_server import mcp
-
-        tool_names = [t.name for t in mcp._tool_manager.list_tools()]
+    def test_ingest_tool_registered(self, server):
+        tool_names = [t.name for t in server._tool_manager.list_tools()]
         assert "strata_ingest_documents" in tool_names

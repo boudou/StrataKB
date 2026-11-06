@@ -4,6 +4,8 @@ from contextlib import asynccontextmanager, contextmanager
 from unittest.mock import AsyncMock, MagicMock, patch
 from uuid import uuid4
 
+from tests.helpers import call_tool
+
 
 def test_learning_tools_import():
     """Verify learning tools module imports without error."""
@@ -11,25 +13,16 @@ def test_learning_tools_import():
     assert callable(register_learning_tools)
 
 
-def test_mcp_server_registers_learning_tools():
-    """Verify MCP server can import and register all tools including learning."""
-    from stratakb.mcp_server import mcp
-    assert mcp.name == "StrataKB"
+def test_mcp_server_registers_learning_tools(server):
+    """Verify the MCP server builds and registers all tools including learning."""
+    assert server.name == "StrataKB"
+    tool_names = {t.name for t in server._tool_manager.list_tools()}
+    assert {"strata_feedback", "strata_reset_learning"} <= tool_names
 
 
 # --- audit entries ------------------------------------------------------------
 
 DB = "postgresql://unused"
-
-
-def _tool(name: str, database_url: str = DB):
-    from mcp.server.fastmcp import FastMCP
-
-    from stratakb.learning.tools import register_learning_tools
-
-    server = FastMCP("test")
-    register_learning_tools(server, database_url)
-    return server._tool_manager.get_tool(name).fn
 
 
 @contextmanager
@@ -57,9 +50,9 @@ def _mocked(stored: bool = True, reset_ok: bool = True):
         yield store, audit
 
 
-async def test_feedback_writes_one_audit_entry():
+async def test_feedback_writes_one_audit_entry(server):
     with _mocked() as (_, audit):
-        result = await _tool("strata_feedback")(interaction_id="abc", helpful=True)
+        result = await call_tool(server, "strata_feedback", interaction_id="abc", helpful=True)
     assert result["status"] == "ok"
     audit.assert_awaited_once()
     kwargs = audit.await_args.kwargs
@@ -70,9 +63,11 @@ async def test_feedback_writes_one_audit_entry():
     assert kwargs["result_summary"] == "Rated helpful"
 
 
-async def test_feedback_audit_leaves_out_free_text():
+async def test_feedback_audit_leaves_out_free_text(server):
     with _mocked() as (_, audit):
-        await _tool("strata_feedback")(
+        await call_tool(
+            server,
+            "strata_feedback",
             interaction_id="abc",
             helpful=False,
             correct_layer="x-layer",
@@ -89,16 +84,16 @@ async def test_feedback_audit_leaves_out_free_text():
     assert audit.await_args.kwargs["parameters"] == {"interaction_id": "abc", "helpful": False}
 
 
-async def test_feedback_unknown_interaction_not_audited():
+async def test_feedback_unknown_interaction_not_audited(server):
     with _mocked(stored=False) as (_, audit):
-        result = await _tool("strata_feedback")(interaction_id="nope", helpful=True)
+        result = await call_tool(server, "strata_feedback", interaction_id="nope", helpful=True)
     assert result["status"] == "error"
     audit.assert_not_awaited()
 
 
-async def test_reset_layer_audited():
+async def test_reset_layer_audited(server):
     with _mocked() as (store, audit):
-        result = await _tool("strata_reset_learning")(layer="L", confirm=True)
+        result = await call_tool(server, "strata_reset_learning", layer="L", confirm=True)
     assert result["status"] == "ok"
     store.reset.assert_awaited_once_with(layer="L")
     audit.assert_awaited_once()
@@ -109,23 +104,23 @@ async def test_reset_layer_audited():
     assert kwargs["result_summary"] == "Reset learned data for layer 'L'"
 
 
-async def test_reset_all_audited():
+async def test_reset_all_audited(server):
     with _mocked() as (_, audit):
-        await _tool("strata_reset_learning")(confirm=True)
+        await call_tool(server, "strata_reset_learning", confirm=True)
     audit.assert_awaited_once()
     assert audit.await_args.kwargs["parameters"] == {"scope": "all"}
     assert "interaction history" in audit.await_args.kwargs["result_summary"]
 
 
-async def test_reset_without_confirm_not_audited():
+async def test_reset_without_confirm_not_audited(server):
     with _mocked() as (store, audit):
-        result = await _tool("strata_reset_learning")(layer="L")
+        result = await call_tool(server, "strata_reset_learning", layer="L")
     assert result["status"] == "error"
     store.reset.assert_not_awaited()
     audit.assert_not_awaited()
 
 
-async def test_feedback_audit_names_only_stored_extras():
+async def test_feedback_audit_names_only_stored_extras(server):
     """An extra signal that fails to store is left out of the audit summary."""
     async def store_feedback(**kwargs):
         # The rating and one chunk rating are stored; better_query is not
@@ -138,7 +133,9 @@ async def test_feedback_audit_names_only_stored_extras():
 
     with _mocked() as (store, audit):
         store.store_feedback = AsyncMock(side_effect=store_feedback)
-        result = await _tool("strata_feedback")(
+        result = await call_tool(
+            server,
+            "strata_feedback",
             interaction_id="abc",
             helpful=False,
             correct_layer="x-layer",
@@ -151,13 +148,15 @@ async def test_feedback_audit_names_only_stored_extras():
     assert summary == "Rated not helpful, with correct_layer, 1 chunk ratings"
 
 
-async def test_feedback_audit_no_extras_when_none_stored():
+async def test_feedback_audit_no_extras_when_none_stored(server):
     async def store_feedback(**kwargs):
         return kwargs["signal_name"] in ("helpful", "wrong")
 
     with _mocked() as (store, audit):
         store.store_feedback = AsyncMock(side_effect=store_feedback)
-        await _tool("strata_feedback")(
+        await call_tool(
+            server,
+            "strata_feedback",
             interaction_id="abc",
             helpful=True,
             correct_layer="x-layer",
@@ -166,26 +165,26 @@ async def test_feedback_audit_no_extras_when_none_stored():
     assert audit.await_args.kwargs["result_summary"] == "Rated helpful"
 
 
-async def test_reset_failed_returns_error_not_audited():
+async def test_reset_failed_returns_error_not_audited(server):
     with _mocked(reset_ok=False) as (store, audit):
-        result = await _tool("strata_reset_learning")(layer="L", confirm=True)
+        result = await call_tool(server, "strata_reset_learning", layer="L", confirm=True)
     assert result["status"] == "error"
     assert "nothing was deleted" in result["error"]
     store.reset.assert_awaited_once_with(layer="L")
     audit.assert_not_awaited()
 
 
-async def test_reset_all_failed_returns_error_not_audited():
+async def test_reset_all_failed_returns_error_not_audited(server):
     with _mocked(reset_ok=False) as (_, audit):
-        result = await _tool("strata_reset_learning")(confirm=True)
+        result = await call_tool(server, "strata_reset_learning", confirm=True)
     assert result["status"] == "error"
     audit.assert_not_awaited()
 
 
-async def test_reset_empty_layer_refused():
+async def test_reset_empty_layer_refused(server):
     for layer in ("", "   "):
         with _mocked() as (store, audit):
-            result = await _tool("strata_reset_learning")(layer=layer, confirm=True)
+            result = await call_tool(server, "strata_reset_learning", layer=layer, confirm=True)
         assert result["status"] == "error"
         assert "empty" in result["error"]
         store.reset.assert_not_awaited()
@@ -292,7 +291,7 @@ async def test_store_reset_empty_layer_is_not_global():
     assert not any("TRUNCATE" in c.args[0] for c in conn.execute.await_args_list)
 
 
-async def test_reset_audit_entry_in_db():
+async def test_reset_audit_entry_in_db(server):
     """A real layer reset leaves one audit row; the unique layer name touches no other data."""
     from stratakb.config import get_settings
     from stratakb.core.database import get_pool
@@ -300,7 +299,7 @@ async def test_reset_audit_entry_in_db():
     db_url = get_settings().database_url
     layer = f"probe{uuid4().hex[:8]}"
     with _admin():
-        result = await _tool("strata_reset_learning", db_url)(layer=layer, confirm=True)
+        result = await call_tool(server, "strata_reset_learning", layer=layer, confirm=True)
     assert result == {"status": "ok", "reset": "layer", "layer": layer}
 
     pool = await get_pool(db_url)

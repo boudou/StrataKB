@@ -933,16 +933,12 @@ class TestAskOrdering:
 
 
 class TestRagToolRegistration:
-    def test_ask_tool_registered(self):
-        from stratakb.mcp_server import mcp
-
-        tool_names = [t.name for t in mcp._tool_manager.list_tools()]
+    def test_ask_tool_registered(self, server):
+        tool_names = [t.name for t in server._tool_manager.list_tools()]
         assert "strata_ask" in tool_names
 
-    def test_search_tool_registered(self):
-        from stratakb.mcp_server import mcp
-
-        tool_names = [t.name for t in mcp._tool_manager.list_tools()]
+    def test_search_tool_registered(self, server):
+        tool_names = [t.name for t in server._tool_manager.list_tools()]
         assert "strata_search" in tool_names
 
 
@@ -952,10 +948,8 @@ class TestRagToolRegistration:
 
 
 class TestUserToolRegistration:
-    def test_user_tools_registered(self):
-        from stratakb.mcp_server import mcp
-
-        tool_names = [t.name for t in mcp._tool_manager.list_tools()]
+    def test_user_tools_registered(self, server):
+        tool_names = [t.name for t in server._tool_manager.list_tools()]
         assert "strata_whoami" in tool_names
         assert "strata_admin_list_users" in tool_names
         assert "strata_admin_update_role" in tool_names

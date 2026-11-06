@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock, call, patch
 
 import pytest
 
-from tests.conftest import call_tool
+from tests.helpers import call_tool
 
 
 def test_settings_load():

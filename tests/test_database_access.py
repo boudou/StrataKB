@@ -20,7 +20,7 @@ from uuid import uuid4
 
 import pytest
 
-from tests.conftest import call_tool
+from tests.helpers import call_tool
 
 
 # ==========================================
