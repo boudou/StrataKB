@@ -169,7 +169,7 @@ async def test_vector_search_sets_statement_timeout():
     ), patch(
         "stratakb.rag.retriever.get_pool", new_callable=AsyncMock, return_value=_mock_pool(conn)
     ), patch(
-        "stratakb.rag.retriever.fetch_layers_stamp", new_callable=AsyncMock, return_value=(0, None)
+        "stratakb.rag.retriever._watcher.fetch", new_callable=AsyncMock, return_value=(0, None)
     ), patch("stratakb.config.get_settings", return_value=settings):
         await search_chunks("postgresql://test", "sk-test", "timeout probe")
 

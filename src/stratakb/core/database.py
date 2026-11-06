@@ -14,6 +14,9 @@ import structlog
 
 logger = structlog.get_logger()
 
+# What fetch_layers_stamp returns: (layer count, newest updated_at)
+Stamp = tuple[int, datetime | None]
+
 # One pool per URL: the SQL tools may connect as a separate read-only role
 _pools: dict[str, asyncpg.Pool] = {}
 # One lock per URL: concurrent first calls wait their turn, and each re-checks _pools,
@@ -112,7 +115,7 @@ async def get_pool(database_url: str) -> asyncpg.Pool:
     return pool
 
 
-async def fetch_layers_stamp(database_url: str) -> tuple[int, datetime | None]:
+async def fetch_layers_stamp(database_url: str) -> Stamp:
     """Return (layer count, newest updated_at) of strata_core.knowledge_layers.
 
     Caches compare this stamp to notice layer changes made by any process.

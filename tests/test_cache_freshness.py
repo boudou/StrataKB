@@ -1,7 +1,7 @@
 """Tests for cache freshness: the query and routing caches clear when the layers change.
 
-All tests need the database; embeddings are mocked and time.monotonic is
-patched per module, never globally.
+All tests need the database; embeddings are mocked and each owner's watcher
+gets a test clock, so time.monotonic is never patched.
 """
 
 from __future__ import annotations
@@ -53,9 +53,8 @@ def _reset_caches(monkeypatch):
     """Fresh caches and stamp state in both modules, before and after each test."""
 
     def reset():
-        for mod in (retriever, layers_mod):
-            mod._stamps.clear()
-            mod._checked_at.clear()
+        retriever._watcher.reset()
+        layers_mod._watcher.reset()
         layers_mod._routing_cache.clear()
 
     reset()
@@ -66,12 +65,13 @@ def _reset_caches(monkeypatch):
 
 @pytest.fixture
 def clock():
-    """Patch time.monotonic in both modules; set clock.value to move time."""
+    """Give both watchers a test clock; set clock.value to move time."""
     state = MagicMock()
     state.value = 100.0
-    with patch("stratakb.rag.retriever.time") as t1, patch("stratakb.knowledge.layers.time") as t2:
-        t1.monotonic.side_effect = lambda: state.value
-        t2.monotonic.side_effect = lambda: state.value
+    with (
+        patch.object(retriever._watcher, "clock", lambda: state.value),
+        patch.object(layers_mod._watcher, "clock", lambda: state.value),
+    ):
         yield state
 
 
@@ -88,8 +88,8 @@ def _caches_empty() -> bool:
 
 
 async def _check_both(db_url: str) -> None:
-    await retriever._maybe_clear(db_url)
-    await layers_mod._maybe_clear(db_url)
+    await retriever._watcher.check(db_url)
+    await layers_mod._watcher.check(db_url)
 
 
 async def _execute_elsewhere(db_url: str, sql: str, *args) -> None:
@@ -177,15 +177,11 @@ async def test_no_stamp_read_within_two_seconds(db_url, layer, clock):
     from stratakb.core.database import fetch_layers_stamp
 
     with (
-        patch(
-            "stratakb.rag.retriever.fetch_layers_stamp",
-            new_callable=AsyncMock,
-            wraps=fetch_layers_stamp,
+        patch.object(
+            retriever._watcher, "fetch", new_callable=AsyncMock, wraps=fetch_layers_stamp
         ) as r_stamp,
-        patch(
-            "stratakb.knowledge.layers.fetch_layers_stamp",
-            new_callable=AsyncMock,
-            wraps=fetch_layers_stamp,
+        patch.object(
+            layers_mod._watcher, "fetch", new_callable=AsyncMock, wraps=fetch_layers_stamp
         ) as l_stamp,
     ):
         await _check_both(db_url)
@@ -303,15 +299,11 @@ async def test_failed_stamp_read_serves_cache(db_url, layer, clock):
     clock.value = 103.0
 
     with (
-        patch(
-            "stratakb.rag.retriever.fetch_layers_stamp",
-            new_callable=AsyncMock,
-            side_effect=OSError("down"),
+        patch.object(
+            retriever._watcher, "fetch", new_callable=AsyncMock, side_effect=OSError("down")
         ),
-        patch(
-            "stratakb.knowledge.layers.fetch_layers_stamp",
-            new_callable=AsyncMock,
-            side_effect=OSError("down"),
+        patch.object(
+            layers_mod._watcher, "fetch", new_callable=AsyncMock, side_effect=OSError("down")
         ),
         patch(
             "stratakb.rag.retriever.embed_texts",

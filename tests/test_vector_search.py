@@ -120,7 +120,7 @@ class TestSearchChunksUnit:
     def _no_stamp_read(self):
         """The fake URL has no database: never read the layers stamp."""
         with patch(
-            "stratakb.rag.retriever.fetch_layers_stamp",
+            "stratakb.rag.retriever._watcher.fetch",
             new_callable=AsyncMock,
             return_value=(0, None),
         ):

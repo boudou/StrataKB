@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import json
 import re
-import time
 from re import _constants as _sre
 from re import _parser as _sre_parser
 from typing import Literal, get_args
@@ -18,7 +17,7 @@ import asyncpg
 import structlog
 from cachetools import TTLCache
 
-from stratakb.core.database import fetch_layers_stamp, get_pool
+from stratakb.core.database import get_pool
 from stratakb.core.migrations import ensure_schema
 from stratakb.core.stamp_watcher import StampWatcher
 
@@ -71,12 +70,14 @@ def _encode_column(column: _LayerColumn, value: object) -> object:
 
 # Search tools read routing patterns and descriptions through a short-lived
 # cache. This process's create, delete and setters clear it at once; a layer
-# change from another process clears it within 2 s (see _maybe_clear).
+# change from another process clears it within 2 s (see _watcher).
 _routing_cache: TTLCache = TTLCache(maxsize=1, ttl=60)
 
-_watcher = StampWatcher("routing_cache")
-_stamps = _watcher.stamps
-_checked_at = _watcher.checked_at
+_watcher = StampWatcher(
+    _routing_cache.clear,
+    cleared_event="routing_cache_cleared",
+    failed_event="routing_cache_stamp_failed",
+)
 
 
 class LayerError(Exception):
@@ -723,7 +724,7 @@ async def get_layer_routing(database_url: str) -> dict:
         {"patterns": {layer: [regex, ...]}, "descriptions": {layer: "Display: description"},
          "structure": {layer: [regex, ...]}}
     """
-    await _maybe_clear(database_url)
+    await _watcher.check(database_url)
     cached = _routing_cache.get("routing")
     if cached is not None:
         return cached
@@ -765,10 +766,3 @@ async def get_structure_patterns(database_url: str, layers: list[str] | None) ->
         if layers is None or name in layers:
             patterns.extend(p for p in layer_patterns if p not in patterns)
     return patterns
-
-
-async def _maybe_clear(database_url: str) -> None:
-    """Clear the routing cache when any process has changed the layers."""
-    await _watcher.check(
-        database_url, _routing_cache.clear, now=time.monotonic(), fetch=fetch_layers_stamp
-    )

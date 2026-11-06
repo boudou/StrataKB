@@ -8,14 +8,13 @@ from __future__ import annotations
 
 import json
 import re
-import time
 import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 
 import structlog
 
-from stratakb.core.database import fetch_layers_stamp, get_pool
+from stratakb.core.database import get_pool
 from stratakb.core.stamp_watcher import StampWatcher
 from stratakb.knowledge.embeddings import embed_texts
 from stratakb.rag.cache import QueryCache
@@ -43,21 +42,19 @@ def _get_cache() -> QueryCache | None:
     return None
 
 
-_watcher = StampWatcher("query_cache")
-_stamps = _watcher.stamps
-_checked_at = _watcher.checked_at
-
-
 def _clear_cache() -> None:
-    if _cache is not None:
-        _cache.clear()
+    # A function, not _cache.clear: _cache is built on first use. The watcher
+    # is only checked after _get_cache() returned it.
+    assert _cache is not None
+    _cache.clear()
 
 
-async def _maybe_clear(database_url: str) -> None:
-    """Clear the query cache when any process has changed the layers."""
-    await _watcher.check(
-        database_url, _clear_cache, now=time.monotonic(), fetch=fetch_layers_stamp
-    )
+# Clears the query cache when any process has changed the layers
+_watcher = StampWatcher(
+    _clear_cache,
+    cleared_event="query_cache_cleared",
+    failed_event="query_cache_stamp_failed",
+)
 
 
 @dataclass
@@ -113,7 +110,7 @@ async def search_chunks(
 
     cache = _get_cache()
     if cache:
-        await _maybe_clear(database_url)
+        await _watcher.check(database_url)
         cached = cache.get(query, layers, top_k, metadata_filter)
         if cached is not None:
             return cached
