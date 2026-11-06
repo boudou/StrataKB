@@ -12,7 +12,15 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from tests.helpers import FAKE_EMBEDDING, call_tool, file_outcomes, ingest, write_file
+from tests.helpers import (
+    FAKE_EMBEDDING,
+    call_tool,
+    fake_openai_client,
+    file_outcomes,
+    ingest,
+    openai_settings,
+    write_file,
+)
 
 
 def _denied_read_bytes(name: str):
@@ -206,7 +214,6 @@ class TestLogsWithoutExceptionText:
         from structlog.testing import capture_logs
 
         from stratakb.knowledge.embeddings import embed_texts
-        from tests.helpers import fake_openai_client, openai_settings
 
         marker = "distinctive-91c2-provider-text"
         client = fake_openai_client()

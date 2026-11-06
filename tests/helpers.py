@@ -81,8 +81,7 @@ async def ingest_with_texts(db_url: str, layer: str, source: Path, **kwargs):
 
 async def ingest(db_url: str, layer: str, source: Path, **kwargs):
     """Run ingest_documents with mocked embeddings; return the result."""
-    result, _ = await ingest_with_texts(db_url, layer, source, **kwargs)
-    return result
+    return (await ingest_with_texts(db_url, layer, source, **kwargs))[0]
 
 
 def file_outcomes(result) -> dict[str, tuple[str, str | None]]:

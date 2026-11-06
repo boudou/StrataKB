@@ -7,10 +7,8 @@ gets a test clock, so time.monotonic is never patched.
 from __future__ import annotations
 
 import asyncio
-import contextlib
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
-from uuid import uuid4
 
 import asyncpg
 import pytest
@@ -19,33 +17,10 @@ from structlog.testing import capture_logs
 from stratakb.knowledge import layers as layers_mod
 from stratakb.rag import retriever
 from stratakb.rag.cache import QueryCache
+from tests.helpers import FAKE_EMBEDDING, fake_embed, ingest
 
-FAKE_EMBEDDING = [0.01] * 768
 SENTINEL_RESULTS = ["cached-result"]
 SENTINEL_ROUTING = {"patterns": {}, "descriptions": {"sentinel": "Sentinel"}}
-
-
-@pytest.fixture
-def db_url():
-    from stratakb.config import get_settings
-    return get_settings().database_url
-
-
-@pytest.fixture
-async def layer(db_url):
-    """A fresh layer with a unique name, deleted afterwards."""
-    from stratakb.knowledge.layers import LayerNotFoundError, create_layer, delete_layer
-
-    name = f"test_fresh_{uuid4().hex[:10]}"
-    await create_layer(
-        db_url,
-        name=name,
-        display_name="Test Fresh",
-        chunk_config={"chunk_size": 500, "chunk_overlap": 50},
-    )
-    yield name
-    with contextlib.suppress(LayerNotFoundError):
-        await delete_layer(db_url, name=name)
 
 
 @pytest.fixture(autouse=True)
@@ -220,7 +195,7 @@ async def test_interrupted_ingest_bumps_updated_at(db_url, layer, tmp_path):
         calls += 1
         if calls == 2:
             raise asyncio.CancelledError
-        return [FAKE_EMBEDDING for _ in texts]
+        return fake_embed(texts)
 
     with (
         patch("stratakb.knowledge.ingestion.embed_texts", side_effect=embed),
@@ -239,17 +214,10 @@ async def test_interrupted_ingest_bumps_updated_at(db_url, layer, tmp_path):
 
 
 async def test_failed_record_run_bumps_updated_at(db_url, layer, tmp_path):
-    from stratakb.knowledge.ingestion import ingest_documents
-
     _write_files(tmp_path / "docs", 2)
     before = (await _layer_row(db_url, layer))["updated_at"]
 
     with (
-        patch(
-            "stratakb.knowledge.ingestion.embed_texts",
-            new_callable=AsyncMock,
-            side_effect=lambda texts, **_: [FAKE_EMBEDDING for _ in texts],
-        ),
         patch(
             "stratakb.knowledge.ingestion._record_run",
             new_callable=AsyncMock,
@@ -257,9 +225,7 @@ async def test_failed_record_run_bumps_updated_at(db_url, layer, tmp_path):
         ),
         pytest.raises(RuntimeError, match="boom"),
     ):
-        await ingest_documents(
-            db_url, "fake-key", layer_name=layer, source_path=str(tmp_path / "docs")
-        )
+        await ingest(db_url, layer, tmp_path / "docs")
 
     row = await _layer_row(db_url, layer)
     assert row["updated_at"] > before
@@ -268,17 +234,10 @@ async def test_failed_record_run_bumps_updated_at(db_url, layer, tmp_path):
 
 
 async def test_clear_layer_recounts(db_url, layer, tmp_path):
-    from stratakb.knowledge.ingestion import clear_layer, ingest_documents
+    from stratakb.knowledge.ingestion import clear_layer
 
     _write_files(tmp_path / "docs", 1)
-    with patch(
-        "stratakb.knowledge.ingestion.embed_texts",
-        new_callable=AsyncMock,
-        side_effect=lambda texts, **_: [FAKE_EMBEDDING for _ in texts],
-    ):
-        await ingest_documents(
-            db_url, "fake-key", layer_name=layer, source_path=str(tmp_path / "docs")
-        )
+    await ingest(db_url, layer, tmp_path / "docs")
     before = await _layer_row(db_url, layer)
     assert before["chunk_count"] > 0
 

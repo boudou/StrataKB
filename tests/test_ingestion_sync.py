@@ -15,6 +15,7 @@ from tests.helpers import (
     FAKE_EMBEDDING,
     call_tool,
     file_outcomes,
+    ingest,
     ingest_with_texts,
     write_file,
 )
@@ -75,7 +76,7 @@ class TestSync:
 
         write_file(tmp_path / "a.md", "# Alpha\n\nAlpha content.\n")
         write_file(tmp_path / "sub" / "b.md", "# Beta\n\nBeta content.\n")
-        await ingest_with_texts(db_url, layer, tmp_path)
+        await ingest(db_url, layer, tmp_path)
         layer_id = (await get_layer(db_url, name=layer))["id"]
         source_root = tmp_path.resolve().as_posix()
 
@@ -90,7 +91,7 @@ class TestSync:
     async def test_edit_replaces_only_that_file(self, db_url, layer, tmp_path):
         write_file(tmp_path / "a.md", "# Alpha\n\nAlpha content.\n")
         b = write_file(tmp_path / "b.md", "# Beta\n\nBeta content.\n")
-        await ingest_with_texts(db_url, layer, tmp_path)
+        await ingest(db_url, layer, tmp_path)
         before = _ids_by_file(await _chunks(db_url, layer))
 
         write_file(b, "# Beta\n\nBeta content, edited with new restore steps.\n")
@@ -106,10 +107,10 @@ class TestSync:
     async def test_deleted_file_is_removed(self, db_url, layer, tmp_path):
         write_file(tmp_path / "a.md", "# Alpha\n\nAlpha content.\n")
         b = write_file(tmp_path / "sub" / "b.md", "# Beta\n\nBeta content.\n")
-        await ingest_with_texts(db_url, layer, tmp_path)
+        await ingest(db_url, layer, tmp_path)
 
         b.unlink()
-        result, _ = await ingest_with_texts(db_url, layer, tmp_path)
+        result = await ingest(db_url, layer, tmp_path)
 
         assert result.files_removed == 1
         assert {r["source_file"] for r in await _chunks(db_url, layer)} == {"a.md"}
@@ -119,7 +120,7 @@ class TestSync:
         write_file(tmp_path / "a" / "readme.md", "# A\n\nReadme of service A.\n")
         write_file(tmp_path / "b" / "readme.md", "# B\n\nReadme of service B.\n")
 
-        result, _ = await ingest_with_texts(db_url, layer, tmp_path)
+        result = await ingest(db_url, layer, tmp_path)
 
         assert result.files_added == 2
         assert {r["source_file"] for r in await _chunks(db_url, layer)} == {
@@ -136,8 +137,8 @@ class TestSync:
         write_file(x / "readme.md", "# X\n\nFolder X content.\n")
         write_file(y / "readme.md", "# Y\n\nFolder Y content.\n")
 
-        await ingest_with_texts(db_url, layer, x)
-        result, _ = await ingest_with_texts(db_url, layer, y)
+        await ingest(db_url, layer, x)
+        result = await ingest(db_url, layer, y)
 
         assert result.files_added == 1
         assert result.files_removed == 0
@@ -149,7 +150,7 @@ class TestSync:
         doc = write_file(
             tmp_path / "codes.json", '{"code": "AC01", "meaning": "Incorrect account"}'
         )
-        await ingest_with_texts(db_url, layer, tmp_path)
+        await ingest(db_url, layer, tmp_path)
         before = _ids_by_file(await _chunks(db_url, layer))["codes.json"]
 
         write_file(doc, '{"code": "AC01", "meaning": ')
@@ -165,10 +166,10 @@ class TestSync:
     async def test_single_file_never_removes(self, db_url, layer, tmp_path):
         a = write_file(tmp_path / "a.md", "# Alpha\n\nAlpha content.\n")
         b = write_file(tmp_path / "b.md", "# Beta\n\nBeta content.\n")
-        await ingest_with_texts(db_url, layer, tmp_path)
+        await ingest(db_url, layer, tmp_path)
 
         b.unlink()
-        result, _ = await ingest_with_texts(db_url, layer, a)
+        result = await ingest(db_url, layer, a)
 
         assert result.files_unchanged == 1
         assert result.files_removed == 0
@@ -179,8 +180,8 @@ class TestSync:
         other = write_file(
             tmp_path.parent / f"{tmp_path.name}_other" / "o.md", "# Other\n\nOther.\n"
         )
-        await ingest_with_texts(db_url, layer, tmp_path)
-        await ingest_with_texts(db_url, layer, other.parent)
+        await ingest(db_url, layer, tmp_path)
+        await ingest(db_url, layer, other.parent)
         before = {r["id"] for r in await _chunks(db_url, layer)}
 
         result, embedded = await ingest_with_texts(db_url, layer, tmp_path, replace_all=True)
@@ -202,8 +203,8 @@ class TestSync:
         write_file(x / "two.md", "# Two\n\nFirst folder again.\n")
         write_file(y / "three.md", "# Three\n\nSecond folder.\n")
 
-        await ingest_with_texts(db_url, layer, x)
-        result, _ = await ingest_with_texts(db_url, layer, y)
+        await ingest(db_url, layer, x)
+        result = await ingest(db_url, layer, y)
 
         status = await get_layer_status(db_url, name=layer)
         assert result.docs_processed == 1
@@ -221,13 +222,13 @@ class TestSync:
             )
         ])
 
-        first, _ = await ingest_with_texts(db_url, layer, tmp_path)
+        first = await ingest(db_url, layer, tmp_path)
         assert first.rebuilt_legacy is True
         assert first.files_added == 1
         rows = await _chunks(db_url, layer)
         assert rows and all(r["file_id"] is not None for r in rows)
 
-        second, _ = await ingest_with_texts(db_url, layer, tmp_path)
+        second = await ingest(db_url, layer, tmp_path)
         assert second.rebuilt_legacy is False
         assert second.files_unchanged == 1
 
@@ -288,11 +289,11 @@ class TestPolicyAndEmpty:
         write_file(tmp_path / "secrets.yaml", "token: abc\nowner: ops\n")
         write_file(tmp_path / "a.md", "# Alpha\n\nAlpha content.\n")
         with patch("stratakb.knowledge.ingestion.is_secret_name", return_value=False):
-            first, _ = await ingest_with_texts(db_url, layer, tmp_path)
+            first = await ingest(db_url, layer, tmp_path)
         assert first.files_added == 2
         assert "secrets.yaml" in _ids_by_file(await _chunks(db_url, layer))
 
-        result, _ = await ingest_with_texts(db_url, layer, tmp_path)
+        result = await ingest(db_url, layer, tmp_path)
 
         assert file_outcomes(result)["secrets.yaml"] == ("removed", "secret")
         assert result.files_removed == 1
@@ -306,7 +307,7 @@ class TestPolicyAndEmpty:
         write_file(tmp_path / "blank.json", "  \n\t\n")
         write_file(tmp_path / "a.md", "# Alpha\n\nAlpha content.\n")
 
-        result, _ = await ingest_with_texts(db_url, layer, tmp_path)
+        result = await ingest(db_url, layer, tmp_path)
 
         outcomes = file_outcomes(result)
         for name in ("empty.md", "zero.csv", "blank.json"):
@@ -322,7 +323,7 @@ class TestPolicyAndEmpty:
         write_file(tmp_path / "blank.html", "<html><body><p> </p></body></html>")
         write_file(tmp_path / "a.md", "# Alpha\n\nAlpha content.\n")
 
-        result, _ = await ingest_with_texts(db_url, layer, tmp_path)
+        result = await ingest(db_url, layer, tmp_path)
 
         outcomes = file_outcomes(result)
         assert outcomes["codes.csv"] == ("skipped", "no_text")
@@ -337,10 +338,10 @@ class TestPolicyAndEmpty:
     async def test_tracked_csv_losing_its_rows_removed(self, db_url, layer, tmp_path):
         codes = write_file(tmp_path / "codes.csv", "Code,Name\nA1,Alpha\n")
         write_file(tmp_path / "b.md", "# Beta\n\nBeta content.\n")
-        await ingest_with_texts(db_url, layer, tmp_path)
+        await ingest(db_url, layer, tmp_path)
 
         write_file(codes, "Code,Name\n")
-        result, _ = await ingest_with_texts(db_url, layer, tmp_path)
+        result = await ingest(db_url, layer, tmp_path)
 
         assert file_outcomes(result)["codes.csv"] == ("removed", "no_text")
         assert result.files_removed == 1
@@ -351,10 +352,10 @@ class TestPolicyAndEmpty:
     async def test_tracked_file_becoming_empty_removed(self, db_url, layer, tmp_path):
         a = write_file(tmp_path / "a.md", "# Alpha\n\nAlpha content.\n")
         write_file(tmp_path / "b.md", "# Beta\n\nBeta content.\n")
-        await ingest_with_texts(db_url, layer, tmp_path)
+        await ingest(db_url, layer, tmp_path)
 
         write_file(a, "")
-        result, _ = await ingest_with_texts(db_url, layer, tmp_path)
+        result = await ingest(db_url, layer, tmp_path)
 
         assert file_outcomes(result)["a.md"] == ("removed", "no_text")
         assert result.files_removed == 1
@@ -366,7 +367,7 @@ class TestPolicyAndEmpty:
         from stratakb.knowledge import ingestion
 
         bad = write_file(tmp_path / "bad.md", "# Bad\n\nFirst version.\n")
-        await ingest_with_texts(db_url, layer, tmp_path)
+        await ingest(db_url, layer, tmp_path)
         before = _ids_by_file(await _chunks(db_url, layer))["bad.md"]
 
         write_file(bad, "# Bad\n\nSecond version.\n")
@@ -379,7 +380,7 @@ class TestPolicyAndEmpty:
             return original_parse(file_path)
 
         with patch("stratakb.knowledge.ingestion._parse_file", side_effect=raising_parse):
-            result, _ = await ingest_with_texts(db_url, layer, tmp_path)
+            result = await ingest(db_url, layer, tmp_path)
 
         outcomes = file_outcomes(result)
         assert outcomes["bad.md"] == ("failed", "parse_error")
@@ -396,7 +397,7 @@ class TestPolicyAndEmpty:
         write_file(tmp_path / "a.md", "# Alpha\n\nAlpha content.\n")
 
         with patch.object(Path, "read_bytes", _locked_read_bytes("locked.md")):
-            result, _ = await ingest_with_texts(db_url, layer, tmp_path)
+            result = await ingest(db_url, layer, tmp_path)
 
         outcomes = file_outcomes(result)
         assert outcomes["locked.md"] == ("failed", "read_error")
@@ -407,12 +408,12 @@ class TestPolicyAndEmpty:
 
     async def test_tracked_file_unreadable_keeps_chunks(self, db_url, layer, tmp_path):
         locked = write_file(tmp_path / "locked.md", "# Locked\n\nFirst version.\n")
-        await ingest_with_texts(db_url, layer, tmp_path)
+        await ingest(db_url, layer, tmp_path)
         before = _ids_by_file(await _chunks(db_url, layer))["locked.md"]
 
         write_file(locked, "# Locked\n\nSecond version.\n")
         with patch.object(Path, "read_bytes", _locked_read_bytes("locked.md")):
-            result, _ = await ingest_with_texts(db_url, layer, tmp_path)
+            result = await ingest(db_url, layer, tmp_path)
 
         assert file_outcomes(result)["locked.md"] == ("failed", "read_error")
         assert _ids_by_file(await _chunks(db_url, layer))["locked.md"] == before
@@ -422,10 +423,10 @@ class TestPolicyAndEmpty:
 
         write_file(tmp_path / "a.md", "# Alpha\n\nAlpha content.\n")
         b = write_file(tmp_path / "sub" / "b.md", "# Beta\n\nBeta content.\n")
-        await ingest_with_texts(db_url, layer, tmp_path)
+        await ingest(db_url, layer, tmp_path)
 
         b.unlink()
-        result, _ = await ingest_with_texts(db_url, layer, tmp_path)
+        result = await ingest(db_url, layer, tmp_path)
 
         assert FileOutcome("sub/b.md", "removed", "deleted") in result.files
         assert FileOutcome("a.md", "unchanged") in result.files
@@ -463,7 +464,7 @@ class TestScannedPdf:
             return original_parse(file_path)
 
         with patch("stratakb.knowledge.ingestion._parse_file", side_effect=fake_parse):
-            result, _ = await ingest_with_texts(db_url, layer, root)
+            result = await ingest(db_url, layer, root)
         return result
 
     async def test_one_of_four_pages_flagged(self, db_url, layer, tmp_path):
@@ -548,7 +549,7 @@ class TestTruncatedCsv:
 
     async def _ingest_capped(self, db_url, layer, root: Path):
         with patch("stratakb.knowledge.parsers.csv_parser.MAX_ROWS", 2):
-            result, _ = await ingest_with_texts(db_url, layer, root)
+            result = await ingest(db_url, layer, root)
         return result
 
     async def test_over_limit_flagged_and_stored(self, db_url, layer, tmp_path):
@@ -612,7 +613,7 @@ async def test_parser_flag_reaches_the_outcome(db_url, layer, tmp_path):
     )
 
     with patch("stratakb.knowledge.ingestion._parse_file", return_value=doc):
-        result, _ = await ingest_with_texts(db_url, layer, tmp_path)
+        result = await ingest(db_url, layer, tmp_path)
 
     assert FileOutcome("a.md", "flagged", "truncated", 7) in result.files
     assert result.files_flagged == 1
@@ -762,11 +763,9 @@ class TestFileList:
 
         write_file(tmp_path / "a.md", "# Alpha\n\nAlpha content.\n")
         write_file(tmp_path / "sub" / "b.md", "# Beta\n\nBeta content.\n")
-        await ingest_with_texts(db_url, layer, tmp_path)
+        await ingest(db_url, layer, tmp_path)
 
-        result, _ = await ingest_with_texts(
-            db_url, layer, tmp_path, files=_entries(tmp_path, "a.md")
-        )
+        result = await ingest(db_url, layer, tmp_path, files=_entries(tmp_path, "a.md"))
 
         assert result.status == "completed"
         assert FileOutcome("sub/b.md", "removed", "not_selected") in result.files
@@ -781,21 +780,19 @@ class TestFileList:
 
         write_file(tmp_path / "a.md", "# Alpha\n\nAlpha content.\n")
         b = write_file(tmp_path / "b.md", "# Beta\n\nBeta content.\n")
-        await ingest_with_texts(db_url, layer, tmp_path)
+        await ingest(db_url, layer, tmp_path)
         b.unlink()
 
-        result, _ = await ingest_with_texts(
-            db_url, layer, tmp_path, files=_entries(tmp_path, "a.md")
-        )
+        result = await ingest(db_url, layer, tmp_path, files=_entries(tmp_path, "a.md"))
 
         assert FileOutcome("b.md", "removed", "deleted") in result.files
 
     async def test_empty_list_removes_all(self, db_url, layer, tmp_path):
         write_file(tmp_path / "a.md", "# Alpha\n\nAlpha content.\n")
         write_file(tmp_path / "b.md", "# Beta\n\nBeta content.\n")
-        await ingest_with_texts(db_url, layer, tmp_path)
+        await ingest(db_url, layer, tmp_path)
 
-        result, _ = await ingest_with_texts(db_url, layer, tmp_path, files=[])
+        result = await ingest(db_url, layer, tmp_path, files=[])
 
         assert result.status == "completed"
         assert result.files_removed == 2
@@ -804,7 +801,7 @@ class TestFileList:
         assert await _chunks(db_url, layer) == []
 
     async def test_empty_list_nothing_tracked_completes(self, db_url, layer, tmp_path):
-        result, _ = await ingest_with_texts(db_url, layer, tmp_path, files=[])
+        result = await ingest(db_url, layer, tmp_path, files=[])
 
         assert result.status == "completed"
         assert result.errors == []
@@ -814,9 +811,7 @@ class TestFileList:
         write_file(tmp_path / "a.md", "# Alpha\n\nAlpha content.\n")
         write_file(tmp_path / "other.md", "# Other\n\nNot listed.\n")
 
-        result, _ = await ingest_with_texts(
-            db_url, layer, tmp_path, files=_entries(tmp_path, "a.md")
-        )
+        result = await ingest(db_url, layer, tmp_path, files=_entries(tmp_path, "a.md"))
 
         assert file_outcomes(result) == {"a.md": ("added", None)}
         assert [f["relative_path"] for f in await _files(db_url, layer)] == ["a.md"]
@@ -828,8 +823,8 @@ class TestFileList:
 
         # Only the module's name: asyncpg's login uses hashlib.sha256 too
         with patch("stratakb.knowledge.ingestion.hashlib") as mock_hashlib:
-            first, _ = await ingest_with_texts(db_url, layer, tmp_path, files=entries)
-            second, _ = await ingest_with_texts(db_url, layer, tmp_path, files=entries)
+            first = await ingest(db_url, layer, tmp_path, files=entries)
+            second = await ingest(db_url, layer, tmp_path, files=entries)
 
         mock_hashlib.sha256.assert_not_called()
         assert first.files_added == 2
@@ -840,10 +835,10 @@ class TestFileList:
     async def test_carried_unchanged_hash_never_opens(self, db_url, layer, tmp_path):
         write_file(tmp_path / "a.md", "# Alpha\n\nAlpha content.\n")
         entries = _entries(tmp_path, "a.md", carry_hash=True)
-        await ingest_with_texts(db_url, layer, tmp_path, files=entries)
+        await ingest(db_url, layer, tmp_path, files=entries)
 
         with patch.object(Path, "read_bytes", side_effect=AssertionError("opened")):
-            result, _ = await ingest_with_texts(db_url, layer, tmp_path, files=entries)
+            result = await ingest(db_url, layer, tmp_path, files=entries)
 
         assert file_outcomes(result) == {"a.md": ("unchanged", None)}
 
@@ -851,7 +846,7 @@ class TestFileList:
         write_file(tmp_path / "a.md", "# Alpha\n\nAlpha content.\n")
 
         with pytest.raises(ValueError, match="replace_all"):
-            await ingest_with_texts(
+            await ingest(
                 db_url, layer, tmp_path, files=_entries(tmp_path, "a.md"), replace_all=True
             )
 
@@ -861,20 +856,20 @@ class TestFileList:
 
         entry = FileEntry(relative_path=bad, size=1, path=tmp_path / "x.md")
         with pytest.raises(ValueError, match="relative"):
-            await ingest_with_texts(db_url, layer, tmp_path, files=[entry])
+            await ingest(db_url, layer, tmp_path, files=[entry])
 
     async def test_file_source_path_raises(self, db_url, layer, tmp_path):
         a = write_file(tmp_path / "a.md", "# Alpha\n\nAlpha content.\n")
 
         with pytest.raises(ValueError, match="folder"):
-            await ingest_with_texts(db_url, layer, a, files=_entries(tmp_path, "a.md"))
+            await ingest(db_url, layer, a, files=_entries(tmp_path, "a.md"))
 
     async def test_progress_calls(self, db_url, layer, tmp_path):
         write_file(tmp_path / "a.md", "# Alpha\n\nAlpha content.\n")
         b = write_file(tmp_path / "b.md", "# Beta\n\nBeta content.\n")
         calls: list[tuple[int, int]] = []
 
-        await ingest_with_texts(
+        await ingest(
             db_url, layer, tmp_path,
             files=_entries(tmp_path, "a.md", "b.md", carry_hash=True),
             progress=lambda done, total: calls.append((done, total)),
@@ -883,7 +878,7 @@ class TestFileList:
 
         calls.clear()
         write_file(b, "# Beta\n\nBeta content, edited.\n")
-        await ingest_with_texts(
+        await ingest(
             db_url, layer, tmp_path,
             files=_entries(tmp_path, "a.md", "b.md", carry_hash=True),
             progress=lambda done, total: calls.append((done, total)),
@@ -894,7 +889,7 @@ class TestFileList:
         write_file(tmp_path / "a.md", "# Alpha\n\nAlpha content.\n")
         calls: list[tuple[int, int]] = []
 
-        await ingest_with_texts(db_url, layer, tmp_path, progress=lambda d, t: calls.append((d, t)))
+        await ingest(db_url, layer, tmp_path, progress=lambda d, t: calls.append((d, t)))
 
         assert calls == [(1, 1)]
 
@@ -911,7 +906,7 @@ class TestFileList:
             ),
             pytest.raises(asyncpg.InterfaceError),
         ):
-            await ingest_with_texts(db_url, layer, tmp_path, files=_entries(tmp_path, "a.md"))
+            await ingest(db_url, layer, tmp_path, files=_entries(tmp_path, "a.md"))
 
     async def test_store_runtime_error_is_embed_error(self, db_url, layer, tmp_path):
         write_file(tmp_path / "a.md", "# Alpha\n\nAlpha content.\n")
@@ -921,9 +916,7 @@ class TestFileList:
             new_callable=AsyncMock,
             side_effect=RuntimeError("constraint"),
         ):
-            result, _ = await ingest_with_texts(
-                db_url, layer, tmp_path, files=_entries(tmp_path, "a.md")
-            )
+            result = await ingest(db_url, layer, tmp_path, files=_entries(tmp_path, "a.md"))
 
         assert file_outcomes(result)["a.md"] == ("failed", "embed_error")
         assert result.status == "failed"

@@ -27,9 +27,9 @@ from stratakb.rag.clause_lookup import (
 )
 from stratakb.rag.passages import passage_cost
 from stratakb.rag.retriever import SearchResult
+from tests.helpers import ingest
 
 FIXTURES = Path(__file__).parent / "fixtures"
-FAKE_EMBEDDING = [0.01] * 768
 CLAUSE_PATH = "2 Termination > 2.2 Termination for cause"
 
 
@@ -238,14 +238,8 @@ async def _make_layer(db_url: str) -> str:
     return name
 
 
-async def _ingest(db_url: str, layer: str, source: Path) -> None:
-    from stratakb.knowledge.ingestion import ingest_documents
-
-    with patch("stratakb.knowledge.ingestion.embed_texts", new_callable=AsyncMock) as mock:
-        mock.side_effect = lambda texts, **_: [FAKE_EMBEDDING for _ in texts]
-        result = await ingest_documents(
-            db_url, "fake-key", layer_name=layer, source_path=str(source)
-        )
+async def _ingest_ok(db_url: str, layer: str, source: Path) -> None:
+    result = await ingest(db_url, layer, source)
     assert result.docs_failed == 0
 
 
@@ -263,8 +257,8 @@ async def layers(settings, tmp_path):
     double.mkdir()
     shutil.copy(FIXTURES / "contract.md", double / "acme.md")
     shutil.copy(FIXTURES / "contract.md", double / "globex.md")
-    await _ingest(db_url, one, single)
-    await _ingest(db_url, two, double)
+    await _ingest_ok(db_url, one, single)
+    await _ingest_ok(db_url, two, double)
     yield one, two
     for name in (one, two):
         with contextlib.suppress(LayerNotFoundError):
@@ -422,7 +416,7 @@ async def test_resolve_caps_a_label_many_documents_share(settings, tmp_path):
     for name in names:
         shutil.copy(FIXTURES / "contract.md", tmp_path / name)
     try:
-        await _ingest(db_url, layer, tmp_path)
+        await _ingest_ok(db_url, layer, tmp_path)
 
         chunks = await resolve(db_url, find_references("clause 2.2"), [layer])
 
@@ -478,7 +472,7 @@ async def rulebook_layer(settings, tmp_path):
     src = tmp_path / "rulebook"
     src.mkdir()
     (src / "rulebook.txt").write_text(_RULEBOOK, encoding="utf-8")
-    await _ingest(db_url, name, src)
+    await _ingest_ok(db_url, name, src)
     yield name
     with contextlib.suppress(LayerNotFoundError):
         await delete_layer(db_url, name=name)

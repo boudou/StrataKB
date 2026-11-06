@@ -19,10 +19,9 @@ import pytest
 from stratakb.knowledge.documents import build_document_text
 from stratakb.knowledge.ingestion import _chunk_document, _map_document, _parse_file
 from stratakb.knowledge.structure import PATH_SEPARATOR, chunk_spans, detect_sections
-from tests.helpers import call_tool
+from tests.helpers import FAKE_EMBEDDING, call_tool, ingest
 
 FIXTURES = Path(__file__).parent / "fixtures"
-FAKE_EMBEDDING = [0.01] * 768
 
 
 def _document_text(name: str) -> str:
@@ -708,12 +707,6 @@ def test_prose_clause_keeps_its_own_chunk():
 
 
 @pytest.fixture
-def db_url():
-    from stratakb.config import get_settings
-    return get_settings().database_url
-
-
-@pytest.fixture
 async def layer(db_url):
     from stratakb.knowledge.layers import LayerNotFoundError, create_layer, delete_layer
 
@@ -727,16 +720,6 @@ async def layer(db_url):
     yield name
     with contextlib.suppress(LayerNotFoundError):
         await delete_layer(db_url, name=name)
-
-
-async def _ingest(db_url: str, layer: str, source: Path):
-    from stratakb.knowledge.ingestion import ingest_documents
-
-    with patch("stratakb.knowledge.ingestion.embed_texts", new_callable=AsyncMock) as mock:
-        mock.side_effect = lambda texts, **_: [FAKE_EMBEDDING for _ in texts]
-        return await ingest_documents(
-            db_url, "fake-key", layer_name=layer, source_path=str(source)
-        )
 
 
 async def _stored(db_url: str, layer: str):
@@ -772,7 +755,7 @@ async def test_ingest_stores_the_map_and_clause_paths(db_url, layer, tmp_path):
     src.mkdir()
     shutil.copy(FIXTURES / "contract.md", src / "contract.md")
 
-    result = await _ingest(db_url, layer, src)
+    result = await ingest(db_url, layer, src)
     assert result.docs_failed == 0
     sections, chunks = await _stored(db_url, layer)
 
@@ -797,7 +780,7 @@ async def test_ingest_stores_the_map_and_clause_paths(db_url, layer, tmp_path):
         (FIXTURES / "contract.md").read_text(encoding="utf-8") + "\nAnnex III\n\nMore.\n",
         encoding="utf-8",
     )
-    await _ingest(db_url, layer, src)
+    await ingest(db_url, layer, src)
     sections, chunks = await _stored(db_url, layer)
     assert {r["document_id"] for r in sections} == {c["document_id"] for c in chunks}
     assert [r["label"] for r in sections][-2:] == ["annex ii", "annex iii"]
@@ -811,7 +794,7 @@ async def test_search_results_carry_the_clause_path_into_citations(db_url, layer
     src = tmp_path / "docs"
     src.mkdir()
     shutil.copy(FIXTURES / "contract.md", src / "contract.md")
-    await _ingest(db_url, layer, src)
+    await ingest(db_url, layer, src)
     _, chunks = await _stored(db_url, layer)
     stored = {c["content"]: c["clause_path"] for c in chunks}
 
@@ -870,7 +853,7 @@ async def test_ingest_builds_text_once_off_the_loop(db_url, layer, tmp_path):
         patch.object(ingestion, "detect_sections",
                      spy("detect_sections", ingestion.detect_sections)),
     ):
-        result = await _ingest(db_url, layer, src)
+        result = await ingest(db_url, layer, src)
 
     assert result.docs_processed == 2
     names = [name for name, _ in off_loop]
@@ -887,7 +870,7 @@ async def test_ingest_markdown_loose_list_stores_no_section(db_url, layer, tmp_p
         "Some intro.\n\n1. Install the tool\n\nRun it once.\n\n2. Configure it\n\nEdit the file.\n",
         encoding="utf-8",
     )
-    result = await _ingest(db_url, layer, src)
+    result = await ingest(db_url, layer, src)
     assert result.docs_processed == 1
     sections, chunks = await _stored(db_url, layer)
     assert sections == []
@@ -917,7 +900,7 @@ async def test_preset_pattern_adds_sections(db_url, layer, tmp_path):
     (src / "rulebook.txt").write_text(SEPA_STYLE, encoding="utf-8")
 
     # A layer without patterns is unchanged: the attributes are body text
-    await _ingest(db_url, layer, src)
+    await ingest(db_url, layer, src)
     sections, chunks = await _stored(db_url, layer)
     assert [r["label"] for r in sections] == ["attributes"]
     assert {c["clause_path"] for c in chunks} == {"Attributes"}
@@ -931,7 +914,7 @@ async def test_preset_pattern_adds_sections(db_url, layer, tmp_path):
         structure_patterns=patterns,
     )
     try:
-        result = await _ingest(db_url, name, src)
+        result = await ingest(db_url, name, src)
         assert result.docs_failed == 0
         sections, chunks = await _stored(db_url, name)
         assert [(r["label"], r["path"]) for r in sections] == [
