@@ -393,6 +393,14 @@ def _hash_entries(entries: list[FileEntry]) -> tuple[list[FileEntry], list[str]]
     return hashed, links
 
 
+def max_file_size_error(size_mb: float) -> str | None:
+    """Why size_mb is not a usable --max-file-size, or None when it is."""
+    # float() also accepts inf and nan; neither is a size
+    if math.isfinite(size_mb) and size_mb > 0:
+        return None
+    return "must be a finite number above 0"
+
+
 def _refuse(plan: Plan, reason: str, hint: str) -> Plan:
     plan.refusal = (reason, hint)
     plan.action = None
@@ -437,10 +445,9 @@ async def plan(database_url: str, path: str | os.PathLike, options: Options) -> 
             f"Invalid layer name '{options.name}'. Must be 3-100 chars, "
             "lowercase alphanumeric with underscores, starting with a letter.",
         )
-    if not (math.isfinite(options.max_file_size_mb) and options.max_file_size_mb > 0):
-        return _refuse(
-            result, "usage_error", "--max-file-size must be a finite number above 0."
-        )
+    size_error = max_file_size_error(options.max_file_size_mb)
+    if size_error is not None:
+        return _refuse(result, "usage_error", f"--max-file-size {size_error}.")
     max_bytes = int(options.max_file_size_mb * 1_000_000)
 
     # 2. Broad paths

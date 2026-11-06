@@ -20,7 +20,6 @@ import argparse
 import asyncio
 import contextlib
 import json
-import math
 import os
 import sys
 from collections.abc import Sequence
@@ -133,9 +132,11 @@ def _size_mb(text: str) -> float:
         size = float(text)
     except ValueError:
         raise argparse.ArgumentTypeError(f"not a number: {text}") from None
-    # float() also accepts inf and nan; neither is a size
-    if not (math.isfinite(size) and size > 0):
-        raise argparse.ArgumentTypeError(f"not a finite number above 0: {text}")
+    from stratakb.knowledge.add_folder import max_file_size_error
+
+    err = max_file_size_error(size)
+    if err is not None:
+        raise argparse.ArgumentTypeError(f"{err}: {text}")
     return size
 
 

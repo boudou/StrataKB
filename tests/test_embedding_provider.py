@@ -5,7 +5,8 @@ Tests cover:
 - Request shape: model, dimensions and encoding_format per endpoint
 - Default model resolution for each backend
 - Vectors of the wrong length are refused on both backends
-- strata_search and strata_ingest_documents need no OpenAI key with a base URL
+- strata_search, strata_ingest_documents and strata_apply_preset need no OpenAI key
+  with a base URL
 - is_model_cached needs config.json and the weights, and never downloads
 - The OpenAI path refuses an empty key without a base URL, whatever the backend name
 """
@@ -253,6 +254,41 @@ class TestToolKeyChecks:
             result = await fn(layer_name="docs", source_path="/tmp/docs")
         assert result["status"] == "error"
         assert "API key" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_apply_preset_needs_no_openai_key_with_base_url(self):
+        from stratakb.knowledge.tools import register_knowledge_tools
+
+        fn = _capture_tools(register_knowledge_tools, "postgresql://test", "")[
+            "strata_apply_preset"
+        ]
+        preset = str(Path(__file__).parent.parent / "examples" / "sepa" / "preset.yaml")
+        create = AsyncMock(return_value={"status": "created", "changes": [], "message": ""})
+        ingest = AsyncMock(return_value={"total_docs": 0, "total_chunks": 0})
+        with (
+            patch(
+                "stratakb.config.get_settings",
+                return_value=openai_settings(embedding_base_url=BASE_URL),
+            ),
+            patch("stratakb.knowledge.presets.create_preset_layer", create),
+            patch("stratakb.knowledge.presets.ingest_preset", ingest),
+            patch("stratakb.knowledge.tools.write_audit_log", AsyncMock()),
+        ):
+            result = await fn(preset_path=preset)
+        assert result["status"] == "completed"
+        create.assert_awaited_once()
+
+        create.reset_mock()
+        with (
+            patch("stratakb.config.get_settings", return_value=openai_settings()),
+            patch("stratakb.knowledge.presets.create_preset_layer", create),
+            patch("stratakb.knowledge.presets.ingest_preset", ingest),
+        ):
+            result = await fn(preset_path=preset)
+        assert result["status"] == "error"
+        assert "API key" in result["error"]
+        # The key is checked before anything is written
+        create.assert_not_awaited()
 
 
 # ── is_model_cached ──────────────────────────────────────

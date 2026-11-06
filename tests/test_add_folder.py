@@ -11,6 +11,7 @@ import json
 import os
 from pathlib import Path
 from types import SimpleNamespace
+from typing import NamedTuple
 from unittest.mock import AsyncMock, patch
 from uuid import uuid4
 
@@ -295,7 +296,7 @@ async def _audit_rows(db_url, root):
     pool = await get_pool(db_url)
     return await pool.fetch(
         "SELECT * FROM strata_core.audit_log WHERE tool_name = 'cli:add' "
-        "AND parameters->>'root' = $1",
+        "AND parameters->>'root' = $1 ORDER BY id",
         root,
     )
 
@@ -438,7 +439,15 @@ async def test_sync_sets_description_only_when_given(db_url, tmp_path, cleanup):
     assert (await _layer(db_url, name))["description"] == "Hand-written"
 
 
-async def _snapshot(db_url, root, name):
+class Snapshot(NamedTuple):
+    layer: dict | None
+    audit_rows: list
+
+
+_NOTHING = Snapshot(None, [])
+
+
+async def _snapshot(db_url, root, name) -> Snapshot:
     """The layer row (None when missing) and the audit rows for root."""
     from stratakb.knowledge.layers import LayerNotFoundError
 
@@ -446,10 +455,10 @@ async def _snapshot(db_url, root, name):
     if name is not None:
         with contextlib.suppress(LayerNotFoundError):
             layer = await _layer(db_url, name)
-    return layer, await _audit_rows(db_url, root)
+    return Snapshot(layer, await _audit_rows(db_url, root))
 
 
-async def _assert_nothing_written(db_url, p, name, *, before=(None, [])):
+async def _assert_nothing_written(db_url, p, name, *, before=_NOTHING):
     """apply() refuses the plan, and the layer row and audit rows stay as before."""
     with pytest.raises(ValueError):
         await add_folder.apply(db_url, _settings("tester"), p, confirmed={"broad_path"})
@@ -469,13 +478,11 @@ async def test_name_taken(db_url, tmp_path, cleanup):
 
     root = _docs(tmp_path)
     before = await _snapshot(db_url, root.resolve().as_posix(), name)
+    assert before.layer is not None and before.layer["root_path"] is None
     p = await add_folder.plan(db_url, root, Options(name=name))
     assert p.refusal is not None and p.refusal[0] == "name_taken"
     assert p.layer == name and p.action is None
-    with pytest.raises(ValueError):
-        await add_folder.apply(db_url, _settings("tester"), p, confirmed=set())
     await _assert_nothing_written(db_url, p, name, before=before)
-    assert (await _layer(db_url, name))["root_path"] is None
 
 
 async def test_root_taken(db_url, tmp_path, cleanup):
@@ -485,7 +492,7 @@ async def test_root_taken(db_url, tmp_path, cleanup):
     await _run(db_url, root, Options(name=name))
     other = _name()
     before = await _snapshot(db_url, root.resolve().as_posix(), other)
-    assert before[0] is None and len(before[1]) == 1
+    assert before.layer is None and len(before.audit_rows) == 1
 
     p = await add_folder.plan(db_url, root, Options(name=other))
     assert p.refusal is not None and p.refusal[0] == "root_taken"
@@ -501,9 +508,10 @@ async def test_overlapping_root(db_url, tmp_path, cleanup):
     _write(tmp_path / "top.md")
 
     for path in (tmp_path, root / "guide"):
-        p = await add_folder.plan(db_url, path, Options(name=_name()))
+        other = _name()
+        p = await add_folder.plan(db_url, path, Options(name=other))
         assert p.refusal is not None and p.refusal[0] == "overlapping_root", path
-        await _assert_nothing_written(db_url, p, None)
+        await _assert_nothing_written(db_url, p, other)
 
 
 async def test_overlapping_root_case_only(db_url, tmp_path, cleanup, monkeypatch):
@@ -532,7 +540,7 @@ async def test_preset_layer(db_url, tmp_path, cleanup):
     await create_layer(db_url, name=name, display_name="Preset", origin="preset:x")
     root = _docs(tmp_path)
     before = await _snapshot(db_url, root.resolve().as_posix(), name)
-    assert before[0] is not None and before[1] == []
+    assert before.layer is not None and before.audit_rows == []
 
     p = await add_folder.plan(db_url, root, Options(name=name))
     assert p.refusal is not None and p.refusal[0] == "preset_layer"
