@@ -5,12 +5,15 @@ examples/README.md exists under examples/peps/source (CI fetches it before the
 tests) and skip with the clone commands otherwise. The dry run needs no
 database; the apply test needs the database and patches the embeddings. All
 chunks get the same dummy embedding, so the search check reads only the
-full-text leg of the hybrid SQL.
+full-text leg of the hybrid SQL. The list of PEPs lives in
+examples/peps/peps.txt; a check that needs no clone keeps the copies in the
+READMEs and the CI workflow equal to it.
 """
 
 from __future__ import annotations
 
 import contextlib
+import re
 import shutil
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
@@ -25,26 +28,39 @@ from stratakb.knowledge.presets import (
     load_preset,
 )
 
-EXAMPLES_DIR = Path(__file__).parent.parent / "examples"
+REPO_DIR = Path(__file__).parent.parent
+EXAMPLES_DIR = REPO_DIR / "examples"
 PEPS_PRESET = EXAMPLES_DIR / "peps" / "preset.yaml"
+PEPS_LIST = EXAMPLES_DIR / "peps" / "peps.txt"
 PEPS_SOURCE = EXAMPLES_DIR / "peps" / "source" / "peps"
-EIGHT_PEPS = [
-    "pep-0008.rst",
-    "pep-0020.rst",
-    "pep-0257.rst",
-    "pep-0484.rst",
-    "pep-0572.rst",
-    "pep-0634.rst",
-    "pep-0695.rst",
-    "pep-0723.rst",
+EXAMPLE_PEPS = [
+    line.strip()
+    for line in PEPS_LIST.read_text(encoding="utf-8").splitlines()
+    if line.strip() and not line.startswith("#")
 ]
 CLONE_HINT = (
     "PEPs not fetched; run: "
     "git clone --depth 1 --filter=blob:none --sparse https://github.com/python/peps.git "
     "examples/peps/source && "
     "git -C examples/peps/source sparse-checkout set --no-cone "
-    + " ".join(f"/peps/{name}" for name in EIGHT_PEPS)
+    + " ".join(f"/peps/{name}" for name in EXAMPLE_PEPS)
+    + " (in Git Bash on Windows, put MSYS_NO_PATHCONV=1 in front of the sparse-checkout "
+    "command; otherwise Git Bash rewrites the /peps/... paths and nothing is checked out)"
 )
+# Every other place that spells out the list
+PEPS_LIST_COPIES = ["README.md", "examples/README.md", ".github/workflows/ci.yml"]
+
+
+@pytest.mark.parametrize("copy", PEPS_LIST_COPIES)
+def test_pep_list_copies_match_peps_txt(copy):
+    text = (REPO_DIR / copy).read_text(encoding="utf-8")
+    assert re.findall(r"/peps/(pep-\d+\.rst)", text) == EXAMPLE_PEPS, (
+        f"{copy} fetches other PEPs than examples/peps/peps.txt"
+    )
+
+
+def test_clone_hint_has_the_git_bash_note():
+    assert "MSYS_NO_PATHCONV=1" in CLONE_HINT
 
 
 @pytest.fixture
@@ -65,8 +81,8 @@ def test_checkout_dry_run_parses_everything():
     assert result.errors == []
 
 
-async def test_eight_peps_apply_and_find_pep8(db_url, tmp_path):
-    if not all((PEPS_SOURCE / name).is_file() for name in EIGHT_PEPS):
+async def test_example_peps_apply_and_find_pep8(db_url, tmp_path):
+    if not all((PEPS_SOURCE / name).is_file() for name in EXAMPLE_PEPS):
         pytest.skip(CLONE_HINT)
 
     from stratakb.config import get_settings
@@ -74,10 +90,10 @@ async def test_eight_peps_apply_and_find_pep8(db_url, tmp_path):
     from stratakb.knowledge.layers import LayerNotFoundError, delete_layer
     from stratakb.rag.retriever import _build_hybrid_sql
 
-    # Exactly these eight files, even when the clone holds every PEP
+    # Exactly the listed files, even when the clone holds every PEP
     docs = tmp_path / "source" / "peps"
     docs.mkdir(parents=True)
-    for name in EIGHT_PEPS:
+    for name in EXAMPLE_PEPS:
         shutil.copy2(PEPS_SOURCE / name, docs / name)
 
     preset = load_preset(PEPS_PRESET)
@@ -87,8 +103,8 @@ async def test_eight_peps_apply_and_find_pep8(db_url, tmp_path):
 
     try:
         dry = dry_run_parse(preset, tmp_path)
-        assert dry.total_files == 8
-        assert dry.parsed_files == 8
+        assert dry.total_files == len(EXAMPLE_PEPS)
+        assert dry.parsed_files == len(EXAMPLE_PEPS)
         assert dry.failed_files == 0
 
         created = await create_preset_layer(db_url, preset)
@@ -98,7 +114,7 @@ async def test_eight_peps_apply_and_find_pep8(db_url, tmp_path):
             mock.side_effect = lambda texts, **_: [vector for _ in texts]
             result = await ingest_preset(db_url, "fake-key", preset, tmp_path)
 
-        assert result["total_docs"] == 8
+        assert result["total_docs"] == len(EXAMPLE_PEPS)
         assert result["total_errors"] == 0
         assert result["groups"]["peps"]["status"] == "completed"
 
@@ -107,7 +123,7 @@ async def test_eight_peps_apply_and_find_pep8(db_url, tmp_path):
             "SELECT DISTINCT source_file FROM strata_vectors.chunks WHERE layer_name = $1",
             preset.name,
         )
-        assert sorted(r["source_file"] for r in rows) == EIGHT_PEPS
+        assert sorted(r["source_file"] for r in rows) == EXAMPLE_PEPS
 
         sql, params = _build_hybrid_sql(
             "[" + ",".join(["0.01"] * dims) + "]", "maximum line length", [preset.name], top_k=3
