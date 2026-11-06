@@ -391,19 +391,5 @@ def main(settings: Settings | None = None) -> None:
     build_server(settings).run(transport="stdio")
 
 
-def __getattr__(name: str) -> FastMCP:
-    """Return a new server built from the current settings for `mcp`.
-
-    Builds a new server on every access and never caches it: a cached server
-    would fix the database URL for the whole process again. Exists only until
-    the tests build their own servers with build_server.
-    """
-    if name == "mcp":
-        from stratakb.config import get_settings
-
-        return build_server(get_settings())
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-
-
 if __name__ == "__main__":
     main()

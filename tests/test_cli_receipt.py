@@ -17,6 +17,7 @@ import pytest
 import structlog
 
 from stratakb import cli
+from tests.helpers import call_tool
 from tests.test_receipts import QUOTE, _as, _audit_rows, _cited, _ingest
 
 UNKNOWN_ID = "rcpt_" + "A" * 22
@@ -268,29 +269,13 @@ def test_json_error_form_escapes_c1_del_and_bidi(capsys):
     assert captured.err == "Can't reach the database at db\\x9b2J\\x7f\\u202e.\n"
 
 
-async def _call_receipt_tool(db_url: str, receipt_id: str) -> dict:
-    """strata_get_receipt, registered on a fresh server bound to db_url.
-
-    The shared server binds its database URL when stratakb.mcp_server is first
-    imported, which another test module may do with get_settings patched.
-    """
-    from mcp.server.fastmcp import FastMCP
-
-    from stratakb.rag.receipt_tools import register_receipt_tools
-
-    server = FastMCP("test-cli-receipt")
-    register_receipt_tools(server, db_url)
-    tool = server._tool_manager.get_tool("strata_get_receipt")
-    return await tool.fn(receipt_id=receipt_id)
-
-
-def test_json(cited, db_url, capsys):
+def test_json(cited, server, capsys):
     receipt_id, _ = cited
     assert _main(["receipt", receipt_id, "--json"]) == cli.EXIT_OK
     printed = json.loads(capsys.readouterr().out)
 
     with _as("alice", "viewer"):
-        tool = _run(_call_receipt_tool(db_url, receipt_id))
+        tool = _run(call_tool(server, "strata_get_receipt", receipt_id=receipt_id))
     assert printed == json.loads(json.dumps(tool))
     assert printed["status"] == "ok"
     assert printed["receipt"]["quotes"][0]["quote"] == QUOTE

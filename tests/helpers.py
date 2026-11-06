@@ -23,6 +23,20 @@ async def call_tool(server: FastMCP, name: str, /, **arguments) -> dict:
     return await server._tool_manager.get_tool(name).fn(**arguments)
 
 
+async def call_health(settings: Settings) -> dict:
+    """Call strata_admin_health on a server built from `settings`, database reported up."""
+    from stratakb.mcp_server import build_server
+
+    with (
+        patch("stratakb.config.get_settings", return_value=settings),
+        patch(
+            "stratakb.mcp_server.check_connection",
+            AsyncMock(return_value={"status": "ok"}),
+        ),
+    ):
+        return await call_tool(build_server(settings), "strata_admin_health")
+
+
 def write_file(path: Path, text: str) -> Path:
     """Write text to path, creating its parent folders; return path."""
     path.parent.mkdir(parents=True, exist_ok=True)

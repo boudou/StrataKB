@@ -12,7 +12,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from tests.helpers import FAKE_EMBEDDING, file_outcomes, ingest, write_file
+from tests.helpers import FAKE_EMBEDDING, call_tool, file_outcomes, ingest, write_file
 
 
 def _denied_read_bytes(name: str):
@@ -28,9 +28,7 @@ def _denied_read_bytes(name: str):
     return read_bytes
 
 
-async def test_tool_reports_read_error(layer, tmp_path):
-    from stratakb.mcp_server import mcp
-
+async def test_tool_reports_read_error(server, layer, tmp_path):
     write_file(tmp_path / "locked.md", "# Locked\n\nLocked content.\n")
     write_file(tmp_path / "a.md", "# Alpha\n\nAlpha content.\n")
     with (
@@ -44,8 +42,9 @@ async def test_tool_reports_read_error(layer, tmp_path):
         ),
         patch.object(Path, "read_bytes", _denied_read_bytes("locked.md")),
     ):
-        tool = mcp._tool_manager.get_tool("strata_ingest_documents")
-        result = await tool.fn(layer_name=layer, source_path=str(tmp_path))
+        result = await call_tool(
+            server, "strata_ingest_documents", layer_name=layer, source_path=str(tmp_path)
+        )
 
     assert result["status"] == "partial"
     assert result["errors"] == [{

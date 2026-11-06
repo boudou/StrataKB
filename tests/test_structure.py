@@ -19,6 +19,7 @@ import pytest
 from stratakb.knowledge.documents import build_document_text
 from stratakb.knowledge.ingestion import _chunk_document, _map_document, _parse_file
 from stratakb.knowledge.structure import PATH_SEPARATOR, chunk_spans, detect_sections
+from tests.helpers import call_tool
 
 FIXTURES = Path(__file__).parent / "fixtures"
 FAKE_EMBEDDING = [0.01] * 768
@@ -946,9 +947,8 @@ async def test_preset_pattern_adds_sections(db_url, layer, tmp_path):
         await delete_layer(db_url, name=name)
 
 
-async def test_apply_preset_dry_run_runs_in_a_thread():
+async def test_apply_preset_dry_run_runs_in_a_thread(server):
     from stratakb.knowledge import presets
-    from stratakb.mcp_server import mcp
 
     threads: list[bool] = []
     real = presets.dry_run_parse
@@ -958,7 +958,6 @@ async def test_apply_preset_dry_run_runs_in_a_thread():
         return real(*args, **kwargs)
 
     preset_path = Path(__file__).parent.parent / "examples" / "sepa" / "preset.yaml"
-    tool = mcp._tool_manager.get_tool("strata_apply_preset")
     with (
         patch("stratakb.core.auth.get_current_user", return_value=("tester", "admin")),
         patch("stratakb.knowledge.tools.get_current_user", return_value=("tester", "admin")),
@@ -969,7 +968,9 @@ async def test_apply_preset_dry_run_runs_in_a_thread():
             return_value={"status": "would_create", "changes": []},
         ),
     ):
-        result = await tool.fn(preset_path=str(preset_path), dry_run=True)
+        result = await call_tool(
+            server, "strata_apply_preset", preset_path=str(preset_path), dry_run=True
+        )
 
     assert result["status"] == "dry_run_complete"
     assert threads == [True]

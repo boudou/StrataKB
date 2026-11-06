@@ -37,7 +37,7 @@ from stratakb.knowledge.embedding_checks import (
     reset_embedding_checks,
     run_embedding_checks,
 )
-from tests.helpers import call_tool
+from tests.helpers import call_health, call_tool
 
 BASE_URL = "http://127.0.0.1:11434/v1"
 
@@ -104,19 +104,6 @@ async def _run(settings: Settings, ids: list[str], *, column: int | None = 768, 
     return client_cls, client
 
 
-async def _health(settings: Settings) -> dict:
-    from stratakb import mcp_server
-
-    with (
-        patch("stratakb.config.get_settings", return_value=settings),
-        patch(
-            "stratakb.mcp_server.check_connection",
-            AsyncMock(return_value={"status": "ok"}),
-        ),
-    ):
-        return await call_tool(mcp_server.build_server(settings), "strata_admin_health")
-
-
 # ==========================================
 # Match rule
 # ==========================================
@@ -142,7 +129,7 @@ def test_model_listed_is_exact():
 async def test_missing_model_degrades_health():
     settings = _settings()
     await _run(settings, ["llama3.2:latest"])
-    result = await _health(settings)
+    result = await call_health(settings)
 
     model = result["embedding"]["model"]
     assert model["status"] == "missing"
@@ -155,7 +142,7 @@ async def test_missing_model_degrades_health():
 async def test_latest_tag_counts_as_present():
     settings = _settings()
     client_cls, client = await _run(settings, ["nomic-embed-text:latest"])
-    result = await _health(settings)
+    result = await call_health(settings)
 
     assert result["embedding"]["model"] == {"status": "ok", "model": "nomic-embed-text"}
     assert result["embedding"]["vector_column"]["status"] == "ok"
@@ -203,7 +190,7 @@ async def test_listing_failure_is_unchecked():
     settings = _settings()
     with capture_logs() as logs:
         await _run(settings, [], error=error)
-    result = await _health(settings)
+    result = await call_health(settings)
 
     model = result["embedding"]["model"]
     assert model["status"] == "unchecked"
@@ -226,7 +213,7 @@ def _unauthorized() -> Exception:
 async def test_401_without_key_names_embedding_api_key():
     settings = _settings(embedding_base_url=_REMOTE_URL, embedding_api_key="")
     await _run(settings, [], error=_unauthorized())
-    result = await _health(settings)
+    result = await call_health(settings)
 
     model = result["embedding"]["model"]
     assert model["status"] == "unchecked"
@@ -241,7 +228,7 @@ async def test_401_with_key_says_the_key_was_refused():
     settings = _settings(embedding_base_url=_REMOTE_URL, embedding_api_key="sk-endpoint-secret")
     with capture_logs() as logs:
         await _run(settings, [], error=_unauthorized())
-        result = await _health(settings)
+        result = await call_health(settings)
 
     model = result["embedding"]["model"]
     assert model["status"] == "unchecked"
@@ -329,7 +316,7 @@ async def test_column_mismatch_degrades_health():
     settings = _settings()
     with capture_logs() as logs:
         await _run(settings, ["nomic-embed-text"], column=1024)
-    result = await _health(settings)
+    result = await call_health(settings)
 
     column = result["embedding"]["vector_column"]
     assert column["status"] == "mismatch"
@@ -348,7 +335,7 @@ async def test_column_without_fixed_size_is_unchecked():
     await _run(settings, ["nomic-embed-text"], column=-1)
     column = embedding_checks_status()["vector_column"]
     assert column == {"status": "unchecked", "reason": "the vector column has no fixed size"}
-    assert (await _health(settings))["overall"] == "ok"
+    assert (await call_health(settings))["overall"] == "ok"
 
 
 async def test_column_read_failure_is_unchecked():
@@ -415,7 +402,7 @@ async def test_column_check_failure_is_logged():
 
 async def test_pending_before_the_checks_run():
     settings = _settings()
-    result = await _health(settings)
+    result = await call_health(settings)
     assert result["embedding"] == {
         "model": {"status": "pending"},
         "vector_column": {"status": "pending"},
@@ -442,7 +429,7 @@ async def test_health_hides_url_and_key():
     )
     with capture_logs() as logs:
         await _run(settings, ["llama3.2:latest"], column=1024)
-        result = await _health(settings)
+        result = await call_health(settings)
 
     assert result["embedding"]["model"]["status"] == "missing"
     for secret in ("pw", "11434", "endpoint-key"):
@@ -492,7 +479,7 @@ async def test_vector_stats_reports_the_column_size():
     server = FastMCP("test")
     register_database_tools(server, db_url, "")
     with patch("stratakb.config.get_settings", return_value=_settings()):
-        stats = await server._tool_manager.get_tool("strata_db_vector_stats").fn()
+        stats = await call_tool(server, "strata_db_vector_stats")
 
     column = await check_vector_column(db_url, 768)
     assert stats["embedding_dimensions"] == column["column_dimensions"]

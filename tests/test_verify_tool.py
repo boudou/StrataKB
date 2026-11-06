@@ -15,6 +15,8 @@ from uuid import uuid4
 
 import pytest
 
+from tests.helpers import call_tool
+
 FAKE_EMBEDDING = [0.01] * 768
 IBAN = "GR1601101250000000012300695"
 
@@ -92,11 +94,8 @@ def _ref(doc, sentence: str) -> str:
     return f"d{doc['id']}:{start}-{start + len(sentence)}"
 
 
-async def _verify(draft: str, passages: list[str]) -> dict:
-    from stratakb.mcp_server import mcp
-
-    tool = mcp._tool_manager.get_tool("strata_verify")
-    return await tool.fn(draft=draft, passages=passages)
+async def _verify(server, draft: str, passages: list[str]) -> dict:
+    return await call_tool(server, "strata_verify", draft=draft, passages=passages)
 
 
 async def _audit_rows(db_url: str, user: str) -> list:
@@ -111,7 +110,7 @@ async def _audit_rows(db_url: str, user: str) -> list:
 
 
 class TestVerifyTool:
-    async def test_verified_has_receipt(self, db_url, layer, tmp_path, user):
+    async def test_verified_has_receipt(self, server, db_url, layer, tmp_path, user):
         from stratakb.rag.receipts import open_receipt
 
         doc = await _document(db_url, layer, tmp_path)
@@ -121,7 +120,7 @@ class TestVerifyTool:
             f"Refunds reach {IBAN} within five business days [S2]."
         )
         with _as(user):
-            result = await _verify(draft, passages)
+            result = await _verify(server, draft, passages)
         assert result["status"] == "ok"
         assert result["result"] == "verified"
         assert result["receipt_id"].startswith("rcpt_")
@@ -140,59 +139,61 @@ class TestVerifyTool:
         assert "[IBAN_REDACTED]" in receipt["draft"]
         assert receipt["draft"].startswith("Records are kept for 30 days [S1]")
 
-    async def test_flagged_has_no_receipt(self, db_url, layer, tmp_path, user):
+    async def test_flagged_has_no_receipt(self, server, db_url, layer, tmp_path, user):
         doc = await _document(db_url, layer, tmp_path)
         with _as(user):
-            result = await _verify("Records are kept for 13 days [S1].", [_ref(doc, QUOTE)])
+            result = await _verify(server, "Records are kept for 13 days [S1].", [_ref(doc, QUOTE)])
         assert result["result"] == "flagged"
         assert "receipt_id" not in result
         assert [(f["kind"], f["text"], f["message"]) for f in result["flags"]] == [
             ("quantity", "13 days", '"13 days" not found in S1')
         ]
 
-    async def test_flag_list_is_bounded(self, db_url, layer, tmp_path, user):
+    async def test_flag_list_is_bounded(self, server, db_url, layer, tmp_path, user):
         from stratakb.rag.verify import MAX_FLAGS
 
         doc = await _document(db_url, layer, tmp_path)
         draft = " ".join(f"Q{i}Z" for i in range(1, 2001))
         with _as(user):
-            result = await _verify(draft, [_ref(doc, QUOTE)])
+            result = await _verify(server, draft, [_ref(doc, QUOTE)])
         assert result["result"] == "flagged"
         assert len(result["flags"]) == MAX_FLAGS
         assert result["more_flags"] == 2000 - MAX_FLAGS
         rows = await _audit_rows(db_url, user)
         assert json.loads(rows[-1]["parameters"])["flags"] == 2000
 
-    async def test_text_is_read_from_the_store(self, db_url, layer, tmp_path, user):
+    async def test_text_is_read_from_the_store(self, server, db_url, layer, tmp_path, user):
         # The ref names the quote's span; the draft cannot supply its own text
         doc = await _document(db_url, layer, tmp_path)
         with _as(user):
-            result = await _verify('"kept for 60 days" [S1]', [_ref(doc, QUOTE)])
+            result = await _verify(server, '"kept for 60 days" [S1]', [_ref(doc, QUOTE)])
         assert [f["kind"] for f in result["flags"]] == ["quote"]
 
-    async def test_wide_ref_flagged(self, db_url, layer, tmp_path, user):
+    async def test_wide_ref_flagged(self, server, db_url, layer, tmp_path, user):
         doc = await _document(db_url, layer, tmp_path)
         whole = f"d{doc['id']}:0-{len(doc['text'])}"
         beyond = f"d{doc['id']}:0-{len(doc['text']) + 5}"
         with _as(user):
-            result = await _verify("Kept for 30 days [S2].", [whole, _ref(doc, QUOTE), beyond])
+            result = await _verify(
+                server, "Kept for 30 days [S2].", [whole, _ref(doc, QUOTE), beyond]
+            )
         assert result["result"] == "flagged"
         flags = [(f["kind"], f["text"]) for f in result["flags"]]
         assert flags == [("passage", whole), ("passage", beyond)]
         assert "more than a passage can (200)" in result["flags"][0]["message"]
         assert "lies outside its document" in result["flags"][1]["message"]
 
-    async def test_unreadable_layer_refused(self, db_url, layer, tmp_path, user):
+    async def test_unreadable_layer_refused(self, server, db_url, layer, tmp_path, user):
         doc = await _document(db_url, layer, tmp_path)
         ref = _ref(doc, QUOTE)
         with (
             _as(user),
             patch("stratakb.rag.verify_tools.readable_layers", AsyncMock(return_value=set())),
         ):
-            refused = await _verify("Kept for 30 days [S1].", [ref])
+            refused = await _verify(server, "Kept for 30 days [S1].", [ref])
         with _as(user):
-            unknown = await _verify("Kept for 30 days [S1].", ["d999999999999:0-10"])
-            malformed = await _verify("Kept for 30 days [S1].", ["whole document please"])
+            unknown = await _verify(server, "Kept for 30 days [S1].", ["d999999999999:0-10"])
+            malformed = await _verify(server, "Kept for 30 days [S1].", ["whole document please"])
         assert refused == {
             "status": "error",
             "error": f"Passage S1 ({ref}) was not found, or you may not read it.",
@@ -205,7 +206,7 @@ class TestVerifyTool:
         rows = await _audit_rows(db_url, user)
         assert [r["result_summary"] for r in rows] == ["refused", "refused", "refused"]
 
-    async def test_legacy_chunk_ref(self, db_url, layer, user):
+    async def test_legacy_chunk_ref(self, server, db_url, layer, user):
         # A chunk stored before documents: its ref is c<chunk id>, its content
         # may start with the old [layer > file] prefix
         from stratakb.core.database import get_pool
@@ -220,17 +221,17 @@ class TestVerifyTool:
             f"[{layer} > old]\nOld records are kept for 45 days.",
         )
         with _as(user):
-            ok = await _verify('"Old records are kept for 45 days." [S1]', [f"c{chunk_id}"])
-            bad = await _verify(f"[{layer} > old] 46 days [S1]", [f"c{chunk_id}"])
+            ok = await _verify(server, '"Old records are kept for 45 days." [S1]', [f"c{chunk_id}"])
+            bad = await _verify(server, f"[{layer} > old] 46 days [S1]", [f"c{chunk_id}"])
         assert ok["result"] == "verified"
         assert ok["receipt_id"].startswith("rcpt_")
         assert {f["text"] for f in bad["flags"]} == {"46 days"}
 
-    async def test_audit_row_without_draft(self, db_url, layer, tmp_path, user):
+    async def test_audit_row_without_draft(self, server, db_url, layer, tmp_path, user):
         doc = await _document(db_url, layer, tmp_path)
         with _as(user):
-            verified = await _verify(f'"{QUOTE}" [S1]', [_ref(doc, QUOTE)])
-            await _verify(f"Refunds reach {IBAN} in 9 days [S1].", [_ref(doc, QUOTE)])
+            verified = await _verify(server, f'"{QUOTE}" [S1]', [_ref(doc, QUOTE)])
+            await _verify(server, f"Refunds reach {IBAN} in 9 days [S1].", [_ref(doc, QUOTE)])
 
         rows = await _audit_rows(db_url, user)
         assert [(r["tool_name"], r["result_summary"]) for r in rows] == [
@@ -247,13 +248,13 @@ class TestVerifyTool:
             assert QUOTE not in r["parameters"]
             assert IBAN not in r["parameters"]
 
-    async def test_input_limits(self, user):
+    async def test_input_limits(self, server, user):
         with _as(user):
-            assert (await _verify("x", []))["status"] == "error"
-            assert (await _verify("x", ["c1"] * 51))["status"] == "error"
+            assert (await _verify(server, "x", []))["status"] == "error"
+            assert (await _verify(server, "x", ["c1"] * 51))["status"] == "error"
 
-    async def test_tool_requires_viewer(self, user):
+    async def test_tool_requires_viewer(self, server, user):
         from stratakb.core.auth import PermissionDeniedError
 
         with _as(user, role="none"), pytest.raises(PermissionDeniedError):
-            await _verify("x", ["d1:0-1"])
+            await _verify(server, "x", ["d1:0-1"])

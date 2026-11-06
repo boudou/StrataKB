@@ -68,11 +68,9 @@ async def peps_layer(tmp_path):
             await delete_layer(db_url, name=preset.name)
 
 
-async def test_search_finds_pep8_for_line_length(peps_layer):
-    from stratakb.mcp_server import mcp
-
+async def test_search_finds_pep8_for_line_length(server, peps_layer):
     response = _payload(
-        await mcp.call_tool("strata_search", {"query": QUESTION, "layers": [peps_layer]})
+        await server.call_tool("strata_search", {"query": QUESTION, "layers": [peps_layer]})
     )
 
     assert response["status"] == "ok", response
@@ -80,11 +78,9 @@ async def test_search_finds_pep8_for_line_length(peps_layer):
     assert "pep-0008.rst" in files, files
 
 
-async def test_ask_cites_pep8_with_a_confidence(peps_layer):
-    from stratakb.mcp_server import mcp
-
+async def test_ask_cites_pep8_with_a_confidence(server, peps_layer):
     response = _payload(
-        await mcp.call_tool(
+        await server.call_tool(
             "strata_ask",
             {"question": QUESTION, "layers": [peps_layer], "response_format": "detailed"},
         )

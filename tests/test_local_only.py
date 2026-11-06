@@ -23,7 +23,7 @@ import pytest
 
 from stratakb.config import Settings
 from stratakb.core.egress import outbound_providers
-from tests.helpers import call_tool
+from tests.helpers import call_health
 
 
 @pytest.fixture(autouse=True)
@@ -273,24 +273,10 @@ def test_main_leaves_env_when_off(main_server, monkeypatch):
 # ==========================================
 
 
-async def _health(mcp_server, settings: Settings) -> dict:
-    """Call strata_admin_health on a server built from `settings`."""
-    return await call_tool(mcp_server.build_server(settings), "strata_admin_health")
-
-
 @pytest.mark.asyncio
 async def test_health_lists_outbound():
-    from stratakb import mcp_server
-
     settings = _settings(anthropic_api_key="sk-ant-test")
-    with (
-        patch("stratakb.config.get_settings", return_value=settings),
-        patch(
-            "stratakb.mcp_server.check_connection",
-            AsyncMock(return_value={"status": "ok"}),
-        ),
-    ):
-        result = await _health(mcp_server, settings)
+    result = await call_health(settings)
 
     for key in ("database", "anthropic_api", "openai_api", "overall", "user"):
         assert key in result
@@ -309,19 +295,10 @@ async def test_health_lists_outbound():
 
 @pytest.mark.asyncio
 async def test_health_lists_rewrite_endpoint():
-    from stratakb import mcp_server
-
     settings = _rewrite_endpoint(
         "http://user:pw@gpu-box:11434/v1", query_rewrite_api_key="endpoint-key"
     )
-    with (
-        patch("stratakb.config.get_settings", return_value=settings),
-        patch(
-            "stratakb.mcp_server.check_connection",
-            AsyncMock(return_value={"status": "ok"}),
-        ),
-    ):
-        result = await _health(mcp_server, settings)
+    result = await call_health(settings)
 
     assert result["outbound"] == [
         {
