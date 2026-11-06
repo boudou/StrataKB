@@ -13,44 +13,16 @@ import contextlib
 import json
 from collections.abc import Sequence
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from unittest.mock import patch
 from uuid import uuid4
 
 import pytest
 
-FAKE_EMBEDDING = [0.01] * 768
+from tests.helpers import ingest
 
 V1_TEXT = "# Retention\n\nRecords are kept for 30 days after closure.\n"
 V2_TEXT = "# Retention\n\nRecords are kept for 60 days after closure.\n"
 QUOTE = "Records are kept"
-
-
-@pytest.fixture
-def db_url():
-    from stratakb.config import get_settings
-    return get_settings().database_url
-
-
-@pytest.fixture
-async def layer(db_url):
-    """A fresh layer, deleted afterwards."""
-    from stratakb.knowledge.layers import LayerNotFoundError, create_layer, delete_layer
-
-    name = f"test_rret_{uuid4().hex[:10]}"
-    await create_layer(db_url, name=name, display_name="Test Receipt Retention")
-    yield name
-    with contextlib.suppress(LayerNotFoundError):
-        await delete_layer(db_url, name=name)
-
-
-async def _ingest(db_url: str, layer: str, source: Path):
-    from stratakb.knowledge.ingestion import ingest_documents
-
-    with patch("stratakb.knowledge.ingestion.embed_texts", new_callable=AsyncMock) as mock:
-        mock.side_effect = lambda texts, **_: [FAKE_EMBEDDING for _ in texts]
-        return await ingest_documents(
-            db_url, "fake-key", layer_name=layer, source_path=str(source)
-        )
 
 
 async def _versions(db_url: str, layer: str) -> list[int]:
@@ -120,10 +92,10 @@ async def _exists(db_url: str, receipt_id: str) -> bool:
 async def _old_version_cited(db_url: str, layer: str, tmp_path: Path) -> str:
     """policy.md v1 cited by a receipt, then rewritten to v2; return the receipt id."""
     (tmp_path / "policy.md").write_text(V1_TEXT, encoding="utf-8")
-    await _ingest(db_url, layer, tmp_path)
+    await ingest(db_url, layer, tmp_path)
     receipt_id = await _cite_latest(db_url, layer)
     (tmp_path / "policy.md").write_text(V2_TEXT, encoding="utf-8")
-    await _ingest(db_url, layer, tmp_path)
+    await ingest(db_url, layer, tmp_path)
     return receipt_id
 
 
@@ -158,7 +130,7 @@ class TestReceiptRetention:
         from stratakb.rag.receipts import prune_receipts
 
         (tmp_path / "policy.md").write_text(V1_TEXT, encoding="utf-8")
-        await _ingest(db_url, layer, tmp_path)
+        await ingest(db_url, layer, tmp_path)
         old = await _cite_latest(db_url, layer)
         fresh = await _cite_latest(db_url, layer)
         await _age(db_url, old, 31)
@@ -200,11 +172,11 @@ class TestReceiptRetention:
         from stratakb.rag.receipts import prune_receipts
 
         (tmp_path / "policy.md").write_text(V1_TEXT, encoding="utf-8")
-        await _ingest(db_url, layer, tmp_path)
+        await ingest(db_url, layer, tmp_path)
         old = await _cite_latest(db_url, layer)
         fresh = await _cite_latest(db_url, layer)
         (tmp_path / "policy.md").write_text(V2_TEXT, encoding="utf-8")
-        await _ingest(db_url, layer, tmp_path)
+        await ingest(db_url, layer, tmp_path)
         await _age(db_url, old, 91)
 
         await prune_receipts(db_url, 90)
@@ -280,7 +252,7 @@ class TestReceiptRetention:
             folder = tmp_path / name
             folder.mkdir()
             (folder / f"{name}.md").write_text(f"# {name}\n\nText of {name}.\n", encoding="utf-8")
-            await _ingest(db_url, layer_name, folder)
+            await ingest(db_url, layer_name, folder)
             docs[name] = await pool.fetchval(
                 """
                 SELECT d.id FROM strata_vectors.documents d

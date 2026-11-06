@@ -15,9 +15,8 @@ from uuid import uuid4
 
 import pytest
 
-from tests.helpers import call_tool
+from tests.helpers import call_tool, ingest
 
-FAKE_EMBEDDING = [0.01] * 768
 IBAN = "GR1601101250000000012300695"
 
 POLICY = (
@@ -28,12 +27,6 @@ POLICY = (
 )
 QUOTE = "Records are kept for thirty (30) days after closure."
 REFUND = f"Refunds go to account {IBAN} within 5 business days."
-
-
-@pytest.fixture
-def db_url():
-    from stratakb.config import get_settings
-    return get_settings().database_url
 
 
 @pytest.fixture
@@ -72,12 +65,9 @@ def _as(user: str, role: str = "viewer"):
 async def _document(db_url: str, layer: str, tmp_path: Path):
     """Ingest policy.md; return its stored document row."""
     from stratakb.core.database import get_pool
-    from stratakb.knowledge.ingestion import ingest_documents
 
     (tmp_path / "policy.md").write_text(POLICY, encoding="utf-8")
-    with patch("stratakb.knowledge.ingestion.embed_texts", new_callable=AsyncMock) as mock:
-        mock.side_effect = lambda texts, **_: [FAKE_EMBEDDING for _ in texts]
-        await ingest_documents(db_url, "fake-key", layer_name=layer, source_path=str(tmp_path))
+    await ingest(db_url, layer, tmp_path)
     pool = await get_pool(db_url)
     return await pool.fetchrow(
         """

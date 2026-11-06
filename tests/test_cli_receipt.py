@@ -17,8 +17,16 @@ import pytest
 import structlog
 
 from stratakb import cli
-from tests.helpers import call_tool
-from tests.test_receipts import QUOTE, _as, _audit_rows, _cited, _ingest
+from tests.helpers import (
+    QUOTE,
+    V1_TEXT,
+    as_user,
+    call_tool,
+    cite_policy,
+    ingest,
+    latest_document,
+    receipt_audit_rows,
+)
 
 UNKNOWN_ID = "rcpt_" + "A" * 22
 NOT_READABLE = "Receipt not found, or you may not open it."
@@ -48,15 +56,8 @@ def cli_env(monkeypatch, tmp_path):
 
 
 @pytest.fixture
-def db_url():
-    from stratakb.config import get_settings
-
-    return get_settings().database_url
-
-
-@pytest.fixture
 def layer(db_url):
-    """A fresh layer, deleted afterwards."""
+    """A fresh layer, deleted afterwards, made on its own loop for these sync tests."""
     from stratakb.knowledge.layers import LayerNotFoundError, create_layer, delete_layer
 
     name = f"test_clircpt_{uuid4().hex[:10]}"
@@ -71,7 +72,7 @@ def cited(db_url, layer, tmp_path):
     """A receipt issued by alice for QUOTE in policy.md: (receipt_id, document)."""
     docs = tmp_path / "docs"
     docs.mkdir()
-    return _run(_cited(db_url, layer, docs))
+    return _run(cite_policy(db_url, layer, docs))
 
 
 def _main(argv: list[str], user: str = "alice", role: str = "viewer") -> int:
@@ -101,12 +102,10 @@ def test_prints_quotes(cited, layer, capsys):
 
 
 def test_changed_source_flagged(cited, db_url, layer, tmp_path, capsys):
-    from tests.test_receipts import V1_TEXT, _ingest
-
     receipt_id, _ = cited
     docs = tmp_path / "docs"
     (docs / "policy.md").write_text(V1_TEXT.replace("30 days", "13 days"), encoding="utf-8")
-    _run(_ingest(db_url, layer, docs))
+    _run(ingest(db_url, layer, docs))
 
     assert _main(["receipt", receipt_id]) == cli.EXIT_OK
     out = capsys.readouterr().out
@@ -125,16 +124,15 @@ async def _cited_hostile(db_url: str, layer: str, docs, quoted: str = "\x1b[8m h
     The quote is QUOTE followed by `quoted`.
     """
     from stratakb.rag.receipts import issue_receipt
-    from tests.test_receipts import _latest_document
 
     text = f"Intro{OSC_52} text.\n\n{QUOTE}{quoted}\x1b[0m\n\nClosing remarks.\n"
     # Bytes, so the newlines stay as written on every platform
     (docs / "policy.md").write_bytes(text.encode("utf-8"))
-    await _ingest(db_url, layer, docs)
-    doc = await _latest_document(db_url, layer, "policy.md")
+    await ingest(db_url, layer, docs)
+    doc = await latest_document(db_url, layer, "policy.md")
     assert "\x1b" in doc["text"]
     start = doc["text"].index(QUOTE)
-    with _as("alice", "viewer"):
+    with as_user("alice", "viewer"):
         return await issue_receipt(
             db_url,
             kind="extractive",
@@ -274,7 +272,7 @@ def test_json(cited, server, capsys):
     assert _main(["receipt", receipt_id, "--json"]) == cli.EXIT_OK
     printed = json.loads(capsys.readouterr().out)
 
-    with _as("alice", "viewer"):
+    with as_user("alice", "viewer"):
         tool = _run(call_tool(server, "strata_get_receipt", receipt_id=receipt_id))
     assert printed == json.loads(json.dumps(tool))
     assert printed["status"] == "ok"
@@ -323,7 +321,7 @@ def test_audited(cited, db_url):
     with patch("stratakb.rag.receipts.readable_layers", AsyncMock(return_value=set())):
         assert _main(["receipt", receipt_id], user="bob") == cli.EXIT_FAILED
 
-    rows = _run(_audit_rows(db_url, receipt_id))
+    rows = _run(receipt_audit_rows(db_url, receipt_id))
     opens = [
         (r["action"], r["tool_name"], r["user_id"], r["result_summary"])
         for r in rows

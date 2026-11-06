@@ -5,6 +5,8 @@ Fixtures live in `tests/conftest.py`; plain functions and constants live here.
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 from pathlib import Path
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
@@ -44,18 +46,23 @@ def write_file(path: Path, text: str) -> Path:
     return path
 
 
+def fake_embed(texts, **_) -> list[list[float]]:
+    """A side effect for a mocked embed_texts: FAKE_EMBEDDING for every text."""
+    return [FAKE_EMBEDDING for _ in texts]
+
+
 async def ingest_with_texts(db_url: str, layer: str, source: Path, **kwargs):
     """Run ingest_documents with mocked embeddings; return (result, texts embedded)."""
     from stratakb.knowledge.ingestion import ingest_documents
 
     embedded: list[str] = []
 
-    def fake_embed(texts, **_):
+    def recording_embed(texts, **_):
         embedded.extend(texts)
-        return [FAKE_EMBEDDING for _ in texts]
+        return fake_embed(texts)
 
     with patch("stratakb.knowledge.ingestion.embed_texts", new_callable=AsyncMock) as mock:
-        mock.side_effect = fake_embed
+        mock.side_effect = recording_embed
         result = await ingest_documents(
             db_url, "fake-key", layer_name=layer, source_path=str(source), **kwargs
         )
@@ -94,3 +101,111 @@ def fake_openai_client(n: int = 768) -> MagicMock:
         return_value=SimpleNamespace(data=[SimpleNamespace(index=0, embedding=[0.1] * n)])
     )
     return client
+
+
+async def wait_until_blocked_by(
+    pool, blocker_pid: int, waiter: asyncio.Task | None = None, *, timeout: float = 10
+) -> None:
+    """Wait until some other backend is waiting on a lock blocker_pid holds.
+
+    If that does not happen within timeout seconds, or the wait fails, cancel
+    and await waiter (the task expected to block), so no task is left pending.
+    """
+    try:
+        async with asyncio.timeout(timeout):
+            while not await pool.fetchval(
+                "SELECT EXISTS (SELECT 1 FROM pg_stat_activity "
+                "WHERE $1 = ANY(pg_blocking_pids(pid)))",
+                blocker_pid,
+            ):
+                await asyncio.sleep(0.05)
+    except BaseException as exc:
+        if waiter is not None:
+            waiter.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await waiter
+        if isinstance(exc, TimeoutError):
+            raise AssertionError("nothing waited on the lock") from None
+        raise
+
+
+# Receipts: a policy document, a quote from it, and a receipt citing that quote
+
+V1_TEXT = (
+    "# Retention\n\nIntro paragraph about the policy.\n\n"
+    "Records are kept for 30 days after closure.\n\nClosing remarks.\n"
+)
+QUOTE = "Records are kept for 30 days after closure."
+
+
+@contextlib.contextmanager
+def as_user(user: str, role: str):
+    """Run as user with role, for the receipt issuer, tool and resource."""
+    with (
+        patch("stratakb.core.auth.get_current_user", return_value=(user, role)),
+        patch("stratakb.rag.receipts.get_current_user", return_value=(user, role)),
+        patch("stratakb.rag.receipt_tools.get_current_user", return_value=(user, role)),
+    ):
+        yield
+
+
+async def latest_document(db_url: str, layer: str, relative_path: str):
+    """The latest stored document row (id, version, text, sha256) of a file in layer."""
+    from stratakb.core.database import get_pool
+
+    pool = await get_pool(db_url)
+    return await pool.fetchrow(
+        """
+        SELECT d.id, d.version, d.text, d.sha256 FROM strata_vectors.documents d
+        JOIN strata_core.knowledge_layers kl ON kl.id = d.layer_id
+        WHERE kl.name = $1 AND d.relative_path = $2
+        ORDER BY d.version DESC LIMIT 1
+        """,
+        layer,
+        relative_path,
+    )
+
+
+async def cite_policy(
+    db_url: str, layer: str, folder: Path,
+    question: str = "How long are records kept?", user: str = "alice",
+):
+    """Ingest policy.md from folder and issue a receipt quoting QUOTE as user.
+
+    Return (receipt_id, document).
+    """
+    from stratakb.rag.receipts import issue_receipt
+
+    (folder / "policy.md").write_text(V1_TEXT, encoding="utf-8")
+    await ingest(db_url, layer, folder)
+    doc = await latest_document(db_url, layer, "policy.md")
+    start = doc["text"].index(QUOTE)
+    with as_user(user, "viewer"):
+        receipt_id = await issue_receipt(
+            db_url,
+            kind="extractive",
+            mode="extractive",
+            question=question,
+            quotes=[
+                {
+                    "document_id": doc["id"],
+                    "char_start": start,
+                    "char_end": start + len(QUOTE),
+                    "clause_path": "Retention",
+                }
+            ],
+            draft="Records are kept for 30 days.",
+        )
+    return receipt_id, doc
+
+
+async def receipt_audit_rows(db_url: str, receipt_id: str) -> list:
+    """The audit rows naming receipt_id, oldest first."""
+    from stratakb.core.database import get_pool
+
+    pool = await get_pool(db_url)
+    return await pool.fetch(
+        "SELECT * FROM strata_core.audit_log WHERE parameters->>'receipt_id' = $1 "
+        "ORDER BY created_at, id",
+        receipt_id,
+    )

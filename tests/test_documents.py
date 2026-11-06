@@ -17,7 +17,9 @@ from uuid import uuid4
 
 import pytest
 
-FIXTURES = Path(__file__).parent / "fixtures"
+from tests.helpers import wait_until_blocked_by
+
+FIXTURES =Path(__file__).parent / "fixtures"
 FAKE_EMBEDDING = [0.01] * 768
 
 
@@ -121,19 +123,6 @@ async def _store_bare_document(
             conn, layer_id=layer_id, file_id=None, source_root=source_root,
             relative_path=relative_path, text=text, page_map=None,
         )
-
-
-async def _wait_until_blocked_by(pool, blocker_pid: int) -> None:
-    """Wait until some other backend is waiting on a lock blocker_pid holds."""
-    for _ in range(200):
-        if await pool.fetchval(
-            "SELECT EXISTS (SELECT 1 FROM pg_stat_activity "
-            "WHERE $1 = ANY(pg_blocking_pids(pid)))",
-            blocker_pid,
-        ):
-            return
-        await asyncio.sleep(0.05)
-    raise AssertionError("nothing waited on the lock")
 
 
 async def _file_rows(db_url: str, layer: str) -> dict:
@@ -539,7 +528,7 @@ class TestVersions:
                 # Back with the same text while the prune is not committed yet
                 away.rename(a)
                 ingest = asyncio.create_task(_ingest(db_url, layer, src))
-                await _wait_until_blocked_by(pool, held.get_server_pid())
+                await wait_until_blocked_by(pool, held.get_server_pid(), ingest)
                 await tx.commit()
             except BaseException:
                 with contextlib.suppress(Exception):
@@ -576,7 +565,7 @@ class TestVersions:
                     file_id,
                 )
                 clearing = asyncio.create_task(clear_layer(db_url, layer))
-                await _wait_until_blocked_by(pool, held.get_server_pid())
+                await wait_until_blocked_by(pool, held.get_server_pid(), clearing)
                 # The clear waits on the file row without holding its chunks
                 probe_tx = probe.transaction()
                 await probe_tx.start()
@@ -635,7 +624,7 @@ class TestVersions:
                         ))
                     else:
                         removal = asyncio.create_task(ingestion.clear_layer(db_url, layer))
-                    await _wait_until_blocked_by(pool, pids[0])
+                    await wait_until_blocked_by(pool, pids[0], removal)
             finally:
                 release.set()
             result = await ingest
