@@ -9,24 +9,34 @@ layer descriptions passed in as domain_context.
 
 from __future__ import annotations
 
+import itertools
 import json
-from typing import TYPE_CHECKING
+from collections.abc import Awaitable, Callable
+from typing import TYPE_CHECKING, NamedTuple
 
 import structlog
+
+from stratakb.config import DEFAULT_QUERY_REWRITE_MODEL
+from stratakb.core.egress import (
+    RewriteProviderName,
+    anthropic_url,
+    keyless_request_options,
+    openai_compatible_client,
+    rewrite_provider,
+    unauthorized_detail,
+)
 
 if TYPE_CHECKING:
     from stratakb.config import Settings
 
 logger = structlog.get_logger()
 
-_PROVIDERS = ("anthropic", "openai_compatible")
-
 # Seconds per request to an OpenAI-compatible endpoint, with no retries: the
 # SDK default (600 s, 2 retries) would hold strata_ask on a dead local server
 _OPENAI_COMPATIBLE_TIMEOUT = 60.0
 
-# Replies with no usable JSON array since the server started
-_parse_failures = 0
+# Replies with no usable JSON array since the server started; next() gives the new total
+_parse_failures = itertools.count(1)
 
 
 def _safe_domain_context(domain_context: str | None) -> str:
@@ -77,18 +87,10 @@ def build_domain_context(descriptions: dict[str, str]) -> str:
 
 def _skip_reason(settings: Settings, anthropic_api_key: str, model: str) -> str | None:
     """Say why no model would be asked to rewrite, or None when one would."""
-    from stratakb.core.egress import rewrite_model_unset
-
-    provider = settings.query_rewrite_provider
-    if provider == "anthropic":
-        return None if anthropic_api_key else "no_api_key"
-    if provider == "openai_compatible":
-        if not settings.query_rewrite_base_url:
-            return "no_base_url"
-        if rewrite_model_unset(model):
-            return "model_not_set"
-        return None
-    return "unknown_provider"
+    entry = REWRITE_PROVIDERS.get(settings.query_rewrite_provider)
+    if entry is None:
+        return "unknown_provider"
+    return entry.skip_reason(settings, anthropic_api_key, model)
 
 
 def rewrite_configured(settings: Settings, anthropic_api_key: str | None = None) -> bool:
@@ -126,11 +128,13 @@ def _extract_queries(text: str | None) -> list[str] | None:
     return None
 
 
-async def _call_anthropic(api_key: str, model: str, system: str, query: str) -> str | None:
+async def _call_anthropic(
+    settings: Settings, anthropic_api_key: str, model: str, system: str, query: str
+) -> str | None:
     """Ask the Anthropic API and return the reply text."""
     import anthropic
 
-    client = anthropic.AsyncAnthropic(api_key=api_key)
+    client = anthropic.AsyncAnthropic(api_key=anthropic_api_key)
     response = await client.messages.create(
         model=model,
         max_tokens=300,
@@ -141,11 +145,9 @@ async def _call_anthropic(api_key: str, model: str, system: str, query: str) -> 
 
 
 async def _call_openai_compatible(
-    settings: Settings, model: str, system: str, query: str
+    settings: Settings, anthropic_api_key: str, model: str, system: str, query: str
 ) -> str | None:
     """Ask the OpenAI-compatible endpoint in QUERY_REWRITE_BASE_URL and return the reply text."""
-    from stratakb.core.egress import keyless_request_options, openai_compatible_client
-
     client = openai_compatible_client(
         settings.query_rewrite_api_key,
         settings.query_rewrite_base_url,
@@ -164,6 +166,66 @@ async def _call_openai_compatible(
     if not response.choices:
         return None
     return response.choices[0].message.content
+
+
+class RewriteProvider(NamedTuple):
+    """One QUERY_REWRITE_PROVIDER value: how to ask it, and what it sends where."""
+
+    name: RewriteProviderName
+    # The setting that turns sending on, for the egress report
+    setting: str
+    # Where the request goes
+    url: Callable[[Settings], str]
+    # Settings, Anthropic key and model in; why nothing would be asked, or None
+    skip_reason: Callable[[Settings, str, str], str | None]
+    # Settings, Anthropic key, model, system prompt and query in; the reply text out
+    call: Callable[[Settings, str, str, str, str], Awaitable[str | None]]
+    # A hint to log with a failed call, or None
+    failure_hint: Callable[[Exception, Settings], str | None]
+    sends: str = "questions and layer descriptions"
+
+
+def _anthropic_skip(settings: Settings, anthropic_api_key: str, model: str) -> str | None:
+    return None if anthropic_api_key else "no_api_key"
+
+
+def _openai_compatible_skip(
+    settings: Settings, anthropic_api_key: str, model: str
+) -> str | None:
+    if not settings.query_rewrite_base_url:
+        return "no_base_url"
+    if model == DEFAULT_QUERY_REWRITE_MODEL:
+        # An Anthropic model name the endpoint would not know: nothing is sent
+        return "model_not_set"
+    return None
+
+
+def _openai_compatible_hint(error: Exception, settings: Settings) -> str | None:
+    return unauthorized_detail(error, settings.query_rewrite_api_key, "QUERY_REWRITE_API_KEY")
+
+
+# Adding a provider: one entry here, and its name in egress.RewriteProviderName
+REWRITE_PROVIDERS: dict[str, RewriteProvider] = {
+    p.name: p
+    for p in (
+        RewriteProvider(
+            name="anthropic",
+            setting="ANTHROPIC_API_KEY",
+            url=lambda settings: anthropic_url(),
+            skip_reason=_anthropic_skip,
+            call=_call_anthropic,
+            failure_hint=lambda error, settings: None,
+        ),
+        RewriteProvider(
+            name="openai_compatible",
+            setting="QUERY_REWRITE_BASE_URL",
+            url=lambda settings: settings.query_rewrite_base_url,
+            skip_reason=_openai_compatible_skip,
+            call=_call_openai_compatible,
+            failure_hint=_openai_compatible_hint,
+        ),
+    )
+}
 
 
 async def rewrite_query(
@@ -225,26 +287,20 @@ async def rewrite_query(
             logger.debug("learning_consult_failed", error=str(e))
 
     from stratakb.config import get_settings
-    from stratakb.core.egress import rewrite_provider
 
     settings = get_settings()
     provider = settings.query_rewrite_provider
     model = model or settings.query_rewrite_model
 
-    reason = _skip_reason(settings, anthropic_api_key, model)
-    if reason == "no_api_key":
-        logger.debug("query_rewrite_skipped", reason=reason)
-        return [enriched_query]
-    if reason == "unknown_provider":
-        logger.warning(
+    if reason := _skip_reason(settings, anthropic_api_key, model):
+        # No Anthropic key is the default install, not a mistake: debug, not warning
+        log = logger.debug if reason == "no_api_key" else logger.warning
+        log(
             "query_rewrite_skipped",
             reason=reason,
             provider=provider,
-            accepted=list(_PROVIDERS),
+            accepted=list(REWRITE_PROVIDERS),
         )
-        return [enriched_query]
-    if reason:
-        logger.warning("query_rewrite_skipped", reason=reason, provider=provider)
         return [enriched_query]
 
     # Learned rewrites and synonyms above are local and stay on
@@ -252,18 +308,12 @@ async def rewrite_query(
         logger.info("query_rewrite_skipped", reason="local_only")
         return [enriched_query]
 
+    entry = REWRITE_PROVIDERS[provider]
     system = _SYSTEM_PROMPT.format(domain_context=_safe_domain_context(domain_context))
     try:
-        if provider == "openai_compatible":
-            text = await _call_openai_compatible(settings, model, system, enriched_query)
-        else:
-            text = await _call_anthropic(anthropic_api_key, model, system, enriched_query)
+        text = await entry.call(settings, anthropic_api_key, model, system, enriched_query)
     except Exception as e:
-        hint = None
-        if provider == "openai_compatible":
-            from stratakb.core.egress import unauthorized_detail
-
-            hint = unauthorized_detail(e, settings.query_rewrite_api_key, "QUERY_REWRITE_API_KEY")
+        hint = entry.failure_hint(e, settings)
         if hint:
             logger.warning("query_rewrite_failed", error=str(e), query=query[:100], hint=hint)
         else:
@@ -273,12 +323,10 @@ async def rewrite_query(
     queries = _extract_queries(text)
     if queries is None:
         # Never log the reply itself: it may echo the question and layer descriptions
-        global _parse_failures
-        _parse_failures += 1
         logger.warning(
             "query_rewrite_json_error",
             provider=provider,
-            failures=_parse_failures,
+            failures=next(_parse_failures),
             reply_chars=len(text or ""),
             query=query[:100],
         )

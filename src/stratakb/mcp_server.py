@@ -12,7 +12,6 @@ import contextlib
 import functools
 import threading
 from contextlib import asynccontextmanager
-from dataclasses import asdict
 
 import structlog
 from mcp.server.fastmcp import FastMCP
@@ -228,7 +227,7 @@ def _register_admin_tools(mcp: FastMCP, settings: Settings) -> None:
 
         # Where data goes (host names and setting names only, never values)
         result["local_only"] = current.strata_local_only
-        result["outbound"] = [asdict(p) for p in outbound_providers(current)]
+        result["outbound"] = [p.report() for p in outbound_providers(current)]
 
         # SQL tools: on only with a safe READONLY_DATABASE_URL role
         result["sql_tools"] = sql_tools_status()

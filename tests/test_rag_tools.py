@@ -397,6 +397,17 @@ async def _rewrite_with_reply(provider: str, reply, question: str = "q") -> list
 
 
 class TestOpenAICompatibleRewriter:
+    def test_rewrite_provider_table(self):
+        """Every provider name has one table entry, keyed by its own name."""
+        import typing
+
+        from stratakb.core.egress import RewriteProviderName
+        from stratakb.rag.query_rewriter import REWRITE_PROVIDERS
+
+        assert set(typing.get_args(RewriteProviderName)) == set(REWRITE_PROVIDERS)
+        for name, p in REWRITE_PROVIDERS.items():
+            assert name == p.name
+
     @pytest.mark.asyncio
     async def test_openai_compatible_rewrite(self, no_sdk_env):
         from stratakb.rag.query_rewriter import build_domain_context, rewrite_query

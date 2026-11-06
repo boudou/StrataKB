@@ -18,6 +18,9 @@ LOCAL_DB_PASSWORD = "strata_dev_password"
 LOCAL_DB_NAME = "strata"
 LOCAL_DB_PORT = 5433
 
+# An Anthropic model name, so an openai_compatible rewrite with it counts as "model not set"
+DEFAULT_QUERY_REWRITE_MODEL = "claude-haiku-5-5"
+
 
 def local_database_url(port: int = LOCAL_DB_PORT) -> str:
     return f"postgresql://{LOCAL_DB_USER}:{LOCAL_DB_PASSWORD}@127.0.0.1:{port}/{LOCAL_DB_NAME}"
@@ -48,7 +51,7 @@ class Settings(BaseSettings):
     # "anthropic" (needs ANTHROPIC_API_KEY), or "openai_compatible" (needs
     # QUERY_REWRITE_BASE_URL, e.g. http://127.0.0.1:11434/v1, and a QUERY_REWRITE_MODEL)
     query_rewrite_provider: str = "anthropic"
-    query_rewrite_model: str = "claude-haiku-5-5"
+    query_rewrite_model: str = DEFAULT_QUERY_REWRITE_MODEL
     query_rewrite_base_url: str = ""
     # key for QUERY_REWRITE_BASE_URL; OPENAI_API_KEY is never sent there
     query_rewrite_api_key: str = ""
