@@ -87,6 +87,7 @@ class _SectionParser(HTMLParser):
     The page title (the first <title> outside an <svg>) is not section text; it
     is kept in self.title. A <title> inside an <svg> is ordinary text, except
     inside a heading, where it is left out of the heading text (an icon's label).
+    An SVG title left open ends at </svg> or at the end of its heading.
     """
 
     _HEADING_TAGS = {"h1", "h2", "h3"}
@@ -133,15 +134,25 @@ class _SectionParser(HTMLParser):
 
         if tag == "title":
             self._in_svg_title = True
-        if tag == "br":
             self._current_text.append("\n")
-        elif tag in ("p", "div", "li", "tr", "title"):
+        elif tag in ("br", "p", "div", "li", "tr"):
             self._current_text.append("\n")
+
+    def set_cdata_mode(self, elem: str, **kwargs):
+        # A <title> inside an <svg> holds markup, as in browsers. Read as raw text,
+        # an unclosed one would swallow the rest of the page up to a </title>
+        if elem.lower() == "title" and self._svg_depth > 0:
+            return
+        super().set_cdata_mode(elem, **kwargs)
 
     def handle_endtag(self, tag: str):
         tag = tag.lower()
         if tag == "svg":
             self._svg_depth = max(0, self._svg_depth - 1)
+            # </svg> also ends an SVG title left open
+            if self._in_svg_title and self._skip_depth == 0:
+                self._in_svg_title = False
+                self._current_text.append("\n")
         elif tag == "title" and self._in_page_title:
             self._in_page_title = False
             if not self.title:
@@ -159,6 +170,7 @@ class _SectionParser(HTMLParser):
             self._current_text.append("\n")
         elif tag in self._HEADING_TAGS and self._in_heading:
             self._in_heading = False
+            self._in_svg_title = False
             self._current_heading = " ".join(self._heading_text).strip()
 
             if self._current_level == 1:
@@ -173,11 +185,10 @@ class _SectionParser(HTMLParser):
             return
         if self._skip_depth > 0:
             return
-        if self._in_heading:
-            if not self._in_svg_title:
-                self._heading_text.append(data)
-        else:
-            self._current_text.append(data)
+        if self._in_heading and self._in_svg_title:
+            # An icon's label is not heading text
+            return
+        (self._heading_text if self._in_heading else self._current_text).append(data)
 
     def _flush_section(self):
         text = "".join(self._current_text).strip()
