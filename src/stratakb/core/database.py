@@ -14,7 +14,8 @@ logger = structlog.get_logger()
 
 # One pool per URL: the SQL tools may connect as a separate read-only role
 _pools: dict[str, asyncpg.Pool] = {}
-# One lock per URL, so concurrent first calls share a single creation
+# One lock per URL: concurrent first calls wait their turn, and each re-checks _pools,
+# so only one pool is made per URL (after a failed creation the next caller tries again)
 _locks: dict[str, asyncio.Lock] = {}
 
 

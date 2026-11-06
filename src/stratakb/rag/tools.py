@@ -96,12 +96,7 @@ def _fuse_query_results(
     rank_lists: list[list[tuple[str, int]]] = []
     for results in batch_results:
         rank_lists.append([(r.chunk_id, rank) for rank, r in enumerate(results, start=1)])
-        seen: set[str] = set()
         for r in results:
-            # Like fuse_rrf, only a chunk's first copy in each search counts
-            if r.chunk_id in seen:
-                continue
-            seen.add(r.chunk_id)
             current = best.get(r.chunk_id)
             if current is None or (
                 similarity_or_zero(r.similarity) > similarity_or_zero(current.similarity)

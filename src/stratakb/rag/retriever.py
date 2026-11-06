@@ -137,12 +137,11 @@ async def search_chunks(
             cache.put(query, layers, top_k, results, metadata_filter)
         return results
 
-    # A chunk without an embedding has no cosine distance: leave it out
-    # ($1 = embedding, $2 = top_k)
+    # $1 = embedding, $2 = top_k
     conditions, filter_params = _filter_conditions(layers, metadata_filter, 3)
     params: list[object] = [query_vector, top_k, *filter_params]
 
-    where_clause = "WHERE " + " AND ".join(["embedding IS NOT NULL", *conditions])
+    where_clause = _semantic_where(conditions)
 
     sql = f"""
         SELECT
@@ -208,6 +207,15 @@ def _filter_conditions(
             params.append(value)
             idx += 1
     return conditions, params
+
+
+def _semantic_where(conditions: list[str]) -> str:
+    """WHERE clause for cosine ranking, with the shared filter conditions.
+
+    A chunk without an embedding has no cosine distance, so cosine ranking
+    leaves it out (keyword search still finds it).
+    """
+    return "WHERE " + " AND ".join(["embedding IS NOT NULL", *conditions])
 
 
 def _supports_iterative_scan(extversion: object) -> bool:
@@ -329,28 +337,6 @@ def fuse_rrf(
     return sorted(scores.items(), key=lambda x: x[1], reverse=True)
 
 
-def _fuse_rrf(
-    semantic: list[tuple[str, int]],
-    keyword: list[tuple[str, int]],
-    k: int = 60,
-    sem_weight: float = 0.7,
-    kw_weight: float = 0.3,
-) -> list[tuple[str, float]]:
-    """Reciprocal Rank Fusion of semantic and keyword result ranks.
-
-    Args:
-        semantic: List of (chunk_id, rank) from vector search.
-        keyword: List of (chunk_id, rank) from full-text search.
-        k: RRF constant (default 60).
-        sem_weight: Weight for semantic results.
-        kw_weight: Weight for keyword results.
-
-    Returns:
-        Sorted list of (chunk_id, fused_score) highest first.
-    """
-    return fuse_rrf([semantic, keyword], k=k, weights=[sem_weight, kw_weight])
-
-
 def _reserve_keyword_slots(
     fused: list[tuple[str, float]],
     keyword: list[tuple[str, int]],
@@ -397,8 +383,7 @@ def _build_hybrid_sql(
     params: list = [query_vector, over_retrieve, *filter_params]
     param_idx = 3 + len(filter_params)
 
-    # Only the semantic leg skips chunks without an embedding; keyword search still finds them
-    where = "WHERE " + " AND ".join(["embedding IS NOT NULL", *conditions])
+    where = _semantic_where(conditions)
 
     params.append(query_text)
     if _WEBSEARCH_SYNTAX.search(query_text):
@@ -449,11 +434,10 @@ async def _hybrid_search(
     semantic_ranks = [(str(r["id"]), r["rank"]) for r in rows if r["source"] == "semantic"]
     keyword_ranks = [(str(r["id"]), r["rank"]) for r in rows if r["source"] == "fulltext"]
 
-    fused = _fuse_rrf(
-        semantic_ranks, keyword_ranks,
+    fused = fuse_rrf(
+        [semantic_ranks, keyword_ranks],
         k=settings.hybrid_rrf_k,
-        sem_weight=settings.hybrid_semantic_weight,
-        kw_weight=settings.hybrid_keyword_weight,
+        weights=[settings.hybrid_semantic_weight, settings.hybrid_keyword_weight],
     )
 
     kept = _reserve_keyword_slots(fused, keyword_ranks, top_k, settings.hybrid_keyword_slots)

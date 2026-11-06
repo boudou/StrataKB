@@ -61,6 +61,11 @@ _LayerColumn = Literal[
 ]
 _WRITABLE_COLUMNS = frozenset(get_args(_LayerColumn))
 
+
+def _encode_column(column: _LayerColumn, value: object) -> object:
+    """A column's value as asyncpg takes it: JSON text for a jsonb column."""
+    return json.dumps(value) if column in _JSONB_COLUMNS else value
+
 # Search tools read routing patterns and descriptions through a short-lived
 # cache. This process's create, delete and setters clear it at once; a layer
 # change from another process clears it within 2 s (see _maybe_clear).
@@ -248,9 +253,9 @@ async def create_layer(
             name,
             display,
             description or "",
-            _json_str(meta),
-            _json_str(chunk_cfg),
-            json.dumps(routing),
+            _encode_column("metadata_schema", meta),
+            _encode_column("chunk_config", chunk_cfg),
+            _encode_column("routing_patterns", routing),
             origin,
             owner,
             root_path,
@@ -452,11 +457,10 @@ async def _write_columns(
     params: list[object] = [name]
     assignments = []
     for column, value in columns.items():
+        params.append(_encode_column(column, value))
         if column in _JSONB_COLUMNS:
-            params.append(json.dumps(value))
             assignments.append(f"{column} = ${len(params)}::jsonb")
         else:
-            params.append(value)
             assignments.append(f"{column} = ${len(params)}")
     guard = ""
     if claim_origin is not None:
@@ -665,8 +669,3 @@ async def _maybe_clear(database_url: str) -> None:
     await _watcher.check(
         database_url, _routing_cache.clear, now=time.monotonic(), fetch=fetch_layers_stamp
     )
-
-
-def _json_str(obj: dict) -> str:
-    """Convert dict to JSON string for asyncpg JSONB parameters."""
-    return json.dumps(obj)
