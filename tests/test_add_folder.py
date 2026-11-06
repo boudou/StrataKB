@@ -27,8 +27,7 @@ from stratakb.knowledge.add_folder import (
     resolve_owner,
     slugify,
 )
-
-FAKE_EMBEDDING = [0.01] * 768
+from tests.helpers import FAKE_EMBEDDING
 
 
 @pytest.fixture(autouse=True)
@@ -459,14 +458,14 @@ async def _assert_nothing_written(db_url, p, name, *, before=(None, [])):
 
 async def test_name_taken(db_url, tmp_path, cleanup):
     from stratakb.knowledge.layers import create_layer
-    from tests.test_ingestion_sync import _ingest
+    from tests.helpers import ingest
 
     name = _name()
     cleanup.append(name)
     await create_layer(db_url, name=name, display_name="Manual")
     other = tmp_path / "other"
     _write(other / "x.md")
-    await _ingest(db_url, name, other)
+    await ingest(db_url,name, other)
 
     root = _docs(tmp_path)
     before = await _snapshot(db_url, root.resolve().as_posix(), name)
@@ -577,14 +576,14 @@ async def test_max_file_size_must_be_finite_and_positive(db_url, tmp_path, size)
 
 async def test_adopt_manual_layer(db_url, tmp_path, cleanup):
     from stratakb.knowledge.layers import create_layer
-    from tests.test_ingestion_sync import _ingest
+    from tests.helpers import ingest
 
     root = _docs(tmp_path)
     name = _name()
     cleanup.append(name)
     await create_layer(db_url, name=name, display_name="Manual", description="Kept")
     (root / "client_secret.json").unlink()
-    await _ingest(db_url, name, root.resolve())
+    await ingest(db_url,name, root.resolve())
 
     p, report = await _run(db_url, root, Options(name=name))
 

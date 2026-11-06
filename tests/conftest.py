@@ -3,13 +3,18 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from typing import TYPE_CHECKING
+from uuid import uuid4
 
 import asyncpg
 import pytest
 
 if TYPE_CHECKING:
     from mcp.server.fastmcp import FastMCP
+
+# Asserts in the shared helpers report like asserts in a test module.
+pytest.register_assert_rewrite("tests.helpers")
 
 
 async def call_tool(server: FastMCP, name: str, /, **arguments) -> dict:
@@ -24,6 +29,36 @@ def server():
     from stratakb.mcp_server import build_server
 
     return build_server(get_settings())
+
+
+@pytest.fixture
+def db_url():
+    """The test database URL from the environment's settings.
+
+    A module may define its own `db_url` fixture, which overrides this one.
+    """
+    from stratakb.config import get_settings
+    return get_settings().database_url
+
+
+@pytest.fixture
+async def layer(db_url):
+    """A fresh layer with a unique name and 500/50 chunking, deleted afterwards.
+
+    A module may define its own `layer` fixture, which overrides this one.
+    """
+    from stratakb.knowledge.layers import LayerNotFoundError, create_layer, delete_layer
+
+    name = f"test_layer_{uuid4().hex[:10]}"
+    await create_layer(
+        db_url,
+        name=name,
+        display_name="Test Layer",
+        chunk_config={"chunk_size": 500, "chunk_overlap": 50},
+    )
+    yield name
+    with contextlib.suppress(LayerNotFoundError):
+        await delete_layer(db_url, name=name)
 
 
 @pytest.fixture(scope="session", autouse=True)
