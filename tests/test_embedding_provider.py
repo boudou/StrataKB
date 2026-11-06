@@ -20,7 +20,7 @@ import pytest
 
 from stratakb.config import Settings
 from stratakb.core.egress import PLACEHOLDER_API_KEY
-from tests.helpers import fake_openai_client, openai_settings
+from tests.helpers import capture_tools, fake_openai_client, openai_settings
 
 BASE_URL = "http://127.0.0.1:11434/v1"
 
@@ -182,28 +182,12 @@ class TestResolveEmbeddingModel:
         assert resolve_embedding_model("openai", "nomic-embed-text") == "nomic-embed-text"
 
 
-def _capture_tools(register, *args) -> dict:
-    mock_mcp = MagicMock()
-    captured = {}
-
-    def capture_tool():
-        def decorator(fn):
-            name = getattr(fn, "__name__", None) or getattr(fn, "__wrapped__", fn).__name__
-            captured[name] = fn
-            return fn
-        return decorator
-
-    mock_mcp.tool = capture_tool
-    register(mock_mcp, *args)
-    return captured
-
-
 class TestToolKeyChecks:
     @pytest.mark.asyncio
     async def test_search_needs_no_openai_key_with_base_url(self):
         from stratakb.rag.tools import register_rag_tools
 
-        fn = _capture_tools(register_rag_tools, "postgresql://test", "")["strata_search"]
+        fn = capture_tools(register_rag_tools, "postgresql://test", "")["strata_search"]
         search = AsyncMock(return_value=[])
         with (
             patch(
@@ -234,7 +218,7 @@ class TestToolKeyChecks:
         from stratakb.knowledge.ingestion import IngestionResult
         from stratakb.knowledge.tools import register_knowledge_tools
 
-        fn = _capture_tools(register_knowledge_tools, "postgresql://test", "")[
+        fn = capture_tools(register_knowledge_tools, "postgresql://test", "")[
             "strata_ingest_documents"
         ]
         ingest = AsyncMock(return_value=IngestionResult(layer_name="docs", status="completed"))
@@ -259,7 +243,7 @@ class TestToolKeyChecks:
     async def test_apply_preset_needs_no_openai_key_with_base_url(self):
         from stratakb.knowledge.tools import register_knowledge_tools
 
-        fn = _capture_tools(register_knowledge_tools, "postgresql://test", "")[
+        fn = capture_tools(register_knowledge_tools, "postgresql://test", "")[
             "strata_apply_preset"
         ]
         preset = str(Path(__file__).parent.parent / "examples" / "sepa" / "preset.yaml")

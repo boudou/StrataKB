@@ -84,6 +84,25 @@ async def call_tool(server: FastMCP, name: str, /, **arguments) -> dict:
     return await server._tool_manager.get_tool(name).fn(**arguments)
 
 
+def capture_tools(register, *args) -> dict:
+    """Call a register_*_tools function on a mock server; return its tools by name.
+
+    The tools keep their role and logging decorators.
+    """
+    captured = {}
+    mock_mcp = MagicMock()
+
+    def capture_tool(**kwargs):
+        def decorator(fn):
+            captured[getattr(fn, "__wrapped__", fn).__name__] = fn
+            return fn
+        return decorator
+
+    mock_mcp.tool = capture_tool
+    register(mock_mcp, *args)
+    return captured
+
+
 async def call_health(settings: Settings) -> dict:
     """Call strata_admin_health on a server built from `settings`, database reported up."""
     from stratakb.mcp_server import build_server
@@ -136,6 +155,56 @@ async def ingest(db_url: str, layer: str, source: Path, **kwargs):
 def file_outcomes(result) -> dict[str, tuple[str, str | None]]:
     """Map each file's relative path to its (outcome, reason) in an ingest result."""
     return {f.relative_path: (f.outcome, f.reason) for f in result.files}
+
+
+@contextlib.contextmanager
+def as_admin():
+    """Run an ingest tool as an admin, with the audit log and embeddings mocked."""
+    with (
+        patch("stratakb.core.auth.get_current_user", return_value=("tester", "admin")),
+        patch("stratakb.knowledge.tools.get_current_user", return_value=("tester", "admin")),
+        patch("stratakb.knowledge.tools.write_audit_log", new_callable=AsyncMock),
+        patch(
+            "stratakb.knowledge.ingestion.embed_texts",
+            new_callable=AsyncMock,
+            side_effect=fake_embed,
+        ),
+    ):
+        yield
+
+
+def mock_pool(conn) -> MagicMock:
+    """An asyncpg pool mock whose acquire() yields conn.
+
+    asyncpg's pool.acquire() and conn.transaction() return context managers, not
+    coroutines, so both are regular MagicMocks, not AsyncMocks. The conn's
+    transaction() is set here; a test may set its return_value afterwards.
+    """
+    tx = AsyncMock()
+    tx.__aenter__.return_value = None
+    tx.__aexit__.return_value = False
+    conn.transaction = MagicMock(return_value=tx)
+    ctx = AsyncMock()
+    ctx.__aenter__.return_value = conn
+    ctx.__aexit__.return_value = False
+    pool = MagicMock()
+    pool.acquire.return_value = ctx
+    return pool
+
+
+class LogitModel:
+    """A fake cross-encoder that applies the activation it is given to fixed logits."""
+
+    def __init__(self, logits):
+        self.logits = logits
+        self.activation_fn = None
+
+    def predict(self, pairs, activation_fn=None):
+        import torch
+
+        self.activation_fn = activation_fn
+        logits = torch.tensor(self.logits[: len(pairs)])
+        return activation_fn(logits).numpy() if activation_fn else logits.numpy()
 
 
 def openai_settings(**overrides) -> Settings:

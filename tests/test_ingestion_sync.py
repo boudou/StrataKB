@@ -13,6 +13,7 @@ import pytest
 
 from tests.helpers import (
     FAKE_EMBEDDING,
+    as_admin,
     call_tool,
     file_outcomes,
     ingest,
@@ -930,16 +931,7 @@ class TestFileList:
         write_file(tmp_path / "a.md", "# Alpha\n\nAlpha content.\n")
         write_file(tmp_path / "sub" / "b.md", "# Beta\n\nBeta content.\n")
 
-        with (
-            patch("stratakb.core.auth.get_current_user", return_value=("tester", "admin")),
-            patch("stratakb.knowledge.tools.get_current_user", return_value=("tester", "admin")),
-            patch("stratakb.knowledge.tools.write_audit_log", new_callable=AsyncMock),
-            patch(
-                "stratakb.knowledge.ingestion.embed_texts",
-                new_callable=AsyncMock,
-                side_effect=lambda texts, **_: [FAKE_EMBEDDING for _ in texts],
-            ),
-        ):
+        with as_admin():
             first = await call_tool(
                 server, "strata_ingest_documents", layer_name=layer, source_path=str(tmp_path)
             )

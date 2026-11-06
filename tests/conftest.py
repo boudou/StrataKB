@@ -15,6 +15,18 @@ pytest.register_assert_rewrite("tests.helpers")
 
 
 @pytest.fixture
+def no_sdk_env(monkeypatch):
+    """Keep SDK keys, base-URL overrides and the rewrite model from the shell out of a test."""
+    for name in (
+        "OPENAI_API_KEY",
+        "OPENAI_BASE_URL",
+        "ANTHROPIC_BASE_URL",
+        "QUERY_REWRITE_MODEL",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+
+@pytest.fixture
 def server():
     """A StrataKB server built from the environment's settings.
 
@@ -182,13 +194,6 @@ async def probe_url(db_url):
         yield urlunsplit(parts._replace(netloc=netloc))
     finally:
         await owner_execute(db_url, drop)
-
-
-@pytest.fixture
-def no_sdk_env(monkeypatch):
-    """Keep SDK keys and base-URL overrides from the shell out of the tests."""
-    for name in ("OPENAI_API_KEY", "OPENAI_BASE_URL", "ANTHROPIC_BASE_URL"):
-        monkeypatch.delenv(name, raising=False)
 
 
 @pytest.fixture(autouse=True)

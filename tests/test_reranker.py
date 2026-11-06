@@ -1,6 +1,8 @@
 import pytest
 from unittest.mock import patch, MagicMock
 
+from tests.helpers import LogitModel
+
 
 def test_rerank_sorts_by_cross_encoder_score():
     """Reranker should sort results by cross-encoder score, not original score."""
@@ -73,21 +75,6 @@ def test_rerank_preserves_chunk_fields():
     assert reranked[0]["rerank_score"] == 0.75  # new score added
 
 
-class _LogitModel:
-    """A fake cross-encoder that applies the activation it is given to fixed logits."""
-
-    def __init__(self, logits):
-        self.logits = logits
-        self.activation_fn = None
-
-    def predict(self, pairs, activation_fn=None):
-        import torch
-
-        self.activation_fn = activation_fn
-        logits = torch.tensor(self.logits[: len(pairs)])
-        return activation_fn(logits).numpy() if activation_fn else logits.numpy()
-
-
 def test_rerank_scores_are_probabilities():
     """Raw logits become relevance probabilities through one sigmoid."""
     from torch import nn
@@ -95,7 +82,7 @@ def test_rerank_scores_are_probabilities():
     from stratakb.rag.reranker import rerank_results
 
     chunks = [{"content": "relevant", "score": 0.5}, {"content": "unrelated", "score": 0.9}]
-    model = _LogitModel([4.0, -4.0])
+    model = LogitModel([4.0, -4.0])
 
     with patch("stratakb.rag.reranker._get_reranker", return_value=model):
         reranked = rerank_results("query", chunks, top_k=2)
@@ -108,7 +95,7 @@ def test_score_pairs_keeps_input_order():
     """score_pairs returns one float per text, in the order the texts came in."""
     from stratakb.rag.reranker import score_pairs
 
-    model = _LogitModel([-1.0, 2.0, 0.0])
+    model = LogitModel([-1.0, 2.0, 0.0])
 
     with patch("stratakb.rag.reranker._get_reranker", return_value=model):
         scores = score_pairs("query", ["a", "b", "c"])

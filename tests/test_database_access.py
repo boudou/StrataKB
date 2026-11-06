@@ -20,7 +20,7 @@ from uuid import uuid4
 
 import pytest
 
-from tests.helpers import call_tool
+from tests.helpers import call_tool, mock_pool
 
 
 # ==========================================
@@ -112,7 +112,7 @@ class TestSQLValidation:
 # ==========================================
 
 
-def _mock_pool(rows=None, fail=None):
+def _read_only_pool(rows=None, fail=None):
     """A pool whose connection records the calls _fetch_read_only makes."""
     tr = MagicMock()
     tr.start = AsyncMock()
@@ -122,15 +122,12 @@ def _mock_pool(rows=None, fail=None):
     cursor.fetch = AsyncMock(return_value=rows or [], side_effect=fail)
 
     conn = MagicMock()
-    conn.transaction.return_value = tr
     conn.execute = AsyncMock()
     conn.cursor = AsyncMock(return_value=cursor)
 
-    ctx = MagicMock()
-    ctx.__aenter__ = AsyncMock(return_value=conn)
-    ctx.__aexit__ = AsyncMock(return_value=False)
-    pool = MagicMock()
-    pool.acquire.return_value = ctx
+    pool = mock_pool(conn)
+    # _fetch_read_only starts and rolls back by hand, not with `async with`
+    conn.transaction.return_value = tr
     return pool, conn, tr, cursor
 
 
@@ -139,7 +136,7 @@ class TestFetchReadOnly:
     async def test_runs_in_read_only_transaction_with_local_timeout(self):
         from stratakb.database_access.tools import _fetch_read_only
 
-        pool, conn, tr, cursor = _mock_pool(rows=[{"x": 1}])
+        pool, conn, tr, cursor = _read_only_pool(rows=[{"x": 1}])
         rows = await _fetch_read_only(pool, "SELECT $1::int AS x", ["1"], 1001)
 
         assert rows == [{"x": 1}]
@@ -153,7 +150,7 @@ class TestFetchReadOnly:
     async def test_always_rolls_back(self):
         from stratakb.database_access.tools import _fetch_read_only
 
-        pool, _, tr, _ = _mock_pool()
+        pool, _, tr, _ = _read_only_pool()
         await _fetch_read_only(pool, "SELECT 1", [], 10)
         tr.rollback.assert_awaited_once()
 
@@ -161,7 +158,7 @@ class TestFetchReadOnly:
     async def test_rolls_back_on_error(self):
         from stratakb.database_access.tools import _fetch_read_only
 
-        pool, _, tr, _ = _mock_pool(fail=RuntimeError("boom"))
+        pool, _, tr, _ = _read_only_pool(fail=RuntimeError("boom"))
         with pytest.raises(RuntimeError):
             await _fetch_read_only(pool, "SELECT 1", [], 10)
         tr.rollback.assert_awaited_once()

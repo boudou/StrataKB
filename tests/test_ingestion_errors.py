@@ -14,6 +14,7 @@ import pytest
 
 from tests.helpers import (
     FAKE_EMBEDDING,
+    as_admin,
     call_tool,
     fake_openai_client,
     file_outcomes,
@@ -39,17 +40,7 @@ def _denied_read_bytes(name: str):
 async def test_tool_reports_read_error(server, layer, tmp_path):
     write_file(tmp_path / "locked.md", "# Locked\n\nLocked content.\n")
     write_file(tmp_path / "a.md", "# Alpha\n\nAlpha content.\n")
-    with (
-        patch("stratakb.core.auth.get_current_user", return_value=("tester", "admin")),
-        patch("stratakb.knowledge.tools.get_current_user", return_value=("tester", "admin")),
-        patch("stratakb.knowledge.tools.write_audit_log", new_callable=AsyncMock),
-        patch(
-            "stratakb.knowledge.ingestion.embed_texts",
-            new_callable=AsyncMock,
-            side_effect=lambda texts, **_: [FAKE_EMBEDDING for _ in texts],
-        ),
-        patch.object(Path, "read_bytes", _denied_read_bytes("locked.md")),
-    ):
+    with as_admin(), patch.object(Path, "read_bytes", _denied_read_bytes("locked.md")):
         result = await call_tool(
             server, "strata_ingest_documents", layer_name=layer, source_path=str(tmp_path)
         )

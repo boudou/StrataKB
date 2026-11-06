@@ -17,6 +17,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from tests.helpers import capture_tools, mock_pool
+
 
 # ==========================================
 # Unit tests — retriever logic
@@ -90,31 +92,6 @@ def _mock_settings(**overrides):
     return s
 
 
-def _mock_pool_and_conn(fetch_return=None):
-    """Create a properly mocked asyncpg pool with async context manager support.
-
-    asyncpg's pool.acquire() returns a context manager (not a coroutine),
-    so acquire must be a regular MagicMock, not AsyncMock.
-    """
-    mock_conn = AsyncMock()
-    mock_conn.fetch.return_value = fetch_return or []
-
-    mock_tx_ctx = AsyncMock()
-    mock_tx_ctx.__aenter__.return_value = None
-    mock_tx_ctx.__aexit__.return_value = False
-    # transaction() returns a sync context manager in asyncpg, not a coroutine
-    mock_conn.transaction = MagicMock(return_value=mock_tx_ctx)
-
-    mock_ctx = AsyncMock()
-    mock_ctx.__aenter__.return_value = mock_conn
-    mock_ctx.__aexit__.return_value = False
-
-    mock_pool = MagicMock()
-    mock_pool.acquire.return_value = mock_ctx
-
-    return mock_pool, mock_conn
-
-
 class TestSearchChunksUnit:
     @pytest.fixture(autouse=True)
     def _no_stamp_read(self):
@@ -146,7 +123,8 @@ class TestSearchChunksUnit:
         from stratakb.rag.retriever import search_chunks
 
         fake_embedding = [0.01] * 768
-        mock_pool, mock_conn = _mock_pool_and_conn()
+        mock_conn = AsyncMock()
+        mock_conn.fetch.return_value = []
 
         with patch(
             "stratakb.rag.retriever.embed_texts",
@@ -155,7 +133,7 @@ class TestSearchChunksUnit:
         ), patch(
             "stratakb.rag.retriever.get_pool",
             new_callable=AsyncMock,
-            return_value=mock_pool,
+            return_value=mock_pool(mock_conn),
         ), patch(
             "stratakb.config.get_settings",
             return_value=_mock_settings(),
@@ -180,7 +158,8 @@ class TestSearchChunksUnit:
         from stratakb.rag.retriever import search_chunks
 
         fake_embedding = [0.01] * 768
-        mock_pool, mock_conn = _mock_pool_and_conn()
+        mock_conn = AsyncMock()
+        mock_conn.fetch.return_value = []
 
         with patch(
             "stratakb.rag.retriever.embed_texts",
@@ -189,7 +168,7 @@ class TestSearchChunksUnit:
         ), patch(
             "stratakb.rag.retriever.get_pool",
             new_callable=AsyncMock,
-            return_value=mock_pool,
+            return_value=mock_pool(mock_conn),
         ), patch(
             "stratakb.config.get_settings",
             return_value=_mock_settings(),
@@ -212,7 +191,8 @@ class TestSearchChunksUnit:
         from stratakb.rag.retriever import search_chunks
 
         fake_embedding = [0.01] * 768
-        mock_pool, mock_conn = _mock_pool_and_conn()
+        mock_conn = AsyncMock()
+        mock_conn.fetch.return_value = []
 
         with patch(
             "stratakb.rag.retriever.embed_texts",
@@ -221,7 +201,7 @@ class TestSearchChunksUnit:
         ), patch(
             "stratakb.rag.retriever.get_pool",
             new_callable=AsyncMock,
-            return_value=mock_pool,
+            return_value=mock_pool(mock_conn),
         ), patch(
             "stratakb.config.get_settings",
             return_value=_mock_settings(),
@@ -245,7 +225,8 @@ class TestSearchChunksUnit:
         """A chunk without an embedding has no cosine distance: the vector query leaves it out."""
         from stratakb.rag.retriever import search_chunks
 
-        mock_pool, mock_conn = _mock_pool_and_conn()
+        mock_conn = AsyncMock()
+        mock_conn.fetch.return_value = []
 
         with patch(
             "stratakb.rag.retriever.embed_texts",
@@ -254,7 +235,7 @@ class TestSearchChunksUnit:
         ), patch(
             "stratakb.rag.retriever.get_pool",
             new_callable=AsyncMock,
-            return_value=mock_pool,
+            return_value=mock_pool(mock_conn),
         ), patch(
             "stratakb.config.get_settings",
             return_value=_mock_settings(),
@@ -282,7 +263,8 @@ class TestSearchChunksUnit:
             "metadata": json.dumps({"api": "Payment Initiation"}),
         }
 
-        mock_pool, mock_conn = _mock_pool_and_conn(fetch_return=[mock_row])
+        mock_conn = AsyncMock()
+        mock_conn.fetch.return_value = [mock_row]
 
         with patch(
             "stratakb.rag.retriever.embed_texts",
@@ -291,7 +273,7 @@ class TestSearchChunksUnit:
         ), patch(
             "stratakb.rag.retriever.get_pool",
             new_callable=AsyncMock,
-            return_value=mock_pool,
+            return_value=mock_pool(mock_conn),
         ), patch(
             "stratakb.config.get_settings",
             return_value=_mock_settings(),
@@ -345,21 +327,7 @@ class TestSearchTool:
     async def test_empty_query_returns_error(self):
         from stratakb.rag.tools import register_rag_tools
 
-        mock_mcp = MagicMock()
-        captured_fn = {}
-
-        def capture_tool():
-            def decorator(fn):
-                # Capture by actual function name to handle multiple tools
-                name = getattr(fn, "__name__", None) or getattr(fn, "__wrapped__", fn).__name__
-                captured_fn[name] = fn
-                return fn
-            return decorator
-
-        mock_mcp.tool = capture_tool
-
-        register_rag_tools(mock_mcp, "postgresql://test", "sk-test")
-        fn = captured_fn["strata_search"]
+        fn = capture_tools(register_rag_tools, "postgresql://test", "sk-test")["strata_search"]
         result = await fn(query="")
         assert result["status"] == "error"
         assert "empty" in result["error"].lower()
@@ -368,20 +336,7 @@ class TestSearchTool:
     async def test_missing_api_key_returns_error_openai_backend(self):
         from stratakb.rag.tools import register_rag_tools
 
-        mock_mcp = MagicMock()
-        captured_fn = {}
-
-        def capture_tool():
-            def decorator(fn):
-                name = getattr(fn, "__name__", None) or getattr(fn, "__wrapped__", fn).__name__
-                captured_fn[name] = fn
-                return fn
-            return decorator
-
-        mock_mcp.tool = capture_tool
-
-        register_rag_tools(mock_mcp, "postgresql://test", "")
-        fn = captured_fn["strata_search"]
+        fn = capture_tools(register_rag_tools, "postgresql://test", "")["strata_search"]
 
         with patch("stratakb.config.get_settings") as mock_settings:
             mock_settings.return_value.embedding_backend = "openai"

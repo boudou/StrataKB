@@ -3,25 +3,14 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock
 
 import pytest
 
 from stratakb.config import Settings
 from stratakb.rag.retriever import SearchResult, _hybrid_search
 from stratakb.rag.tools import register_rag_tools
-
-
-class _ToolCollector:
-    def __init__(self):
-        self.tools = {}
-
-    def tool(self):
-        def register(fn):
-            self.tools[fn.__name__] = fn
-            return fn
-
-        return register
+from tests.helpers import capture_tools, mock_pool
 
 
 @pytest.fixture
@@ -41,9 +30,7 @@ def tools(monkeypatch):
     monkeypatch.setattr("stratakb.rag.tools.write_audit_log", AsyncMock())
     detect = AsyncMock(return_value=[])
     monkeypatch.setattr("stratakb.rag.tools._detect_layers", detect)
-    collector = _ToolCollector()
-    register_rag_tools(collector, "postgresql://test")
-    return collector.tools, settings, detect
+    return capture_tools(register_rag_tools, "postgresql://test"), settings, detect
 
 
 def _result(name, layer, *, score=1.0, similarity=0.9, doc_type="markdown"):
@@ -251,12 +238,6 @@ async def test_hybrid_search_keeps_cosine_similarity_separate_from_rrf_rank():
             }
         ],
     ]
-    transaction = AsyncMock()
-    conn.transaction = MagicMock(return_value=transaction)
-    acquired = AsyncMock()
-    acquired.__aenter__.return_value = conn
-    pool = MagicMock()
-    pool.acquire.return_value = acquired
     settings = SimpleNamespace(
         hnsw_ef_search=40,
         hybrid_rrf_k=60,
@@ -265,6 +246,7 @@ async def test_hybrid_search_keeps_cosine_similarity_separate_from_rrf_rank():
         hybrid_keyword_slots=1,
     )
 
+    pool = mock_pool(conn)
     results = await _hybrid_search(pool, "question", "[1,0]", ["routed"], 1, None, settings)
 
     assert results[0].score == 1.0

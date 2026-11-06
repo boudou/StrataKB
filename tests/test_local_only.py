@@ -34,15 +34,9 @@ from stratakb.core.egress import (
     outbound_providers,
     rewrite_skip_reason,
 )
-from tests.helpers import call_health
+from tests.helpers import call_health, capture_tools
 
-
-@pytest.fixture(autouse=True)
-def _no_base_url_env(monkeypatch):
-    """Keep SDK base-URL overrides from the shell out of the tests."""
-    monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
-    monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
-    monkeypatch.delenv("QUERY_REWRITE_MODEL", raising=False)
+pytestmark = pytest.mark.usefixtures("no_sdk_env")
 
 
 def _settings(**overrides) -> Settings:
@@ -331,27 +325,11 @@ async def test_health_lists_rewrite_endpoint():
 # ==========================================
 
 
-def _capture_tools(register, *args) -> dict:
-    captured = {}
-    mock_mcp = MagicMock()
-
-    def capture_tool(**kwargs):
-        def decorator(fn):
-            name = getattr(fn, "__wrapped__", fn).__name__
-            captured[name] = fn
-            return fn
-        return decorator
-
-    mock_mcp.tool = capture_tool
-    register(mock_mcp, *args)
-    return captured
-
-
 @pytest.mark.asyncio
 async def test_search_refused_under_local_only():
     from stratakb.rag.tools import register_rag_tools
 
-    fn = _capture_tools(register_rag_tools, "postgresql://test", "sk-test")["strata_search"]
+    fn = capture_tools(register_rag_tools, "postgresql://test", "sk-test")["strata_search"]
     search = AsyncMock(return_value=[])
     settings = _settings(
         strata_local_only=True, embedding_backend="openai", learning_enabled=False

@@ -10,13 +10,15 @@ Tests cover:
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
 from tests.helpers import (
     ISO_PRESET,
     SEPA_PRESET,
+    LogitModel,
+    capture_tools,
     compatible_rewrite_settings,
     example_routing_patterns,
     openai_reply_client,
@@ -353,23 +355,12 @@ class TestSearchItem:
         assert item["match"] == "exact"
 
 
-def _capture_ask(settings):
-    """Register the RAG tools on a mock server and return strata_ask."""
+def _ask_tool(settings):
+    """Register the RAG tools with settings and return strata_ask."""
     from stratakb.rag.tools import register_rag_tools
 
-    captured = {}
-    mock_mcp = MagicMock()
-
-    def capture_tool(**kwargs):
-        def decorator(fn):
-            captured[getattr(fn, "__wrapped__", fn).__name__] = fn
-            return fn
-        return decorator
-
-    mock_mcp.tool = capture_tool
     with patch("stratakb.config.get_settings", return_value=settings):
-        register_rag_tools(mock_mcp, "postgresql://test", "")
-    return captured["strata_ask"]
+        return capture_tools(register_rag_tools, "postgresql://test", "")["strata_ask"]
 
 
 class TestAskDomainContext:
@@ -382,7 +373,7 @@ class TestAskDomainContext:
         settings = (
             compatible_rewrite_settings(**base) if configured else rewrite_settings(**base)
         )
-        ask = _capture_ask(settings)
+        ask = _ask_tool(settings)
         routing = AsyncMock(
             return_value={"descriptions": {"sepa": "SEPA Payments: rulebooks"}, "patterns": {}}
         )
@@ -413,19 +404,6 @@ class TestAskDomainContext:
             assert result["queries_used"] == ["Why was it rejected?"]
 
 
-class _LogitModel:
-    """A fake cross-encoder that applies the activation it is given to fixed logits."""
-
-    def __init__(self, logits):
-        self.logits = logits
-
-    def predict(self, pairs, activation_fn=None):
-        import torch
-
-        logits = torch.tensor(self.logits[: len(pairs)])
-        return activation_fn(logits).numpy() if activation_fn else logits.numpy()
-
-
 def _search_results(scores, similarities):
     from stratakb.rag.retriever import SearchResult
 
@@ -443,7 +421,7 @@ class TestAskConfidence:
     async def test_hybrid_confidence_uses_similarity(self, no_sdk_env):
         """Without reranking, confidence reads the cosine similarity, not the fused score."""
         settings = rewrite_settings(learning_enabled=False, reranking_enabled=False)
-        ask = _capture_ask(settings)
+        ask = _ask_tool(settings)
         results = _search_results([1.0, 0.95, 0.9], [0.2, 0.15, 0.1])
         with (
             patch("stratakb.config.get_settings", return_value=settings),
@@ -465,7 +443,7 @@ class TestAskConfidence:
     async def test_rerank_confidence_uses_probabilities(self, no_sdk_env):
         """With reranking, confidence reads the cross-encoder's probabilities (0-1)."""
         settings = rewrite_settings(learning_enabled=False, reranking_enabled=True)
-        ask = _capture_ask(settings)
+        ask = _ask_tool(settings)
         results = _search_results([1.0, 0.95, 0.9], [0.2, 0.15, 0.1])
         with (
             patch("stratakb.config.get_settings", return_value=settings),
@@ -473,7 +451,7 @@ class TestAskConfidence:
             patch("stratakb.rag.tools.write_audit_log", AsyncMock()),
             patch(
                 "stratakb.rag.reranker._get_reranker",
-                return_value=_LogitModel([1.0, 0.8, 0.7]),
+                return_value=LogitModel([1.0, 0.8, 0.7]),
             ),
         ):
             result = await ask(
@@ -508,7 +486,7 @@ def _result(name, score, similarity, *, content=None, layer="docs"):
 async def _ask_with(by_query, *, reranking=False, logits=None):
     """Run strata_ask with the rewriter giving these queries and each query these results."""
     settings = rewrite_settings(learning_enabled=False, reranking_enabled=reranking)
-    ask = _capture_ask(settings)
+    ask = _ask_tool(settings)
 
     async def search(_db, _key, query, *, layers, top_k):
         return by_query[query]
@@ -521,7 +499,7 @@ async def _ask_with(by_query, *, reranking=False, logits=None):
         ),
         patch("stratakb.rag.retriever.search_chunks", AsyncMock(side_effect=search)),
         patch("stratakb.rag.tools.write_audit_log", AsyncMock()),
-        patch("stratakb.rag.reranker._get_reranker", return_value=_LogitModel(logits or [])),
+        patch("stratakb.rag.reranker._get_reranker", return_value=LogitModel(logits or [])),
     ):
         return await ask(question="q", layers=["docs"], response_format="detailed")
 
