@@ -1,6 +1,6 @@
 """The one table of supported file formats, shared by ingestion and the ingest
-policy: per extension, its parser, the stored doc type, whether the file is
-binary, and whether the "probably scanned" check applies."""
+policy: per extension, its parser, the stored doc type, and whether the file is
+binary."""
 
 from __future__ import annotations
 
@@ -24,18 +24,16 @@ class Format:
     """How StrataKB handles one file extension.
 
     binary: read as bytes by its parser, so never decoded to check for empty text.
-    scanned_check: flag the file as probably scanned when it has too little text.
     """
 
     parser: Callable[[str | Path], ParsedDocument]
     doc_type: str
     binary: bool = False
-    scanned_check: bool = False
 
 
 # Supported formats. Adding a format means adding one row here.
 FORMATS: dict[str, Format] = {
-    ".pdf": Format(parse_pdf, "pdf", binary=True, scanned_check=True),
+    ".pdf": Format(parse_pdf, "pdf", binary=True),
     ".docx": Format(parse_docx, "docx", binary=True),
     ".yaml": Format(parse_yaml, "yaml"),
     ".yml": Format(parse_yaml, "yaml"),

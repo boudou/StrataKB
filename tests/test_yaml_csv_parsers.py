@@ -253,7 +253,7 @@ class TestCSVParser:
 
         with capture_logs() as logs:
             result = parse_csv(TEST_CSV)
-        assert result.rows_left_out == 0
+        assert result.flag is None
         assert not [e for e in logs if e["event"] == "csv_truncated"]
 
     def test_exactly_max_rows_not_truncated(self, tmp_path):
@@ -266,20 +266,21 @@ class TestCSVParser:
             result = parse_csv(path)
         assert result.error is None
         assert result.total_pages == MAX_ROWS
-        assert result.rows_left_out == 0
+        assert result.flag is None
         assert not [e for e in logs if e["event"] == "csv_truncated"]
 
     def test_rows_past_max_counted_and_logged(self, tmp_path):
         from structlog.testing import capture_logs
 
         from stratakb.knowledge.parsers.csv_parser import MAX_ROWS, parse_csv
+        from stratakb.knowledge.parsers.pdf_parser import ParserFlag
 
         path = _write_rows(tmp_path / "big.csv", MAX_ROWS + 5)
         with capture_logs() as logs:
             result = parse_csv(path)
         assert result.error is None
         assert result.total_pages == MAX_ROWS
-        assert result.rows_left_out == 5
+        assert result.flag == ParserFlag("truncated", 5)
         truncated = [e for e in logs if e["event"] == "csv_truncated"]
         assert len(truncated) == 1
         assert truncated[0]["log_level"] == "warning"
@@ -390,6 +391,7 @@ class TestCSVParser:
         from unittest.mock import patch
 
         from stratakb.knowledge.parsers.csv_parser import parse_csv
+        from stratakb.knowledge.parsers.pdf_parser import ParserFlag
 
         path = tmp_path / "blank.csv"
         path.write_text("a,b\n1,2\n\n3,4\n", encoding="utf-8")
@@ -397,13 +399,13 @@ class TestCSVParser:
         assert result.error is None
         assert result.total_pages == 2
         assert [p.page_number for p in result.pages] == [1, 2]
-        assert result.rows_left_out == 0
+        assert result.flag is None
 
         path.write_text("a,b\n1,2\n\n\n3,4\n", encoding="utf-8")
         with patch("stratakb.knowledge.parsers.csv_parser.MAX_ROWS", 1):
             result = parse_csv(path)
         assert result.total_pages == 1
-        assert result.rows_left_out == 1
+        assert result.flag == ParserFlag("truncated", 1)
 
     def test_nonexistent_csv(self):
         from stratakb.knowledge.parsers.csv_parser import parse_csv

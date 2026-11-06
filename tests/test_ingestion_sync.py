@@ -428,9 +428,9 @@ class TestPolicyAndEmpty:
 
 def _pdf_doc(page_lengths: list[int], total_pages: int):
     """A parsed PDF with one text page per length; the parser drops pages without text."""
-    from stratakb.knowledge.parsers.pdf_parser import ParsedDocument, ParsedPage
+    from stratakb.knowledge.parsers.pdf_parser import ParsedDocument, ParsedPage, scanned_flag
 
-    return ParsedDocument(
+    doc = ParsedDocument(
         source_file="scan.pdf",
         pages=[
             ParsedPage(text="x" * n, page_number=i + 1, source_file="scan.pdf")
@@ -438,6 +438,8 @@ def _pdf_doc(page_lengths: list[int], total_pages: int):
         ],
         total_pages=total_pages,
     )
+    doc.flag = scanned_flag(doc)
+    return doc
 
 
 class TestScannedPdf:
@@ -544,6 +546,8 @@ class TestTruncatedCsv:
         return result
 
     async def test_over_limit_flagged_and_stored(self, db_url, layer, tmp_path):
+        from stratakb.knowledge.ingestion import FileOutcome
+
         write_file(tmp_path / "codes.csv", _csv(["A1", "A2", "A3"]))
         write_file(tmp_path / "a.md", "# Alpha\n\nAlpha content.\n")
 
@@ -551,6 +555,7 @@ class TestTruncatedCsv:
 
         outcomes = file_outcomes(result)
         assert outcomes["codes.csv"] == ("flagged", "truncated")
+        assert FileOutcome("codes.csv", "flagged", "truncated", 1) in result.files
         assert outcomes["a.md"] == ("added", None)
         assert result.files_flagged == 1
         assert result.files_added == 2
@@ -568,6 +573,8 @@ class TestTruncatedCsv:
         assert result.files_added == 1
 
     async def test_flagged_update_and_unchanged_rerun(self, db_url, layer, tmp_path):
+        from stratakb.knowledge.ingestion import FileOutcome
+
         codes = tmp_path / "codes.csv"
         write_file(codes, _csv(["A1", "A2", "A3"]))
         first = await self._ingest_capped(db_url, layer, tmp_path)
@@ -575,7 +582,7 @@ class TestTruncatedCsv:
 
         write_file(codes, _csv(["B1", "B2", "B3", "B4"]))
         second = await self._ingest_capped(db_url, layer, tmp_path)
-        assert file_outcomes(second)["codes.csv"] == ("flagged", "truncated")
+        assert FileOutcome("codes.csv", "flagged", "truncated", 2) in second.files
         assert second.files_updated == 1
         assert second.files_flagged == 1
 
@@ -583,6 +590,27 @@ class TestTruncatedCsv:
         assert file_outcomes(third)["codes.csv"] == ("unchanged", None)
         assert third.files_flagged == 0
         assert third.files_unchanged == 1
+
+
+async def test_parser_flag_reaches_the_outcome(db_url, layer, tmp_path):
+    """The ingest loop copies any parser's flag into the outcome, whatever the format."""
+    from stratakb.knowledge.ingestion import FileOutcome
+    from stratakb.knowledge.parsers.pdf_parser import ParsedDocument, ParsedPage, ParserFlag
+
+    write_file(tmp_path / "a.md", "# Alpha\n\nAlpha content.\n")
+    doc = ParsedDocument(
+        source_file="a.md",
+        pages=[ParsedPage(text="Alpha content.", page_number=1, source_file="a.md")],
+        total_pages=1,
+        flag=ParserFlag("truncated", 7),
+    )
+
+    with patch("stratakb.knowledge.ingestion._parse_file", return_value=doc):
+        result, _ = await ingest_with_texts(db_url, layer, tmp_path)
+
+    assert FileOutcome("a.md", "flagged", "truncated", 7) in result.files
+    assert result.files_flagged == 1
+    assert result.files_added == 1
 
 
 async def test_tool_returns_files_skipped():
@@ -644,6 +672,24 @@ def test_file_outcome_rejects_values_outside_the_set():
     for outcome, reasons in REASONS.items():
         for reason in reasons:
             assert FileOutcome("a.md", outcome, reason).reason == reason
+    for outcome, reason, count in [
+        ("added", None, 3),
+        ("failed", "parse_error", 1),
+        ("flagged", "truncated", 0),
+    ]:
+        with pytest.raises(ValueError, match="Not a count for this outcome"):
+            FileOutcome("a.md", outcome, reason, count)
+    assert FileOutcome("a.md", "flagged", "truncated", 5).count == 5
+    assert FileOutcome("a.md", "flagged", "probably_scanned").count is None
+
+
+def test_flagged_outcome_reasons_match_the_parser_literal():
+    from typing import get_args
+
+    from stratakb.knowledge.ingestion import REASONS
+    from stratakb.knowledge.parsers.pdf_parser import FlagReason
+
+    assert REASONS["flagged"] == set(get_args(FlagReason))
 
 
 def test_reasons_cover_the_literals():
