@@ -16,13 +16,14 @@ from typing import TYPE_CHECKING, NamedTuple
 
 import structlog
 
-from stratakb.config import DEFAULT_QUERY_REWRITE_MODEL
 from stratakb.core.egress import (
-    RewriteProviderName,
-    anthropic_url,
+    REWRITE_EGRESS,
+    RewriteEgress,
+    RewriteRequest,
     keyless_request_options,
     openai_compatible_client,
-    rewrite_provider,
+    outbound_rewrite,
+    rewrite_skip_reason,
     unauthorized_detail,
 )
 
@@ -85,14 +86,6 @@ def build_domain_context(descriptions: dict[str, str]) -> str:
     return "The knowledge base contains these layers:\n" + "\n".join(lines)
 
 
-def _skip_reason(settings: Settings, anthropic_api_key: str, model: str) -> str | None:
-    """Say why no model would be asked to rewrite, or None when one would."""
-    entry = REWRITE_PROVIDERS.get(settings.query_rewrite_provider)
-    if entry is None:
-        return "unknown_provider"
-    return entry.skip_reason(settings, anthropic_api_key, model)
-
-
 def rewrite_configured(settings: Settings, anthropic_api_key: str | None = None) -> bool:
     """True when rewrite_query would ask a model with these settings.
 
@@ -103,7 +96,9 @@ def rewrite_configured(settings: Settings, anthropic_api_key: str | None = None)
         anthropic_api_key: The Anthropic key; defaults to ANTHROPIC_API_KEY.
     """
     key = settings.anthropic_api_key if anthropic_api_key is None else anthropic_api_key
-    return _skip_reason(settings, key, settings.query_rewrite_model) is None
+    request = RewriteRequest(settings, key, settings.query_rewrite_model)
+    entry = REWRITE_EGRESS.get(settings.query_rewrite_provider)
+    return rewrite_skip_reason(entry, request) is None
 
 
 def _extract_queries(text: str | None) -> list[str] | None:
@@ -128,15 +123,13 @@ def _extract_queries(text: str | None) -> list[str] | None:
     return None
 
 
-async def _call_anthropic(
-    settings: Settings, anthropic_api_key: str, model: str, system: str, query: str
-) -> str | None:
+async def _call_anthropic(request: RewriteRequest, system: str, query: str) -> str | None:
     """Ask the Anthropic API and return the reply text."""
     import anthropic
 
-    client = anthropic.AsyncAnthropic(api_key=anthropic_api_key)
+    client = anthropic.AsyncAnthropic(api_key=request.anthropic_api_key)
     response = await client.messages.create(
-        model=model,
+        model=request.model,
         max_tokens=300,
         system=system,
         messages=[{"role": "user", "content": query}],
@@ -144,10 +137,9 @@ async def _call_anthropic(
     return response.content[0].text if response.content else None
 
 
-async def _call_openai_compatible(
-    settings: Settings, anthropic_api_key: str, model: str, system: str, query: str
-) -> str | None:
+async def _call_openai_compatible(request: RewriteRequest, system: str, query: str) -> str | None:
     """Ask the OpenAI-compatible endpoint in QUERY_REWRITE_BASE_URL and return the reply text."""
+    settings = request.settings
     client = openai_compatible_client(
         settings.query_rewrite_api_key,
         settings.query_rewrite_base_url,
@@ -155,7 +147,7 @@ async def _call_openai_compatible(
         max_retries=0,
     )
     response = await client.chat.completions.create(
-        model=model,
+        model=request.model,
         max_tokens=300,
         messages=[
             {"role": "system", "content": system},
@@ -169,60 +161,35 @@ async def _call_openai_compatible(
 
 
 class RewriteProvider(NamedTuple):
-    """One QUERY_REWRITE_PROVIDER value: how to ask it, and what it sends where."""
+    """One QUERY_REWRITE_PROVIDER value: how to ask it, on top of its egress facts."""
 
-    name: RewriteProviderName
-    # The setting that turns sending on, for the egress report
-    setting: str
-    # Where the request goes
-    url: Callable[[Settings], str]
-    # Settings, Anthropic key and model in; why nothing would be asked, or None
-    skip_reason: Callable[[Settings, str, str], str | None]
-    # Settings, Anthropic key, model, system prompt and query in; the reply text out
-    call: Callable[[Settings, str, str, str, str], Awaitable[str | None]]
+    egress: RewriteEgress
+    # Request, system prompt and query in; the reply text out
+    call: Callable[[RewriteRequest, str, str], Awaitable[str | None]]
     # A hint to log with a failed call, or None
-    failure_hint: Callable[[Exception, Settings], str | None]
-    sends: str = "questions and layer descriptions"
+    failure_hint: Callable[[Exception, RewriteRequest], str | None] | None = None
+
+    @property
+    def name(self) -> str:
+        return self.egress.name
 
 
-def _anthropic_skip(settings: Settings, anthropic_api_key: str, model: str) -> str | None:
-    return None if anthropic_api_key else "no_api_key"
+def _openai_compatible_hint(error: Exception, request: RewriteRequest) -> str | None:
+    return unauthorized_detail(
+        error, request.settings.query_rewrite_api_key, "QUERY_REWRITE_API_KEY"
+    )
 
 
-def _openai_compatible_skip(
-    settings: Settings, anthropic_api_key: str, model: str
-) -> str | None:
-    if not settings.query_rewrite_base_url:
-        return "no_base_url"
-    if model == DEFAULT_QUERY_REWRITE_MODEL:
-        # An Anthropic model name the endpoint would not know: nothing is sent
-        return "model_not_set"
-    return None
-
-
-def _openai_compatible_hint(error: Exception, settings: Settings) -> str | None:
-    return unauthorized_detail(error, settings.query_rewrite_api_key, "QUERY_REWRITE_API_KEY")
-
-
-# Adding a provider: one entry here, and its name in egress.RewriteProviderName
+# Adding a provider: one entry here, one in egress.REWRITE_EGRESS, and its name
+# in egress.RewriteProviderName
 REWRITE_PROVIDERS: dict[str, RewriteProvider] = {
     p.name: p
     for p in (
+        RewriteProvider(REWRITE_EGRESS["anthropic"], _call_anthropic),
         RewriteProvider(
-            name="anthropic",
-            setting="ANTHROPIC_API_KEY",
-            url=lambda settings: anthropic_url(),
-            skip_reason=_anthropic_skip,
-            call=_call_anthropic,
-            failure_hint=lambda error, settings: None,
-        ),
-        RewriteProvider(
-            name="openai_compatible",
-            setting="QUERY_REWRITE_BASE_URL",
-            url=lambda settings: settings.query_rewrite_base_url,
-            skip_reason=_openai_compatible_skip,
-            call=_call_openai_compatible,
-            failure_hint=_openai_compatible_hint,
+            REWRITE_EGRESS["openai_compatible"],
+            _call_openai_compatible,
+            _openai_compatible_hint,
         ),
     )
 }
@@ -292,7 +259,10 @@ async def rewrite_query(
     provider = settings.query_rewrite_provider
     model = model or settings.query_rewrite_model
 
-    if reason := _skip_reason(settings, anthropic_api_key, model):
+    request = RewriteRequest(settings, anthropic_api_key, model)
+    entry = REWRITE_PROVIDERS.get(provider)
+    reason = rewrite_skip_reason(entry.egress if entry else None, request)
+    if entry is None or reason:
         # No Anthropic key is the default install, not a mistake: debug, not warning
         log = logger.debug if reason == "no_api_key" else logger.warning
         log(
@@ -304,17 +274,15 @@ async def rewrite_query(
         return [enriched_query]
 
     # Learned rewrites and synonyms above are local and stay on
-    if settings.strata_local_only and rewrite_provider(settings, anthropic_api_key, model):
+    if settings.strata_local_only and outbound_rewrite(entry.egress, settings):
         logger.info("query_rewrite_skipped", reason="local_only")
         return [enriched_query]
 
-    entry = REWRITE_PROVIDERS[provider]
     system = _SYSTEM_PROMPT.format(domain_context=_safe_domain_context(domain_context))
     try:
-        text = await entry.call(settings, anthropic_api_key, model, system, enriched_query)
+        text = await entry.call(request, system, enriched_query)
     except Exception as e:
-        hint = entry.failure_hint(e, settings)
-        if hint:
+        if entry.failure_hint and (hint := entry.failure_hint(e, request)):
             logger.warning("query_rewrite_failed", error=str(e), query=query[:100], hint=hint)
         else:
             logger.warning("query_rewrite_failed", error=str(e), query=query[:100])

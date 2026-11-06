@@ -7,6 +7,7 @@ Tests cover:
 - strata_admin_health lists the switch and the outbound providers
 - Embedding, model loading and query rewriting refuse or skip at call time
 - A rewrite endpoint (QUERY_REWRITE_BASE_URL) is outbound unless loopback
+- core owns the rewrite egress table, and one rewrite runs its skip rule once
 
 No database and no model are needed: the pool, the server run and the
 model classes are patched.
@@ -14,15 +15,25 @@ model classes are patched.
 
 from __future__ import annotations
 
+import ast
 import os
 import sys
+import typing
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from stratakb.config import Settings
-from stratakb.core.egress import outbound_providers
+import stratakb.core
+from stratakb.config import DEFAULT_QUERY_REWRITE_MODEL, Settings
+from stratakb.core.egress import (
+    REWRITE_EGRESS,
+    RewriteProviderName,
+    RewriteRequest,
+    outbound_providers,
+    rewrite_skip_reason,
+)
 from tests.helpers import call_health
 
 
@@ -493,3 +504,81 @@ async def test_explicit_model_rewrite_refused_under_local_only():
         result = await rewrite_query("q")
     assert result == ["a", "b"]
     client_cls.assert_called_once()
+
+
+# ==========================================
+# The rewrite egress table and its skip rule
+# ==========================================
+
+
+def test_core_owns_the_egress_table():
+    """The egress table has the same names, and core imports nothing from rag."""
+    assert set(typing.get_args(RewriteProviderName)) == set(REWRITE_EGRESS)
+    for name, e in REWRITE_EGRESS.items():
+        assert name == e.name
+
+    for path in Path(stratakb.core.__path__[0]).rglob("*.py"):
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+            modules = []
+            if isinstance(node, ast.Import):
+                modules = [alias.name for alias in node.names]
+            elif isinstance(node, ast.ImportFrom):
+                modules = [node.module or ""]
+            assert not [m for m in modules if m.startswith("stratakb.rag")], path
+
+
+@pytest.mark.asyncio
+async def test_one_rewrite_runs_the_skip_rule_once(monkeypatch):
+    """Even with the local-only check, one rewrite asks the rule once and calls the entry."""
+    from stratakb.rag.query_rewriter import (
+        REWRITE_PROVIDERS,
+        RewriteProvider,
+        rewrite_query,
+    )
+
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "http://127.0.0.1:9/")
+    skip = MagicMock(return_value=None)
+    call = AsyncMock(return_value='["one", "two"]')
+    egress = REWRITE_EGRESS["anthropic"]._replace(skip_reason=skip)
+    settings = _settings(strata_local_only=True)
+
+    with (
+        patch.dict(REWRITE_PROVIDERS, {"anthropic": RewriteProvider(egress, call)}),
+        patch("stratakb.config.get_settings", return_value=settings),
+    ):
+        result = await rewrite_query("question", anthropic_api_key="fake-key")
+
+    assert result == ["one", "two"]
+    skip.assert_called_once()
+    request = skip.call_args.args[0]
+    assert (request.settings, request.anthropic_api_key) == (settings, "fake-key")
+    call.assert_awaited_once()
+    assert call.await_args.args[0] == request
+
+
+@pytest.mark.parametrize(
+    ("overrides", "reason"),
+    [
+        ({"query_rewrite_provider": "ollama"}, "unknown_provider"),
+        ({}, "no_api_key"),
+        ({"anthropic_api_key": "k"}, None),
+        (
+            {"query_rewrite_provider": "openai_compatible", "query_rewrite_base_url": ""},
+            "no_base_url",
+        ),
+        (
+            {
+                "query_rewrite_provider": "openai_compatible",
+                "query_rewrite_base_url": "http://127.0.0.1:11434/v1",
+            },
+            "model_not_set",
+        ),
+    ],
+)
+def test_skip_reasons_from_the_one_rule(overrides, reason):
+    """The base URL is checked before the model; an unknown name has its own reason."""
+    values = {"anthropic_api_key": "", "query_rewrite_model": DEFAULT_QUERY_REWRITE_MODEL}
+    settings = _settings(**(values | overrides))
+    request = RewriteRequest(settings, settings.anthropic_api_key, settings.query_rewrite_model)
+    entry = REWRITE_EGRESS.get(settings.query_rewrite_provider)
+    assert rewrite_skip_reason(entry, request) == reason
