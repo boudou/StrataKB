@@ -29,6 +29,55 @@ READONLY_READABLE = (
     "strata_vectors.documents",
 )
 
+# The example presets
+
+REPO_DIR = Path(__file__).parent.parent
+EXAMPLES_DIR = REPO_DIR / "examples"
+SEPA_PRESET = EXAMPLES_DIR / "sepa" / "preset.yaml"
+ISO_PRESET = EXAMPLES_DIR / "iso20022" / "preset.yaml"
+PEPS_PRESET = EXAMPLES_DIR / "peps" / "preset.yaml"
+PEPS_SOURCE = EXAMPLES_DIR / "peps" / "source" / "peps"
+EXAMPLE_PEPS = [
+    line.strip()
+    for line in (EXAMPLES_DIR / "peps" / "peps.txt").read_text(encoding="utf-8").splitlines()
+    if line.strip() and not line.startswith("#")
+]
+CLONE_HINT = (
+    "PEPs not fetched; run: "
+    "git clone --depth 1 --filter=blob:none --sparse https://github.com/python/peps.git "
+    "examples/peps/source && "
+    "git -C examples/peps/source sparse-checkout set --no-cone "
+    + " ".join(f"/peps/{name}" for name in EXAMPLE_PEPS)
+    + " (in Git Bash on Windows, put MSYS_NO_PATHCONV=1 in front of the sparse-checkout "
+    "command; otherwise Git Bash rewrites the /peps/... paths and nothing is checked out)"
+)
+
+
+def example_routing_patterns(*presets: Path) -> dict:
+    """The routing patterns of the preset files, compiled as the server compiles them."""
+    from stratakb.knowledge.presets import load_preset
+    from stratakb.rag.layer_detect import compile_patterns
+
+    loaded = [load_preset(path) for path in presets]
+    return compile_patterns({preset.name: preset.routing_patterns for preset in loaded})
+
+
+async def fulltext_hits(pool, layer: str, vector: str, query: str, top_k: int = 3) -> list:
+    """The full-text leg of the hybrid SQL in layer, best first: rows of (id, source_file)."""
+    from stratakb.rag.retriever import _build_hybrid_sql
+
+    sql, params = _build_hybrid_sql(vector, query, [layer], top_k=top_k)
+    return await pool.fetch(
+        f"""
+        SELECT hit.id, chunk.source_file
+        FROM ({sql}) AS hit
+        JOIN strata_vectors.chunks chunk ON chunk.id = hit.id
+        WHERE hit.source = 'fulltext'
+        ORDER BY hit.rank
+        """,
+        *params,
+    )
+
 
 async def call_tool(server: FastMCP, name: str, /, **arguments) -> dict:
     """Call tool `name` on a built server, through its role and logging decorators."""

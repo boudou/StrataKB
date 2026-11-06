@@ -12,32 +12,23 @@ Tests cover:
 
 from __future__ import annotations
 
-from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from stratakb.core.egress import PLACEHOLDER_API_KEY
+from tests.helpers import ISO_PRESET, SEPA_PRESET, example_routing_patterns
 
 # ==========================================
 # Layer detection tests
 # ==========================================
 
-EXAMPLES_DIR = Path(__file__).parent.parent / "examples"
-
 
 @pytest.fixture(scope="module")
 def example_patterns():
     """Routing patterns from the example SEPA and ISO 20022 presets."""
-    from stratakb.knowledge.presets import load_preset
-    from stratakb.rag.layer_detect import compile_patterns
-
-    raw = {}
-    for name in ("sepa", "iso20022"):
-        preset = load_preset(EXAMPLES_DIR / name / "preset.yaml")
-        raw[preset.name] = preset.routing_patterns
-    return compile_patterns(raw)
+    return example_routing_patterns(SEPA_PRESET, ISO_PRESET)
 
 
 class TestLayerDetection:

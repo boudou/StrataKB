@@ -14,6 +14,7 @@ import uuid
 import pytest
 
 from stratakb.rag.retriever import _build_hybrid_sql
+from tests.helpers import fulltext_hits
 
 # ==========================================
 # Built SQL
@@ -106,11 +107,7 @@ async def corpus():
 
 
 async def _fulltext_ids(pool, layer, vector, query, top_k=3) -> list[str]:
-    sql, params = _build_hybrid_sql(vector, query, [layer], top_k=top_k)
-    async with pool.acquire() as conn:
-        rows = await conn.fetch(sql, *params)
-    ranked = sorted((r for r in rows if r["source"] == "fulltext"), key=lambda r: r["rank"])
-    return [str(r["id"]) for r in ranked]
+    return [str(r["id"]) for r in await fulltext_hits(pool, layer, vector, query, top_k)]
 
 
 class TestFullTextLeg:

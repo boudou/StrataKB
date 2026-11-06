@@ -16,7 +16,7 @@ from uuid import uuid4
 
 import pytest
 
-from tests.test_example_peps import CLONE_HINT, EXAMPLE_PEPS, PEPS_PRESET, PEPS_SOURCE
+from tests.helpers import CLONE_HINT, EXAMPLE_PEPS, PEPS_PRESET, PEPS_SOURCE
 
 pytestmark = pytest.mark.skipif(
     os.environ.get("STRATA_E2E") != "1",

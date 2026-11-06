@@ -259,7 +259,7 @@ The layer's **answer_mode** says how its questions are to be answered: `grounded
 
 ### Try an example preset
 
-The repository also ships three example presets. The quickest to try is Python PEPs: git fetches eight PEPs in a few seconds, with no account:
+The repository also ships three example presets. The quickest to try is Python PEPs: git fetches a handful of PEPs in a few seconds, with no account:
 
 ```bash
 git clone --depth 1 --filter=blob:none --sparse https://github.com/python/peps.git examples/peps/source

@@ -13,12 +13,13 @@ from stratakb.knowledge.presets import (
     dry_run_parse,
     load_preset,
 )
-from tests.helpers import call_tool
-
-EXAMPLES_DIR = Path(__file__).parent.parent / "examples"
-SEPA_PRESET = EXAMPLES_DIR / "sepa" / "preset.yaml"
-ISO_PRESET = EXAMPLES_DIR / "iso20022" / "preset.yaml"
-PEPS_PRESET = EXAMPLES_DIR / "peps" / "preset.yaml"
+from tests.helpers import (
+    ISO_PRESET,
+    PEPS_PRESET,
+    SEPA_PRESET,
+    call_tool,
+    example_routing_patterns,
+)
 
 
 def _write_preset(tmp_path: Path, body: str) -> Path:
@@ -225,13 +226,6 @@ class TestLoadPreset:
 class TestPepsRouting:
     """The PEPs preset's routing patterns, compiled as the server compiles them."""
 
-    @staticmethod
-    def _patterns(*paths: Path) -> dict:
-        from stratakb.rag.layer_detect import compile_patterns
-
-        presets = [load_preset(p) for p in paths]
-        return compile_patterns({p.name: p.routing_patterns for p in presets})
-
     @pytest.mark.parametrize("query", [
         "PEP 8",
         "pep-484",
@@ -243,7 +237,7 @@ class TestPepsRouting:
     def test_routed(self, query):
         from stratakb.rag.layer_detect import detect_layers
 
-        assert detect_layers(query, self._patterns(PEPS_PRESET)) == ["python_peps"]
+        assert detect_layers(query, example_routing_patterns(PEPS_PRESET)) == ["python_peps"]
 
     @pytest.mark.parametrize(
         "query", ["pepper", "step 8", "pep 12345", "general payments question"]
@@ -251,12 +245,12 @@ class TestPepsRouting:
     def test_not_routed(self, query):
         from stratakb.rag.layer_detect import detect_layers
 
-        assert detect_layers(query, self._patterns(PEPS_PRESET)) == []
+        assert detect_layers(query, example_routing_patterns(PEPS_PRESET)) == []
 
     def test_alongside_the_other_examples(self):
         from stratakb.rag.layer_detect import detect_layers
 
-        patterns = self._patterns(SEPA_PRESET, ISO_PRESET, PEPS_PRESET)
+        patterns = example_routing_patterns(SEPA_PRESET, ISO_PRESET, PEPS_PRESET)
         assert detect_layers("PEP 8 line length", patterns) == ["python_peps"]
         assert "python_peps" not in detect_layers("pacs.008 settlement amount", patterns)
 

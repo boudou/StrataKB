@@ -15,7 +15,6 @@ from __future__ import annotations
 import contextlib
 import re
 import shutil
-from pathlib import Path
 from unittest.mock import AsyncMock, patch
 from uuid import uuid4
 
@@ -27,26 +26,15 @@ from stratakb.knowledge.presets import (
     ingest_preset,
     load_preset,
 )
-
-REPO_DIR = Path(__file__).parent.parent
-EXAMPLES_DIR = REPO_DIR / "examples"
-PEPS_PRESET = EXAMPLES_DIR / "peps" / "preset.yaml"
-PEPS_LIST = EXAMPLES_DIR / "peps" / "peps.txt"
-PEPS_SOURCE = EXAMPLES_DIR / "peps" / "source" / "peps"
-EXAMPLE_PEPS = [
-    line.strip()
-    for line in PEPS_LIST.read_text(encoding="utf-8").splitlines()
-    if line.strip() and not line.startswith("#")
-]
-CLONE_HINT = (
-    "PEPs not fetched; run: "
-    "git clone --depth 1 --filter=blob:none --sparse https://github.com/python/peps.git "
-    "examples/peps/source && "
-    "git -C examples/peps/source sparse-checkout set --no-cone "
-    + " ".join(f"/peps/{name}" for name in EXAMPLE_PEPS)
-    + " (in Git Bash on Windows, put MSYS_NO_PATHCONV=1 in front of the sparse-checkout "
-    "command; otherwise Git Bash rewrites the /peps/... paths and nothing is checked out)"
+from tests.helpers import (
+    CLONE_HINT,
+    EXAMPLE_PEPS,
+    PEPS_PRESET,
+    PEPS_SOURCE,
+    REPO_DIR,
+    fulltext_hits,
 )
+
 # Every other place that spells out the list
 PEPS_LIST_COPIES = ["README.md", "examples/README.md", ".github/workflows/ci.yml"]
 
@@ -54,8 +42,12 @@ PEPS_LIST_COPIES = ["README.md", "examples/README.md", ".github/workflows/ci.yml
 @pytest.mark.parametrize("copy", PEPS_LIST_COPIES)
 def test_pep_list_copies_match_peps_txt(copy):
     text = (REPO_DIR / copy).read_text(encoding="utf-8")
-    assert re.findall(r"/peps/(pep-\d+\.rst)", text) == EXAMPLE_PEPS, (
+    found = re.findall(r"/peps/(pep-\d+\.rst)", text)
+    assert sorted(found) == sorted(EXAMPLE_PEPS), (
         f"{copy} fetches other PEPs than examples/peps/peps.txt"
+    )
+    assert found == EXAMPLE_PEPS, (
+        f"{copy} lists the PEPs in another order than examples/peps/peps.txt"
     )
 
 
@@ -88,7 +80,6 @@ async def test_example_peps_apply_and_find_pep8(db_url, tmp_path):
     from stratakb.config import get_settings
     from stratakb.core.database import get_pool
     from stratakb.knowledge.layers import LayerNotFoundError, delete_layer
-    from stratakb.rag.retriever import _build_hybrid_sql
 
     # Exactly the listed files, even when the clone holds every PEP
     docs = tmp_path / "source" / "peps"
@@ -123,21 +114,12 @@ async def test_example_peps_apply_and_find_pep8(db_url, tmp_path):
             "SELECT DISTINCT source_file FROM strata_vectors.chunks WHERE layer_name = $1",
             preset.name,
         )
-        assert sorted(r["source_file"] for r in rows) == EXAMPLE_PEPS
+        assert sorted(r["source_file"] for r in rows) == sorted(EXAMPLE_PEPS)
 
-        sql, params = _build_hybrid_sql(
-            "[" + ",".join(["0.01"] * dims) + "]", "maximum line length", [preset.name], top_k=3
+        hits = await fulltext_hits(
+            pool, preset.name, "[" + ",".join(["0.01"] * dims) + "]", "maximum line length"
         )
-        async with pool.acquire() as conn:
-            hits = await conn.fetch(sql, *params)
-            ranked = sorted((r for r in hits if r["source"] == "fulltext"), key=lambda r: r["rank"])
-            files = [
-                await conn.fetchval(
-                    "SELECT source_file FROM strata_vectors.chunks WHERE id = $1", r["id"]
-                )
-                for r in ranked[:3]
-            ]
-        assert "pep-0008.rst" in files
+        assert "pep-0008.rst" in [r["source_file"] for r in hits[:3]]
     finally:
         with contextlib.suppress(LayerNotFoundError):
             await delete_layer(db_url, name=preset.name)
