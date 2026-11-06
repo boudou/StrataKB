@@ -100,6 +100,8 @@ async def store_document_version(
     file wait until the first caller's transaction ends, and then read the
     version it committed. The function opens its own transaction (a savepoint
     inside the caller's), so the lock holds until the outermost one ends.
+    A version that a concurrent prune deletes while this call waits on it is
+    not reused: the call reads the latest version again.
     """
     sha256 = hashlib.sha256(text.encode("utf-8")).hexdigest()
     async with conn.transaction():
@@ -108,23 +110,26 @@ async def store_document_version(
             _VERSION_LOCK_NAMESPACE,
             _version_lock_key(layer_id, source_root, relative_path),
         )
-        latest = await conn.fetchrow(
-            """
-            SELECT id, version, sha256 FROM strata_vectors.documents
-            WHERE layer_id = $1 AND source_root = $2 AND relative_path = $3
-            ORDER BY version DESC LIMIT 1
-            """,
-            layer_id,
-            source_root,
-            relative_path,
-        )
-        if latest is not None and latest["sha256"] == sha256:
-            await conn.execute(
-                "UPDATE strata_vectors.documents SET file_id = $2 WHERE id = $1",
+        while True:
+            latest = await conn.fetchrow(
+                """
+                SELECT id, version, sha256 FROM strata_vectors.documents
+                WHERE layer_id = $1 AND source_root = $2 AND relative_path = $3
+                ORDER BY version DESC LIMIT 1
+                """,
+                layer_id,
+                source_root,
+                relative_path,
+            )
+            if latest is None or latest["sha256"] != sha256:
+                break
+            # No row back: a prune deleted this version while we waited on it
+            if await conn.fetchval(
+                "UPDATE strata_vectors.documents SET file_id = $2 WHERE id = $1 RETURNING id",
                 latest["id"],
                 file_id,
-            )
-            return latest["id"], latest["version"]
+            ) is not None:
+                return latest["id"], latest["version"]
 
         version = 1 if latest is None else latest["version"] + 1
         document_id = await conn.fetchval(

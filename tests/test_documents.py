@@ -6,6 +6,7 @@ real pipeline against the database with embeddings mocked.
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import hashlib
 import json
@@ -120,6 +121,35 @@ async def _store_bare_document(
             conn, layer_id=layer_id, file_id=None, source_root=source_root,
             relative_path=relative_path, text=text, page_map=None,
         )
+
+
+async def _wait_until_blocked_by(pool, blocker_pid: int) -> None:
+    """Wait until some other backend is waiting on a lock blocker_pid holds."""
+    for _ in range(200):
+        if await pool.fetchval(
+            "SELECT EXISTS (SELECT 1 FROM pg_stat_activity "
+            "WHERE $1 = ANY(pg_blocking_pids(pid)))",
+            blocker_pid,
+        ):
+            return
+        await asyncio.sleep(0.05)
+    raise AssertionError("nothing waited on the lock")
+
+
+async def _file_rows(db_url: str, layer: str) -> dict:
+    """The layer's ingested_files ids, keyed by relative path."""
+    from stratakb.core.database import get_pool
+
+    pool = await get_pool(db_url)
+    rows = await pool.fetch(
+        """
+        SELECT f.relative_path, f.id FROM strata_core.ingested_files f
+        JOIN strata_core.knowledge_layers kl ON kl.id = f.layer_id
+        WHERE kl.name = $1
+        """,
+        layer,
+    )
+    return {r["relative_path"]: r["id"] for r in rows}
 
 
 def _copy(name: str, dest: Path) -> Path:
@@ -464,6 +494,186 @@ class TestVersions:
         (tmp_path / "a.md").write_text("# A\n\nAlpha.\n", encoding="utf-8")
         await _ingest(db_url, layer, tmp_path)
         await clear_layer(db_url, layer)
+        assert await _documents(db_url, layer) == []
+
+    async def test_ingest_reuses_no_version_a_prune_deleted(self, db_url, layer, tmp_path):
+        from stratakb.core.database import get_pool
+        from stratakb.knowledge.documents import prune_documents
+        from stratakb.rag.receipts import new_receipt_id
+
+        src = tmp_path / "src"
+        src.mkdir()
+        a = src / "a.md"
+        a.write_text("# A\n\nAlpha about failover.\n", encoding="utf-8")
+        (src / "b.md").write_text("# B\n\nBeta.\n", encoding="utf-8")
+        await _ingest(db_url, layer, src)
+        pruned = {d["relative_path"]: d["id"] for d in await _documents(db_url, layer)}["a.md"]
+
+        pool = await get_pool(db_url)
+        layer_id = await _layer_id(db_url, layer)
+        receipt_id = new_receipt_id()
+        await pool.execute(
+            """
+            INSERT INTO strata_core.receipts (id, issued_by, kind, mode, layers, body)
+            VALUES ($1, 'alice', 'verify', 'grounded', '[]', '{}')
+            """,
+            receipt_id,
+        )
+        await pool.execute(
+            "INSERT INTO strata_core.receipt_documents (receipt_id, document_id) VALUES ($1, $2)",
+            receipt_id,
+            pruned,
+        )
+        # Removed from the folder: the receipt keeps its version
+        away = tmp_path / "away.md"
+        a.rename(away)
+        await _ingest(db_url, layer, src)
+        assert pruned in [d["id"] for d in await _documents(db_url, layer)]
+
+        async with pool.acquire() as held:
+            tx = held.transaction()
+            await tx.start()
+            try:
+                await held.execute("DELETE FROM strata_core.receipts WHERE id = $1", receipt_id)
+                assert await prune_documents(held, [layer_id]) == 1
+                # Back with the same text while the prune is not committed yet
+                away.rename(a)
+                ingest = asyncio.create_task(_ingest(db_url, layer, src))
+                await _wait_until_blocked_by(pool, held.get_server_pid())
+                await tx.commit()
+            except BaseException:
+                with contextlib.suppress(Exception):
+                    await tx.rollback()
+                raise
+        result = await ingest
+
+        assert ("a.md", "added", None) in [
+            (f.relative_path, f.outcome, f.reason) for f in result.files
+        ]
+        assert result.errors == []
+        docs = await _assert_offsets_match(db_url, layer)
+        a_docs = [d for d in await _documents(db_url, layer) if d["relative_path"] == "a.md"]
+        assert len(a_docs) == 1
+        assert docs["a.md"]["id"] != pruned
+
+    async def test_clear_layer_locks_file_rows_before_chunks(self, db_url, layer, tmp_path):
+        import asyncpg
+
+        from stratakb.core.database import get_pool
+        from stratakb.knowledge.ingestion import clear_layer
+
+        (tmp_path / "a.md").write_text("# A\n\nAlpha.\n", encoding="utf-8")
+        await _ingest(db_url, layer, tmp_path)
+        file_id = (await _file_rows(db_url, layer))["a.md"]
+
+        pool = await get_pool(db_url)
+        async with pool.acquire() as held, pool.acquire() as probe:
+            tx = held.transaction()
+            await tx.start()
+            try:
+                await held.execute(
+                    "SELECT id FROM strata_core.ingested_files WHERE id = $1 FOR KEY SHARE",
+                    file_id,
+                )
+                clearing = asyncio.create_task(clear_layer(db_url, layer))
+                await _wait_until_blocked_by(pool, held.get_server_pid())
+                # The clear waits on the file row without holding its chunks
+                probe_tx = probe.transaction()
+                await probe_tx.start()
+                try:
+                    await probe.execute(
+                        "SELECT id FROM strata_vectors.chunks WHERE file_id = $1"
+                        " FOR UPDATE NOWAIT",
+                        file_id,
+                    )
+                except asyncpg.LockNotAvailableError:
+                    pytest.fail("clear_layer locked the chunks before the file row")
+                finally:
+                    await probe_tx.rollback()
+            finally:
+                await tx.rollback()
+        await clearing
+
+        assert await _chunks(db_url, layer) == []
+        assert await _documents(db_url, layer) == []
+        assert await _file_rows(db_url, layer) == {}
+
+    @pytest.mark.parametrize("how", ["remove", "clear"])
+    async def test_removal_waits_for_ingest_of_same_file(self, db_url, layer, tmp_path, how):
+        from stratakb.core.database import get_pool
+        from stratakb.knowledge import ingestion
+
+        a = tmp_path / "a.md"
+        a.write_text("# A\n\nFirst text about failover.\n", encoding="utf-8")
+        await _ingest(db_url, layer, tmp_path)
+        row_id = (await _file_rows(db_url, layer))["a.md"]
+        layer_id = await _layer_id(db_url, layer)
+        a.write_text("# A\n\nSecond text about restores.\n", encoding="utf-8")
+
+        real = ingestion.store_document_version
+        picked, release = asyncio.Event(), asyncio.Event()
+        pids = []
+
+        async def paused(conn, **kwargs):
+            stored = await real(conn, **kwargs)
+            pids.append(conn.get_server_pid())
+            picked.set()
+            await release.wait()
+            return stored
+
+        pool = await get_pool(db_url)
+        with patch("stratakb.knowledge.ingestion.store_document_version", paused):
+            ingest = asyncio.create_task(_ingest(db_url, layer, tmp_path))
+            try:
+                async with asyncio.timeout(30):
+                    await picked.wait()
+                    if how == "remove":
+                        removal = asyncio.create_task(ingestion._remove_files(
+                            pool, layer_id=str(layer_id),
+                            source_root=tmp_path.resolve().as_posix(),
+                            files=[("a.md", row_id)],
+                        ))
+                    else:
+                        removal = asyncio.create_task(ingestion.clear_layer(db_url, layer))
+                    await _wait_until_blocked_by(pool, pids[0])
+            finally:
+                release.set()
+            result = await ingest
+        await removal
+
+        assert ("a.md", "updated", None) in [
+            (f.relative_path, f.outcome, f.reason) for f in result.files
+        ]
+        assert result.errors == []
+        assert await _file_rows(db_url, layer) == {}
+        assert await _chunks(db_url, layer) == []
+        assert await _documents(db_url, layer) == []
+
+    async def test_overlapping_removers_do_not_deadlock(self, db_url, layer, tmp_path):
+        from stratakb.core.database import get_pool
+        from stratakb.knowledge.ingestion import _remove_files, clear_layer
+
+        for name in ("a", "b", "c"):
+            (tmp_path / f"{name}.md").write_text(f"# {name}\n\nText {name}.\n", encoding="utf-8")
+        await _ingest(db_url, layer, tmp_path)
+        ids = await _file_rows(db_url, layer)
+        layer_id = str(await _layer_id(db_url, layer))
+        root = tmp_path.resolve().as_posix()
+        pool = await get_pool(db_url)
+
+        def remove(*names):
+            return _remove_files(
+                pool, layer_id=layer_id, source_root=root,
+                files=[(f"{n}.md", ids[f"{n}.md"]) for n in names],
+            )
+
+        async with asyncio.timeout(30):
+            await asyncio.gather(
+                remove("a", "b"), remove("c", "b", "a"), clear_layer(db_url, layer)
+            )
+
+        assert await _file_rows(db_url, layer) == {}
+        assert await _chunks(db_url, layer) == []
         assert await _documents(db_url, layer) == []
 
     async def test_delete_layer_removes_documents(self, db_url, tmp_path):

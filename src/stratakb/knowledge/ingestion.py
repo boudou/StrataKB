@@ -237,12 +237,21 @@ async def _remove_files(
     """Remove tracked files, given as (relative path, ingested_files id), in one transaction.
 
     Deleting the rows cascades to their chunks and unlinks their documents,
-    so their versions are pruned afterwards.
+    so their versions are pruned afterwards. The rows are locked in id order
+    before anything is deleted, so an ingest of the same file (which locks its
+    row first) and other removers never lock them in the opposite order.
     """
+    file_ids = [file_id for _, file_id in files]
     async with pool.acquire() as conn, conn.transaction():
         await conn.execute(
-            "DELETE FROM strata_core.ingested_files WHERE id = ANY($1::uuid[])",
-            [file_id for _, file_id in files],
+            """
+            SELECT id FROM strata_core.ingested_files
+            WHERE id = ANY($1::uuid[]) ORDER BY id FOR UPDATE
+            """,
+            file_ids,
+        )
+        await conn.execute(
+            "DELETE FROM strata_core.ingested_files WHERE id = ANY($1::uuid[])", file_ids
         )
         await prune_documents(
             conn, [layer_id], source_root=source_root, relative_paths=[path for path, _ in files]
@@ -270,7 +279,12 @@ async def tracked_files(
 
 
 async def clear_layer(database_url: str, layer_name: str) -> None:
-    """Delete every chunk and ingested_files row of a layer, and its unreferenced documents."""
+    """Delete every chunk and ingested_files row of a layer, and its unreferenced documents.
+
+    The layer's file rows are locked in id order before anything is deleted,
+    so an ingest of the same file (which locks its row first) and removers of
+    some of its files never lock them in the opposite order.
+    """
     await ensure_schema(database_url)
     pool = await get_pool(database_url)
     files = 0
@@ -279,13 +293,29 @@ async def clear_layer(database_url: str, layer_name: str) -> None:
             layer_id = await conn.fetchval(
                 "SELECT id FROM strata_core.knowledge_layers WHERE name = $1", layer_name
             )
-            # By name: this also removes legacy chunks that have no file row
+            file_ids = []
+            if layer_id is not None:
+                rows = await conn.fetch(
+                    """
+                    SELECT id FROM strata_core.ingested_files
+                    WHERE layer_id = $1 ORDER BY id FOR UPDATE
+                    """,
+                    layer_id,
+                )
+                file_ids = [r["id"] for r in rows]
+            # Only the locked files' chunks, plus legacy chunks that have no file row:
+            # a file first ingested meanwhile is not cleared
             chunks = await conn.execute(
-                "DELETE FROM strata_vectors.chunks WHERE layer_name = $1", layer_name
+                """
+                DELETE FROM strata_vectors.chunks
+                WHERE layer_name = $1 AND (file_id IS NULL OR file_id = ANY($2::uuid[]))
+                """,
+                layer_name,
+                file_ids,
             )
             if layer_id is not None:
                 deleted = await conn.execute(
-                    "DELETE FROM strata_core.ingested_files WHERE layer_id = $1", layer_id
+                    "DELETE FROM strata_core.ingested_files WHERE id = ANY($1::uuid[])", file_ids
                 )
                 files = int(deleted.split()[-1])
                 await prune_documents(conn, [layer_id])
