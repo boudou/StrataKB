@@ -59,7 +59,7 @@ class LearningStore:
                 rows = await conn.fetch(sql, *args)
             return [dict(r) for r in rows]
         except Exception as e:
-            logger.debug("learning_store_fetch_failed", error=str(e))
+            logger.warning("learning_store_fetch_failed", error_type=type(e).__name__)
             return []
 
     async def _execute(self, sql: str, *args) -> str | None:
@@ -72,7 +72,20 @@ class LearningStore:
             async with pool.acquire() as conn:
                 return await conn.execute(sql, *args)
         except Exception as e:
-            logger.debug("learning_store_execute_failed", error=str(e))
+            logger.warning("learning_store_execute_failed", error_type=type(e).__name__)
+            return None
+
+    async def _transaction(self, *statements: tuple) -> list[str] | None:
+        """Run (sql, *args) statements in one transaction and return their statuses.
+
+        Returns None if it fails, and then none of them took effect.
+        """
+        try:
+            pool = await get_pool(self.database_url)
+            async with pool.acquire() as conn, conn.transaction():
+                return [await conn.execute(sql, *args) for sql, *args in statements]
+        except Exception as e:
+            logger.warning("learning_store_transaction_failed", error_type=type(e).__name__)
             return None
 
     # ── Sessions ──────────────────────────────────────────────
@@ -490,37 +503,26 @@ class LearningStore:
         """Reset learning data. If layer is given (even ""), only that layer.
 
         Runs as one transaction: returns None if it fails, and then nothing
-        was deleted.
+        was deleted. A layer reset also returns how many rows it deleted.
         """
         _rewrite_cache.clear()
         _synonym_cache.clear()
-        try:
-            pool = await get_pool(self.database_url)
-            async with pool.acquire() as conn, conn.transaction():
-                if layer is not None:
-                    await conn.execute(
-                        "DELETE FROM strata_learning.learned_rewrites WHERE $1 = ANY(layers)",
-                        layer,
-                    )
-                    await conn.execute(
-                        "DELETE FROM strata_learning.query_synonyms WHERE layer = $1", layer
-                    )
-                    await conn.execute(
-                        "DELETE FROM strata_learning.layer_affinity_scores WHERE layer_name = $1",
-                        layer,
-                    )
-                else:
-                    await conn.execute(
-                        "TRUNCATE strata_learning.feedback_signals,"
-                        " strata_learning.interaction_events,"
-                        " strata_learning.query_sessions,"
-                        " strata_learning.learned_rewrites,"
-                        " strata_learning.query_synonyms,"
-                        " strata_learning.layer_affinity_scores CASCADE"
-                    )
-        except Exception as e:
-            logger.debug("learning_store_reset_failed", error=str(e))
+        if layer is None:
+            statuses = await self._transaction((
+                "TRUNCATE strata_learning.feedback_signals,"
+                " strata_learning.interaction_events,"
+                " strata_learning.query_sessions,"
+                " strata_learning.learned_rewrites,"
+                " strata_learning.query_synonyms,"
+                " strata_learning.layer_affinity_scores CASCADE",
+            ))
+            return None if statuses is None else {"reset": "all"}
+        statuses = await self._transaction(
+            ("DELETE FROM strata_learning.learned_rewrites WHERE $1 = ANY(layers)", layer),
+            ("DELETE FROM strata_learning.query_synonyms WHERE layer = $1", layer),
+            ("DELETE FROM strata_learning.layer_affinity_scores WHERE layer_name = $1", layer),
+        )
+        if statuses is None:
             return None
-        if layer is not None:
-            return {"reset": "layer", "layer": layer}
-        return {"reset": "all"}
+        deleted = sum(int(status.split()[-1]) for status in statuses)
+        return {"reset": "layer", "layer": layer, "deleted": deleted}

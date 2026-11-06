@@ -280,7 +280,7 @@ Then ask from your client, for example *"How long should a line of Python be?"*.
 | `strata_list_knowledge_layers` | viewer | Lists layers with document and chunk counts |
 | `strata_get_layer_status` | viewer | One layer's configuration and ingestion history |
 | `strata_get_receipt` | viewer | Opens a receipt (`rcpt_…`, also the resource `strata://receipts/{receipt_id}`): the stored quotes of an answer, each in its surrounding document text, marked current, changed (with the newer version) or gone (its file was removed from its folder or its layer was deleted). Open to whoever asked, to admins, and to anyone who may read every cited layer, for `RECEIPT_RETENTION_DAYS` (90 by default). From the command line: `stratakb receipt <id>`. Receipts are issued by `strata_verify`; extractive answers will issue them too ([roadmap](#roadmap)) |
-| `strata_feedback` | viewer | Rates a result as helpful or not, per answer or per passage (`S1`) or chunk |
+| `strata_feedback` | viewer | Rates a result as helpful or not, per answer or per passage (`S1`) or chunk (`useful`, `wrong` or `outdated`) |
 | `strata_learning_stats` | viewer | What the learning system has recorded and learned |
 | `strata_whoami` | viewer | Your identity and role |
 | `strata_admin_health` | viewer | Database, pgvector and schema status, the local-only switch, the providers that receive data, whether the SQL tools are on, and the embedding model and vector column checks |
@@ -306,7 +306,9 @@ The `stratakb add` command has no role check: whoever can reach the database wit
 
 `strata_search` and `strata_ask` each write one audit entry with the first 200 characters of the query or question, with IBANs, BICs and account numbers replaced by placeholders (`[IBAN_REDACTED]`, `[BIC_REDACTED]`, `[ACCT_REDACTED]`), plus the layers searched and whether routing fell back. `AUDIT_STORE_RAW_QUERIES=true` keeps the question as written; `LEARNING_STORE_RAW_QUERIES` has no effect on the audit log.
 
-`strata_feedback` and `strata_reset_learning` each write one audit entry. A feedback entry holds the interaction id and the rating, not the suggested query or layer, and names only the extras (layer correction, better query, chunk ratings) that were stored; a reset entry names the layer, or says it reset everything. A reset runs as one transaction: if it fails in the database, nothing is deleted, and the tool returns an error and writes no audit entry. An empty `layer` is refused; omit it for a global reset.
+`strata_feedback` and `strata_reset_learning` each write one audit entry. A feedback entry holds the interaction id and the rating, not the suggested query or layer, and names only the extras (layer correction, better query, chunk ratings) that were stored; a reset entry names the layer, or says it reset everything. A reset runs as one transaction: if it fails in the database, nothing is deleted, and the tool returns an error and writes no audit entry. An empty `layer` is refused; omit it for a global reset. A `layer` is trimmed of surrounding spaces, and the result gives the number of rows `deleted`, with a `message` when that is 0 because the layer has no learning data or does not exist.
+
+A chunk rating other than `useful`, `wrong` or `outdated` refuses the whole `strata_feedback` call: it stores nothing, and the error lists the allowed values. When the rating is stored but an extra is not, the status stays `ok`, and `not_stored` and `warning` name each extra that failed (`correct_layer`, `better_query`, `chunk rating S2`). A failed learning read or write logs a warning with the error type only, never the error text.
 
 Each `strata_apply_preset` run writes one audit entry with the layer, whether it was created, updated or already up to date, the names of the settings that changed (never their values) and the number of documents and chunks ingested. A refused run writes none.
 
