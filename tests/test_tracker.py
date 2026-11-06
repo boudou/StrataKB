@@ -1,7 +1,9 @@
 """Tests for the interaction tracker."""
 
-import pytest
+from datetime import UTC
 from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
 
 
 @pytest.mark.asyncio
@@ -13,11 +15,13 @@ async def test_tracker_calls_pii_scrub():
         learning_session_timeout_minutes=30,
     )
 
-    from stratakb.learning.tracker import Tracker
     from stratakb.learning.store import LearningStore
+    from stratakb.learning.tracker import Tracker
 
     store = MagicMock(spec=LearningStore)
-    store.get_or_create_session = AsyncMock(return_value={"id": "sess-1", "session_start": None, "query_count": 0})
+    store.get_or_create_session = AsyncMock(
+        return_value={"id": "sess-1", "session_start": None, "query_count": 0}
+    )
     store.store_interaction = AsyncMock(return_value={"id": "int-1", "created_at": None})
     store.update_session = AsyncMock()
     store.get_recent_interactions = AsyncMock(return_value=[])
@@ -61,7 +65,7 @@ async def test_tracker_skips_when_disabled():
 @pytest.mark.asyncio
 async def test_tracker_detects_signals_on_reformulation():
     """Tracker should detect reformulation signals between sequential queries."""
-    from datetime import datetime, timedelta, timezone
+    from datetime import datetime, timedelta
 
     settings = MagicMock(
         learning_enabled=True,
@@ -69,17 +73,31 @@ async def test_tracker_detects_signals_on_reformulation():
         learning_session_timeout_minutes=30,
     )
 
-    from stratakb.learning.tracker import Tracker
     from stratakb.learning.store import LearningStore
+    from stratakb.learning.tracker import Tracker
 
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     store = MagicMock(spec=LearningStore)
     store.get_or_create_session = AsyncMock(return_value={"id": "sess-1"})
     store.store_interaction = AsyncMock(return_value={"id": "int-2", "created_at": now})
     store.update_session = AsyncMock()
     store.get_recent_interactions = AsyncMock(return_value=[
-        {"id": "int-2", "query_text": "SEPA credit transfer rejection codes", "created_at": now, "confidence_level": None, "layers_searched": None, "results": None},
-        {"id": "int-1", "query_text": "SEPA credit transfer errors", "created_at": now - timedelta(seconds=15), "confidence_level": "low", "layers_searched": None, "results": None},
+        {
+            "id": "int-2",
+            "query_text": "SEPA credit transfer rejection codes",
+            "created_at": now,
+            "confidence_level": None,
+            "layers_searched": None,
+            "results": None,
+        },
+        {
+            "id": "int-1",
+            "query_text": "SEPA credit transfer errors",
+            "created_at": now - timedelta(seconds=15),
+            "confidence_level": "low",
+            "layers_searched": None,
+            "results": None,
+        },
     ])
     store.store_feedback = AsyncMock()
 
