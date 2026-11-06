@@ -10,7 +10,6 @@ from __future__ import annotations
 import json
 import re
 import time
-from datetime import datetime
 from typing import Literal, get_args
 
 import asyncpg
@@ -19,6 +18,7 @@ from cachetools import TTLCache
 
 from stratakb.core.database import fetch_layers_stamp, get_pool
 from stratakb.core.migrations import ensure_schema
+from stratakb.core.stamp_watcher import StampWatcher
 
 logger = structlog.get_logger()
 
@@ -66,10 +66,9 @@ _WRITABLE_COLUMNS = frozenset(get_args(_LayerColumn))
 # change from another process clears it within 2 s (see _maybe_clear).
 _routing_cache: TTLCache = TTLCache(maxsize=1, ttl=60)
 
-# The layers stamp is read at most this often (seconds) per database URL
-_STAMP_INTERVAL = 2.0
-_stamps: dict[str, tuple[int, datetime | None]] = {}
-_checked_at: dict[str, float] = {}
+_watcher = StampWatcher("routing_cache")
+_stamps = _watcher.stamps
+_checked_at = _watcher.checked_at
 
 
 class LayerError(Exception):
@@ -638,22 +637,9 @@ async def get_layer_routing(database_url: str) -> dict:
 
 async def _maybe_clear(database_url: str) -> None:
     """Clear the routing cache when any process has changed the layers."""
-    now = time.monotonic()
-    last = _checked_at.get(database_url)
-    if last is not None and now - last < _STAMP_INTERVAL:
-        return
-    # Set before the await: concurrent callers skip, a failing DB is retried every 2 s
-    _checked_at[database_url] = now
-    try:
-        stamp = await fetch_layers_stamp(database_url)
-    except Exception as e:
-        logger.warning("routing_cache_stamp_failed", error_type=type(e).__name__)
-        return
-    previous = _stamps.get(database_url)
-    _stamps[database_url] = stamp
-    if previous is not None and stamp != previous:
-        _routing_cache.clear()
-        logger.info("routing_cache_cleared")
+    await _watcher.check(
+        database_url, _routing_cache.clear, now=time.monotonic(), fetch=fetch_layers_stamp
+    )
 
 
 def _json_str(obj: dict) -> str:

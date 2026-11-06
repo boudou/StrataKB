@@ -12,11 +12,11 @@ import time
 import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass, field
-from datetime import datetime
 
 import structlog
 
 from stratakb.core.database import fetch_layers_stamp, get_pool
+from stratakb.core.stamp_watcher import StampWatcher
 from stratakb.knowledge.embeddings import embed_texts
 from stratakb.rag.cache import QueryCache
 
@@ -43,32 +43,21 @@ def _get_cache() -> QueryCache | None:
     return None
 
 
-# The layers stamp is read at most this often (seconds) per database URL
-_STAMP_INTERVAL = 2.0
-_stamps: dict[str, tuple[int, datetime | None]] = {}
-_checked_at: dict[str, float] = {}
+_watcher = StampWatcher("query_cache")
+_stamps = _watcher.stamps
+_checked_at = _watcher.checked_at
+
+
+def _clear_cache() -> None:
+    if _cache is not None:
+        _cache.clear()
 
 
 async def _maybe_clear(database_url: str) -> None:
     """Clear the query cache when any process has changed the layers."""
-    now = time.monotonic()
-    last = _checked_at.get(database_url)
-    if last is not None and now - last < _STAMP_INTERVAL:
-        return
-    # Set before the await: concurrent searches skip, a failing DB is retried every 2 s
-    _checked_at[database_url] = now
-    try:
-        stamp = await fetch_layers_stamp(database_url)
-    except Exception as e:
-        logger.warning("query_cache_stamp_failed", error_type=type(e).__name__)
-        return
-    previous = _stamps.get(database_url)
-    _stamps[database_url] = stamp
-    if previous is not None and stamp != previous:
-        cache = _get_cache()
-        if cache:
-            cache.clear()
-        logger.info("query_cache_cleared")
+    await _watcher.check(
+        database_url, _clear_cache, now=time.monotonic(), fetch=fetch_layers_stamp
+    )
 
 
 @dataclass
