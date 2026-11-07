@@ -18,6 +18,7 @@ from tests.helpers import (
     file_outcomes,
     ingest,
     ingest_with_texts,
+    locked_read_bytes,
     write_file,
 )
 
@@ -234,18 +235,6 @@ class TestSync:
         assert second.files_unchanged == 1
 
 
-def _locked_read_bytes(name: str):
-    """A Path.read_bytes that raises PermissionError("locked") for files called name."""
-    original_read = Path.read_bytes
-
-    def read_bytes(self):
-        if self.name == name:
-            raise PermissionError("locked")
-        return original_read(self)
-
-    return read_bytes
-
-
 class TestPolicyAndEmpty:
     async def test_secret_names_never_opened(self, db_url, layer, tmp_path):
         from stratakb.knowledge import ingestion
@@ -397,7 +386,7 @@ class TestPolicyAndEmpty:
         write_file(tmp_path / "locked.md", "# Locked\n\nLocked content.\n")
         write_file(tmp_path / "a.md", "# Alpha\n\nAlpha content.\n")
 
-        with patch.object(Path, "read_bytes", _locked_read_bytes("locked.md")):
+        with patch.object(Path, "read_bytes", locked_read_bytes("locked.md")):
             result = await ingest(db_url, layer, tmp_path)
 
         outcomes = file_outcomes(result)
@@ -413,7 +402,7 @@ class TestPolicyAndEmpty:
         before = _ids_by_file(await _chunks(db_url, layer))["locked.md"]
 
         write_file(locked, "# Locked\n\nSecond version.\n")
-        with patch.object(Path, "read_bytes", _locked_read_bytes("locked.md")):
+        with patch.object(Path, "read_bytes", locked_read_bytes("locked.md")):
             result = await ingest(db_url, layer, tmp_path)
 
         assert file_outcomes(result)["locked.md"] == ("failed", "read_error")
@@ -563,7 +552,7 @@ class TestTruncatedCsv:
 
         outcomes = file_outcomes(result)
         assert outcomes["codes.csv"] == ("flagged", "truncated")
-        assert FileOutcome("codes.csv", "flagged", "truncated", 1) in result.files
+        assert FileOutcome("codes.csv", "flagged", "truncated", 1, stored="added") in result.files
         assert outcomes["a.md"] == ("added", None)
         assert result.files_flagged == 1
         assert result.files_added == 2
@@ -590,7 +579,7 @@ class TestTruncatedCsv:
 
         write_file(codes, _csv(["B1", "B2", "B3", "B4"]))
         second = await self._ingest_capped(db_url, layer, tmp_path)
-        assert FileOutcome("codes.csv", "flagged", "truncated", 2) in second.files
+        assert FileOutcome("codes.csv", "flagged", "truncated", 2, stored="updated") in second.files
         assert second.files_updated == 1
         assert second.files_flagged == 1
 
@@ -616,15 +605,22 @@ async def test_parser_flag_reaches_the_outcome(db_url, layer, tmp_path):
     with patch("stratakb.knowledge.ingestion._parse_file", return_value=doc):
         result = await ingest(db_url, layer, tmp_path)
 
-    assert FileOutcome("a.md", "flagged", "truncated", 7) in result.files
+    assert FileOutcome("a.md", "flagged", "truncated", 7, stored="added") in result.files
     assert result.files_flagged == 1
     assert result.files_added == 1
 
 
 async def test_tool_returns_files_skipped(server):
-    from stratakb.knowledge.ingestion import IngestionResult
+    from stratakb.knowledge.ingestion import FileOutcome, IngestionResult
 
-    fake = IngestionResult(layer_name="x", status="completed", files_skipped=2)
+    fake = IngestionResult(
+        layer_name="x",
+        status="completed",
+        files=[
+            FileOutcome("a.md", "skipped", "secret"),
+            FileOutcome("b.md", "skipped", "no_text"),
+        ],
+    )
     with (
         patch("stratakb.core.auth.get_current_user", return_value=("tester", "admin")),
         patch("stratakb.knowledge.tools.get_current_user", return_value=("tester", "admin")),
@@ -644,9 +640,13 @@ async def test_tool_returns_files_skipped(server):
 
 
 async def test_tool_returns_files_flagged(server):
-    from stratakb.knowledge.ingestion import IngestionResult
+    from stratakb.knowledge.ingestion import FileOutcome, IngestionResult
 
-    fake = IngestionResult(layer_name="x", status="completed", files_added=1, files_flagged=1)
+    fake = IngestionResult(
+        layer_name="x",
+        status="completed",
+        files=[FileOutcome("a.csv", "flagged", "truncated", stored="added")],
+    )
     with (
         patch("stratakb.core.auth.get_current_user", return_value=("tester", "admin")),
         patch("stratakb.knowledge.tools.get_current_user", return_value=("tester", "admin")),
@@ -678,8 +678,9 @@ def test_file_outcome_rejects_values_outside_the_set():
         with pytest.raises(ValueError, match="Not an ingest outcome and reason"):
             FileOutcome("a.md", outcome, reason)
     for outcome, reasons in REASONS.items():
+        stored = "added" if outcome == "flagged" else None
         for reason in reasons:
-            assert FileOutcome("a.md", outcome, reason).reason == reason
+            assert FileOutcome("a.md", outcome, reason, stored=stored).reason == reason
     for outcome, reason, count in [
         ("added", None, 3),
         ("failed", "parse_error", 1),
@@ -687,8 +688,59 @@ def test_file_outcome_rejects_values_outside_the_set():
     ]:
         with pytest.raises(ValueError, match="Not a count for this outcome"):
             FileOutcome("a.md", outcome, reason, count)
-    assert FileOutcome("a.md", "flagged", "truncated", 5).count == 5
-    assert FileOutcome("a.md", "flagged", "probably_scanned").count is None
+    assert FileOutcome("a.md", "flagged", "truncated", 5, stored="added").count == 5
+    assert FileOutcome("a.md", "flagged", "probably_scanned", stored="added").count is None
+
+
+def test_flagged_outcome_says_how_it_was_stored():
+    from stratakb.knowledge.ingestion import FileOutcome
+
+    for args, stored in [
+        (("flagged", "truncated"), None),
+        (("added", None), "added"),
+        (("flagged", "truncated"), "removed"),
+    ]:
+        with pytest.raises(ValueError, match="Not a stored value for this outcome"):
+            FileOutcome("a.md", *args, stored=stored)
+    assert FileOutcome("a.md", "flagged", "truncated", stored="updated").stored == "updated"
+
+
+def test_counters_follow_the_file_outcomes():
+    from stratakb.knowledge.ingestion import FileOutcome, IngestionResult
+
+    result = IngestionResult(
+        layer_name="x",
+        status="completed",
+        files=[
+            FileOutcome("added.md", "added"),
+            FileOutcome("updated.md", "updated"),
+            FileOutcome("unchanged.md", "unchanged"),
+            FileOutcome("removed.md", "removed", "deleted"),
+            FileOutcome("skipped.md", "skipped", "secret"),
+            FileOutcome("failed.md", "failed", "read_error"),
+            FileOutcome("flagged-new.csv", "flagged", "truncated", stored="added"),
+            FileOutcome("flagged-old.csv", "flagged", "truncated", stored="updated"),
+        ],
+    )
+
+    assert result.files_added == 2
+    assert result.files_updated == 2
+    assert result.files_unchanged == 1
+    assert result.files_removed == 1
+    assert result.files_skipped == 1
+    assert result.files_flagged == 2
+    assert result.docs_failed == 1
+    assert result.docs_processed == 4
+
+
+def test_counters_cannot_be_set():
+    from stratakb.knowledge.ingestion import IngestionResult
+
+    with pytest.raises(TypeError):
+        IngestionResult(layer_name="x", status="completed", files_added=1)
+    result = IngestionResult(layer_name="x", status="completed")
+    with pytest.raises(AttributeError):
+        result.files_added = 1
 
 
 def test_flagged_outcome_reasons_match_the_parser_literal():

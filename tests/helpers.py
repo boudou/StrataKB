@@ -126,6 +126,18 @@ def write_file(path: Path, text: str = "# Doc\n\nSome text about the topic.\n") 
     return path
 
 
+def locked_read_bytes(name: str):
+    """A Path.read_bytes that raises PermissionError("locked") for files called name."""
+    original_read = Path.read_bytes
+
+    def read_bytes(self):
+        if self.name == name:
+            raise PermissionError("locked")
+        return original_read(self)
+
+    return read_bytes
+
+
 def docs_folder(tmp_path: Path) -> Path:
     """A docs folder under tmp_path: three documents, a code file and a secret file."""
     root = tmp_path / "docs"

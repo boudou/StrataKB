@@ -12,6 +12,7 @@ import hashlib
 import json
 from bisect import bisect_right
 from collections.abc import Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from uuid import UUID
 
@@ -188,21 +189,28 @@ def _version_lock_key(layer_id: str, source_root: str, relative_path: str) -> in
     return int.from_bytes(hashlib.sha256(identity).digest()[:4], "big", signed=True)
 
 
+@dataclass(frozen=True)
+class FileScope:
+    """Some files of one layer: their source root and their paths relative to it."""
+
+    source_root: str
+    relative_paths: Sequence[str]
+
+
 async def prune_documents(
     conn: asyncpg.Connection,
     layer_ids: Sequence[str | UUID],
     *,
-    source_root: str | None = None,
-    relative_paths: Sequence[str] | None = None,
+    files: FileScope | None = None,
 ) -> int:
     """Delete documents that no chunk and no receipt references; return the count.
 
-    Without source_root and relative_paths the whole of each layer in
-    layer_ids is swept; with them, only those files' versions, and layer_ids
-    must then hold exactly one layer (a file belongs to one). Pass both or
-    neither. Several layers are swept in one statement, so their versions are
-    locked in one id order across layers, the order a receipt locks the
-    versions it cites (sweeping them one by one could deadlock).
+    Without files the whole of each layer in layer_ids is swept; with them,
+    only those files' versions, and layer_ids must then hold exactly one layer
+    (a file belongs to one). Several layers are swept in one statement, so
+    their versions are locked in one id order across layers, the order a
+    receipt locks the versions it cites (sweeping them one by one could
+    deadlock).
 
     Two statements, because a lone DELETE that waits on an uncommitted
     reference still deletes once it commits: its checks keep the snapshot taken
@@ -213,15 +221,13 @@ async def prune_documents(
     between. The function opens its own transaction (a savepoint inside the
     caller's), so the locks hold until the outermost one ends.
     """
-    if (source_root is None) != (relative_paths is None):
-        raise ValueError("Pass both source_root and relative_paths, or neither")
-    if source_root is not None and len(layer_ids) != 1:
+    if files is not None and len(layer_ids) != 1:
         raise ValueError("A file scope needs exactly one layer")
     scope = ""
     args: list = [list(layer_ids)]
-    if source_root is not None:
+    if files is not None:
         scope = "AND d.source_root = $2 AND d.relative_path = ANY($3::text[])"
-        args += [source_root, list(relative_paths)]
+        args += [files.source_root, list(files.relative_paths)]
     unreferenced = """
           AND NOT EXISTS (
               SELECT 1 FROM strata_vectors.chunks c WHERE c.document_id = d.id

@@ -578,7 +578,6 @@ class TestVersions:
         a = tmp_path / "a.md"
         a.write_text("# A\n\nFirst text about failover.\n", encoding="utf-8")
         await ingest(db_url, layer, tmp_path)
-        row_id = (await _file_rows(db_url, layer))["a.md"]
         layer_id = await _layer_id(db_url, layer)
         a.write_text("# A\n\nSecond text about restores.\n", encoding="utf-8")
 
@@ -603,7 +602,7 @@ class TestVersions:
                         removal = asyncio.create_task(ingestion._remove_files(
                             pool, layer_id=str(layer_id),
                             source_root=tmp_path.resolve().as_posix(),
-                            files=[("a.md", row_id)],
+                            relative_paths=["a.md"],
                         ))
                     else:
                         removal = asyncio.create_task(ingestion.clear_layer(db_url, layer))
@@ -628,7 +627,6 @@ class TestVersions:
         for name in ("a", "b", "c"):
             (tmp_path / f"{name}.md").write_text(f"# {name}\n\nText {name}.\n", encoding="utf-8")
         await ingest(db_url, layer, tmp_path)
-        ids = await _file_rows(db_url, layer)
         layer_id = str(await _layer_id(db_url, layer))
         root = tmp_path.resolve().as_posix()
         pool = await get_pool(db_url)
@@ -636,7 +634,7 @@ class TestVersions:
         def remove(*names):
             return _remove_files(
                 pool, layer_id=layer_id, source_root=root,
-                files=[(f"{n}.md", ids[f"{n}.md"]) for n in names],
+                relative_paths=[f"{n}.md" for n in names],
             )
 
         async with asyncio.timeout(30):
@@ -647,6 +645,38 @@ class TestVersions:
         assert await _file_rows(db_url, layer) == {}
         assert await _chunks(db_url, layer) == []
         assert await _documents(db_url, layer) == []
+
+    async def test_remove_files_keeps_the_same_path_under_another_root(
+        self, db_url, layer, tmp_path
+    ):
+        from stratakb.core.database import get_pool
+        from stratakb.knowledge.ingestion import _remove_files
+
+        x = tmp_path / "x"
+        y = tmp_path / "y"
+        for folder, text in ((x, "Folder X content."), (y, "Folder Y content.")):
+            folder.mkdir()
+            (folder / "readme.md").write_text(f"# Title\n\n{text}\n", encoding="utf-8")
+        await ingest(db_url, layer, x)
+        await ingest(db_url, layer, y)
+        root_x, root_y = x.resolve().as_posix(), y.resolve().as_posix()
+        layer_id = await _layer_id(db_url, layer)
+        pool = await get_pool(db_url)
+
+        await _remove_files(
+            pool, layer_id=str(layer_id), source_root=root_x, relative_paths=["readme.md"]
+        )
+
+        file_roots = await pool.fetch(
+            "SELECT source_root FROM strata_core.ingested_files WHERE layer_id = $1", layer_id
+        )
+        assert [r["source_root"] for r in file_roots] == [root_y]
+        doc_rows = await pool.fetch(
+            "SELECT id, source_root FROM strata_vectors.documents WHERE layer_id = $1", layer_id
+        )
+        assert [r["source_root"] for r in doc_rows] == [root_y]
+        chunks = await _chunks(db_url, layer)
+        assert chunks and {c["document_id"] for c in chunks} == {doc_rows[0]["id"]}
 
     async def test_delete_layer_removes_documents(self, db_url, tmp_path):
         from stratakb.core.database import get_pool
@@ -665,6 +695,13 @@ class TestVersions:
         assert await pool.fetchval(
             "SELECT count(*) FROM strata_vectors.documents WHERE layer_id = $1", layer_id
         ) == 0
+
+
+async def test_file_scope_needs_one_layer():
+    from stratakb.knowledge.documents import FileScope, prune_documents
+
+    with pytest.raises(ValueError, match="exactly one layer"):
+        await prune_documents(None, ["a", "b"], files=FileScope("r", ["x.md"]))
 
 
 class TestLegacyChunks:

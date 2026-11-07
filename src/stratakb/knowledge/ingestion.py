@@ -25,6 +25,7 @@ import structlog
 from stratakb.core.database import get_pool
 from stratakb.core.migrations import ensure_schema
 from stratakb.knowledge.documents import (
+    FileScope,
     build_document_text,
     document_headings,
     page_starts,
@@ -69,7 +70,7 @@ Reason = Literal[
 ]
 
 # The reasons each outcome may carry; None: no reason
-REASONS: dict[str, frozenset[str | None]] = {
+REASONS: dict[Outcome, frozenset[Reason | None]] = {
     "added": frozenset({None}),
     "updated": frozenset({None}),
     "unchanged": frozenset({None}),
@@ -95,12 +96,15 @@ class FileOutcome:
     count: how many items (rows) the parser's limit left out of a flagged
     file; None when not counted. A count on any other outcome, or below 1,
     raises ValueError.
+    stored: how a flagged file was stored, "added" or "updated"; required on a
+    flagged file, and on any other outcome a value raises ValueError.
     """
 
     relative_path: str
     outcome: Outcome
     reason: Reason | None = None
     count: int | None = None
+    stored: Literal["added", "updated"] | None = None
 
     def __post_init__(self) -> None:
         if self.reason not in REASONS.get(self.outcome, frozenset()):
@@ -111,29 +115,65 @@ class FileOutcome:
             raise ValueError(
                 f"Not a count for this outcome: {self.outcome!r}, {self.count!r}"
             )
+        if self.stored not in (("added", "updated") if self.outcome == "flagged" else (None,)):
+            raise ValueError(
+                f"Not a stored value for this outcome: {self.outcome!r}, {self.stored!r}"
+            )
 
 
 @dataclass
 class IngestionResult:
-    """Result of an ingestion run."""
+    """Result of an ingestion run; files holds what the file counters count."""
 
     layer_name: str
     status: str  # "completed", "partial", "failed"
-    docs_processed: int = 0  # files parsed and stored in this run (added + updated)
-    docs_failed: int = 0
     chunks_created: int = 0
-    files_added: int = 0
-    files_updated: int = 0
-    files_unchanged: int = 0
-    files_removed: int = 0
-    files_skipped: int = 0  # secret-looking names and files without text, not tracked
-    # Files their parser flagged; also counted as added or updated
-    files_flagged: int = 0
     # True when chunks from before per-file tracking were dropped and the layer rebuilt
     rebuilt_legacy: bool = False
     errors: list[dict] = field(default_factory=list)
     files: list[FileOutcome] = field(default_factory=list)
     duration_seconds: float = 0.0
+
+    def _count(self, outcome: Outcome) -> int:
+        return sum(1 for f in self.files if f.outcome == outcome)
+
+    def _count_stored(self, stored: Literal["added", "updated"]) -> int:
+        return sum(1 for f in self.files if f.outcome == stored or f.stored == stored)
+
+    @property
+    def docs_processed(self) -> int:
+        """Files parsed and stored in this run (added + updated)."""
+        return self.files_added + self.files_updated
+
+    @property
+    def docs_failed(self) -> int:
+        return self._count("failed")
+
+    @property
+    def files_added(self) -> int:
+        return self._count_stored("added")
+
+    @property
+    def files_updated(self) -> int:
+        return self._count_stored("updated")
+
+    @property
+    def files_unchanged(self) -> int:
+        return self._count("unchanged")
+
+    @property
+    def files_removed(self) -> int:
+        return self._count("removed")
+
+    @property
+    def files_skipped(self) -> int:
+        """Secret-looking names and files without text, not tracked."""
+        return self._count("skipped")
+
+    @property
+    def files_flagged(self) -> int:
+        """Files their parser flagged; also counted as added or updated."""
+        return self._count("flagged")
 
 
 async def _embed_chunks(
@@ -222,9 +262,7 @@ async def _store_file(
                     chunk.char_start = chunk.char_end = None
             await insert_chunks(database_url, chunks, conn=conn)
             # Only after the insert: until then the current version is unreferenced
-            await prune_documents(
-                conn, [layer_id], source_root=source_root, relative_paths=[relative_path]
-            )
+            await prune_documents(conn, [layer_id], files=FileScope(source_root, [relative_path]))
 
 
 async def _remove_files(
@@ -232,30 +270,33 @@ async def _remove_files(
     *,
     layer_id: str,
     source_root: str,
-    files: Sequence[tuple[str, UUID]],
+    relative_paths: Sequence[str],
 ) -> None:
-    """Remove tracked files, given as (relative path, ingested_files id), in one transaction.
+    """Remove tracked files of a layer and root, in one transaction.
 
     Deleting the rows cascades to their chunks and unlinks their documents,
     so their versions are pruned afterwards. The rows are locked in id order
     before anything is deleted, so an ingest of the same file (which locks its
-    row first) and other removers never lock them in the opposite order.
+    row first) and other removers never lock them in the opposite order. The
+    delete targets the locked ids, so a row committed after the lock is left
+    alone.
     """
-    file_ids = [file_id for _, file_id in files]
     async with pool.acquire() as conn, conn.transaction():
-        await conn.execute(
+        rows = await conn.fetch(
             """
             SELECT id FROM strata_core.ingested_files
-            WHERE id = ANY($1::uuid[]) ORDER BY id FOR UPDATE
+            WHERE layer_id = $1 AND source_root = $2 AND relative_path = ANY($3::text[])
+            ORDER BY id FOR UPDATE
             """,
-            file_ids,
+            layer_id,
+            source_root,
+            list(relative_paths),
         )
         await conn.execute(
-            "DELETE FROM strata_core.ingested_files WHERE id = ANY($1::uuid[])", file_ids
+            "DELETE FROM strata_core.ingested_files WHERE id = ANY($1::uuid[])",
+            [r["id"] for r in rows],
         )
-        await prune_documents(
-            conn, [layer_id], source_root=source_root, relative_paths=[path for path, _ in files]
-        )
+        await prune_documents(conn, [layer_id], files=FileScope(source_root, relative_paths))
 
 
 async def tracked_files(
@@ -263,13 +304,13 @@ async def tracked_files(
 ) -> dict[str, asyncpg.Record]:
     """The tracked files of a layer and root, keyed by relative path.
 
-    Each row holds id, relative_path and content_hash. The caller has
-    already run ensure_schema.
+    Each row holds relative_path and content_hash. The caller has already run
+    ensure_schema.
     """
     pool = await get_pool(database_url)
     rows = await pool.fetch(
         """
-        SELECT id, relative_path, content_hash FROM strata_core.ingested_files
+        SELECT relative_path, content_hash FROM strata_core.ingested_files
         WHERE layer_id = $1 AND source_root = $2
         """,
         layer_id,
@@ -498,20 +539,17 @@ async def ingest_documents(
             """Skip a file, or remove it (row and chunks) when it was tracked."""
             if previous is None:
                 result.files.append(FileOutcome(relative_path, "skipped", reason))
-                result.files_skipped += 1
                 return
             await _remove_files(
                 pool,
                 layer_id=layer_id,
                 source_root=source_root,
-                files=[(relative_path, previous["id"])],
+                relative_paths=[relative_path],
             )
             result.files.append(FileOutcome(relative_path, "removed", reason))
-            result.files_removed += 1
 
         def fail(relative_path: str, file_path: Path, error: str, reason: Reason) -> None:
             result.files.append(FileOutcome(relative_path, "failed", reason))
-            result.docs_failed += 1
             error = _file_error(error, file_path=file_path, relative_path=relative_path, root=root)
             result.errors.append({"file": relative_path, "error": error, "reason": reason})
 
@@ -528,7 +566,6 @@ async def ingest_documents(
 
             # A carried hash equal to the tracked one: unchanged, never opened
             if _matches_tracked(carried_hash, previous):
-                result.files_unchanged += 1
                 result.files.append(FileOutcome(relative_path, "unchanged"))
                 continue
 
@@ -544,7 +581,6 @@ async def ingest_documents(
             content_hash = carried_hash or hashlib.sha256(data).hexdigest()
 
             if _matches_tracked(content_hash, previous):
-                result.files_unchanged += 1
                 result.files.append(FileOutcome(relative_path, "unchanged"))
                 continue
 
@@ -621,17 +657,12 @@ async def ingest_documents(
                 continue
 
             flag = parsed.flag
-            if previous is None:
-                result.files_added += 1
-            else:
-                result.files_updated += 1
+            stored = "added" if previous is None else "updated"
             if flag is not None:
-                result.files_flagged += 1
-                outcome = FileOutcome(relative_path, "flagged", flag.reason, flag.count)
+                outcome = FileOutcome(relative_path, "flagged", flag.reason, flag.count, stored)
             else:
-                outcome = FileOutcome(relative_path, "added" if previous is None else "updated")
+                outcome = FileOutcome(relative_path, stored)
             result.files.append(outcome)
-            result.docs_processed += 1
             result.chunks_created += len(doc_chunks)
             done += 1
             if progress is not None:
@@ -641,20 +672,19 @@ async def ingest_documents(
         # or, for a file list, every tracked file that is not in it
         if not single_file:
             gone = [
-                (path, r["id"]) for path, r in tracked.items()
+                path for path in tracked
                 if path not in seen and (files is not None or not (root / path).exists())
             ]
             if gone:
                 await _remove_files(
-                    pool, layer_id=layer_id, source_root=source_root, files=gone
+                    pool, layer_id=layer_id, source_root=source_root, relative_paths=gone
                 )
                 result.files.extend(
                     FileOutcome(
                         path, "removed", "deleted" if not (root / path).exists() else "not_selected"
                     )
-                    for path, _ in gone
+                    for path in gone
                 )
-                result.files_removed += len(gone)
 
         # Step 6: Record ingestion run
         if result.docs_failed == 0:

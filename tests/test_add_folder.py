@@ -31,6 +31,7 @@ from tests.helpers import (
     fake_embed,
     folder_settings,
     ingest,
+    locked_read_bytes,
     unique_layer_name,
     write_file,
 )
@@ -277,14 +278,8 @@ async def test_unreadable_file_is_read_error(folder_db_url, tmp_path, cleanup):
     root = docs_folder(tmp_path)
     name = unique_layer_name()
     cleanup.append(name)
-    original_read = Path.read_bytes
 
-    def locked_read(self):
-        if self.name == "notes.md":
-            raise PermissionError("locked")
-        return original_read(self)
-
-    with patch.object(Path, "read_bytes", locked_read):
+    with patch.object(Path, "read_bytes", locked_read_bytes("notes.md")):
         _, report = await _run(folder_db_url, root, Options(name=name))
 
     assert _outcomes(report)["notes.md"] == ("failed", "read_error")
