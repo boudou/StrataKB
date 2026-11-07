@@ -44,6 +44,7 @@ from stratakb.knowledge.layers import (
 )
 from stratakb.knowledge.parsers.document import FlagReason, ParsedDocument
 from stratakb.knowledge.parsers.registry import FORMATS, Format
+from stratakb.knowledge.pattern_safety import usable_patterns
 from stratakb.knowledge.policy import is_secret_name
 from stratakb.knowledge.structure import (
     Section,
@@ -469,8 +470,14 @@ async def ingest_documents(
     chunk_config = layer["chunk_config"]
     chunk_size = chunk_config.get("chunk_size", DEFAULT_CHUNK_SIZE)
     chunk_overlap = chunk_config.get("chunk_overlap", DEFAULT_CHUNK_OVERLAP)
-    # The layer's own section starts (set by a preset), compiled once per run
-    structure_patterns = [re.compile(p) for p in layer.get("structure_patterns") or []]
+    # The layer's own section starts (set by a preset), compiled once per run;
+    # an unsafe one that reached the row another way is skipped with a warning
+    structure_patterns = usable_patterns(
+        layer.get("structure_patterns") or [],
+        kind="structure",
+        layer=layer_name,
+        line_starts=True,
+    )
 
     # Step 2: Discover files
     source = Path(source_path)

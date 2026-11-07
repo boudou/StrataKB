@@ -15,12 +15,14 @@ Lookup reads plain indexed columns (the label index), no full-text search.
 
 from __future__ import annotations
 
+import functools
 import re
 from collections.abc import Iterable, Sequence
 from typing import Any, NamedTuple
 
 import structlog
 
+from stratakb.knowledge.pattern_safety import pattern_problem
 from stratakb.knowledge.structure import normalise_label
 from stratakb.rag.layer_detect import pattern_text
 from stratakb.rag.passages import ask_chunk, passage_cost
@@ -147,7 +149,16 @@ def question_pattern(pattern: str) -> str:
     return rf"{flags}(?<!\w){group}(?!\w)"
 
 
-def _compile_for_questions(pattern: str) -> re.Pattern[str]:
+@functools.lru_cache(maxsize=256)
+def _question_regex(pattern: str) -> re.Pattern[str] | None:
+    """question_pattern(pattern) compiled, or None when the stored pattern
+    must not run (it does not compile or it repeats a repeated part)."""
+    # Check the stored pattern, not the question form: an unsafe part outside
+    # the label group would not show in the label group alone
+    problem = pattern_problem(pattern, line_starts=True)
+    if problem is not None:
+        logger.warning("unsafe_structure_pattern", pattern=pattern, reason=problem)
+        return None
     try:
         return re.compile(question_pattern(pattern))
     except re.error:
@@ -162,8 +173,10 @@ def find_references(
 
     extra_patterns are a layer's structure patterns (a named group 'label'
     gives the label, as in structure.detect_sections); each match of
-    question_pattern anywhere in the question is a reference. Only the first
-    MAX_PATTERN_QUESTION_CHARS characters of the question are read.
+    question_pattern anywhere in the question is a reference. A stored
+    pattern that does not compile or repeats a repeated part is skipped (it
+    reached the layer some other way than its validated writes). Only the
+    first MAX_PATTERN_QUESTION_CHARS characters of the question are read.
     """
     question = pattern_text(question)
     found: list[tuple[int, Reference]] = []
@@ -180,7 +193,14 @@ def find_references(
         found.append((m.start(), Reference(m.group(0), (normalise_label(m.group(1)),))))
 
     for pattern in extra_patterns:
-        compiled = _compile_for_questions(pattern) if isinstance(pattern, str) else pattern
+        if isinstance(pattern, str):
+            compiled = _question_regex(pattern)
+        elif hasattr(pattern, "finditer"):
+            compiled = pattern
+        else:
+            compiled = None
+        if compiled is None:
+            continue
         for m in compiled.finditer(question):
             if not m.group(0):
                 continue

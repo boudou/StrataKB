@@ -11,11 +11,13 @@ Nothing here knows about any particular domain.
 
 from __future__ import annotations
 
+import functools
+import json
 import re
 
 import structlog
 
-from stratakb.knowledge.layers import has_nested_repeat
+from stratakb.knowledge.pattern_safety import usable_patterns
 
 logger = structlog.get_logger()
 
@@ -41,21 +43,26 @@ def pattern_text(question: str) -> str:
 
 
 def compile_patterns(raw: dict[str, list[str]]) -> dict[str, list[re.Pattern[str]]]:
-    """Compile routing patterns per layer, dropping any that are invalid regex
-    or repeat a repeated part (one stored before such patterns were refused)."""
+    """Compile routing patterns per layer, dropping any that are invalid regex,
+    repeat a repeated part (one stored before such patterns were refused, or
+    imported) or are not strings. A layer left with none is omitted.
+
+    The result is cached by content, so a search with an unchanged pattern
+    set neither re-parses it nor logs a dropped pattern again. Callers must
+    not change the returned dict.
+    """
+    # The patterns come from jsonb, so they always serialise; the canonical
+    # JSON is the cache key and sort_keys keeps the layer order stable.
+    return _compile_frozen(json.dumps(raw, sort_keys=True))
+
+
+@functools.lru_cache(maxsize=32)
+def _compile_frozen(key: str) -> dict[str, list[re.Pattern[str]]]:
     compiled: dict[str, list[re.Pattern[str]]] = {}
-    for layer, patterns in raw.items():
-        layer_patterns = []
-        for pattern in patterns or []:
-            try:
-                compiled_pattern = re.compile(pattern, re.IGNORECASE)
-            except re.error as e:
-                logger.warning("invalid_routing_pattern", layer=layer, pattern=pattern, error=str(e))
-                continue
-            if has_nested_repeat(pattern):
-                logger.warning("unsafe_routing_pattern", layer=layer, pattern=pattern)
-                continue
-            layer_patterns.append(compiled_pattern)
+    for layer, patterns in json.loads(key).items():
+        layer_patterns = usable_patterns(
+            patterns or (), kind="routing", layer=layer, flags=re.IGNORECASE
+        )
         if layer_patterns:
             compiled[layer] = layer_patterns
     return compiled

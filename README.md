@@ -189,6 +189,8 @@ Make a layer per folder or domain. A preset is a YAML file that names a layer an
 
 **Archived files.** A layer can hold a list of path patterns saying which of its files are archived, and citations of those files then say so ([what the label means](#answers-you-can-prove)). `strata_set_archived_patterns` (admin) sets them, in `.gitignore` style, at most three wildcards each; an empty list clears them. A preset sets them with `archived_patterns: ['archive/', '*-2024.md', '!keep.md']`, quoted because YAML reads a leading `*` or `!` as its own syntax. A preset without the key leaves the layer's patterns alone, and `[]` clears them. Each pattern is matched against the file's path relative to the folder ingested, letter case included, so in a preset with several source groups `rulebooks/archive/` matches nothing: write `archive/`. This is not the layer's `archived` status, which covers the whole layer.
 
+**Routing and structure patterns.** A layer's routing patterns (which questions go to it) and structure patterns (where its sections start) are regular expressions. `strata_create_knowledge_layer` and presets refuse one that repeats a repeated part, such as `(a+)+`, because it can take very long on some text. The check is strict, so it also refuses some harmless ones, such as `(x+y)*z`. A pattern that reaches a layer another way (an older export through `import-layer`, a full `restore`, a layer stored by an older version) is skipped by searches and ingests, with a warning in the server log, and `import-layer` drops it and names it.
+
 ### Try an example preset
 
 The repository also ships three example presets. The quickest to try is Python PEPs: git fetches a handful of PEPs in a few seconds, with no account:

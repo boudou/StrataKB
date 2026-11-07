@@ -9,8 +9,6 @@ from __future__ import annotations
 
 import json
 import re
-from re import _constants as _sre
-from re import _parser as _sre_parser
 from typing import Literal, get_args
 
 import asyncpg
@@ -22,6 +20,7 @@ from stratakb.core.database import get_pool
 from stratakb.core.migrations import ensure_schema
 from stratakb.core.stamp_watcher import StampWatcher
 from stratakb.knowledge.documents import lock_file_rows
+from stratakb.knowledge.pattern_safety import pattern_problem
 
 logger = structlog.get_logger()
 
@@ -134,46 +133,6 @@ def _validate_name(name: str) -> None:
         )
 
 
-_REPEATS = (_sre.MAX_REPEAT, _sre.MIN_REPEAT, _sre.POSSESSIVE_REPEAT)
-
-
-def _subpatterns(value: object):
-    """The parsed subpatterns inside a node's argument, at any depth."""
-    if isinstance(value, _sre_parser.SubPattern):
-        yield value
-    elif isinstance(value, (tuple, list)):
-        for item in value:
-            yield from _subpatterns(item)
-
-
-def _nested_repeat(items, unbounded_outside: bool = False) -> bool:
-    """True when a variable repeat of more than one sits inside an unbounded repeat.
-
-    Such a pattern ('(a+)+', '(\\w+\\s?)*') can backtrack exponentially on a
-    line it almost matches; a fixed count inside ('(\\d{3})+') cannot.
-    """
-    for op, av in items:
-        if op in _REPEATS:
-            lo, hi, body = av
-            if unbounded_outside and hi > 1 and lo != hi:
-                return True
-            if _nested_repeat(body, unbounded_outside or hi == _sre.MAXREPEAT):
-                return True
-            continue
-        for sub in _subpatterns(av):
-            if _nested_repeat(sub, unbounded_outside):
-                return True
-    return False
-
-
-def has_nested_repeat(pattern: str) -> bool:
-    """True when pattern nests a variable repeat inside an unbounded one.
-
-    Call it only on a pattern that compiles (parsing raises re.error otherwise).
-    """
-    return _nested_repeat(_sre_parser.parse(pattern))
-
-
 def _validate_patterns(
     key: str, patterns: list[str], *, line_starts: bool = False
 ) -> list[str]:
@@ -189,19 +148,9 @@ def _validate_patterns(
         raise LayerValidationError(f"{key} must be a list of strings.")
     kind = key.removesuffix("_patterns")
     for pattern in patterns:
-        try:
-            compiled = re.compile(pattern)
-        except re.error as e:
-            raise LayerValidationError(f"Invalid {kind} pattern '{pattern}': {e}") from e
-        if line_starts and compiled.match(""):
-            raise LayerValidationError(
-                f"Invalid {kind} pattern '{pattern}': it matches an empty line."
-            )
-        if has_nested_repeat(pattern):
-            raise LayerValidationError(
-                f"Invalid {kind} pattern '{pattern}': it repeats a repeated part, "
-                "which can take very long on some lines."
-            )
+        problem = pattern_problem(pattern, line_starts=line_starts)
+        if problem is not None:
+            raise LayerValidationError(f"Invalid {kind} pattern '{pattern}': {problem}")
     return patterns
 
 
