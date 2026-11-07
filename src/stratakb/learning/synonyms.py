@@ -1,7 +1,7 @@
 """Synonym extraction from reformulation chains.
 
-When a user searches for "AC01" then reformulates to
-"incorrect account number", we learn that "AC01" maps to
+When a user searches for "AC01 reject reason" then reformulates to
+"incorrect account number reject reason", we learn that "AC01" maps to
 "incorrect account number".
 """
 
@@ -9,56 +9,52 @@ from __future__ import annotations
 
 import re
 
+# English function words. They say nothing about what a question is about,
+# so they neither make two questions similar nor get mined as synonyms.
+STOPWORDS = frozenset({
+    "a", "an", "and", "are", "as", "at", "be", "been", "but", "by", "can", "could",
+    "did", "didn", "do", "does", "doesn", "don", "for", "from", "had", "has", "have",
+    "how", "i", "if", "in", "is", "isn", "it", "its", "me", "my", "no", "not", "of",
+    "on", "or", "our", "should", "so", "than", "that", "the", "their", "them", "then",
+    "there", "these", "they", "this", "to", "us", "was", "we", "were", "what", "when",
+    "where", "which", "who", "whom", "why", "will", "with", "would", "you", "your",
+})
+
+
+def content_terms(text: str) -> list[str]:
+    """The words that carry a question's meaning, in order, without repeats.
+
+    Leaves out stopwords, single characters and the placeholders from
+    learning/pii.py, such as [IBAN_REDACTED].
+    """
+    tokens = re.findall(r"\w+", text.lower())
+    return list(dict.fromkeys(
+        t for t in tokens
+        if len(t) >= 2 and t not in STOPWORDS and not t.endswith("_redacted")
+    ))
+
 
 def extract_synonym_candidates(
     query_a: str,
     query_b: str,
 ) -> list[dict]:
-    """Extract term→synonym pairs from a reformulation pair.
+    """Extract a term→synonym pair from a reformulation pair.
 
-    Compares tokens in query_a vs query_b. Tokens only in query_a
-    are candidate terms; tokens only in query_b are candidate synonyms.
+    Compares content terms in query_a vs query_b. A pair needs exactly one
+    term only in query_a: with more, nothing says which word maps to which.
+    All the terms only in query_b form the synonym.
 
     Returns:
-        List of {term, synonym} dicts.
+        List of {term, synonym} dicts, empty or with one entry.
     """
-    tokens_a = re.findall(r"\b[\w]+\b", query_a.lower())
-    tokens_b = re.findall(r"\b[\w]+\b", query_b.lower())
+    terms_a = content_terms(query_a)
+    terms_b = content_terms(query_b)
 
-    if tokens_a == tokens_b:
+    only_in_a = [t for t in terms_a if t not in terms_b]
+    only_in_b = [t for t in terms_b if t not in terms_a]
+
+    if len(only_in_a) != 1 or not only_in_b:
         return []
 
-    set_a = set(tokens_a)
-    set_b = set(tokens_b)
-
-    only_in_a = [t for t in tokens_a if t not in set_b]
-    only_in_b = [t for t in tokens_b if t not in set_a]
-
-    if not only_in_a or not only_in_b:
-        return []
-
-    candidates = []
-
-    # Simple 1:1 mapping when both sides have single unique tokens
-    if len(only_in_a) == 1 and len(only_in_b) == 1:
-        candidates.append({
-            "term": only_in_a[0],
-            "synonym": only_in_b[0],
-        })
-    elif len(only_in_a) == 1 and len(only_in_b) > 1:
-        # Single term maps to multi-word synonym
-        # e.g., "AC01" -> "incorrect account number"
-        synonym_phrase = " ".join(only_in_b)
-        candidates.append({
-            "term": only_in_a[0],
-            "synonym": synonym_phrase,
-        })
-    else:
-        # Multiple terms changed — try pairwise by position
-        for term, synonym in zip(only_in_a, only_in_b):
-            candidates.append({
-                "term": term,
-                "synonym": synonym,
-            })
-
-    return candidates
+    # e.g., "AC01" -> "incorrect account number"
+    return [{"term": only_in_a[0], "synonym": " ".join(only_in_b)}]

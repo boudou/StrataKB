@@ -38,6 +38,10 @@ async def store(tag):
     await store._execute(
         "DELETE FROM strata_learning.layer_affinity_scores WHERE query_pattern LIKE $1", f"%{tag}%"
     )
+    await store._execute(
+        "DELETE FROM strata_learning.query_synonyms WHERE term LIKE $1 OR synonym LIKE $1",
+        f"%{tag}%",
+    )
 
 
 def _tracker(store):
@@ -135,6 +139,125 @@ async def test_correct_layer_feedback_steers_routing(store, tag):
     await Promoter(store).update_layer_affinities()
 
     assert await store.find_layer_affinities(question) == ["sepa"]
+
+
+async def _synonym_rows(store, tag):
+    return await store._fetch(
+        """
+        SELECT term, synonym, layer, confidence, usage_count, source
+        FROM strata_learning.query_synonyms WHERE term LIKE $1 OR synonym LIKE $1
+        ORDER BY term
+        """,
+        f"%{tag}%",
+    )
+
+
+async def _ask(tracker, question):
+    await tracker.track_ask(_ask_returning([question], "low"), question, None, True, 10)
+
+
+@pytest.mark.asyncio
+async def test_one_sighting_is_not_applied_and_two_are(store, tag):
+    from stratakb.config import get_settings
+    from stratakb.rag.query_rewriter import rewrite_query
+
+    tracker = _tracker(store)
+    first = f"rotate service keys{tag}"
+    second = f"rotate service credentials{tag}"
+    term, synonym = f"keys{tag}", f"credentials{tag}"
+    settings = get_settings().model_copy(update={"query_rewrite_provider": "anthropic"})
+
+    async def rewritten():
+        return await rewrite_query(
+            first, anthropic_api_key="", learning_store=store, settings=settings
+        )
+
+    await _ask(tracker, first)
+    await _ask(tracker, second)
+    await Promoter(store).mine_synonyms()
+
+    assert await _synonym_rows(store, tag) == []
+    assert await rewritten() == [first]
+
+    # The step back from second to first is one sighting of the reverse pair
+    await _ask(tracker, first)
+    await _ask(tracker, second)
+    await Promoter(store).mine_synonyms()
+
+    rows = await _synonym_rows(store, tag)
+    assert [(r["term"], r["synonym"]) for r in rows] == [(term, synonym)]
+    assert rows[0]["confidence"] == pytest.approx(0.7)
+    assert rows[0]["usage_count"] == 2
+    assert [r["synonym"] for r in await store.find_synonyms(first)] == [synonym]
+    assert await rewritten() == [f"{first} ({synonym})"]
+
+
+@pytest.mark.asyncio
+async def test_promoter_rerun_keeps_one_row_with_no_layer(store, tag):
+    tracker = _tracker(store)
+    first = f"renew tls certificate{tag}"
+    second = f"renew tls cert{tag}"
+    for question in (first, second, first, second):
+        await _ask(tracker, question)
+
+    for _ in range(3):
+        await Promoter(store).mine_synonyms()
+
+    rows = await _synonym_rows(store, tag)
+    assert len(rows) == 1
+    assert rows[0]["layer"] is None
+    assert rows[0]["usage_count"] == 2
+
+
+@pytest.mark.asyncio
+async def test_old_mined_rows_are_ignored_then_purged(store, tag):
+    mined, manual = f"oldmined{tag}", f"oldmanual{tag}"
+    for term, source in ((mined, "pattern_mining"), (manual, "manual")):
+        await store._execute(
+            "INSERT INTO strata_learning.query_synonyms (term, synonym, source, confidence)"
+            " VALUES ($1, 'x', $2, 0.6)",
+            term,
+            source,
+        )
+
+    assert await store.find_synonyms(f"{mined} {manual}") == []
+
+    await Promoter(store).mine_synonyms()
+
+    assert [r["term"] for r in await _synonym_rows(store, tag)] == [manual]
+
+
+@pytest.mark.asyncio
+async def test_old_reformulation_signals_do_not_feed_mining(store, tag):
+    """A signal stored under the old rule is re-checked before it teaches anything."""
+    tracker = _tracker(store)
+    first = f"How do I bake{tag}?"
+    second = f"How do I configure{tag}?"
+    for question in (first, second, first, second):
+        await _ask(tracker, question)
+    # Today's detector stays silent here, so store the old rule's signals by hand
+    rows = await store._fetch(
+        "SELECT id FROM strata_learning.interaction_events WHERE query_text = $1", second
+    )
+    for row in rows:
+        await store.store_feedback(str(row["id"]), "implicit", "reformulation", -0.5)
+
+    await Promoter(store).mine_synonyms()
+
+    assert await _synonym_rows(store, tag) == []
+
+
+@pytest.mark.asyncio
+async def test_top_synonyms_show_layer_and_usage(store, tag):
+    layer = f"layer{tag}"
+    await store.upsert_synonym(
+        f"term{tag}", "x", layer=layer, confidence=0.7, usage_count=10_000_000
+    )
+
+    for stats in (await store.get_stats(layer=layer), await store.get_stats()):
+        row = next(r for r in stats["top_synonyms"] if r["term"] == f"term{tag}")
+        assert row["layer"] == layer
+        assert row["usage_count"] == 10_000_000
 
 
 @pytest.mark.asyncio

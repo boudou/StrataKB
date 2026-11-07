@@ -215,6 +215,10 @@ def register_learning_tools(mcp: FastMCP, database_url: str) -> None:
         Clears learned rewrites, synonyms, and affinities. Admin only.
         Interaction history is preserved unless doing a global reset.
 
+        A layer reset does not reach synonyms stored with no layer, and because
+        it keeps the history, a pair with enough evidence is learned again on the
+        next promoter run. Use the global reset to remove a bad synonym for good.
+
         Args:
             layer: Reset only this layer's learned data. Omit for global reset;
                 an empty layer is refused. Surrounding spaces are trimmed.

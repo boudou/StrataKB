@@ -22,6 +22,10 @@ logger = structlog.get_logger()
 _rewrite_cache: TTLCache = TTLCache(maxsize=200, ttl=3600)
 _synonym_cache: TTLCache = TTLCache(maxsize=500, ttl=3600)
 
+# Mined rows are written at this confidence and applied from it. Rows below it
+# came from an older rule with no evidence bar.
+MINED_SYNONYM_CONFIDENCE = 0.7
+
 
 def _decode_results(value):
     """An interaction's results column: asyncpg returns JSONB as text."""
@@ -256,10 +260,11 @@ class LearningStore:
             SELECT term, synonym, layer, confidence
             FROM strata_learning.query_synonyms
             WHERE lower(term) IN ({placeholders})
-              AND confidence >= 0.5
+              AND confidence >= ${len(terms) + 1}
             ORDER BY confidence DESC
             """,
             *list(terms),
+            MINED_SYNONYM_CONFIDENCE,
         )
         _synonym_cache[cache_key] = result
         return result
@@ -271,23 +276,53 @@ class LearningStore:
         layer: str | None = None,
         source: str = "pattern_mining",
         confidence: float = 0.5,
+        usage_count: int = 0,
     ) -> None:
-        """Insert or update a synonym mapping."""
+        """Insert or update a synonym mapping.
+
+        Updates first: UNIQUE(term, synonym, layer) treats NULL layers as
+        distinct, so ON CONFLICT alone would add a row on every call. Keeps the
+        higher of the old and new values, so repeating a call changes nothing.
+        """
         _synonym_cache.clear()
-        await self._execute(
+        status = await self._execute(
             """
-            INSERT INTO strata_learning.query_synonyms (term, synonym, layer, source, confidence)
-            VALUES ($1, $2, $3, $4, $5)
-            ON CONFLICT (term, synonym, layer)
-            DO UPDATE SET
-                confidence = GREATEST(strata_learning.query_synonyms.confidence, $5),
-                usage_count = strata_learning.query_synonyms.usage_count + 1
+            UPDATE strata_learning.query_synonyms
+            SET confidence = GREATEST(confidence, $4),
+                usage_count = GREATEST(usage_count, $5)
+            WHERE term = $1 AND synonym = $2 AND layer IS NOT DISTINCT FROM $3
             """,
             term,
             synonym,
             layer,
-            source,
             confidence,
+            usage_count,
+        )
+        if status == "UPDATE 0":
+            await self._execute(
+                """
+                INSERT INTO strata_learning.query_synonyms
+                    (term, synonym, layer, source, confidence, usage_count)
+                VALUES ($1, $2, $3, $4, $5, $6)
+                ON CONFLICT (term, synonym, layer) DO NOTHING
+                """,
+                term,
+                synonym,
+                layer,
+                source,
+                confidence,
+                usage_count,
+            )
+
+    async def purge_weak_mined_synonyms(self) -> None:
+        """Delete mined rows below the current bar: only the older rule wrote them."""
+        _synonym_cache.clear()
+        await self._execute(
+            """
+            DELETE FROM strata_learning.query_synonyms
+            WHERE source = 'pattern_mining' AND confidence < $1
+            """,
+            MINED_SYNONYM_CONFIDENCE,
         )
 
     # ── Learned Rewrites ──────────────────────────────────────
@@ -450,7 +485,7 @@ class LearningStore:
         if layer:
             rows = await self._fetch(
                 """
-                SELECT term, synonym, confidence
+                SELECT term, synonym, layer, confidence, usage_count
                 FROM strata_learning.query_synonyms
                 WHERE layer = $1
                 ORDER BY usage_count DESC LIMIT 10
@@ -460,7 +495,7 @@ class LearningStore:
         else:
             rows = await self._fetch(
                 """
-                SELECT term, synonym, confidence
+                SELECT term, synonym, layer, confidence, usage_count
                 FROM strata_learning.query_synonyms
                 ORDER BY usage_count DESC LIMIT 10
                 """
@@ -485,7 +520,11 @@ class LearningStore:
         for s in synonyms:
             term = s["term"]
             synonym = s["synonym"]
-            if term.lower() in query.lower() and synonym.lower() not in query.lower():
+            if (
+                term.lower() in query.lower()
+                and synonym.lower() not in query.lower()
+                and synonym not in expansions  # one pair can be stored under several layers
+            ):
                 expansions.append(synonym)
 
         if expansions:
