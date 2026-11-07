@@ -596,9 +596,6 @@ def test_deep_outline_is_capped():
 
 def test_pdf_past_the_outline_cap_is_flagged_truncated(tmp_path, monkeypatch):
     monkeypatch.setattr(pdf_parser, "MAX_OUTLINE_ENTRIES", 2)
-    # The fixture's pages are short: it would be flagged probably scanned,
-    # which wins over truncated
-    monkeypatch.setattr(pdf_parser, "_SCANNED_MIN_CHARS_PER_PAGE", 0)
     pdf =_pdf_with_outline(
         tmp_path / "many.pdf",
         outline=[("Service: Customer Order", 0, None), ("Service Operations", 1, None),

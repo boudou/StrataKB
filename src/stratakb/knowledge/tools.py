@@ -49,8 +49,8 @@ def _ingest_description() -> str:
     opened; one ingested earlier is removed. Empty files are reported as
     no text, not as failures: skipped, or removed if ingested earlier.
     files_skipped counts the skipped files. A PDF that looks scanned
-    (under half its pages have text, or under 200 characters per page on
-    average) is stored for the text it has and counted in files_flagged;
+    (more than half its pages have an image and under 200 characters of
+    text) is stored for the text it has and counted in files_flagged;
     it also counts as added or updated. A CSV over {limit} rows is stored
     for its first {limit} rows and also counted in files_flagged. flagged
     lists these files with file, reason ("probably_scanned" or "truncated")

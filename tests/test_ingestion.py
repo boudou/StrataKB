@@ -275,9 +275,9 @@ class TestIngestionPipeline:
             assert result.docs_processed == 1
             assert result.docs_failed == 0
             assert result.chunks_created > 0
-            # 2 pages averaging about 140 characters: stored, and flagged as probably scanned
+            # 2 short pages with text and no image: stored, and not flagged as scanned
             assert result.files_added == 1
-            assert result.files_flagged == 1
+            assert result.files_flagged == 0
             assert result.layer_name == layer_name
 
             # Verify layer stats were updated

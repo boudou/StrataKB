@@ -44,3 +44,7 @@ class ParsedDocument:
     error: str | None = None
     # Set by a parser that stored only part of a file or found it probably scanned; None otherwise
     flag: ParserFlag | None = None
+    # PDF only: the 1-based numbers of the pages with little text whose images
+    # were found or could not be read; empty for other formats. A page without
+    # text has no ParsedPage, so scanned_flag cannot learn this any other way.
+    scanned_pages: set[int] = field(default_factory=set)

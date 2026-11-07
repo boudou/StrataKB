@@ -423,8 +423,9 @@ class TestPolicyAndEmpty:
         assert result.files_removed == 1
 
 
-def _pdf_doc(page_lengths: list[int], total_pages: int):
-    """A parsed PDF with one text page per length; the parser drops pages without text."""
+def _pdf_doc(page_lengths: list[int], total_pages: int, scanned_pages: set[int]):
+    """A parsed PDF with one text page per length, numbered from 1; the parser
+    drops pages without text. scanned_pages are the pages that count as scanned."""
     from stratakb.knowledge.parsers.document import ParsedDocument, ParsedPage
     from stratakb.knowledge.parsers.pdf_parser import scanned_flag
 
@@ -435,6 +436,7 @@ def _pdf_doc(page_lengths: list[int], total_pages: int):
             for i, n in enumerate(page_lengths)
         ],
         total_pages=total_pages,
+        scanned_pages=scanned_pages,
     )
     doc.flag = scanned_flag(doc)
     return doc
@@ -442,7 +444,13 @@ def _pdf_doc(page_lengths: list[int], total_pages: int):
 
 class TestScannedPdf:
     async def _ingest_pdf(
-        self, db_url, layer, root: Path, page_lengths: list[int], total_pages: int
+        self,
+        db_url,
+        layer,
+        root: Path,
+        page_lengths: list[int],
+        total_pages: int,
+        scanned_pages: set[int],
     ):
         """Ingest root with scan.pdf parsed as the given pages; other files parse as usual."""
         from stratakb.knowledge import ingestion
@@ -451,7 +459,7 @@ class TestScannedPdf:
 
         def fake_parse(file_path):
             if file_path.name == "scan.pdf":
-                return _pdf_doc(page_lengths, total_pages)
+                return _pdf_doc(page_lengths, total_pages, scanned_pages)
             return original_parse(file_path)
 
         with patch("stratakb.knowledge.ingestion._parse_file", side_effect=fake_parse):
@@ -462,7 +470,7 @@ class TestScannedPdf:
         (tmp_path / "scan.pdf").write_bytes(b"%PDF-1.4 test")
         write_file(tmp_path / "a.md", "# Alpha\n\nAlpha content.\n")
 
-        result = await self._ingest_pdf(db_url, layer, tmp_path, [1000], 4)
+        result = await self._ingest_pdf(db_url, layer, tmp_path, [1000], 4, {2, 3, 4})
 
         outcomes = file_outcomes(result)
         assert outcomes["scan.pdf"] == ("flagged", "probably_scanned")
@@ -478,33 +486,26 @@ class TestScannedPdf:
     async def test_two_of_four_pages_not_flagged(self, db_url, layer, tmp_path):
         (tmp_path / "scan.pdf").write_bytes(b"%PDF-1.4 test")
 
-        result = await self._ingest_pdf(db_url, layer, tmp_path, [400, 400], 4)
+        result = await self._ingest_pdf(db_url, layer, tmp_path, [400, 400], 4, {3, 4})
 
         assert file_outcomes(result)["scan.pdf"] == ("added", None)
         assert result.files_flagged == 0
         assert result.files_added == 1
 
-    async def test_just_under_200_chars_flagged(self, db_url, layer, tmp_path):
+    async def test_short_pages_without_images_not_flagged(self, db_url, layer, tmp_path):
         (tmp_path / "scan.pdf").write_bytes(b"%PDF-1.4 test")
 
-        result = await self._ingest_pdf(db_url, layer, tmp_path, [199, 200, 200, 200], 4)
-
-        assert file_outcomes(result)["scan.pdf"] == ("flagged", "probably_scanned")
-        assert result.files_flagged == 1
-
-    async def test_200_chars_not_flagged(self, db_url, layer, tmp_path):
-        (tmp_path / "scan.pdf").write_bytes(b"%PDF-1.4 test")
-
-        result = await self._ingest_pdf(db_url, layer, tmp_path, [200, 200, 200, 200], 4)
+        result = await self._ingest_pdf(db_url, layer, tmp_path, [100, 100], 2, set())
 
         assert file_outcomes(result)["scan.pdf"] == ("added", None)
         assert result.files_flagged == 0
+        assert result.files_added == 1
 
     async def test_pdf_without_text_pages_is_no_text(self, db_url, layer, tmp_path):
         (tmp_path / "scan.pdf").write_bytes(b"%PDF-1.4 test")
         write_file(tmp_path / "a.md", "# Alpha\n\nAlpha content.\n")
 
-        result = await self._ingest_pdf(db_url, layer, tmp_path, [], 3)
+        result = await self._ingest_pdf(db_url, layer, tmp_path, [], 3, {1, 2, 3})
 
         assert file_outcomes(result)["scan.pdf"] == ("skipped", "no_text")
         assert result.files_flagged == 0
@@ -514,18 +515,18 @@ class TestScannedPdf:
     async def test_flagged_update_counts_as_updated(self, db_url, layer, tmp_path):
         scan = tmp_path / "scan.pdf"
         scan.write_bytes(b"%PDF-1.4 first")
-        first = await self._ingest_pdf(db_url, layer, tmp_path, [1000], 4)
+        first = await self._ingest_pdf(db_url, layer, tmp_path, [1000], 4, {2, 3, 4})
         assert file_outcomes(first)["scan.pdf"] == ("flagged", "probably_scanned")
         assert first.files_added == 1
 
         scan.write_bytes(b"%PDF-1.4 second")
-        second = await self._ingest_pdf(db_url, layer, tmp_path, [1000], 4)
+        second = await self._ingest_pdf(db_url, layer, tmp_path, [1000], 4, {2, 3, 4})
         assert file_outcomes(second)["scan.pdf"] == ("flagged", "probably_scanned")
         assert second.files_updated == 1
         assert second.files_flagged == 1
         assert second.docs_processed == 1
 
-        third = await self._ingest_pdf(db_url, layer, tmp_path, [1000], 4)
+        third = await self._ingest_pdf(db_url, layer, tmp_path, [1000], 4, {2, 3, 4})
         assert file_outcomes(third)["scan.pdf"] == ("unchanged", None)
         assert third.files_flagged == 0
         assert third.files_unchanged == 1

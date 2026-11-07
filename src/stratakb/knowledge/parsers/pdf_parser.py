@@ -15,7 +15,7 @@ from stratakb.knowledge.structure import Heading, leading_label, strip_clause_nu
 
 logger = structlog.get_logger()
 
-# Below this many extracted characters per page on average, a PDF is probably scanned
+# Under this many extracted characters, a page with an image counts as scanned
 _SCANNED_MIN_CHARS_PER_PAGE = 200
 
 # The most outline entries read, and the deepest level read: a crafted outline
@@ -31,21 +31,32 @@ _MAX_TITLE_LINES = 3
 
 
 def scanned_flag(doc: ParsedDocument) -> ParserFlag | None:
-    """Flag a parsed PDF as probably scanned: under half its pages have text, or
-    under _SCANNED_MIN_CHARS_PER_PAGE characters per page on average.
-
-    parse_pdf keeps only pages with text, so len(doc.pages) counts those and
-    total_pages counts all pages. A document with no text pages is not flagged
-    (ingestion skips it as no_text).
+    """Flag a parsed PDF as probably scanned: more than half its pages are in
+    doc.scanned_pages. A document with no text pages is not flagged (ingestion
+    skips it as no_text).
     """
-    if doc.total_pages <= 0 or not doc.pages:
-        return None
-    if (
-        2 * len(doc.pages) < doc.total_pages
-        or sum(len(p.text) for p in doc.pages) / doc.total_pages < _SCANNED_MIN_CHARS_PER_PAGE
-    ):
+    if doc.pages and 2 * len(doc.scanned_pages) > doc.total_pages:
         return ParserFlag("probably_scanned")
     return None
+
+
+def _has_image(page, source: str, page_number: int) -> bool:
+    """Whether a page holds an image. Only the count is read: fetching an image
+    decodes it, which needs Pillow.
+
+    A page that cannot be inspected counts as having one: without Pillow, an
+    inline image raises here. Being wrong costs a flag, not any text.
+    """
+    try:
+        return len(page.images) > 0
+    except Exception as e:
+        logger.debug(
+            "pdf_images_unreadable",
+            file=source,
+            page=page_number,
+            error_type=type(e).__name__,
+        )
+        return True
 
 
 def parse_pdf(file_path: str | Path) -> ParsedDocument:
@@ -71,10 +82,13 @@ def parse_pdf(file_path: str | Path) -> ParsedDocument:
 
         reader = PdfReader(str(file_path))
         pages: list[ParsedPage] = []
+        scanned_pages: set[int] = set()
 
         for i, page in enumerate(reader.pages):
             text = page.extract_text() or ""
             text = text.strip()
+            if len(text) < _SCANNED_MIN_CHARS_PER_PAGE and _has_image(page, source, i + 1):
+                scanned_pages.add(i + 1)
             if text:
                 pages.append(
                     ParsedPage(
@@ -98,6 +112,7 @@ def parse_pdf(file_path: str | Path) -> ParsedDocument:
             source_file=source,
             pages=pages,
             total_pages=len(reader.pages),
+            scanned_pages=scanned_pages,
         )
         # A probably scanned file is the more useful flag: its text is missing
         doc.flag = scanned_flag(doc) or (
