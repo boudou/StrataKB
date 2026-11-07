@@ -7,11 +7,14 @@
    on the small layer.
 3. Each refusal's absent patterns must match nothing in any PEP.
 
-The ids of the questions from (2) go to the --out file, and nothing else is written.
+The ids of the questions from (2) go to the --out file, and nothing else is written. Exits
+non-zero when a row has a problem: evidence that does not match, a source file the corpus lacks,
+or a refusal pattern that matches.
 """
 import argparse
 import json
 import re
+import sys
 from pathlib import Path
 
 WINDOW = 1500
@@ -76,6 +79,10 @@ def main(argv=None):
                 print("REFUSAL HIT", row["id"], row["question"], names, len(hits))
             continue
         file = row["source"].split(":")[0]
+        if file not in texts:
+            bad += 1
+            print("SOURCE FILE MISSING FROM CORPUS", row["id"], file)
+            continue
         if not in_window(texts[file], row["evidence"]):
             bad += 1
             print("NO EVIDENCE IN SOURCE", row["id"], file, row["evidence"])
@@ -87,6 +94,8 @@ def main(argv=None):
             cross.append(row["id"])
     print("problems", bad, "weak", weak, "cross-layer refusals", len(cross))
     args.out.write_text(json.dumps(cross), encoding="utf-8")
+    if bad:
+        sys.exit(1)
 
 
 if __name__ == "__main__":

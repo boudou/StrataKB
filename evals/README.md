@@ -30,7 +30,7 @@ grep -v '^#' examples/peps/peps.txt | while read -r name; do cp "../peps-eval/fu
 
 `full/` then holds 746 PEPs and `small/` holds 8.
 
-**2. Check the gold set against the corpus.** This needs no server and no database, and takes about a minute. It prints any row whose evidence does not match, then writes the ids of the full-tier questions the small layer cannot answer to `--out`.
+**2. Check the gold set against the corpus.** This needs no server and no database, and takes about a minute. It prints any row whose evidence does not match or whose source file the corpus lacks, then writes the ids of the full-tier questions the small layer cannot answer to `--out`. It exits non-zero when it reports a problem; a `WEAK` line alone is not one.
 
 ```bash
 uv run python evals/check_gold.py --gold evals/gold/batch1/gold.jsonl \
@@ -40,7 +40,7 @@ cmp ../peps-eval/cross_batch1.json evals/gold/batch1/cross_refusals.json
 
 At the pinned commit the output reports no problems and `cmp` finds the two files identical. Do the same with `batch2`.
 
-**3. Use a database built for evaluation.** Scoring writes to the database it is pointed at (below), so do not point it at one you use. With the container from `stratakb db up`:
+**3. Use a database built for evaluation.** Scoring adds audit rows to the database it is pointed at (below), so do not point it at one you use. With the container from `stratakb db up`:
 
 ```bash
 docker exec stratakb-db psql -U strata -c 'CREATE DATABASE strata_eval'
@@ -61,19 +61,18 @@ uv run python evals/score_gold.py --gold evals/gold/batch1/gold.jsonl \
   --layer peps_small --out ../peps-eval/batch1_small.json
 ```
 
+The scorer stops with a non-zero exit in two cases, so a broken run cannot pass for a normal one:
+
+- **The layer is missing or empty.** It stops before any question, because such a layer would score every refusal as correct. A file already at `--out` is left alone.
+- **A question fails.** It stops at that question and leaves no file at `--out`. A file from an earlier run is deleted when the questions start, so what is there after a run is that run's.
+
 Both scripts print their usage with `--help`, or when an argument is missing, and stop before doing anything else.
 
 ## What scoring writes
 
-Each question goes through the real `strata_ask`, so it writes what any question writes. The layers and their documents are not changed.
+Each question goes through the real `strata_ask`, with learning turned off by the scorer itself, whatever `LEARNING_ENABLED` or a config file says. A run writes no row to any `strata_learning` table and does not read what is already there, so a score does not depend on the order of the questions or on what was scored before. The layers and their documents are not changed.
 
 | Table | Written | When |
 | --- | --- | --- |
 | `strata_core.audit_log` | One row per question | Always |
-| `strata_learning.interaction_events` | One row per question | Unless `LEARNING_ENABLED=false` |
-| `strata_learning.query_sessions` | The session the questions belong to | Unless `LEARNING_ENABLED=false` |
-| `strata_learning.feedback_signals` | A row for each signal detected, such as a reformulation | Unless `LEARNING_ENABLED=false` |
-| `strata_learning.learned_rewrites`, `query_synonyms`, `layer_affinity_scores` | Whatever a promotion run finds, every 50 questions by default (`LEARNING_PROMOTE_EVERY_N_QUERIES`) | Unless `LEARNING_ENABLED=false` |
 | `strata_core.receipts`, `strata_core.receipt_documents` | One receipt per extractive answer | Only on a layer with `answer_mode: extractive`, which the layers above are not |
-
-Learned rewrites and synonyms feed back into later questions, even within one run. Export `LEARNING_ENABLED=false` before scoring when a score must not depend on the order of the questions or on what was scored before.

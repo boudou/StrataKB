@@ -4,18 +4,26 @@ On peps_small: small-tier questions are answerable; full-tier questions listed i
 cross-refusals file and all refusals must be refused.
 On peps_full: every question but the refusals is answerable; refusals must be refused.
 
-Of the files, only the --out file is written. Each question also writes to the database, as any
-strata_ask does: see evals/README.md.
+Of the files, only the --out file is written, and only by a run that finished. Learning is off
+whatever the settings say, so a question writes only its audit row: see evals/README.md.
+
+Stops with a non-zero exit before any question on a layer that is missing or empty, and at the
+first question that fails.
 """
 import argparse
 import asyncio
 import json
 import re
 import statistics
+import sys
 import time
 from pathlib import Path
 
 FROZEN = Path(__file__).resolve().parent / "gold"
+
+
+class RunStoppedError(Exception):
+    """The run cannot produce a score worth reading; the message says why."""
 
 
 def parse_args(argv):
@@ -106,9 +114,38 @@ def summary(rows):
                 for s in sorted({r["status"] for r in group})
             },
         }
-    lat = sorted(r["seconds"] for r in rows[1:])
-    out_["latency"] = {"median_s": round(statistics.median(lat), 2), "p95_s": round(lat[int(0.95 * (len(lat) - 1))], 2)}
+    # The first question also loads the models, so it counts only when it is alone.
+    lat = sorted(r["seconds"] for r in rows[1:] or rows)
+    out_["latency"] = {
+        "median_s": round(statistics.median(lat), 2) if lat else None,
+        "p95_s": round(lat[int(0.95 * (len(lat) - 1))], 2) if lat else None,
+    }
     return out_
+
+
+async def check_layer(database_url, layer):
+    from stratakb.knowledge.layers import LayerNotFoundError, get_layer_status
+
+    try:
+        status = await get_layer_status(database_url, name=layer)
+    except LayerNotFoundError:
+        raise RunStoppedError(f"layer {layer} does not exist, build it first") from None
+    except Exception as e:
+        raise RunStoppedError(f"cannot read layer {layer}: {type(e).__name__}: {e}") from e
+    if not status["chunk_count"]:
+        raise RunStoppedError(f"layer {layer} holds no chunks, build it first")
+
+
+async def ask(server, row, layer):
+    try:
+        r = payload(await server.call_tool("strata_ask", {
+            "question": row["question"], "layers": [layer], "response_format": "detailed",
+        }))
+    except Exception as e:
+        raise RunStoppedError(f"question {row['id']} failed: {type(e).__name__}: {e}") from e
+    if r.get("status") != "ok":
+        raise RunStoppedError(f"question {row['id']} failed: {r.get('error') or r.get('status')}")
+    return r
 
 
 async def score(gold, layer, cross, out):
@@ -116,23 +153,26 @@ async def score(gold, layer, cross, out):
     from stratakb.core.database import close_pool
     from stratakb.mcp_server import build_server
 
-    server = build_server(get_settings())
+    # Set here, so neither the environment nor a config file can turn it back on
+    settings = get_settings().model_copy(update={"learning_enabled": False})
     rows = []
     try:
+        await check_layer(settings.database_url, layer)
+        # From here on, a file at --out can only be this run's, written when it finishes
+        out.unlink(missing_ok=True)
+        server = build_server(settings)
         for row in gold:
             want, group = expected(row, layer, cross)
             if want is None:
                 continue
             t = time.perf_counter()
-            r = payload(await server.call_tool("strata_ask", {
-                "question": row["question"], "layers": [layer], "response_format": "detailed",
-            }))
+            r = await ask(server, row, layer)
             seconds = time.perf_counter() - t
             ps = r.get("passages") or []
             rows.append({
                 "id": row["id"], "question": row["question"], "want": want, "group": group,
                 "sampled": row.get("sampled", False),
-                "status": r.get("answer_status") or r.get("status"), "seconds": round(seconds, 2),
+                "status": r["answer_status"], "seconds": round(seconds, 2),
                 "rank": rank(row, ps) if want == "answer" else None,
                 "top": [
                     {
@@ -159,7 +199,10 @@ def main(argv=None):
     from stratakb.core.logging import configure_logging
 
     configure_logging("ERROR")
-    asyncio.run(score(gold, args.layer, cross, args.out))
+    try:
+        asyncio.run(score(gold, args.layer, cross, args.out))
+    except RunStoppedError as e:
+        sys.exit(f"Stopped, no results written: {e}")
 
 
 if __name__ == "__main__":
