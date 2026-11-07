@@ -6,6 +6,7 @@ import asyncio
 from unittest.mock import patch
 
 import pytest
+from structlog.testing import capture_logs
 
 from stratakb.core import database
 from stratakb.core.database import close_pool, get_pool
@@ -130,6 +131,25 @@ async def test_failed_creation_is_terminated_and_retried(clean_pools):
 
     assert pool is factory.pools[1]
     assert database._pools[URL] is pool
+
+
+@pytest.mark.parametrize(
+    ("url", "shown"),
+    [
+        ("postgresql://db.example:6543/strata?user=app&password=hunter2", "db.example:6543"),
+        ("postgresql://db.example/strata?user=app&password=hunter2", "db.example:5432"),
+        ("postgresql://app:hunter2@db.example:6543/strata", "db.example:6543"),
+    ],
+)
+async def test_pool_log_shows_host_and_port_only(clean_pools, url, shown):
+    factory = FakeFactory()
+    factory.gate.set()
+    with patch.object(database.asyncpg, "create_pool", factory), capture_logs() as logs:
+        await get_pool(url)
+
+    creating = [log for log in logs if log["event"] == "creating_db_pool"]
+    assert [log["url"] for log in creating] == [shown]
+    assert "hunter2" not in repr(logs)
 
 
 async def test_close_pool_clears_locks(clean_pools):

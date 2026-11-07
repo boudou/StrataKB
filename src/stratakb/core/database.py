@@ -5,12 +5,12 @@ from __future__ import annotations
 import asyncio
 import contextlib
 from collections.abc import AsyncIterator
-from dataclasses import dataclass, field
 from datetime import datetime
-from urllib.parse import urlsplit
 
 import asyncpg
 import structlog
+
+from stratakb.core.urls import url_host_port
 
 logger = structlog.get_logger()
 
@@ -22,51 +22,6 @@ _pools: dict[str, asyncpg.Pool] = {}
 # One lock per URL: concurrent first calls wait their turn, and each re-checks _pools,
 # so only one pool is made per URL (after a failed creation the next caller tries again)
 _locks: dict[str, asyncio.Lock] = {}
-
-
-@dataclass(frozen=True)
-class UrlParts:
-    """What StrataKB reads from a URL. host is "" and port None when the URL names none."""
-
-    host: str
-    port: int | None
-    database: str  # the path without its leading "/"
-    user: str | None
-    password: str | None = field(default=None, repr=False)
-
-
-def url_parts(url: str) -> UrlParts | None:
-    """The parts of url, or None when it cannot be parsed (an invalid port included)."""
-    try:
-        parts = urlsplit(url)
-        return UrlParts(
-            host=parts.hostname or "",
-            port=parts.port,
-            database=parts.path.lstrip("/"),
-            user=parts.username,
-            password=parts.password,
-        )
-    except ValueError:
-        return None
-
-
-def url_host(url: str) -> str:
-    """The host of url, or "" when it names none or cannot be parsed.
-
-    The port is not read, so an invalid port does not hide the host.
-    """
-    try:
-        return urlsplit(url).hostname or ""
-    except ValueError:
-        return ""
-
-
-def url_host_port(database_url: str) -> str:
-    """host:port of a database URL, never its user, password or database name."""
-    parts = url_parts(database_url)
-    if parts is None:
-        return "localhost:5432"
-    return f"{parts.host or 'localhost'}:{parts.port or 5432}"
 
 
 @contextlib.asynccontextmanager
@@ -96,7 +51,7 @@ async def get_pool(database_url: str) -> asyncpg.Pool:
         pool = _pools.get(database_url)
         if pool is not None:
             return pool
-        logger.info("creating_db_pool", url=database_url.split("@")[-1])
+        logger.info("creating_db_pool", url=url_host_port(database_url))
         pool = asyncpg.create_pool(
             database_url,
             min_size=2,

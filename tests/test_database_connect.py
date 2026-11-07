@@ -1,4 +1,4 @@
-"""One connection with a deadline (connect_once) and URL parsing in core/database.py.
+"""One connection with a deadline (connect_once) in core/database.py.
 
 No database needed: asyncpg.connect is patched, or pointed at a local TCP
 listener that never answers.
@@ -12,7 +12,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from stratakb.core.database import connect_once, url_host, url_host_port, url_parts
+from stratakb.core.database import connect_once
 
 _FAKE_URL = "postgresql://strata:secret-pw@db.example:6543/strata"
 
@@ -125,48 +125,3 @@ class TestEachSiteConnectsWithADeadline:
         ):
             await tools._unsafe_role_reason("postgresql://u:p@127.0.0.1:1/strata")
         assert connect.await_args.kwargs["timeout"] == tools._CHECK_TIMEOUT
-
-
-class TestUrlParsing:
-    def test_url_parts(self):
-        parts = url_parts(_FAKE_URL)
-        assert parts is not None
-        assert (parts.host, parts.port, parts.database, parts.user, parts.password) == (
-            "db.example",
-            6543,
-            "strata",
-            "strata",
-            "secret-pw",
-        )
-
-    def test_url_parts_without_host_or_port(self):
-        parts = url_parts("postgresql:///strata")
-        assert parts is not None
-        assert (parts.host, parts.port, parts.database) == ("", None, "strata")
-
-    @pytest.mark.parametrize(
-        "url",
-        ["postgresql://u:p@localhost:99999/x", "http://[::1/x"],
-    )
-    def test_url_parts_unparsable(self, url):
-        assert url_parts(url) is None
-
-    def test_url_parts_repr_hides_password(self):
-        assert "secret-pw" not in repr(url_parts(_FAKE_URL))
-
-    def test_url_host_ignores_an_invalid_port(self):
-        assert url_host("http://localhost:99999/v1") == "localhost"
-
-    def test_url_host_unparsable_or_missing(self):
-        assert url_host("http://[::1/x") == ""
-        assert url_host("not a url") == ""
-
-    def test_url_host_port(self):
-        assert url_host_port(_FAKE_URL) == "db.example:6543"
-        assert url_host_port("postgresql:///strata") == "localhost:5432"
-        assert url_host_port("postgresql://u:p@localhost:99999/x") == "localhost:5432"
-
-    def test_url_host_port_never_shows_credentials_or_database(self):
-        shown = url_host_port(_FAKE_URL)
-        for secret in ("secret-pw", "strata@", "/strata"):
-            assert secret not in shown

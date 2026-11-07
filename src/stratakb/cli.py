@@ -461,8 +461,9 @@ async def _add(args: argparse.Namespace, settings: Any, root: str) -> Report:
 
     root is the folder as shown until the plan resolves it.
     """
-    from stratakb.core.database import close_pool, url_host_port
+    from stratakb.core.database import close_pool
     from stratakb.core.migrations import MigrationError, ensure_schema
+    from stratakb.core.urls import url_host_port
     from stratakb.knowledge import add_folder
     from stratakb.knowledge.layers import (
         LayerExistsError,
@@ -641,8 +642,9 @@ class _ReceiptOpenError(Exception):
 
 async def _open_receipt(url: str, receipt_id: str, user_id: str, role: str) -> dict:
     """open_receipt, with every failure turned into a _ReceiptOpenError."""
-    from stratakb.core.database import close_pool, url_host_port
+    from stratakb.core.database import close_pool
     from stratakb.core.migrations import MigrationError
+    from stratakb.core.urls import url_host_port
     from stratakb.rag.receipts import ReceiptAccessError, open_receipt
 
     try:

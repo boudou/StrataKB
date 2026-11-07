@@ -19,7 +19,8 @@ from pathlib import Path
 import asyncpg
 import structlog
 
-from stratakb.core.database import connect_once, url_host_port
+from stratakb.core.database import connect_once
+from stratakb.core.urls import url_host_port
 
 logger = structlog.get_logger()
 

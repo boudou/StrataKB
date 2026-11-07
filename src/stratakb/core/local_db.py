@@ -23,7 +23,8 @@ from stratakb.config import (
     LOCAL_DB_USER,
     local_database_url,
 )
-from stratakb.core.database import connect_once, url_parts
+from stratakb.core.database import connect_once
+from stratakb.core.urls import url_parts
 
 CONTAINER = "stratakb-db"
 VOLUME = "stratakb-data"
