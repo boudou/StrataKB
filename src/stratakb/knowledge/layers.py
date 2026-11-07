@@ -758,6 +758,23 @@ async def get_layer_routing(database_url: str) -> dict:
     return routing
 
 
+async def get_answer_modes(database_url: str, layers: list[str] | None) -> list[str]:
+    """The answer modes of the given layers (all when None or empty), each mode once.
+
+    Read from the table, not the cached routing: a layer just made extractive
+    must not answer in the looser mode.
+    """
+    pool = await get_pool(database_url)
+    rows = await pool.fetch(
+        """
+        SELECT DISTINCT answer_mode FROM strata_core.knowledge_layers
+        WHERE $1::text[] IS NULL OR name = ANY($1::text[])
+        """,
+        layers or None,
+    )
+    return [row["answer_mode"] for row in rows]
+
+
 async def get_structure_patterns(database_url: str, layers: list[str] | None) -> list[str]:
     """The structure patterns of the given active layers (all when None), deduplicated.
 

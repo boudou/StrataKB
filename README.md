@@ -269,7 +269,7 @@ flowchart TD
 
 The layer's **description** also tells the query rewriter which terminology the layer uses, so a clear description improves `strata_ask`.
 
-The layer's **answer_mode** says how its questions are to be answered: `grounded` (the default) means your client writes the answer from the cited passages; `extractive` is for layers where paraphrase is not acceptable, answered with the document's own sentences. Any other value is refused. `strata_list_knowledge_layers` shows each layer's mode, applying a preset again sets the mode of an existing layer when the preset gives one (a preset without `answer_mode` leaves the layer's mode alone), and layers created before this setting read as `grounded`. The server records the mode but does not act on it yet: extractive answers are on the [roadmap](#roadmap).
+The layer's **answer_mode** says how its questions are to be answered: `grounded` (the default) means your client writes the answer from the cited passages; `extractive` is for layers where paraphrase is not acceptable, answered with the document's own sentences. Any other value is refused. `strata_create_knowledge_layer` takes the same `answer_mode`. `strata_list_knowledge_layers` shows each layer's mode, applying a preset again sets the mode of an existing layer when the preset gives one (a preset without `answer_mode` leaves the layer's mode alone), and layers created before this setting read as `grounded`. See [extractive answers](#extractive-answers) for what the mode does.
 
 ### Try an example preset
 
@@ -288,12 +288,12 @@ Then ask from your client, for example *"How long should a line of Python be?"*.
 
 | Tool | Role | What it does |
 | --- | --- | --- |
-| `strata_ask` | viewer | Rewrites a question, searches in parallel, reranks, and returns found, partly found or not found with the best passages, each with its file, page, lines and headings ([what it returns](#what-strata_ask-returns)) |
+| `strata_ask` | viewer | Rewrites a question, searches in parallel, reranks, and returns found, partly found or not found with the best passages, each with its file, page, lines and headings ([what it returns](#what-strata_ask-returns)). On an extractive layer, or with `mode: "extractive"`, it answers with [the document's own sentences](#extractive-answers) and a receipt |
 | `strata_verify` | viewer | Checks a drafted answer against the passages it cites: every quote, number, date, amount, code and clause reference must be in them. A verified draft gets a receipt ([checking a drafted answer](#checking-a-drafted-answer)) |
 | `strata_search` | viewer | Hybrid search for exact terms and identifiers, with optional layer and metadata filters, and a confidence level; a clause or section the query names (`clause 7.2`) comes first, verbatim |
 | `strata_list_knowledge_layers` | viewer | Lists layers with document and chunk counts |
 | `strata_get_layer_status` | viewer | One layer's configuration and ingestion history |
-| `strata_get_receipt` | viewer | Opens a receipt (`rcpt_…`, also the resource `strata://receipts/{receipt_id}`): the stored quotes of an answer, each in its surrounding document text, marked current, changed (with the newer version) or gone (its file was removed from its folder or its layer was deleted). Open to whoever asked, to admins, and to anyone who may read every cited layer, for `RECEIPT_RETENTION_DAYS` (90 by default). From the command line: `stratakb receipt <id>`. Receipts are issued by `strata_verify`; extractive answers will issue them too ([roadmap](#roadmap)) |
+| `strata_get_receipt` | viewer | Opens a receipt (`rcpt_…`, also the resource `strata://receipts/{receipt_id}`): the stored quotes of an answer, each in its surrounding document text, marked current, changed (with the newer version) or gone (its file was removed from its folder or its layer was deleted). Open to whoever asked, to admins, and to anyone who may read every cited layer, for `RECEIPT_RETENTION_DAYS` (90 by default). From the command line: `stratakb receipt <id>`. Receipts are issued by `strata_verify` and by [extractive answers](#extractive-answers) |
 | `strata_feedback` | viewer | Rates a result as helpful or not, per answer or per passage (`S1`) or chunk (`useful`, `wrong` or `outdated`) |
 | `strata_learning_stats` | viewer | What the learning system has recorded and learned |
 | `strata_whoami` | viewer | Your identity and role |
@@ -318,7 +318,7 @@ On the stdio transport, `STRATA_USER` and `STRATA_ROLE` set who you are. Whoever
 
 The `stratakb add` command has no role check: whoever can reach the database with `DATABASE_URL` can add a folder. Each run writes one audit entry with the tool name `cli:add`, the folder, the run id and the counts per outcome (no file names). Its user is `STRATA_USER` when you set it, otherwise `os:` plus your login name, a name nobody verified.
 
-`strata_search` and `strata_ask` each write one audit entry with the first 200 characters of the query or question, with IBANs, BICs and account numbers replaced by placeholders (`[IBAN_REDACTED]`, `[BIC_REDACTED]`, `[ACCT_REDACTED]`), plus the layers searched and whether routing fell back. `AUDIT_STORE_RAW_QUERIES=true` keeps the question as written; `LEARNING_STORE_RAW_QUERIES` has no effect on the audit log.
+`strata_search` and `strata_ask` each write one audit entry with the first 200 characters of the query or question, with IBANs, BICs and account numbers replaced by placeholders (`[IBAN_REDACTED]`, `[BIC_REDACTED]`, `[ACCT_REDACTED]`), plus the layers searched and whether routing fell back; for `strata_ask` also the answer mode used. `AUDIT_STORE_RAW_QUERIES=true` keeps the question as written; `LEARNING_STORE_RAW_QUERIES` has no effect on the audit log.
 
 `strata_feedback` and `strata_reset_learning` each write one audit entry. A feedback entry holds the interaction id and the rating, not the suggested query or layer, and names only the extras (layer correction, better query, chunk ratings) that were stored; a reset entry names the layer, or says it reset everything. A reset runs as one transaction: if it fails in the database, nothing is deleted, and the tool returns an error and writes no audit entry. An empty `layer` is refused; omit it for a global reset. A `layer` is trimmed of surrounding spaces, and the result gives the number of rows `deleted`, with a `message` when that is 0 because the layer has no learning data or does not exist.
 
@@ -353,12 +353,59 @@ By default the answer is short: a status, the mode and the passages, each with i
 ```
 
 - `status` is `found` when the best passage scores high, `partly_found` when it scores medium, and `not_found` when it scores low or nothing came back. The last two add a `next_step`, such as adding a folder with `stratakb add` when no layer covers the question. The thresholds are the provisional ones of [Confidence](#glossary).
-- `mode` is `grounded`: the client writes the answer from the passages and cites them by id.
+- `mode` is the mode used. In `grounded` the client writes the answer from the passages and cites them by id; in `extractive` the server [answers with the document's own sentences](#extractive-answers).
 - A question that names a clause or section (`clause 7.2`, `Article 12`, `§ 4`, `Annex II`, or a bare `4.3.2` or `7(2)(b)`) is looked up exactly in the [structure map](#how-it-works) of the layers searched (only the first 2,000 characters of a question are read for references): that section's text comes back first, verbatim, with its citation and `status` `found`, cut at a word when it would pass the budget. When the same number exists in several documents, each one comes back, cited by its file. The search's own passages follow, without the parts already inside the section. A reference that matches no section (a bare `7.2` that is a version or an amount) changes nothing. `strata_search` puts the same sections first among its results, marked `"match": "exact"`. Exact passages have no chunk id, so `strata_feedback` cannot rate them by passage id yet.
 - The passages come best first and fill a budget of about 1,500 tokens (`ANSWER_TOKEN_BUDGET`), each passage's id, ref and citation counted with its text; the first passage always comes back, at most 50 come back, and `top_k` (default 10) only bounds the search before that.
 - Each passage's `text` is the stored document's own text. `ref` names its span in the stored document (`d<document id>:<start>-<end>`), or the chunk (`c<chunk id>`) for a chunk ingested before documents were stored. The citation has the file's path relative to the ingested folder, the page (PDFs; `page_end` too when the passage spans pages), the line range (from the page's start for PDFs) and the clause path from the structure map (for a chunk without one, such as one stored before the map existed or text before the first heading, the parser's heading path when it has one). A chunk ingested before documents were stored is cited by its file name, without lines.
 - `interaction_id` goes to `strata_feedback`, which takes passage ids for every passage returned: `{"S1": "useful", "S2": "wrong"}`.
 - `response_format: "detailed"` returns everything as well: `confidence`, the query variants (`queries_used`), `retrieved_chunks` with their ids, scores and metadata, `sources`, with `status` `ok` and the found, partly found or not found in `answer_status`.
+
+### Extractive answers
+
+For text that must not be paraphrased, the server answers with the document's own sentences, chosen without a language model. Nothing is rewritten, so nothing can be paraphrased wrongly, and nothing leaves the machine that a grounded answer would not send.
+
+```mermaid
+flowchart LR
+    P["Best passages"] --> S["Whole sentences<br/>they touch"]
+    S --> C["Cross-encoder scores<br/>each against the question"]
+    C --> T{"Any at or above<br/>the threshold?"}
+    T -->|yes| A["Up to 5 sentences within the budget,<br/>word for word, and a receipt"]
+    T -->|no| N["not_found:<br/>no answer, no guess"]
+```
+
+```json
+{
+  "status": "found",
+  "mode": "extractive",
+  "answer": [
+    {
+      "text": "7.2 Either party may end this agreement\nwith ninety days' written notice.",
+      "ref": "d42:1830-1905",
+      "passage": "S1",
+      "citation": {
+        "file": "contracts/acme-msa.md",
+        "page": null,
+        "lines": "30-31",
+        "clause_path": "Master agreement > 7 Termination",
+        "layer": "contracts"
+      },
+      "text_origin": "text"
+    }
+  ],
+  "receipt_id": "rcpt_…",
+  "interaction_id": "…"
+}
+```
+
+- **When it applies:** the strictest wins. The answer is extractive when any layer searched is extractive or the call passes `mode: "extractive"`. `mode: "grounded"` cannot loosen an extractive layer: the answer stays extractive and a `note` says so. The layers searched are the ones finally used, so a question with no layer named that is not routed, or that falls back to all layers, is extractive as soon as one layer in the knowledge base is.
+- **Each `text`** is exactly the span `ref` names in the stored document, whole sentences only, even when a passage starts or stops inside one. A wrapped line stays in its sentence; headings are left out; abbreviations and clause numbers (`e.g.`, `No.`, `7.2`) do not end one. A sentence from scanned text has `text_origin` `ocr` and a `warning` to check the original page.
+- **Long blocks are not quoted.** Lines without end marks (a price list, a schedule, a log, YAML) run together as one sentence until a blank line, heading or list item. A span over 2,000 characters is never cut and never returned, so a question that only such a block could answer is `not_found`. The best sentences that fit `ANSWER_TOKEN_BUDGET` are returned; the rest are left out.
+- **`receipt_id`** opens the quotes with `strata_get_receipt`. No sentence, no receipt.
+- **`status`** is judged on the sentences, on the same thresholds as above. `not_found` means no sentence that can be quoted scored at or above the threshold, which is the medium one of [Confidence](#glossary) and just as provisional.
+- **A clause the question names** (`clause 7.2`) is quoted sentence by sentence up to the budget, without needing the model.
+- **Passages stored before documents were kept** cannot be quoted: when they are all that matched, the answer is `not_found` with the `note` "Re-ingest this layer to enable extractive answers."
+- **The model:** sentences are scored by the reranking model (`RERANKING_MODEL`), also when `RERANKING_ENABLED=false`. When it cannot load, the call fails with an error rather than answering without it.
+- With `response_format: "detailed"` each sentence also has its `score`, and everything a detailed answer holds comes along, `passages` included.
 
 ### Checking a drafted answer
 
@@ -384,7 +431,7 @@ flowchart LR
 - **Facts:** every number, date, amount, percentage, code (such as `AC01`, `pacs.008` or an IBAN) and clause reference outside the quotes must appear in at least one passage. Both sides are normalised: `30 days` matches `thirty (30) days`, `1,000.00` matches `1000`, `EUR 1.000,00` matches `1000 EUR`, and `2026-11-04` matches `4 November 2026`. An amount matches only an amount or a plain number, never a day count, clause number or year. A date such as `04/11/2026`, which could be either day or month first, only matches as written. The `1.` and `2)` of a numbered list are not facts.
 - **Citations:** an `[S5]` when four passages were given is flagged.
 - The result is `verified` with a `receipt_id` (open it with `strata_get_receipt`), or `flagged` with a list of flags, each naming the text, why, and the passages searched, for example `"13 days" not found in S1–S4`. At most 50 flags are listed; `more_flags` counts the rest. The receipt keeps the passages and the draft, with IBANs, BICs and account numbers in the draft replaced by placeholders.
-- Both checks run in Python, without a model: nothing leaves the machine. They catch a changed quote, number, date, amount, code or clause, not a paraphrase that changes the meaning without changing a fact. For layers where that is not acceptable, use `answer_mode: extractive` ([roadmap](#roadmap)).
+- Both checks run in Python, without a model: nothing leaves the machine. They catch a changed quote, number, date, amount, code or clause, not a paraphrase that changes the meaning without changing a fact. For layers where that is not acceptable, use [`answer_mode: extractive`](#extractive-answers).
 - Each call writes one audit entry (`verify`) with counts and, when verified, the receipt id; never the draft.
 
 To check an answer outside the chat, open its receipt from the command line:
@@ -431,7 +478,7 @@ flowchart LR
 | `HYBRID_RRF_K` | `60` | RRF constant |
 | `HYBRID_KEYWORD_SLOTS` | `1` | Results kept for the best full-text matches, so an exact term the embedding misses still comes back (at most `top_k` − 1; `0` turns it off) |
 | `HNSW_EF_SEARCH` | `40` | Recall versus latency for the vector index |
-| `RERANKING_ENABLED` | `true` | Cross-encoder reranking in `strata_ask` |
+| `RERANKING_ENABLED` | `true` | Cross-encoder reranking in `strata_ask`. Extractive answers score their sentences with the same model even when this is off |
 | `RERANKING_MODEL` | `cross-encoder/ms-marco-MiniLM-L-6-v2` | Reranker |
 | `RERANKING_CANDIDATE_MULTIPLIER` | `3` | `strata_ask` reranks `top_k` times this many candidates |
 | `ANSWER_TOKEN_BUDGET` | `1500` | How much text `strata_ask` returns: the best passages that fit this many tokens (about four characters each), citations included; the first passage always comes back |
@@ -618,8 +665,8 @@ The target: ask your own documents (contracts, rulebooks, specs, runbooks) and g
 2. **Answers you can prove** (planned): every claim can be checked against its source, so you can be sure the model did not make it up.
    - Each passage comes with its exact location: file, page, line range and clause (`7 Termination > 7.2`), and documents are chunked along their clauses and sections.
    - **Grounded mode** (available): your client writes the answer, and `strata_verify` checks that every quote, number, date, amount, code and clause reference in it appears in the cited passages.
-   - **Extractive mode:** for layers where paraphrase is not acceptable, the server answers with the document's own sentences, chosen without a language model.
-   - **Receipts:** every verified or extractive answer gets a receipt you can open outside the chat, showing the quotes in context and whether the document changed since.
+   - **Extractive mode** (available): for layers where paraphrase is not acceptable, the server answers with the document's own sentences, chosen without a language model.
+   - **Receipts** (available): every verified or extractive answer gets a receipt you can open outside the chat, showing the quotes in context and whether the document changed since.
    - An honest "not found" instead of a confident guess, and smaller responses that cost fewer tokens.
 3. **Team server**: Streamable HTTP, real identities, per-layer access.
 4. **Daily use and sync**: a command line for daily use, connectors (git first), scanned PDFs.

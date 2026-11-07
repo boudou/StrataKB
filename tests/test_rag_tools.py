@@ -355,6 +355,11 @@ class TestSearchItem:
         assert item["match"] == "exact"
 
 
+def _grounded_layers():
+    """Layer modes come from the table; these tests run without a database."""
+    return patch("stratakb.knowledge.layers.get_answer_modes", AsyncMock(return_value=["grounded"]))
+
+
 def _ask_tool(settings):
     """Register the RAG tools with settings and return strata_ask."""
     from stratakb.rag.tools import register_rag_tools
@@ -386,6 +391,7 @@ class TestAskDomainContext:
             patch("stratakb.knowledge.layers.get_structure_patterns", AsyncMock(return_value=[])),
             patch("stratakb.rag.retriever.search_chunks", AsyncMock(return_value=[])),
             patch("stratakb.rag.tools.write_audit_log", AsyncMock()),
+            _grounded_layers(),
             patch("openai.AsyncOpenAI", return_value=client) as openai_cls,
         ):
             result = await ask(
@@ -427,6 +433,7 @@ class TestAskConfidence:
             patch("stratakb.config.get_settings", return_value=settings),
             patch("stratakb.rag.retriever.search_chunks", AsyncMock(return_value=results)),
             patch("stratakb.rag.tools.write_audit_log", AsyncMock()),
+            _grounded_layers(),
         ):
             result = await ask(
                 question="What does AC04 mean?", layers=["docs"], response_format="detailed"
@@ -449,6 +456,7 @@ class TestAskConfidence:
             patch("stratakb.config.get_settings", return_value=settings),
             patch("stratakb.rag.retriever.search_chunks", AsyncMock(return_value=results)),
             patch("stratakb.rag.tools.write_audit_log", AsyncMock()),
+            _grounded_layers(),
             patch(
                 "stratakb.rag.reranker._get_reranker",
                 return_value=LogitModel([1.0, 0.8, 0.7]),
@@ -499,6 +507,7 @@ async def _ask_with(by_query, *, reranking=False, logits=None):
         ),
         patch("stratakb.rag.retriever.search_chunks", AsyncMock(side_effect=search)),
         patch("stratakb.rag.tools.write_audit_log", AsyncMock()),
+        _grounded_layers(),
         patch("stratakb.rag.reranker._get_reranker", return_value=LogitModel(logits or [])),
     ):
         return await ask(question="q", layers=["docs"], response_format="detailed")

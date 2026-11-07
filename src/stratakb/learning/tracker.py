@@ -18,7 +18,13 @@ from stratakb.learning.pii import scrub_query
 from stratakb.learning.signals import detect_reformulation, detect_layer_switch, detect_follow_up
 from stratakb.learning.store import LearningStore
 from stratakb.rag.confidence import Confidence
-from stratakb.rag.passages import MAX_PASSAGES, AskResult, SearchResponse, ToolFailure
+from stratakb.rag.passages import (
+    MAX_PASSAGES,
+    AnswerMode,
+    AskResult,
+    SearchResponse,
+    ToolFailure,
+)
 
 logger = structlog.get_logger()
 
@@ -78,9 +84,12 @@ class Tracker:
         layers: list[str] | None = None,
         include_sources: bool = True,
         top_k: int = 10,
+        mode: AnswerMode | None = None,
     ) -> AskResult | ToolFailure:
         """Wrap strata_ask with tracking; adds interaction_id to the result."""
-        return await self._track(_ASK, original_fn, question, layers, include_sources, top_k)
+        return await self._track(
+            _ASK, original_fn, question, layers, include_sources, top_k, mode
+        )
 
     async def track_search(
         self,

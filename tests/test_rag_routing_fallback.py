@@ -28,6 +28,9 @@ def tools(monkeypatch):
     )
     monkeypatch.setattr("stratakb.config.get_settings", lambda: settings)
     monkeypatch.setattr("stratakb.rag.tools.write_audit_log", AsyncMock())
+    monkeypatch.setattr(
+        "stratakb.knowledge.layers.get_answer_modes", AsyncMock(return_value=["grounded"])
+    )
     detect = AsyncMock(return_value=[])
     monkeypatch.setattr("stratakb.rag.tools._detect_layers", detect)
     return capture_tools(register_rag_tools, "postgresql://test"), settings, detect

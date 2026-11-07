@@ -57,6 +57,11 @@ class ConfidenceThresholds:
 SIMILARITY_THRESHOLDS = ConfidenceThresholds(high_score=0.6, medium_score=0.45)
 # Cross-encoder relevance probability (sigmoid over the logits; 0.5 is logit 0).
 RERANK_THRESHOLDS = ConfidenceThresholds(high_score=0.8, medium_score=0.5)
+# The score a sentence needs before an extractive answer quotes it, on the same
+# relevance probability. Provisional like the rest, not measured: it is the
+# medium threshold, so a quote never scores below what answer_status calls
+# partly found. The evaluation suite's abstention tier sets the final value.
+EXTRACTIVE_SENTENCE_THRESHOLD = RERANK_THRESHOLDS.medium_score
 
 _BASIS_THRESHOLDS = {
     "similarity": SIMILARITY_THRESHOLDS,

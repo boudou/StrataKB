@@ -297,7 +297,7 @@ async def test_track_ask_records_rewritten_queries_and_chunks():
     ))
     result = await tracker.track_ask(ask, "question", ["sepa"], True, 10)
 
-    ask.assert_awaited_once_with("question", ["sepa"], True, 10)
+    ask.assert_awaited_once_with("question", ["sepa"], True, 10, None)
     assert result.interaction_id == "int-9"
     assert result.concise()["interaction_id"] == "int-9"
     kwargs = store.store_interaction.call_args.kwargs

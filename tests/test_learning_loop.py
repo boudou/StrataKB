@@ -53,7 +53,7 @@ def _tracker(store):
 
 
 def _ask_returning(queries, level, layers=None):
-    async def ask(question, layers_arg, include_sources, top_k):
+    async def ask(question, layers_arg, include_sources, top_k, mode=None):
         return AskResult(
             question=question,
             queries_used=queries,

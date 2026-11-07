@@ -58,6 +58,9 @@ class TestAuditedQuestion:
     async def test_ask_entry(self, monkeypatch, audit_raw, learning_raw):
         audit = AsyncMock()
         monkeypatch.setattr("stratakb.rag.tools.write_audit_log", audit)
+        monkeypatch.setattr(
+            "stratakb.knowledge.layers.get_answer_modes", AsyncMock(return_value=["grounded"])
+        )
         tools = _register(monkeypatch, _settings(audit_raw, learning_raw), "postgresql://test")
 
         await tools["strata_ask"](question=QUESTION, layers=["sepa"])

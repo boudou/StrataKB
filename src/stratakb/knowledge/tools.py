@@ -14,6 +14,7 @@ from stratakb.core.audit import write_audit_log
 from stratakb.core.auth import check_role, get_current_user, require_role
 from stratakb.core.logging import log_tool_call
 from stratakb.knowledge.layers import (
+    DEFAULT_ANSWER_MODE,
     LayerError,
     LayerExistsError,
     LayerNotFoundError,
@@ -142,6 +143,7 @@ def register_knowledge_tools(
         metadata_schema: dict | None = None,
         chunk_config: dict | None = None,
         routing_patterns: list[str] | None = None,
+        answer_mode: str = DEFAULT_ANSWER_MODE,
     ) -> dict:
         """Create a new knowledge layer for one documentation domain.
 
@@ -162,6 +164,10 @@ def register_knowledge_tools(
             routing_patterns: Optional regular expressions; a query matching any of
                               them is routed to this layer when no layers are given.
                               Example: ["\\biso\\s*20022\\b", "\\bpacs\\.\\d{3}\\b"]
+            answer_mode: "grounded" (default): the client writes answers from the
+                         passages. "extractive": for text that must not be
+                         paraphrased, strata_ask answers with the document's own
+                         sentences.
         """
         user_id, _ = get_current_user()
         try:
@@ -173,6 +179,7 @@ def register_knowledge_tools(
                 metadata_schema=metadata_schema,
                 chunk_config=chunk_config,
                 routing_patterns=routing_patterns,
+                answer_mode=answer_mode,
                 origin="manual",
                 owner=user_id,
             )
