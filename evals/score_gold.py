@@ -1,25 +1,46 @@
-"""Score gold.jsonl on one layer through strata_ask. argv: gold.jsonl, layer (peps_small|peps_full), out.json.
+"""Score a gold.jsonl on one layer through strata_ask, on the database in DATABASE_URL.
 
-On peps_small: small-tier questions are answerable; full-tier questions listed in
-cross_refusals.json and all refusals must be refused.
-On peps_full: all 90 are answerable; refusals must be refused.
+On peps_small: small-tier questions are answerable; full-tier questions listed in the
+cross-refusals file and all refusals must be refused.
+On peps_full: every question but the refusals is answerable; refusals must be refused.
+
+Of the files, only the --out file is written. Each question also writes to the database, as any
+strata_ask does: see evals/README.md.
 """
+import argparse
 import asyncio
 import json
 import re
 import statistics
-import sys
 import time
 from pathlib import Path
 
-from stratakb.config import get_settings
-from stratakb.core.logging import configure_logging
-from stratakb.mcp_server import build_server
+FROZEN = Path(__file__).resolve().parent / "gold"
 
-configure_logging("ERROR")
-gold_path, layer, out = Path(sys.argv[1]), sys.argv[2], Path(sys.argv[3])
-gold = [json.loads(x) for x in gold_path.read_text(encoding="utf-8").splitlines()]
-cross = set(json.loads(gold_path.with_name("cross_refusals.json").read_text(encoding="utf-8")))
+
+def parse_args(argv):
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--gold", type=Path, required=True, help="the gold.jsonl to score")
+    parser.add_argument(
+        "--layer", required=True, choices=["peps_small", "peps_full"], help="the layer to ask"
+    )
+    parser.add_argument("--out", type=Path, required=True, help="file to write the results to")
+    parser.add_argument(
+        "--cross-refusals",
+        type=Path,
+        help="the checker's cross-layer refusal ids (default: cross_refusals.json beside --gold)",
+    )
+    args = parser.parse_args(argv)
+    if args.cross_refusals is None:
+        args.cross_refusals = args.gold.with_name("cross_refusals.json")
+    for name, path in (("--gold", args.gold), ("--cross-refusals", args.cross_refusals)):
+        if not path.is_file():
+            parser.error(f"{name}: no such file: {path}")
+    if args.out.resolve().is_relative_to(FROZEN):
+        parser.error(f"--out: {FROZEN.name}/ is frozen, write somewhere else")
+    if not args.out.parent.is_dir():
+        parser.error(f"--out: no such folder: {args.out.parent}")
+    return args
 
 
 def payload(result):
@@ -30,7 +51,7 @@ def payload(result):
     return json.loads(result[0].text)
 
 
-def expected(row):
+def expected(row, layer, cross):
     if row["kind"] == "refusal":
         return "refuse", row["group"]
     if layer == "peps_full" or row["tier"] == "small":
@@ -53,7 +74,9 @@ def pct(n, d):
 def summary(rows):
     out_ = {}
     ans = [r for r in rows if r["want"] == "answer"]
-    for name, group in [("all", ans), ("random_sample", [r for r in ans if r["sampled"]])] + [(k, [r for r in ans if r["group"] == k]) for k in sorted({r["group"] for r in ans})]:
+    for name, group in [("all", ans), ("random_sample", [r for r in ans if r["sampled"]])] + [
+        (k, [r for r in ans if r["group"] == k]) for k in sorted({r["group"] for r in ans})
+    ]:
         n = len(group)
         out_[f"answer:{name}"] = {
             "n": n,
@@ -61,7 +84,10 @@ def summary(rows):
             "r@3": pct(sum((r["rank"] or 99) <= 3 for r in group), n),
             "any": pct(sum(r["rank"] is not None for r in group), n),
             "mrr": round(sum(1 / r["rank"] for r in group if r["rank"]) / n, 3) if n else None,
-            "status": {s: sum(r["status"] == s for r in group) for s in sorted({r["status"] for r in group})},
+            "status": {
+                s: sum(r["status"] == s for r in group)
+                for s in sorted({r["status"] for r in group})
+            },
             "found_without_evidence": sum(r["status"] == "found" and r["rank"] is None for r in group),
             "not_found_with_evidence": sum(r["status"] == "not_found" and r["rank"] is not None for r in group),
         }
@@ -75,34 +101,66 @@ def summary(rows):
             "refused": pct(sum(r["status"] == "not_found" for r in group), n),
             "said_found": pct(sum(r["status"] == "found" for r in group), n),
             "said_partly": pct(sum(r["status"] == "partly_found" for r in group), n),
-            "status": {s: sum(r["status"] == s for r in group) for s in sorted({r["status"] for r in group})},
+            "status": {
+                s: sum(r["status"] == s for r in group)
+                for s in sorted({r["status"] for r in group})
+            },
         }
     lat = sorted(r["seconds"] for r in rows[1:])
     out_["latency"] = {"median_s": round(statistics.median(lat), 2), "p95_s": round(lat[int(0.95 * (len(lat) - 1))], 2)}
     return out_
 
 
-async def main():
+async def score(gold, layer, cross, out):
+    from stratakb.config import get_settings
+    from stratakb.core.database import close_pool
+    from stratakb.mcp_server import build_server
+
     server = build_server(get_settings())
     rows = []
-    for row in gold:
-        want, group = expected(row)
-        if want is None:
-            continue
-        t = time.perf_counter()
-        r = payload(await server.call_tool("strata_ask", {"question": row["question"], "layers": [layer], "response_format": "detailed"}))
-        seconds = time.perf_counter() - t
-        ps = r.get("passages") or []
-        rows.append({
-            "id": row["id"], "question": row["question"], "want": want, "group": group, "sampled": row.get("sampled", False),
-            "status": r.get("answer_status") or r.get("status"), "seconds": round(seconds, 2),
-            "rank": rank(row, ps) if want == "answer" else None,
-            "top": [{"file": (p.get("citation") or {}).get("file"), "text": (p.get("text") or "")[:300]} for p in ps[:3]],
-            "n_passages": len(ps),
-        })
+    try:
+        for row in gold:
+            want, group = expected(row, layer, cross)
+            if want is None:
+                continue
+            t = time.perf_counter()
+            r = payload(await server.call_tool("strata_ask", {
+                "question": row["question"], "layers": [layer], "response_format": "detailed",
+            }))
+            seconds = time.perf_counter() - t
+            ps = r.get("passages") or []
+            rows.append({
+                "id": row["id"], "question": row["question"], "want": want, "group": group,
+                "sampled": row.get("sampled", False),
+                "status": r.get("answer_status") or r.get("status"), "seconds": round(seconds, 2),
+                "rank": rank(row, ps) if want == "answer" else None,
+                "top": [
+                    {
+                        "file": (p.get("citation") or {}).get("file"),
+                        "text": (p.get("text") or "")[:300],
+                    }
+                    for p in ps[:3]
+                ],
+                "n_passages": len(ps),
+            })
+    finally:
+        await close_pool()
     s = summary(rows)
-    out.write_text(json.dumps({"layer": layer, "summary": s, "rows": rows}, ensure_ascii=False, indent=1), encoding="utf-8")
+    result = {"layer": layer, "summary": s, "rows": rows}
+    out.write_text(json.dumps(result, ensure_ascii=False, indent=1), encoding="utf-8")
     print(json.dumps(s, indent=1))
 
 
-asyncio.run(main())
+def main(argv=None):
+    args = parse_args(argv)
+    gold = [json.loads(x) for x in args.gold.read_text(encoding="utf-8").splitlines()]
+    cross = set(json.loads(args.cross_refusals.read_text(encoding="utf-8")))
+
+    from stratakb.core.logging import configure_logging
+
+    configure_logging("ERROR")
+    asyncio.run(score(gold, args.layer, cross, args.out))
+
+
+if __name__ == "__main__":
+    main()
