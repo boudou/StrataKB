@@ -316,6 +316,48 @@ class TestAskExtractive:
         assert response["status"] == "not_found"
         assert response["answer"] == []
 
+    @staticmethod
+    def _exact_chunk(layer, document_id, text):
+        chunk = ask_chunk(
+            chunk_id=None, content=text.rstrip(), score=1.0, similarity=None, layer=layer,
+            source_file="contracts/acme-msa.md", section="7 Payment", doc_type="markdown",
+            metadata={}, document_id=document_id, char_start=0,
+            char_end=len(text.rstrip()), clause_path="7 Payment",
+        )
+        chunk["match"] = "exact"
+        return chunk
+
+    async def test_clause_missing_a_long_sentence_is_partly_found(self, server, make_layer):
+        due, interest = "Payment is due within ten days.", "Interest accrues daily."
+        exception = f"However, this does not apply where {'word ' * 500}in writing."
+        text = f"{due} {exception} {interest}\n"
+        layer, document_id = await make_layer("extractive", text=text)
+        chunk = self._exact_chunk(layer, document_id, text)
+
+        with patch("stratakb.rag.tools._exact_clauses", AsyncMock(return_value=[chunk])):
+            response = await _ask(server, [], layers=[layer])
+
+        assert [a["text"] for a in response["answer"]] == [due, interest]
+        assert response["status"] == "partly_found"
+        assert response["note"].startswith("7 Payment is only partly quoted")
+        assert "contracts/acme-msa.md" in response["note"]
+        assert response["receipt_id"].startswith("rcpt_")
+
+    async def test_clause_over_the_budget_is_partly_found(self, server, make_layer):
+        from stratakb.rag.clause_lookup import fit_to_budget
+
+        text = " ".join(f"Rule {i} applies to {'word ' * 40}here." for i in range(60)) + "\n"
+        layer, document_id = await make_layer("extractive", text=text)
+        chunk = fit_to_budget(self._exact_chunk(layer, document_id, text), 500)
+
+        with patch("stratakb.rag.tools._exact_clauses", AsyncMock(return_value=[chunk])):
+            response = await _ask(server, [], layers=[layer], response_format="detailed")
+
+        assert 0 < len(response["answer"]) < 60
+        assert response["answer_status"] == "partly_found"
+        assert "the rest does not fit in the answer" in response["note"]
+        assert "cut" not in response["passages"][0]
+
     async def test_answer_stays_within_the_budget(self, server, settings, make_layer):
         sentences = [f"Clause {i} says ninety {'word ' * 370}here." for i in range(5)]
         text = " ".join(sentences) + " Tail.\n"

@@ -136,6 +136,27 @@ def split_sentences(text: str, start: int = 0) -> list[tuple[int, int]]:
     return spans
 
 
+def _touched_spans(
+    spans: Sequence[tuple[int, int]], chunk_start: int, chunk_end: int
+) -> list[tuple[int, int]]:
+    """The sentence spans that overlap a chunk: spans are sorted and do not overlap."""
+    # The first sentence ending after the chunk's start
+    first = bisect_right(spans, chunk_start, key=lambda span: span[1])
+    touched = []
+    for span in spans[first:]:
+        if span[0] >= chunk_end:
+            break
+        touched.append(span)
+    return touched
+
+
+def _cut_by_read(
+    span: tuple[int, int], spans: Sequence[tuple[int, int]], text: str, read_end: int
+) -> bool:
+    """True for the last sentence when the read stopped at read_end: it may be cut."""
+    return span == spans[-1] and len(text) >= read_end
+
+
 def effective_mode(requested: str | None, layer_modes: Sequence[str]) -> tuple[str, str | None]:
     """The mode an answer runs in and a note when the request could not loosen it.
 
@@ -191,12 +212,8 @@ def candidate_sentences(
         if document_id not in spans_by_document:
             spans_by_document[document_id] = split_sentences(text)
         spans = spans_by_document[document_id]
-        # The first sentence ending after the chunk's start
-        first = bisect_right(spans, chunk_start, key=lambda span: span[1])
-        for start, end in spans[first:]:
-            if start >= chunk_end:
-                break
-            if (start, end) == spans[-1] and len(text) >= read_ends[document_id]:
+        for start, end in _touched_spans(spans, chunk_start, chunk_end):
+            if _cut_by_read((start, end), spans, text, read_ends[document_id]):
                 continue
             if end - start > MAX_SENTENCE_CHARS:
                 continue
@@ -276,9 +293,9 @@ def fit_to_answer_budget(
     """The best sentences whose answer items fit the token budget, in the order given.
 
     Exact sentences count as best, in document order, so a clause over the budget
-    keeps its start. As with passages, each costs its text, ref and citation,
-    taking stops before the sentence that would pass the budget, and the best is
-    always kept (MAX_SENTENCE_CHARS bounds it).
+    keeps its start and clause_gap_note says so. As with passages, each costs its
+    text, ref and citation, taking stops before the sentence that would pass the
+    budget, and the best is always kept (MAX_SENTENCE_CHARS bounds it).
     """
     kept: set[Sentence] = set()
     used = 0
@@ -291,3 +308,51 @@ def fit_to_answer_budget(
         kept.add(sentence)
         used += cost
     return [s for s in sentences if s in kept]
+
+
+def clause_gap_note(
+    chunks: Sequence[dict[str, Any]],
+    documents: dict[int, dict[str, Any]],
+    read_ends: dict[int, int],
+    kept: Sequence[Sentence],
+) -> str | None:
+    """A note naming each clause the question names that kept is missing part of, or None.
+
+    Half a clause can say the opposite of the whole one, so an answer must say
+    when it leaves part of one out: a sentence candidate_sentences skips as too
+    long or cut by the read, or text past the token budget, whether the clause
+    lookup cut it or fit_to_answer_budget did.
+    """
+    kept_spans = {(s.document_id, s.start, s.end) for s in kept}
+    notes = []
+    for chunk in chunks:
+        document_id = chunk.get("document_id")
+        document = documents.get(document_id)
+        if chunk.get("match") != "exact" or document is None:
+            continue
+        text = document["text"]
+        # Re-split per clause: only a named clause gets here, and there are few
+        spans = split_sentences(text)
+        too_long, over_budget = False, bool(chunk.get("cut"))
+        for span in _touched_spans(spans, chunk["char_start"], chunk["char_end"]):
+            if _cut_by_read(span, spans, text, read_ends[document_id]) or (
+                span[1] - span[0] > MAX_SENTENCE_CHARS
+            ):
+                too_long = True
+            elif (document_id, *span) not in kept_spans:
+                over_budget = True
+        if too_long or over_budget:
+            reasons = [
+                reason
+                for reason, applies in (
+                    ("a sentence too long to quote is left out", too_long),
+                    ("the rest does not fit in the answer", over_budget),
+                )
+                if applies
+            ]
+            name = chunk.get("clause_path") or "The clause the question names"
+            notes.append(
+                f"{name} is only partly quoted: {' and '.join(reasons)}. "
+                f"Read the whole clause in {document['relative_path']}."
+            )
+    return " ".join(notes) or None

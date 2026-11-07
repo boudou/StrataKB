@@ -29,6 +29,7 @@ from stratakb.rag.extractive import (
     SENTENCE_REACH,
     answer_item,
     candidate_sentences,
+    clause_gap_note,
     effective_mode,
     fit_to_answer_budget,
     select_sentences,
@@ -243,7 +244,8 @@ async def _extract_answer(
     """Choose the sentences that answer question from the chunks, and issue their receipt.
 
     The best that fit the token budget are kept. Below the threshold, or with
-    nothing to quote, the answer is not_found and has no receipt. Unlike a
+    nothing to quote, the answer is not_found and has no receipt. A named clause
+    with a part left out makes a found answer partly_found, with a note. Unlike a
     grounded answer it fails when the documents cannot be read or the model
     cannot load: there is no answer without them.
     refused_note says the caller asked for a mode the layers do not allow.
@@ -293,7 +295,11 @@ async def _extract_answer(
         tool_name="strata_ask",
     )
     status = answer_status(max(s.score for s in sentences), "rerank")
-    return ExtractiveAnswer(answer, receipt_id, status, refused_note)
+    gap_note = await asyncio.to_thread(clause_gap_note, chunks, documents, ends, sentences)
+    if gap_note and status == "found":
+        status = "partly_found"
+    note = " ".join(n for n in (refused_note, gap_note) if n) or None
+    return ExtractiveAnswer(answer, receipt_id, status, note)
 
 
 def _search_item(chunk: dict[str, Any]) -> dict[str, Any]:

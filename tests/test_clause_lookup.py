@@ -166,6 +166,7 @@ def test_fit_to_budget_keeps_offsets():
     assert text.startswith(trimmed["content"])
     assert trimmed["char_end"] - trimmed["char_start"] == len(trimmed["content"])
     assert not trimmed["content"].endswith((" ", "wor"))
+    assert trimmed["cut"] is True
     assert fit_to_budget(_exact("short"), budget)["content"] == "short"
 
 

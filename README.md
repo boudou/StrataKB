@@ -445,7 +445,7 @@ flowchart TD
 - **Long blocks are not quoted.** Lines without end marks (a price list, a schedule, a log, YAML) run together as one sentence until a blank line, heading or list item. A span over 2,000 characters is never cut and never returned, so a question that only such a block could answer is `not_found`. The best sentences that fit `ANSWER_TOKEN_BUDGET` are returned; the rest are left out.
 - **`receipt_id`** opens the quotes with `strata_get_receipt`. No sentence, no receipt.
 - **`status`** is judged on the sentences, on the same thresholds as above. `not_found` means no sentence that can be quoted scored at or above the threshold, which is the medium one of [Confidence](#glossary) and just as provisional.
-- **A clause the question names** (`clause 7.2`) is quoted sentence by sentence up to the budget, without needing the model.
+- **A clause the question names** (`clause 7.2`) is quoted sentence by sentence up to the budget, without needing the model. When part of it is left out, because a sentence is too long to quote or the rest is over the budget, the status is `partly_found` and a `note` names the clause and says why.
 - **Passages stored before documents were kept** cannot be quoted: when they are all that matched, the answer is `not_found` with the `note` "Re-ingest this layer to enable extractive answers."
 - **The model:** sentences are scored by the reranking model (`RERANKING_MODEL`), also when `RERANKING_ENABLED=false`. When it cannot load, the call fails with an error rather than answering without it.
 - With `response_format: "detailed"` each sentence also has its `score`, and everything a detailed answer holds comes along, `passages` included.

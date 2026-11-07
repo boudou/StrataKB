@@ -22,6 +22,7 @@ from stratakb.rag.extractive import (
     Sentence,
     answer_item,
     candidate_sentences,
+    clause_gap_note,
     effective_mode,
     fit_to_answer_budget,
     select_sentences,
@@ -223,6 +224,60 @@ class TestCandidateSentences:
             [_chunk(DOC_TEXT.index(NINETY), DOC_TEXT.index(LETTER), match="exact")]
         )
         assert [(s.text, s.exact) for s in sentences] == [(NINETY, True)]
+
+
+class TestClauseGapNote:
+    TEXT = f"{INVOICES} {'word ' * 450}end. {INTEREST}\n"
+    DOCUMENTS = {1: {"text": TEXT, "relative_path": "terms.md"}}
+    ENDS = {1: len(TEXT) + 1000}
+
+    def _note(self, chunk, kept=None):
+        kept = _candidates([chunk], self.TEXT) if kept is None else kept
+        return clause_gap_note([chunk], self.DOCUMENTS, self.ENDS, kept)
+
+    def test_whole_clause_needs_no_note(self):
+        short = "One here. Two there.\n"
+        chunk = _chunk(0, len(short), match="exact", clause_path="7 Pay")
+        documents = {1: {"text": short, "relative_path": "terms.md"}}
+        kept = candidate_sentences([chunk], documents, {1: len(short) + 1000})
+
+        assert clause_gap_note([chunk], documents, {1: len(short) + 1000}, kept) is None
+
+    def test_sentence_too_long_to_quote_is_named(self):
+        note = self._note(_chunk(0, len(self.TEXT), match="exact", clause_path="7 Pay"))
+
+        assert note.startswith("7 Pay is only partly quoted: a sentence too long to quote")
+        assert "does not fit" not in note
+        assert note.endswith("Read the whole clause in terms.md.")
+
+    def test_sentence_past_the_budget_is_named(self):
+        short = "One here. Two there.\n"
+        documents = {1: {"text": short, "relative_path": "terms.md"}}
+        whole = _chunk(0, len(short), match="exact")
+        kept = candidate_sentences([whole], documents, {1: len(short) + 1000})[:1]
+
+        note = clause_gap_note([whole], documents, {1: len(short) + 1000}, kept)
+
+        assert note.startswith("The clause the question names is only partly quoted: the rest")
+        assert "too long" not in note
+
+    def test_sentence_cut_by_the_read_is_named(self):
+        text = "One here. Two is cut"
+        documents = {1: {"text": text, "relative_path": "terms.md"}}
+        chunk = _chunk(0, len(text), match="exact")
+        kept = candidate_sentences([chunk], documents, {1: len(text)})
+
+        assert [s.text for s in kept] == ["One here."]
+        note = clause_gap_note([chunk], documents, {1: len(text)}, kept)
+        assert "a sentence too long to quote" in note
+
+    def test_clause_cut_by_the_lookup_is_named(self):
+        chunk = _chunk(0, len(INVOICES), match="exact", cut=True)
+
+        assert "the rest does not fit" in self._note(chunk)
+
+    def test_scored_chunk_needs_no_note(self):
+        assert self._note(_chunk(0, len(self.TEXT)), kept=[]) is None
 
 
 def _sentence(text: str, *, exact: bool = False, start: int = 0) -> Sentence:

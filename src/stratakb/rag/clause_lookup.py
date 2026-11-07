@@ -295,7 +295,8 @@ def fit_to_budget(chunk: dict[str, Any], budget: int) -> dict[str, Any]:
     """chunk, its text cut at a word so its passage fits budget tokens.
 
     The cut text is still the document's text from char_start, and char_end
-    moves with it. At least _MIN_TRIMMED_CHARS characters are kept.
+    moves with it; "cut" marks the chunk, so an extractive answer can say part of
+    the clause is missing. At least _MIN_TRIMMED_CHARS characters are kept.
     """
     if passage_cost(chunk) <= budget:
         return chunk
@@ -308,11 +309,15 @@ def fit_to_budget(chunk: dict[str, Any], budget: int) -> dict[str, Any]:
         if space > cut // 2:
             piece = piece[:space]
         piece = piece.rstrip()
-        trimmed = {**chunk, "content": piece, "char_end": chunk["char_start"] + len(piece)}
+        trimmed = {
+            **chunk, "content": piece, "char_end": chunk["char_start"] + len(piece), "cut": True,
+        }
         if passage_cost(trimmed) <= budget:
             return trimmed
     piece = content[:_MIN_TRIMMED_CHARS].rstrip()
-    return {**chunk, "content": piece, "char_end": chunk["char_start"] + len(piece)}
+    return {
+        **chunk, "content": piece, "char_end": chunk["char_start"] + len(piece), "cut": True,
+    }
 
 
 async def lookup(
