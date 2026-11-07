@@ -649,18 +649,18 @@ async def _write_layer(database_url: str, plan: Plan, layer: str, owner: str) ->
 
 def _file_rows(plan: Plan, result: IngestionResult) -> list[dict]:
     """One row per path: ingestion outcomes, then untracked policy skips."""
-    rows: dict[str, tuple[str, str | None]] = {}
+    rows: dict[str, tuple[str, str | None, int | None]] = {}
     for outcome in result.files:
         reason = outcome.reason
         if outcome.outcome == "removed" and reason == "not_selected":
             reason = plan.removals.get(outcome.relative_path, reason)
-        rows[outcome.relative_path] = (outcome.outcome, reason)
+        rows[outcome.relative_path] = (outcome.outcome, reason, outcome.count)
     for rel, verdict in plan.verdicts.items():
         if not verdict.ingest and rel not in rows:
-            rows[rel] = ("skipped", verdict.reason)
+            rows[rel] = ("skipped", verdict.reason, None)
     return [
-        {"path": rel, "outcome": outcome, "reason": reason}
-        for rel, (outcome, reason) in sorted(rows.items())
+        {"path": rel, "outcome": outcome, "reason": reason, "count": count}
+        for rel, (outcome, reason, count) in sorted(rows.items())
     ]
 
 

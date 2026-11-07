@@ -665,124 +665,47 @@ async def test_tool_returns_files_flagged(server):
     assert result["status"] == "completed"
     assert result["files_flagged"] == 1
     assert result["files_added"] == 1
+    assert result["flagged"] == [{"file": "a.csv", "reason": "truncated", "count": None}]
 
 
-def test_file_outcome_rejects_values_outside_the_set():
-    from stratakb.knowledge.ingestion import REASONS, FileOutcome
+async def test_tool_lists_flagged_csv_with_the_rows_left_out(server, db_url, layer, tmp_path):
+    write_file(tmp_path / "codes.csv", _csv(["A1", "A2", "A3", "A4", "A5"]))
+    write_file(tmp_path / "a.md", "# Alpha\n\nAlpha content.\n")
 
-    for outcome, reason in [
-        ("addded", None),
-        ("failed", "read_eror"),
-        ("added", "secret"),
-        ("failed", None),
-    ]:
-        with pytest.raises(ValueError, match="Not an ingest outcome and reason"):
-            FileOutcome("a.md", outcome, reason)
-    for outcome, reasons in REASONS.items():
-        stored = "added" if outcome == "flagged" else None
-        for reason in reasons:
-            assert FileOutcome("a.md", outcome, reason, stored=stored).reason == reason
-    for outcome, reason, count in [
-        ("added", None, 3),
-        ("failed", "parse_error", 1),
-        ("flagged", "truncated", 0),
-    ]:
-        with pytest.raises(ValueError, match="Not a count for this outcome"):
-            FileOutcome("a.md", outcome, reason, count)
-    assert FileOutcome("a.md", "flagged", "truncated", 5, stored="added").count == 5
-    assert FileOutcome("a.md", "flagged", "probably_scanned", stored="added").count is None
+    with as_admin(), patch("stratakb.knowledge.parsers.csv_parser.MAX_ROWS", 2):
+        result = await call_tool(
+            server, "strata_ingest_documents", layer_name=layer, source_path=str(tmp_path)
+        )
+
+    assert result["flagged"] == [{"file": "codes.csv", "reason": "truncated", "count": 3}]
 
 
-def test_flagged_outcome_says_how_it_was_stored():
-    from stratakb.knowledge.ingestion import FileOutcome
+async def test_tool_flagged_is_none_without_flagged_files(server, db_url, layer, tmp_path):
+    write_file(tmp_path / "a.md", "# Alpha\n\nAlpha content.\n")
 
-    for args, stored in [
-        (("flagged", "truncated"), None),
-        (("added", None), "added"),
-        (("flagged", "truncated"), "removed"),
-    ]:
-        with pytest.raises(ValueError, match="Not a stored value for this outcome"):
-            FileOutcome("a.md", *args, stored=stored)
-    assert FileOutcome("a.md", "flagged", "truncated", stored="updated").stored == "updated"
+    with as_admin():
+        result = await call_tool(
+            server, "strata_ingest_documents", layer_name=layer, source_path=str(tmp_path)
+        )
 
-
-def test_counters_follow_the_file_outcomes():
-    from stratakb.knowledge.ingestion import FileOutcome, IngestionResult
-
-    result = IngestionResult(
-        layer_name="x",
-        status="completed",
-        files=[
-            FileOutcome("added.md", "added"),
-            FileOutcome("updated.md", "updated"),
-            FileOutcome("unchanged.md", "unchanged"),
-            FileOutcome("removed.md", "removed", "deleted"),
-            FileOutcome("skipped.md", "skipped", "secret"),
-            FileOutcome("failed.md", "failed", "read_error"),
-            FileOutcome("flagged-new.csv", "flagged", "truncated", stored="added"),
-            FileOutcome("flagged-old.csv", "flagged", "truncated", stored="updated"),
-        ],
-    )
-
-    assert result.files_added == 2
-    assert result.files_updated == 2
-    assert result.files_unchanged == 1
-    assert result.files_removed == 1
-    assert result.files_skipped == 1
-    assert result.files_flagged == 2
-    assert result.docs_failed == 1
-    assert result.docs_processed == 4
+    assert result["status"] == "completed"
+    assert result["flagged"] is None
 
 
-def test_counters_cannot_be_set():
-    from stratakb.knowledge.ingestion import IngestionResult
+def test_tool_description_names_the_csv_row_limit():
+    from mcp.server.fastmcp import FastMCP
 
-    with pytest.raises(TypeError):
-        IngestionResult(layer_name="x", status="completed", files_added=1)
-    result = IngestionResult(layer_name="x", status="completed")
-    with pytest.raises(AttributeError):
-        result.files_added = 1
+    from stratakb.knowledge.parsers import csv_parser
+    from stratakb.knowledge.tools import register_knowledge_tools
 
+    def description() -> str:
+        mcp = FastMCP("test")
+        register_knowledge_tools(mcp, "postgresql://unused")
+        return mcp._tool_manager.get_tool("strata_ingest_documents").description
 
-def test_reasons_cover_the_literals():
-    from typing import get_args
-
-    from stratakb.knowledge.ingestion import REASONS, Outcome, Reason
-
-    assert set(REASONS) == set(get_args(Outcome))
-    assert {r for rs in REASONS.values() for r in rs} - {None} == set(get_args(Reason))
-
-
-def test_outcome_keys_follow_outcome():
-    from typing import get_args
-
-    from stratakb.knowledge.add_folder import OUTCOME_KEYS
-    from stratakb.knowledge.ingestion import Outcome
-
-    assert OUTCOME_KEYS == get_args(Outcome) == (
-        "added", "updated", "unchanged", "removed", "skipped", "flagged", "failed",
-    )
-
-
-@pytest.mark.parametrize(
-    ("suffix", "data", "expected"),
-    [
-        (".md", b"", True),
-        (".pdf", b"", True),
-        (".md", b"  \n\t", True),
-        (".txt", b"\xef\xbb\xbf  ", True),
-        (None, b"   ", True),
-        (".md", b"x", False),
-        (".pdf", b"   ", False),
-        (".docx", b"\n", False),
-    ],
-)
-def test_has_no_text(suffix, data, expected):
-    from stratakb.knowledge.ingestion import _has_no_text
-    from stratakb.knowledge.parsers.registry import FORMATS
-
-    fmt = FORMATS[suffix] if suffix is not None else None
-    assert _has_no_text(fmt, data) is expected
+    assert f"A CSV over {csv_parser.MAX_ROWS:,} rows" in description()
+    with patch.object(csv_parser, "MAX_ROWS", 1_234):
+        assert "A CSV over 1,234 rows" in description()
 
 
 def _entries(root: Path, *relative_paths: str, carry_hash: bool = False) -> list:

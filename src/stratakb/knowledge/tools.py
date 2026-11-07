@@ -23,8 +23,53 @@ from stratakb.knowledge.layers import (
     get_layer_status,
     list_layers,
 )
+from stratakb.knowledge.parsers import csv_parser
 
 logger = structlog.get_logger()
+
+
+def _ingest_description() -> str:
+    """The strata_ingest_documents description; a docstring cannot name the row limit."""
+    limit = f"{csv_parser.MAX_ROWS:,}"
+    return f"""Ingest documents into a knowledge layer, syncing with the source folder.
+
+    Parses files, chunks text, generates embeddings, and stores in the
+    vector database. Re-running on the same folder is a sync: files whose
+    content is unchanged are skipped, changed files are replaced, new files
+    are added, and files ingested from that folder that no longer exist are
+    removed. Other folders ingested into the layer are left alone, and a
+    single-file source_path never removes anything. A file that cannot be
+    read or fails to parse keeps its previous chunks and is listed in
+    errors with file, error and reason ("read_error": locked or no
+    permission, "parse_error", or "embed_error").
+
+    Files whose names look like secrets (.env, keys, certificates,
+    credentials, e.g. client_secret.json) are always skipped and never
+    opened; one ingested earlier is removed. Empty files are reported as
+    no text, not as failures: skipped, or removed if ingested earlier.
+    files_skipped counts the skipped files. A PDF that looks scanned
+    (under half its pages have text, or under 200 characters per page on
+    average) is stored for the text it has and counted in files_flagged;
+    it also counts as added or updated. A CSV over {limit} rows is stored
+    for its first {limit} rows and also counted in files_flagged. flagged
+    lists these files with file, reason ("probably_scanned" or "truncated")
+    and count: how many rows or other items were left out, null when the
+    parser did not count.
+
+    Unchanged means the same file content (SHA-256). A change to the
+    layer's chunk_config or to the embedding model is not detected: use
+    replace_all=True after such a change.
+
+    Supported formats: PDF, DOCX, YAML/OpenAPI, CSV, JSON, XML/XSD, Markdown, HTML,
+    plain text (.txt), reStructuredText (.rst), AsciiDoc (.adoc).
+
+    Args:
+        layer_name: Target knowledge layer (must exist). Example: "runbooks"
+        source_path: Absolute path to a file or directory to ingest.
+                    For directories, all supported files are discovered recursively.
+        replace_all: If True, delete every chunk of the layer first and
+                    ingest everything again (a full rebuild).
+    """
 
 
 def _serialize(obj: object) -> object:
@@ -187,7 +232,7 @@ def register_knowledge_tools(
         except LayerNotFoundError as e:
             return {"status": "error", "error": str(e)}
 
-    @mcp.tool()
+    @mcp.tool(description=_ingest_description())
     @require_role("admin")
     @log_tool_call
     async def strata_ingest_documents(
@@ -195,42 +240,6 @@ def register_knowledge_tools(
         source_path: str,
         replace_all: bool = False,
     ) -> dict:
-        """Ingest documents into a knowledge layer, syncing with the source folder.
-
-        Parses files, chunks text, generates embeddings, and stores in the
-        vector database. Re-running on the same folder is a sync: files whose
-        content is unchanged are skipped, changed files are replaced, new files
-        are added, and files ingested from that folder that no longer exist are
-        removed. Other folders ingested into the layer are left alone, and a
-        single-file source_path never removes anything. A file that cannot be
-        read or fails to parse keeps its previous chunks and is listed in
-        errors with file, error and reason ("read_error": locked or no
-        permission, "parse_error", or "embed_error").
-
-        Files whose names look like secrets (.env, keys, certificates,
-        credentials, e.g. client_secret.json) are always skipped and never
-        opened; one ingested earlier is removed. Empty files are reported as
-        no text, not as failures: skipped, or removed if ingested earlier.
-        files_skipped counts the skipped files. A PDF that looks scanned
-        (under half its pages have text, or under 200 characters per page on
-        average) is stored for the text it has and counted in files_flagged;
-        it also counts as added or updated. A CSV over 10,000 rows is stored
-        for its first 10,000 rows and also counted in files_flagged.
-
-        Unchanged means the same file content (SHA-256). A change to the
-        layer's chunk_config or to the embedding model is not detected: use
-        replace_all=True after such a change.
-
-        Supported formats: PDF, DOCX, YAML/OpenAPI, CSV, JSON, XML/XSD, Markdown, HTML,
-        plain text (.txt), reStructuredText (.rst), AsciiDoc (.adoc).
-
-        Args:
-            layer_name: Target knowledge layer (must exist). Example: "runbooks"
-            source_path: Absolute path to a file or directory to ingest.
-                        For directories, all supported files are discovered recursively.
-            replace_all: If True, delete every chunk of the layer first and
-                        ingest everything again (a full rebuild).
-        """
         from stratakb.config import get_settings
         from stratakb.knowledge.embeddings import embedding_key_error
         from stratakb.knowledge.ingestion import ingest_documents
@@ -277,6 +286,11 @@ def register_knowledge_tools(
                 "rebuilt_legacy": result.rebuilt_legacy,
                 "duration_seconds": round(result.duration_seconds, 1),
                 "errors": result.errors if result.errors else None,
+                "flagged": [
+                    {"file": f.relative_path, "reason": f.reason, "count": f.count}
+                    for f in result.files
+                    if f.outcome == "flagged"
+                ] or None,
             }
         except Exception as e:
             return {"status": "error", "error": str(e)}

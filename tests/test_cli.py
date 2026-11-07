@@ -583,6 +583,39 @@ def test_text_quiet_rerun():
     assert "  4 unchanged" in text
 
 
+def _flagged_report():
+    counts = dict.fromkeys(add_folder.OUTCOME_KEYS, 0)
+    counts.update(flagged=2)
+    files = [
+        {"path": "codes.csv", "outcome": "flagged", "reason": "truncated", "count": 1234},
+        {"path": "scan.pdf", "outcome": "flagged", "reason": "probably_scanned", "count": None},
+    ]
+    return _report(
+        counts=counts, files=files, excluded=[{"path": ".github/", "reason": "builtin_skip"}]
+    )
+
+
+def test_text_lists_flagged_files_after_excluded():
+    lines = cli.render_text(_flagged_report()).split("\n")
+    start = lines.index("Flagged:")
+    assert lines[start - 2:start + 3] == [
+        "Excluded:",
+        "  builtin_skip (1): .github/",
+        "Flagged:",
+        "  codes.csv (truncated, 1,234 left out)",
+        "  scan.pdf (probably_scanned)",
+    ]
+
+
+def test_text_has_no_flagged_section_without_flagged_files():
+    assert "Flagged" not in cli.render_text(_report())
+
+
+def test_json_carries_the_flagged_rows():
+    report = _flagged_report()
+    assert json.loads(cli.render_json(report))["files"] == report.files
+
+
 # ── db up / db down ──────────────────────────────────────
 
 CONTAINER_URL = "postgresql://strata:strata_dev_password@127.0.0.1:5433/strata"

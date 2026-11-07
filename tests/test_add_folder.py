@@ -284,9 +284,25 @@ async def test_unreadable_file_is_read_error(folder_db_url, tmp_path, cleanup):
 
     assert _outcomes(report)["notes.md"] == ("failed", "read_error")
     assert report.counts["failed"] == 1
-    assert {"path": "notes.md", "outcome": "failed", "reason": "read_error"} in (
+    assert {"path": "notes.md", "outcome": "failed", "reason": "read_error", "count": None} in (
         report.as_dict()["files"]
     )
+
+
+async def test_flagged_row_carries_the_count_left_out(folder_db_url, tmp_path, cleanup):
+    root = docs_folder(tmp_path)
+    write_file(root / "codes.csv", "Code,Name\nA1,One\nA2,Two\nA3,Three\nA4,Four\n")
+    name = unique_layer_name()
+    cleanup.append(name)
+
+    with patch("stratakb.knowledge.parsers.csv_parser.MAX_ROWS", 1):
+        _, report = await _run(folder_db_url, root, Options(name=name))
+
+    rows = {f["path"]: f for f in report.as_dict()["files"]}
+    assert rows["codes.csv"] == {
+        "path": "codes.csv", "outcome": "flagged", "reason": "truncated", "count": 3,
+    }
+    assert rows["notes.md"]["count"] is None
 
 
 async def test_default_name_is_the_folder_slug(folder_db_url, tmp_path, cleanup):

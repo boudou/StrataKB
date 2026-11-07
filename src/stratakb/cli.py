@@ -683,6 +683,12 @@ def _group_lines(pairs: list[tuple[str, str | None]]) -> list[str]:
     return lines
 
 
+def _flagged_line(row: dict) -> str:
+    """One flagged file: its reason, and how much was left out when the parser counted."""
+    left_out = "" if row["count"] is None else f", {row['count']:,} left out"
+    return f"  {row['path']} ({row['reason']}{left_out})"
+
+
 def render_text(report: Report) -> str:
     """The report for a person to read."""
     if report.reason is not None:
@@ -705,6 +711,10 @@ def render_text(report: Report) -> str:
     if excluded:
         lines.append("Excluded:")
         lines.extend(_group_lines(excluded))
+    flagged = [f for f in report.files if f["outcome"] == "flagged"]
+    if flagged:
+        lines.append("Flagged:")
+        lines.extend(_flagged_line(f) for f in flagged)
     failed = [f for f in report.files if f["outcome"] == "failed"]
     if failed:
         lines.append("Failed:")
