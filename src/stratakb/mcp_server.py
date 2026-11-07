@@ -10,11 +10,14 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import functools
+import json
 import threading
 from contextlib import asynccontextmanager
+from typing import Annotated
 
 import structlog
 from mcp.server.fastmcp import FastMCP
+from pydantic import Field
 
 # get_settings is imported where it is called, never here: a module-level binding
 # made while a test patches stratakb.config.get_settings keeps the mock for good
@@ -149,13 +152,32 @@ def _preload_embedding_model_sync(model_name: str) -> None:
         logger.warning("embedding_preload_failed", error=str(e))
 
 
+# The answer contract: the instructions and the prompt both list these rules
+_ANSWER_CONTRACT = (
+    "Answer only from the passages strata_ask returns, never from your own knowledge.",
+    'Cite every claim by passage id, as [S1]; write a quote as "..." [S1].',
+    "Copy numbers, dates, amounts, codes and clause numbers verbatim.",
+    "Follow the mode in the response. In grounded mode write the answer, then call strata_verify "
+    "before showing it, with the draft and every returned passage's ref in order (the first is "
+    "S1). When the result is flagged, fix or drop the flagged claims and verify again. A flag of "
+    "kind passage cannot be fixed by rewriting: say the answer is unverified.",
+    "In extractive mode show answer verbatim, each sentence with its citation, and any note or "
+    "warning.",
+    "Always show the receipt id when there is one: receipt_id from strata_verify, or from "
+    "strata_ask in extractive mode. strata_get_receipt opens it.",
+    'When status is not_found, say "not in the documents" and give next_step, even if passages '
+    "came back. When it is partly_found, answer what the passages support and say what they "
+    "leave open. When it is error, report the error.",
+)
+
 _INSTRUCTIONS = (
-    "StrataKB is a knowledge base of documents organised in layers, one per "
-    "domain (for example a standard, a product's docs or a team's runbooks). "
-    "Use strata_ask to answer questions with cited context, strata_search for "
-    "exact terms and identifiers, strata_verify to check a drafted answer's "
-    "quotes and facts against the cited passages, and strata_list_knowledge_layers "
-    "to see what the knowledge base covers. Admin tools create layers, ingest documents and "
+    "StrataKB is a knowledge base of documents organised in layers, one per domain (for example "
+    "a standard, a product's docs or a team's runbooks). Use strata_ask to answer questions, and "
+    "follow these rules:\n"
+    + "\n".join(f"- {rule}" for rule in _ANSWER_CONTRACT)
+    + "\nUse strata_search for exact terms and identifiers and strata_list_knowledge_layers to "
+    "see what the knowledge base covers. With response_format detailed, the found, partly_found "
+    "or not_found status is in answer_status. Admin tools create layers, ingest documents and "
     "apply layer presets."
 )
 
@@ -178,7 +200,29 @@ def build_server(settings: Settings) -> FastMCP:
     register_database_tools(mcp, settings.database_url, settings.readonly_database_url)
     register_learning_tools(mcp, settings.database_url)
     _register_admin_tools(mcp, settings)
+    _register_prompts(mcp)
     return mcp
+
+
+def _register_prompts(mcp: FastMCP) -> None:
+    """Register the MCP prompts."""
+
+    @mcp.prompt(name="answer_from_documents", title="Answer from documents")
+    async def answer_from_documents(
+        question: Annotated[str, Field(description="The question to answer")],
+        layers: Annotated[str | None, Field(description="Layer names, comma-separated")] = None,
+    ) -> str:
+        """Answer a question from the knowledge base, with citations and a receipt."""
+        names = [name.strip() for name in (layers or "").split(",") if name.strip()]
+        call = (
+            f"Call strata_ask with this question and layers={json.dumps(names)}."
+            if names
+            else "Call strata_ask with this question."
+        )
+        steps = (call, *_ANSWER_CONTRACT)
+        return f"Question: {question}\n\n" + "\n".join(
+            f"{number}. {step}" for number, step in enumerate(steps, 1)
+        )
 
 
 def _register_admin_tools(mcp: FastMCP, settings: Settings) -> None:

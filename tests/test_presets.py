@@ -328,7 +328,7 @@ class TestCreatePresetLayer:
 
     async def test_new_layer_without_answer_mode_is_grounded(self):
         preset = load_preset(SEPA_PRESET)
-        assert preset.answer_mode is None
+        preset.answer_mode = None
         with patch(
             "stratakb.knowledge.presets.create_layer", new_callable=AsyncMock
         ) as mock_create:
@@ -472,7 +472,11 @@ class TestCreatePresetLayer:
         self.mock_update.assert_not_awaited()
 
     async def test_missing_answer_mode_keeps_layer_mode(self):
-        result = await self._create_existing("preset:sepa", existing_mode="extractive")
+        preset = load_preset(SEPA_PRESET)
+        preset.answer_mode = None
+        result = await self._create_existing(
+            "preset:sepa", existing_mode="extractive", preset=preset
+        )
 
         assert result["status"] == "exists"
         self.mock_update.assert_not_awaited()
@@ -676,11 +680,16 @@ class TestPresetLayerChanges:
         from stratakb.knowledge.presets import preset_layer_changes
 
         preset = load_preset(SEPA_PRESET)
-        assert preset.answer_mode is None
+        preset.answer_mode = None
         stored = _stored_layer(preset, answer_mode="extractive")
         assert preset_layer_changes(stored, preset) == []
         preset.answer_mode = "grounded"
         assert preset_layer_changes(stored, preset) == ["answer_mode"]
+
+    def test_example_presets_answer_mode(self):
+        assert load_preset(SEPA_PRESET).answer_mode == "grounded"
+        assert load_preset(ISO_PRESET).answer_mode == "grounded"
+        assert load_preset(PEPS_PRESET).answer_mode is None
 
 
 class TestApplyPresetTool:

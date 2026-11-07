@@ -33,6 +33,9 @@ routing_patterns:
 structure_patterns:
   - '^(?P<label>(?:pain|pacs|camt)\.\d{3}\.\d{3}\.\d{2})\b'
 
+# Tables, code lists and schemas have lines without end marks, which extractive does not quote
+answer_mode: grounded
+
 sources:
   - name: message_definitions
     path: message_definitions

@@ -10,7 +10,7 @@ Point it at your documentation, organise it in layers, and query it from any MCP
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![PRs welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](CONTRIBUTING.md)
 
-[Quick start](#quick-start) · [How it works](#how-it-works) · [Layers and presets](#layers-and-presets) · [Tools](#tools) · [Configuration](#configuration) · [Glossary](#glossary) · [Roadmap](#roadmap)
+[Quick start](#quick-start) · [How it works](#how-it-works) · [Layers and presets](#layers-and-presets) · [Answers you can prove](#answers-you-can-prove) · [Tools](#tools) · [Configuration](#configuration) · [Glossary](#glossary) · [Roadmap](#roadmap)
 
 </div>
 
@@ -72,7 +72,7 @@ Replace /path/to/StrataKB with the folder you cloned into, then restart the clie
 
 ### 4. Ask
 
-Ask your client a question about the documents, for example *"How do we fail over the database?"*. The client calls StrataKB's `strata_ask` tool, gets back the passages that match and the files they come from, and writes the answer.
+Ask your client a question about the documents, for example *"How do we fail over the database?"*. The client calls StrataKB's `strata_ask` tool, gets back the passages that match and the files they come from, and writes the answer. The server tells the client to answer only from those passages, cite them and check the answer, and a checked answer comes with a receipt you can open with `uv run stratakb receipt <id>`.
 
 No documents at hand? Try the [Python PEPs example](#try-an-example-preset).
 
@@ -82,6 +82,7 @@ The reference below explains how StrataKB works, every tool and every setting; t
 
 - **Knowledge layers**: create a layer per domain at runtime, each with its own chunking and routing rules; no code changes to add a new domain
 - **Layer presets**: describe a layer and its source folders in one YAML file, then build or rebuild it in one call
+- **Answers you can prove**: cited passages, a check of the quotes and facts in a drafted answer, the document's own sentences where paraphrase is not acceptable, and a receipt to open outside the chat; see [Answers you can prove](#answers-you-can-prove)
 - **Hybrid retrieval**: pgvector HNSW similarity plus PostgreSQL full-text search, fused with Reciprocal Rank Fusion, then reranked by a cross-encoder
 - **Query routing**: when no layers are given, questions are routed to the right layers by each layer's patterns. A routed search that finds fewer results than asked for, or only low-confidence ones, runs again across all layers, and the result says so (`routing_fallback`, with the reason; in `strata_ask` only with `response_format: "detailed"`). Layers you name yourself are never broadened
 - **Query rewriting** (optional): with an Anthropic API key or any OpenAI-compatible endpoint (including a local Ollama), `strata_ask` expands a question into several searches in the knowledge base's own terminology
@@ -283,6 +284,40 @@ uv run python scripts/apply_preset.py examples/peps/preset.yaml             # cr
 ```
 
 Then ask from your client, for example *"How long should a line of Python be?"*. The SEPA preset includes a small sample of reason codes, so it works before you download anything (ask *"What does reject reason AC04 mean?"*); the ISO 20022 preset needs the downloaded schemas. [examples/README.md](examples/README.md) has the PEPs options (all PEPs, updates, Git Bash on Windows) and lists where to download the SEPA rulebooks and ISO 20022 documents.
+
+## Answers you can prove
+
+Every claim in an answer can be checked against the document it came from. How the answer is written depends on the mode, which the layer's `answer_mode` chooses:
+
+- **Grounded** (the default): your client writes the answer from the passages, cites them by id and checks the draft with `strata_verify`. The response is [the cited passages](#what-strata_ask-returns), and [the check](#checking-a-drafted-answer) issues a receipt when it passes.
+- **Extractive**: for text that must not be paraphrased, the server [answers with the document's own sentences](#extractive-answers) and a receipt, and your client shows them as they are.
+
+```mermaid
+flowchart TD
+    Q[Question] --> A[strata_ask]
+    A --> S{status}
+    S -->|not_found| N["Say: not in the documents"]
+    S -->|"found, partly_found"| M{mode}
+    M -->|grounded| W["Client writes the answer<br/>from the passages, cites [S1]"] --> V[strata_verify]
+    V -->|flagged| W
+    V -->|verified| R[Receipt]
+    M -->|extractive| X["Server returns the document's<br/>own sentences, shown as they are"] --> R
+```
+
+**The answer contract** is what the server tells the client's model to do, in the instructions it sends when a client connects:
+
+- Answer only from the passages `strata_ask` returns, never from its own knowledge.
+- Cite every claim by passage id, and copy numbers, dates, amounts, codes and clause numbers verbatim.
+- In grounded mode, call `strata_verify` before showing the answer, and fix or drop what it flags. A flag of kind `passage` (a span too wide to check, for example) cannot be fixed by rewriting, so the client says the answer is unverified.
+- In extractive mode, show `answer` verbatim, with each sentence's citation and any note or warning.
+- Show the receipt id when there is one. A `not_found`, a flagged draft and a grounded answer not yet verified have none.
+- When the status is `not_found`, say "not in the documents" and give `next_step`, even if passages came back. When it is `partly_found`, answer what the passages support and say what they leave open.
+
+Clients that show MCP prompts also offer the same steps as the prompt `answer_from_documents`, with a `question` and optional comma-separated `layers`. The prompt reads no data and needs no database; the tools it names make their usual role checks.
+
+**The limits.** The instructions are a request to the client, not something the server can enforce: a client can ignore them, skip the check or retype a quote. What you can rely on is the receipt, which holds what the server itself read from the documents and, for a checked answer, the draft it checked. `strata_verify` checks quotes, numbers, dates, amounts, codes and clause references. It does not catch a paraphrase that changes the meaning without changing a fact; for layers where that is not acceptable, use `answer_mode: extractive`.
+
+**Opening a receipt.** Use `strata_get_receipt`, the resource `strata://receipts/{receipt_id}` or the command line, `uv run stratakb receipt <id>` ([what it prints](#checking-a-drafted-answer)). Each quote appears in its surrounding text, marked current, changed or gone. Receipts are kept for `RECEIPT_RETENTION_DAYS` (90 by default).
 
 ## Tools
 
@@ -614,14 +649,18 @@ StrataKB cannot control what your MCP client's language model does with the retr
 
 ## Glossary
 
+- **Answer contract**: what the server tells the client's model to do with an answer: use only the returned passages, cite them, copy facts verbatim, check the draft and show the receipt. See [Answers you can prove](#answers-you-can-prove).
 - **Chunk**: a passage of a document, cut along its headings or structure. Search returns chunks, each with its file and section.
 - **Confidence**: `high`, `medium` or `low`, returned with every `strata_search` result and with `strata_ask` in `response_format: "detailed"`; a low one comes with a warning. `strata_ask`'s detailed `confidence`, and the one the learning loop stores, is judged on all reranked chunks before the budget trims them; its `found`, `partly_found` or `not_found` is read from the best returned passage's score on the same thresholds. It is judged on the reranker's relevance probability (0 to 1) or, with reranking off, on each chunk's `similarity` (how similar the question and the chunk are by meaning); the result says which (`basis`: `rerank` or `similarity`). Each detailed `strata_ask` chunk carries `score` (its merged rank, best 1.0), `similarity`, `rerank_score` (null with reranking off), `source_file` and `section`, and each source's `relevance_score` is the score confidence was judged on. `strata_search` results carry each chunk's `similarity` (with hybrid search on, the default, its `score` is the fused rank, where the best result is always 1.0), and `strata_search` judges its confidence on that similarity (`basis` `similarity`), never on the fused `score`; a chunk without an embedding counts as similarity 0. The learning loop stores the confidence the tool returned, and each stored result keeps its `similarity`. The thresholds are provisional until the evaluation suite measures them.
 - **Embedding**: a list of numbers that stands for a chunk's meaning, so similar meanings get similar numbers. The embedding model (`all-mpnet-base-v2` by default) makes them; the vector column stores them (`EMBEDDING_DIMENSIONS`, 768 by default).
+- **Extractive answer**: an answer made of the document's own sentences, chosen by the server without a language model. See [Extractive answers](#extractive-answers).
+- **Grounded answer**: an answer your client writes from the cited passages and checks with `strata_verify`. See [Checking a drafted answer](#checking-a-drafted-answer).
 - **HNSW**: the pgvector index that finds similar embeddings quickly; `HNSW_EF_SEARCH` trades recall for speed.
 - **Hybrid search**: a search by meaning (embeddings) and a search by words (PostgreSQL full-text search), merged into one list with RRF.
 - **interaction_id**: the id on each search and ask result while learning is on; pass it to `strata_feedback` to rate the result.
 - **Layer**: a named collection of documents, usually one folder or one domain, with its own chunking and routing rules.
 - **Query rewriting**: optional; a language model turns a question into several searches in the layer's own terms. Learned rewrites are reused without the model.
+- **Receipt**: the stored record of a verified or extractive answer (`rcpt_…`), which shows its quotes in their documents and whether those have changed since. See [Answers you can prove](#answers-you-can-prove).
 - **Reranking**: in `strata_ask`, a second model (a cross-encoder, `RERANKING_MODEL`) reads the question with each candidate chunk and puts the best first.
 - **Routing patterns**: a layer's regular expressions. When a question names no layers, those whose patterns match its first 2,000 characters are searched first. A pattern that does not compile or that repeats a repeated part (such as `(\w+\s?)*`) is refused when the layer is created or updated or the preset is loaded, and skipped if a layer already holds one.
 - **RRF** (Reciprocal Rank Fusion): how hybrid search merges its two lists by rank, weighted by `HYBRID_SEMANTIC_WEIGHT` and `HYBRID_KEYWORD_WEIGHT`, with the constant `HYBRID_RRF_K`. The best full-text matches keep `HYBRID_KEYWORD_SLOTS` places in the results, because a chunk found only by words would otherwise rank below every chunk found by meaning. `strata_ask` merges the results of its searches (one per rewritten query) the same way, by rank with `HYBRID_RRF_K`: a chunk several searches find comes first, and ties go to the more similar chunk.
@@ -670,24 +709,10 @@ Without a running database, the integration tests fail with a connection error a
 The target: ask your own documents (contracts, rulebooks, specs, runbooks) and get answers you can **prove**, without learning how retrieval works and without sending private data anywhere you did not choose. Work is grouped into [milestones](https://github.com/boudou/StrataKB/milestones):
 
 1. **Five-minute start**: add a folder in one step, a one-command local mode, any OpenAI-compatible model provider, and a clear statement of where data goes.
-2. **Answers you can prove** (planned): every claim can be checked against its source, so you can be sure the model did not make it up.
-   - Each passage comes with its exact location: file, page, line range and clause (`7 Termination > 7.2`), and documents are chunked along their clauses and sections.
-   - **Grounded mode** (available): your client writes the answer, and `strata_verify` checks that every quote, number, date, amount, code and clause reference in it appears in the cited passages.
-   - **Extractive mode** (available): for layers where paraphrase is not acceptable, the server answers with the document's own sentences, chosen without a language model.
-   - **Receipts** (available): every verified or extractive answer gets a receipt you can open outside the chat, showing the quotes in context and whether the document changed since.
-   - An honest "not found" instead of a confident guess, and smaller responses that cost fewer tokens.
+2. **[Answers you can prove](#answers-you-can-prove)** (available): every claim can be checked against its source. Still to come: an evaluation suite that measures the provisional not-found thresholds.
 3. **Team server**: Streamable HTTP, real identities, per-layer access.
 4. **Daily use and sync**: a command line for daily use, connectors (git first), scanned PDFs.
 5. **Depth**: exact-lookup catalogs, cross-document references, source code.
-
-```mermaid
-flowchart LR
-    Q[Question] --> A[strata_ask]
-    A --> P["Passages with<br/>exact locations"]
-    P --> G{"Mode of the<br/>passages' layers"}
-    G -->|grounded| W[Client writes answer] --> V[strata_verify] --> R[Receipt]
-    G -->|extractive| X["Server returns the<br/>document's own sentences"] --> R
-```
 
 The product goal, the goals every change is checked against and the order of work are in [docs/IMPROVEMENTS.md](docs/IMPROVEMENTS.md).
 
