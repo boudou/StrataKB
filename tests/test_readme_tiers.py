@@ -1,4 +1,4 @@
-"""The README opens with a Quick start in plain words; the reference below it has a Glossary."""
+"""The README is short and opens with a Quick start in plain words; the reference is in the wiki."""
 
 import re
 from pathlib import Path
@@ -11,22 +11,20 @@ BANNED = re.compile(
     re.IGNORECASE,
 )
 
-GLOSSARY_TERMS = [
-    "Chunk",
-    "Confidence",
-    "Embedding",
-    "HNSW",
-    "Hybrid search",
-    "interaction_id",
-    "Layer",
-    "Query rewriting",
-    "Reranking",
-    "Routing patterns",
-    "RRF",
-    "top_k",
-]
+EXTERNAL_ANCHORS = ["quick-start", "layers-and-presets", "roadmap"]
 
-EXTERNAL_ANCHORS = ["quick-start", "layers-and-presets", "configuration", "roadmap", "tools"]
+WIKI_PAGES = {
+    "Home",
+    "Installation",
+    "Connecting-a-Client",
+    "Configuration",
+    "Tools",
+    "Layers-and-Presets",
+    "Asking-and-Searching",
+    "Roles-and-Audit",
+    "Troubleshooting",
+    "Glossary",
+}
 
 
 def _lines() -> list[str]:
@@ -104,14 +102,24 @@ def test_top_has_no_retrieval_terms():
     assert not matches, "retrieval terms in the Quick start: " + "; ".join(matches)
 
 
-def test_glossary_has_the_terms():
+def test_readme_stays_short():
+    assert len(README.read_text(encoding="utf-8").split()) < 4000
+
+
+def test_intro_says_who_it_is_for_today():
     lines = _lines()
     quick, _ = _section(lines, "Quick start")
-    start, end = _section(lines, "Glossary")
-    assert start > quick
-    body = "\n".join(lines[start:end])
-    missing = [term for term in GLOSSARY_TERMS if f"**{term}**" not in body]
-    assert not missing, f"missing from the Glossary: {missing}"
+    intro = "\n".join(lines[:quick]).lower()
+    for claim in ("whole team", "share one server", "self-learning"):
+        assert claim not in intro
+    for statement in ("small trusted group", "team server", "planned"):
+        assert statement in intro
+
+
+def test_links_to_the_wiki_reference():
+    text = README.read_text(encoding="utf-8")
+    linked = set(re.findall(r"github\.com/boudou/StrataKB/wiki/([\w-]+)", text))
+    assert linked == WIKI_PAGES
 
 
 def test_in_page_links_resolve():
