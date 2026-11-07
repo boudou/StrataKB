@@ -295,12 +295,15 @@ def fit_to_budget(chunk: dict[str, Any], budget: int) -> dict[str, Any]:
     """chunk, its text cut at a word so its passage fits budget tokens.
 
     The cut text is still the document's text from char_start, and char_end
-    moves with it; "cut" marks the chunk, so an extractive answer can say part of
-    the clause is missing. At least _MIN_TRIMMED_CHARS characters are kept.
+    moves with it; "cut" marks a chunk that lost text, so both answer modes can
+    say part of the clause is missing. At least _MIN_TRIMMED_CHARS characters are
+    kept, so a clause no longer than that comes back whole and unmarked.
     """
     if passage_cost(chunk) <= budget:
         return chunk
     content = chunk["content"]
+    if len(content) <= _MIN_TRIMMED_CHARS:
+        return chunk
     cut = len(content)
     while cut > _MIN_TRIMMED_CHARS:
         cut = max(int(cut * 0.9), _MIN_TRIMMED_CHARS)

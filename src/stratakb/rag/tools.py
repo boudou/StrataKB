@@ -44,6 +44,7 @@ from stratakb.rag.passages import (
     ask_chunk,
     basis_score,
     build_passages,
+    cut_clause_note,
     pack_passages,
     sources_from,
 )
@@ -307,7 +308,8 @@ async def _extract_answer(
 def _search_item(chunk: dict[str, Any]) -> dict[str, Any]:
     """A chunk in the strata_ask shape as a strata_search result.
 
-    An exact clause chunk keeps its "match": "exact" marker, last.
+    An exact clause chunk keeps its "match": "exact" marker, and one cut to fit
+    the budget its "cut" mark, last.
     """
     item = {
         "chunk_id": chunk["chunk_id"],
@@ -322,6 +324,8 @@ def _search_item(chunk: dict[str, Any]) -> dict[str, Any]:
     }
     if "match" in chunk:
         item["match"] = chunk["match"]
+    if chunk.get("cut"):
+        item["cut"] = True
     return item
 
 
@@ -476,7 +480,8 @@ def register_rag_tools(
         medium or low) judged on the results' similarity, with a warning when
         low, and an interaction_id to pass to strata_feedback. A clause or
         section the query names ("clause 7.2") comes first, verbatim,
-        marked "match": "exact".
+        marked "match": "exact". A result cut to fit the token budget also has
+        "cut": true: it holds only the start of the clause.
 
         Args:
             query: Natural language search query, or exact terms and identifiers.
@@ -618,6 +623,7 @@ def register_rag_tools(
             # Judged on the passages handed back, not on the layers searched
             used_mode, refused_note = await _answer_mode(database_url, mode, chunks, layers)
             extraction = None
+            note = None
             if used_mode == "extractive":
                 extraction = await _extract_answer(
                     database_url,
@@ -628,6 +634,10 @@ def register_rag_tools(
                     refused_note,
                 )
                 status = extraction.status
+            else:
+                note = cut_clause_note(chunks, passages)
+                if note and status == "found":
+                    status = "partly_found"
 
             # Audit
             await write_audit_log(
@@ -659,6 +669,7 @@ def register_rag_tools(
                 auto_detected_layers=detected,
                 routing_fallback=fallback_reason,
                 extraction=extraction,
+                note=note,
             )
 
         except Exception as e:
@@ -686,7 +697,9 @@ def register_rag_tools(
         cites them by id. When a passage comes from an extractive layer the
         server answers with the document's own sentences. A clause or section
         the question names ("clause 7.2", "Annex II") is looked up exactly and
-        comes first, verbatim, once per document that has it.
+        comes first, verbatim, once per document that has it. A named clause over
+        its share of the budget comes back cut: a found answer becomes
+        partly_found, with a note naming the clause and the file.
 
         The response: status is found, partly_found or not_found, with a
         next_step for the last two; mode is the mode used; passages lists S1,

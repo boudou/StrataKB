@@ -180,6 +180,9 @@ _ANSWER_CONTRACT = (
     "A citation with archived true is a file its layer's patterns mark as archived. Tell the "
     "reader, and give it beside the answer, not in the draft you verify. It does not say what "
     "replaces the file, and no label does not mean a passage is current.",
+    "When strata_ask in grounded mode returns a note, or a strata_search result has cut true, a "
+    "clause the question names came back only in part, and the missing part can reverse what is "
+    "there. Tell the reader and name the file, beside the answer, not in the draft you verify.",
     'When status is not_found, say "not in the documents" and give next_step, even if passages '
     "came back. When it is partly_found, answer what the passages support and say what they "
     "leave open. When it is error, report the error.",

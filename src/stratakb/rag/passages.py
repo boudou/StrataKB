@@ -248,6 +248,22 @@ def build_passages(
     ]
 
 
+def cut_clause_note(
+    chunks: list[dict[str, Any]], passages: list[dict[str, Any]]
+) -> str | None:
+    """A note naming each clause that was cut to fit the budget, and its file, or None."""
+    notes = []
+    for chunk, passage in zip(chunks, passages, strict=True):
+        if chunk.get("cut"):
+            citation = passage["citation"]
+            name = citation["clause_path"] or "The clause the question names"
+            notes.append(
+                f"{name} is only partly returned: the rest does not fit in the answer. "
+                f"Read the whole clause in {citation['file']}."
+            )
+    return " ".join(notes) or None
+
+
 def basis_score(chunk: dict[str, Any], basis: str) -> float:
     """The score confidence judges a strata_ask chunk on, for this basis.
 
@@ -361,7 +377,8 @@ class AskResult:
     None when they were not asked for. The learning tracker sets interaction_id.
 
     extraction is the server's answer when the mode is extractive; without it
-    the client composes the answer from the passages.
+    the client composes the answer from the passages. note is a grounded answer's
+    note; an extractive answer keeps its own in ExtractiveAnswer.note.
     """
 
     ok: ClassVar[Literal[True]] = True
@@ -377,6 +394,7 @@ class AskResult:
     routing_fallback: str | None = None
     interaction_id: str | None = None
     extraction: ExtractiveAnswer | None = None
+    note: str | None = None
 
     @property
     def mode(self) -> AnswerMode:
@@ -386,14 +404,16 @@ class AskResult:
         return self.detailed() if response_format == "detailed" else self.concise()
 
     def concise(self) -> dict[str, Any]:
-        """The answer status, the mode, the passages (grounded) or the answer and
-        its receipt (extractive), the next step when there is one, and the
-        interaction_id for strata_feedback."""
+        """The answer status, the mode, the passages and any note (grounded) or the
+        answer and its receipt (extractive), the next step when there is one, and
+        the interaction_id for strata_feedback."""
         response: dict[str, Any] = {"status": self.status, "mode": self.mode}
         if self.extraction is not None:
             response |= self.extraction.fields(with_scores=False)
         else:
             response["passages"] = self.passages
+            if self.note is not None:
+                response["note"] = self.note
         if step := next_step(self.status, self.mode):
             response["next_step"] = step
         if self.interaction_id is not None:
@@ -414,6 +434,8 @@ class AskResult:
             **(self.extraction.fields(with_scores=True) if self.extraction is not None else {}),
             "passages": self.passages,
         }
+        if self.extraction is None and self.note is not None:
+            response["note"] = self.note
         if step := next_step(self.status, self.mode):
             response["next_step"] = step
         if self.sources is not None:

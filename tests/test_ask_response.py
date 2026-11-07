@@ -26,6 +26,7 @@ from stratakb.rag.passages import (
     ToolFailure,
     build_passages,
     cite,
+    cut_clause_note,
     estimate_tokens,
     pack_passages,
     parse_ref,
@@ -422,6 +423,41 @@ class TestAskResultShapes:
         assert _answer().detailed()["confidence"] == {
             "level": "high", "top_score": 0.9, "relevant_sources": 3, "basis": "similarity",
         }
+
+    def test_note_follows_the_passages(self):
+        answer = _answer(status="partly_found", note="Read the rest.", interaction_id="int-1")
+
+        assert list(answer.concise()) == [
+            "status", "mode", "passages", "note", "next_step", "interaction_id",
+        ]
+        assert list(answer.detailed()) == [
+            "status", "question", "queries_used", "confidence", "retrieved_chunks",
+            "total_chunks", "answer_status", "mode", "passages", "note", "next_step",
+            "interaction_id",
+        ]
+        assert answer.concise()["note"] == "Read the rest."
+        assert answer.detailed()["note"] == "Read the rest."
+
+
+def test_cut_clause_note_names_only_cut_clauses():
+    def passage(path, file):
+        return {"citation": {"clause_path": path, "file": file}}
+
+    note = cut_clause_note(
+        [{"cut": True}, {}],
+        [passage("7 Fees", "a.md"), passage("8 Term", "b.md")],
+    )
+
+    assert note.startswith("7 Fees is only partly returned")
+    assert "a.md" in note
+    assert "8 Term" not in note
+    assert "b.md" not in note
+
+    unnamed = cut_clause_note([{"cut": True}], [passage(None, "a.md")])
+    assert unnamed.startswith("The clause the question names is only partly returned")
+
+    assert cut_clause_note([{}], [passage("7 Fees", "a.md")]) is None
+    assert cut_clause_note([], []) is None
 
 
 class TestSearchResponseShape:
