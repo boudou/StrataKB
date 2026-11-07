@@ -16,6 +16,12 @@ import pytest
 pytest.register_assert_rewrite("tests.helpers")
 
 
+@pytest.fixture(autouse=True)
+def no_server_identity(monkeypatch):
+    """main() pins the identity for the process; keep that inside one test."""
+    monkeypatch.setattr("stratakb.core.auth._server_identity", None)
+
+
 @pytest.fixture
 def no_sdk_env(monkeypatch):
     """Keep SDK keys, base-URL overrides and the rewrite model from the shell out of a test."""

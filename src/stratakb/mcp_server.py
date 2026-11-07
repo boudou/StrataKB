@@ -23,7 +23,7 @@ from pydantic import Field
 # made while a test patches stratakb.config.get_settings keeps the mock for good
 from stratakb.config import Settings, config_file_missing, dotenv_warning
 from stratakb.core.audit import query_audit_log, write_audit_log
-from stratakb.core.auth import require_role
+from stratakb.core.auth import require_role, set_server_identity
 from stratakb.core.database import check_connection, close_pool, get_pool
 from stratakb.core.egress import enforce_local_only, outbound_providers
 from stratakb.core.local_db import START_HINT
@@ -439,6 +439,9 @@ def main(settings: Settings | None = None) -> None:
 
     # Before anything imports huggingface_hub, which reads its offline flags once
     enforce_local_only(settings)
+
+    # One server, one identity: role checks and the audit log keep this pair
+    set_server_identity(settings.strata_user, settings.strata_role)
 
     logger.info(
         "starting_stratakb",
