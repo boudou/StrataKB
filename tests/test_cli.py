@@ -163,6 +163,20 @@ def test_max_file_size_must_be_finite_and_positive(capsys, size):
     plan_mock.assert_not_called()
 
 
+def test_max_file_size_zero_is_refused_once(capsys):
+    plan_mock = AsyncMock()
+    with patch.object(add_folder, "plan", plan_mock):
+        assert cli.main(["add", ROOT, "--max-file-size", "0"]) == 2
+    plan_mock.assert_not_called()
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    message = "must be a finite number above 0"
+    assert captured.err.count(message) == 1
+    assert captured.err.endswith(
+        f"stratakb add: error: argument --max-file-size: {message}: 0\n"
+    )
+
+
 def test_usage_error_with_json_prints_a_refusal(capsys):
     assert cli.main(["add", "--json"]) == 2
     data = json.loads(capsys.readouterr().out)
@@ -180,7 +194,7 @@ def test_add_passes_the_flags_to_the_service():
     assert options.name == "my_docs"
     assert options.description == "D"
     assert options.max_file_size_mb == 2.5
-    assert options.allow_broad is False and options.yes is False
+    assert options.confirmed == frozenset()
 
 
 # ── Exit codes ───────────────────────────────────────────

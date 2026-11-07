@@ -10,6 +10,9 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import os
+import subprocess
+import sys
 from unittest.mock import AsyncMock, patch
 from uuid import uuid4
 
@@ -252,6 +255,81 @@ def test_render_receipt_escapes_every_field():
     # Lines break on newlines only; a carriage return or form feed is shown
     assert "    beforex\\x9b\\u202e\\x0d\n    line\\x0c>>> x\\x9b\\u202e <<<afterx" in text
     assert text.endswith("<<<afterx\\x9b\\u202e")
+
+
+_VERIFIED_RECEIPT = {
+    "receipt_id": "rcpt_x",
+    "kind": "verify",
+    "mode": "grounded",
+    "layers": [],
+    "issued_at": "2026-11-07",
+    "issued_by": "alice",
+    "question": None,
+    "draft": "D",
+    "quotes": [],
+    "verification": {"result": "verified", "passages": [], "quotes": 2, "facts": 1, "flags": 0},
+}
+
+
+def test_render_receipt_shows_the_verification():
+    lines = cli.render_receipt(_VERIFIED_RECEIPT).splitlines()
+    assert "Verification: verified (quotes checked: 2, facts checked: 1, flags: 0)" in lines
+    assert lines.index("Draft: D") < lines.index("No quotes.")
+
+
+def test_render_receipt_escapes_the_verification():
+    verification = {**_VERIFIED_RECEIPT["verification"], "result": "x\x9b"}
+    text = cli.render_receipt({**_VERIFIED_RECEIPT, "verification": verification})
+    assert "\x9b" not in text
+    assert "Verification: x\\x9b (" in text
+
+
+def test_receipt_without_verification_has_no_such_line(cited, capsys):
+    receipt_id, _ = cited
+    assert _main(["receipt", receipt_id]) == cli.EXIT_OK
+    assert "Verification:" not in capsys.readouterr().out
+
+
+def test_verified_draft_prints_its_verification(db_url, layer, tmp_path, capsys):
+    """A receipt from the real verify path, stored and opened by the command."""
+    from stratakb.rag.verify_tools import verify_draft
+
+    async def verified() -> str:
+        (tmp_path / "policy.md").write_text(V1_TEXT, encoding="utf-8")
+        await ingest(db_url, layer, tmp_path)
+        doc = await latest_document(db_url, layer, "policy.md")
+        start = doc["text"].index(QUOTE)
+        passage = f"d{doc['id']}:{start}-{start + len(QUOTE)}"
+        with as_user("alice", "viewer"):
+            response = await verify_draft(
+                db_url, f'"{QUOTE}" [S1]', [passage], "alice", "viewer"
+            )
+        assert response["result"] == "verified", response
+        return response["receipt_id"]
+
+    receipt_id = _run(verified())
+    assert _main(["receipt", receipt_id]) == cli.EXIT_OK
+    assert (
+        "Verification: verified (quotes checked: 1, facts checked: 0, flags: 0)"
+        in capsys.readouterr().out
+    )
+
+
+def test_receipt_does_not_import_add_folder_or_the_server():
+    """A fresh process, unreachable database: the path that shows the host and port too."""
+    code = (
+        "import sys\n"
+        "from stratakb import cli\n"
+        f"assert cli.main(['receipt', '{UNKNOWN_ID}']) == cli.EXIT_DATABASE\n"
+        "assert 'stratakb.knowledge.add_folder' not in sys.modules\n"
+        "assert 'stratakb.mcp_server' not in sys.modules\n"
+    )
+    env = {**os.environ, "DATABASE_URL": "postgresql://u:p@127.0.0.1:1/x"}
+    env.pop("STRATAKB_CONFIG", None)
+    done = subprocess.run(
+        [sys.executable, "-c", code], env=env, capture_output=True, text=True, timeout=60
+    )
+    assert done.returncode == 0, done.stderr
 
 
 def test_json_error_form_escapes_c1_del_and_bidi(capsys):

@@ -10,8 +10,8 @@
 Each subcommand is a subparser and a handler; a new one adds both and
 nothing else. The command owns the terminal (prompts, progress, the report
 and the exit code); add_folder makes every decision. stdout carries only
-the report; prompts, progress and hints go to stderr. `add` never imports
-the server.
+the report; prompts, progress and hints go to stderr. `add` and `receipt`
+never import the server.
 """
 
 from __future__ import annotations
@@ -61,6 +61,51 @@ class _ArgumentParser(argparse.ArgumentParser):
         raise _UsageError(self.format_usage(), f"{self.prog}: error: {message}")
 
 
+# ── Confirmation needs of add ────────────────────────────
+
+
+def _broad_path_text(plan: Plan) -> str:
+    return f"{plan.root} is a broad path ({plan.broad_why})."
+
+
+def _large_run_text(plan: Plan) -> str:
+    return (
+        f"This run adds or updates {plan.added_or_updated} files "
+        f"({plan.work_bytes / 1_000_000:.1f} MB) "
+        f"and removes {plan.planned.get('removed', 0)}."
+    )
+
+
+class _Need(NamedTuple):
+    """A confirmation need of add_folder.plan: how the command confirms it."""
+
+    name: str  # as in Plan.needs and Options.confirmed
+    flag: str  # the command-line flag that confirms it
+    help: str
+    text: Callable[[Plan], str]  # what needs confirming, in one sentence
+    question: str  # the prompt after the text
+
+
+# In the order they are asked. A row only says how to confirm a need:
+# add_folder.plan() must also detect it and add its name to Plan.needs.
+_NEEDS = (
+    _Need(
+        name="broad_path",
+        flag="--allow-broad",
+        help="allow a drive root, the home folder or a system folder",
+        text=_broad_path_text,
+        question="Add it anyway?",
+    ),
+    _Need(
+        name="large_run",
+        flag="--yes",
+        help="go ahead with a large run without asking",
+        text=_large_run_text,
+        question="Continue?",
+    ),
+)
+
+
 def _parser() -> _ArgumentParser:
     from stratakb.config import LOCAL_DB_PORT
 
@@ -91,7 +136,9 @@ def _parser() -> _ArgumentParser:
         help="skip files larger than this many megabytes (default: 50)",
     )
     for need in _NEEDS:
-        add.add_argument(need.flag, dest=need.option, action="store_true", help=need.help)
+        add.add_argument(
+            need.flag, dest="confirmed", action="append_const", const=need.name, help=need.help
+        )
     add.add_argument("--json", action="store_true", help="print the report as JSON")
 
     db = commands.add_parser(
@@ -131,6 +178,8 @@ def _size_mb(text: str) -> float:
         raise argparse.ArgumentTypeError(f"not a number: {text}") from None
     from stratakb.knowledge.add_folder import max_file_size_error
 
+    # Here as well as in add_folder.plan(): a bad value is a usage error of the
+    # command line, reported before the command needs a database
     err = max_file_size_error(size)
     if err is not None:
         raise argparse.ArgumentTypeError(f"{err}: {text}")
@@ -347,50 +396,6 @@ def _down_text(outcome: DownOutcome) -> str:
 # ── add ──────────────────────────────────────────────────
 
 
-def _broad_path_text(plan: Plan) -> str:
-    return f"{plan.root} is a broad path ({plan.broad_why})."
-
-
-def _large_run_text(plan: Plan) -> str:
-    return (
-        f"This run adds or updates {plan.added_or_updated} files "
-        f"({plan.work_bytes / 1_000_000:.1f} MB) "
-        f"and removes {plan.planned.get('removed', 0)}."
-    )
-
-
-class _Need(NamedTuple):
-    """A confirmation need of add_folder.plan: how the command confirms it."""
-
-    name: str  # as in Plan.needs
-    flag: str  # the command-line flag that confirms it
-    option: str  # the Options field the flag sets
-    help: str
-    text: Callable[[Plan], str]  # what needs confirming, in one sentence
-    question: str  # the prompt after the text
-
-
-# In the order they are asked
-_NEEDS = (
-    _Need(
-        "broad_path",
-        "--allow-broad",
-        "allow_broad",
-        "allow a drive root, the home folder or a system folder",
-        _broad_path_text,
-        "Add it anyway?",
-    ),
-    _Need(
-        "large_run",
-        "--yes",
-        "yes",
-        "go ahead with a large run without asking",
-        _large_run_text,
-        "Continue?",
-    ),
-)
-
-
 def _run_add(args: argparse.Namespace) -> int:
     from stratakb.config import config_file_missing, dotenv_warning, get_settings
     from stratakb.core.logging import configure_logging
@@ -456,7 +461,7 @@ async def _add(args: argparse.Namespace, settings: Any, root: str) -> Report:
 
     root is the folder as shown until the plan resolves it.
     """
-    from stratakb.core.database import close_pool
+    from stratakb.core.database import close_pool, url_host_port
     from stratakb.core.migrations import MigrationError, ensure_schema
     from stratakb.knowledge import add_folder
     from stratakb.knowledge.layers import (
@@ -466,7 +471,7 @@ async def _add(args: argparse.Namespace, settings: Any, root: str) -> Report:
     )
 
     url = settings.database_url
-    target = add_folder.db_target(url)
+    target = url_host_port(url)
     layer: str | None = None
 
     def refuse(
@@ -486,7 +491,7 @@ async def _add(args: argparse.Namespace, settings: Any, root: str) -> Report:
         name=args.name,
         description=args.description,
         max_file_size_mb=args.max_file_size,
-        **{need.option: getattr(args, need.option) for need in _NEEDS},
+        confirmed=frozenset(args.confirmed or ()),
     )
     progress = _Progress() if _isatty(sys.stderr) else None
     try:
@@ -542,7 +547,7 @@ def _confirmations(plan: Plan, options: Options) -> tuple[set[str], tuple[str, s
     for need in _NEEDS:
         if need.name not in plan.needs:
             continue
-        if getattr(options, need.option):
+        if need.name in options.confirmed:
             confirmed.add(need.name)
             continue
         if not _stdin_is_tty():
@@ -636,9 +641,8 @@ class _ReceiptOpenError(Exception):
 
 async def _open_receipt(url: str, receipt_id: str, user_id: str, role: str) -> dict:
     """open_receipt, with every failure turned into a _ReceiptOpenError."""
-    from stratakb.core.database import close_pool
+    from stratakb.core.database import close_pool, url_host_port
     from stratakb.core.migrations import MigrationError
-    from stratakb.knowledge.add_folder import db_target
     from stratakb.rag.receipts import ReceiptAccessError, open_receipt
 
     try:
@@ -646,7 +650,8 @@ async def _open_receipt(url: str, receipt_id: str, user_id: str, role: str) -> d
     except ReceiptAccessError as e:
         raise _ReceiptOpenError(str(e), EXIT_FAILED) from None
     except _connection_errors() as e:
-        raise _ReceiptOpenError(_unreachable_message(db_target(url), e), EXIT_DATABASE) from None
+        message = _unreachable_message(url_host_port(url), e)
+        raise _ReceiptOpenError(message, EXIT_DATABASE) from None
     except MigrationError as e:
         raise _ReceiptOpenError(str(e), EXIT_DATABASE) from None
     except Exception as e:
@@ -728,6 +733,15 @@ def render_text(report: Report) -> str:
     return "\n".join(lines)
 
 
+def _verification_line(verification: dict[str, Any]) -> str:
+    """The stored result of strata_verify, as --json carries it."""
+    return (
+        f"Verification: {verification['result']} "
+        f"(quotes checked: {verification['quotes']}, facts checked: {verification['facts']}, "
+        f"flags: {verification['flags']})"
+    )
+
+
 def render_receipt(receipt: dict) -> str:
     """A receipt for a person to read: each quote marked >>> <<< in its context.
 
@@ -743,6 +757,8 @@ def render_receipt(receipt: dict) -> str:
         lines.append(f"Question: {receipt['question']}")
     if receipt.get("draft"):
         lines.append(f"Draft: {receipt['draft']}")
+    if receipt.get("verification"):
+        lines.append(_verification_line(receipt["verification"]))
     for position, quote in enumerate(receipt["quotes"], start=1):
         where = [f"layer {quote['layer']}", f"v{quote['version']}"]
         if quote.get("clause_path"):

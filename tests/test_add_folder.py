@@ -20,7 +20,6 @@ from stratakb.knowledge.add_folder import (
     REPORT_KEYS,
     Options,
     broad_reason,
-    db_target,
     derive_description,
     is_broad,
     resolve_owner,
@@ -190,13 +189,6 @@ def test_owner_from_login():
         assert resolve_owner(folder_settings()) == "os:dave"
     with patch("stratakb.knowledge.add_folder.getpass.getuser", side_effect=KeyError("x")):
         assert resolve_owner(folder_settings()) == "os:unknown"
-
-
-def test_db_target_hides_credentials():
-    target = db_target("postgresql://strata:s3cret_pw@db.example.com:6543/strata")
-    assert target == "db.example.com:6543"
-    assert "s3cret_pw" not in target and "strata" not in target
-    assert db_target("postgresql:///strata") == "localhost:5432"
 
 
 def test_refused_report_shape():

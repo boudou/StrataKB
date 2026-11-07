@@ -22,11 +22,13 @@ import os
 import re
 import sys
 from collections import Counter
-from collections.abc import Callable, Collection, Mapping
+from collections.abc import Callable, Collection
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal, get_args
 from uuid import UUID, uuid4
+
+import asyncpg
 
 from stratakb.core.audit import write_audit_log
 from stratakb.core.database import url_host_port
@@ -107,13 +109,15 @@ _RULE_LINE = re.compile(r"^[=\-~^*+#_`]+$")
 
 @dataclass
 class Options:
-    """What the caller asked for: the command's flags."""
+    """What the caller asked for: the command's flags.
+
+    confirmed holds the needs (as in Plan.needs) a flag already confirmed.
+    """
 
     name: str | None = None
     description: str | None = None
     max_file_size_mb: float = 50.0
-    allow_broad: bool = False
-    yes: bool = False
+    confirmed: frozenset[str] = frozenset()
 
 
 @dataclass
@@ -208,11 +212,6 @@ def refused(
         hint=hint,
         db_target=db_target,
     )
-
-
-def db_target(database_url: str) -> str:
-    """host:port of a database URL, never its user, password or database name."""
-    return url_host_port(database_url)
 
 
 def resolve_owner(settings: Any) -> str:
@@ -402,10 +401,9 @@ def max_file_size_error(size_mb: float) -> str | None:
     return "must be a finite number above 0"
 
 
-def _refuse(plan: Plan, reason: str, hint: str) -> Plan:
+def _refuse(plan: Plan, reason: str, hint: str) -> None:
     plan.refusal = (reason, hint)
     plan.action = None
-    return plan
 
 
 def _removal_reason(path: str, plan: Plan, selection: SelectionResult, root: Path) -> str:
@@ -420,54 +418,42 @@ def _removal_reason(path: str, plan: Plan, selection: SelectionResult, root: Pat
     return "deleted"
 
 
-def _check_input(path: str | os.PathLike, options: Options) -> Plan:
-    """The root and the usage errors; a plan refused here has no selection."""
-    p = Path(path).expanduser()
-    if not p.exists():
-        return _refuse(
-            Plan(root=p.absolute().as_posix()), "path_not_found", f"{p} does not exist."
-        )
-    if not p.is_dir():
-        return _refuse(
-            Plan(root=p.absolute().as_posix()),
-            "not_a_folder",
-            f"{p} is a file; give the folder that holds it.",
-        )
-    result = Plan(root=p.resolve().as_posix())
+# The steps of plan(): each returns None and refuses by setting result.refusal
+# (through _refuse); plan() stops at the first refusal.
 
-    if options.name is not None and not NAME_PATTERN.match(options.name):
-        return _refuse(
+
+def _check_input(result: Plan, path: Path, options: Options) -> None:
+    """The usage errors; a plan refused here has no selection."""
+    if not path.exists():
+        _refuse(result, "path_not_found", f"{path} does not exist.")
+    elif not path.is_dir():
+        _refuse(result, "not_a_folder", f"{path} is a file; give the folder that holds it.")
+    elif options.name is not None and not NAME_PATTERN.match(options.name):
+        _refuse(
             result,
             "usage_error",
             f"Invalid layer name '{options.name}'. Must be 3-100 chars, "
             "lowercase alphanumeric with underscores, starting with a letter.",
         )
-    size_error = max_file_size_error(options.max_file_size_mb)
-    if size_error is not None:
-        return _refuse(result, "usage_error", f"--max-file-size {size_error}.")
-    return result
+    # Here as well as in the command's argument parser: Options can come from
+    # any front end, and a parser's check protects only its own command line
+    elif (size_error := max_file_size_error(options.max_file_size_mb)) is not None:
+        _refuse(result, "usage_error", f"--max-file-size {size_error}.")
 
 
-async def _select(
-    result: Plan, max_bytes: int
-) -> tuple[SelectionResult, list[FileEntry]] | None:
-    """Select the files and judge each by policy: the selection and the ingest candidates.
-
-    None when the folder can't be listed; the plan is then refused.
-    """
+async def _select(result: Plan, max_bytes: int) -> None:
+    """Select the files and judge each by policy; refuse when the folder can't be listed."""
     root = result.root
     try:
         selection = await asyncio.to_thread(select_files, Path(root))
     except NotADirectoryError:
         _refuse(result, "not_a_folder", f"{root} is not a folder.")
-        return None
+        return
     except PermissionError:
         _refuse(result, "path_unreadable", f"{root} can't be listed (permission denied).")
-        return None
+        return
     result.selection = selection
     result.verdicts = {e.relative_path: evaluate(e, max_bytes) for e in selection.entries}
-    candidates = [e for e in selection.entries if result.verdicts[e.relative_path].ingest]
-    return selection, candidates
 
 
 async def _resolve_layer(database_url: str, result: Plan, options: Options) -> None:
@@ -533,13 +519,11 @@ async def _resolve_layer(database_url: str, result: Plan, options: Options) -> N
         )
 
 
-async def _compare_with_tracked(
-    result: Plan,
-    selection: SelectionResult,
-    candidates: list[FileEntry],
-    tracked: Mapping[str, Mapping[str, Any]],
-) -> None:
-    """Hash the candidates and count what the run adds, updates and removes."""
+async def _compare_with_tracked(result: Plan, tracked: dict[str, asyncpg.Record]) -> None:
+    """Hash the files policy lets in and count what the run adds, updates and removes."""
+    selection = result.selection
+    assert selection is not None  # _select set it, or plan() stopped
+    candidates = [e for e in selection.entries if result.verdicts[e.relative_path].ingest]
     result.tracked = len(tracked)
     # Only files that passed policy are ever opened
     entries, links = await asyncio.to_thread(_hash_entries, candidates)
@@ -579,15 +563,16 @@ async def _compare_with_tracked(
         result.needs.add("large_run")
 
 
-def _finish(result: Plan, options: Options) -> Plan:
+def _finish(result: Plan, options: Options) -> None:
     """Refuse a new layer without files; set the display name and description."""
     root = result.root
     if result.action == "create" and not result.entries:
-        return _refuse(
+        _refuse(
             result,
             "nothing_to_add",
             f"No file in {root} can be added: every file is excluded or skipped.",
         )
+        return
     if result.action == "create":
         result.display_name = Path(root).name[:_DISPLAY_NAME_MAX] or slugify("", root)
         result.description = (
@@ -597,12 +582,14 @@ def _finish(result: Plan, options: Options) -> Plan:
         )
     else:
         result.description = options.description
-    return result
 
 
 async def plan(database_url: str, path: str | os.PathLike, options: Options) -> Plan:
     """Decide what adding the folder at path would do. Writes nothing."""
-    result = _check_input(path, options)
+    p = Path(path).expanduser()
+    result = Plan(root=(p.resolve() if p.is_dir() else p.absolute()).as_posix())
+
+    _check_input(result, p, options)
     if result.refusal is not None:
         return result
 
@@ -610,10 +597,9 @@ async def plan(database_url: str, path: str | os.PathLike, options: Options) -> 
     if result.broad_why is not None:
         result.needs.add("broad_path")
 
-    selected = await _select(result, int(options.max_file_size_mb * 1_000_000))
-    if selected is None:
+    await _select(result, int(options.max_file_size_mb * 1_000_000))
+    if result.refusal is not None:
         return result
-    selection, candidates = selected
 
     await _resolve_layer(database_url, result, options)
     if result.refusal is not None:
@@ -624,12 +610,15 @@ async def plan(database_url: str, path: str | os.PathLike, options: Options) -> 
         if result.layer_id is not None
         else {}
     )
-    await _compare_with_tracked(result, selection, candidates, tracked)
-    return _finish(result, options)
+    await _compare_with_tracked(result, tracked)
+    _finish(result, options)
+    return result
 
 
-async def _write_layer(database_url: str, plan: Plan, layer: str, owner: str) -> None:
+async def _write_layer(database_url: str, plan: Plan, owner: str) -> None:
     """Create the layer, or adopt the folder into it; write a new description."""
+    layer = plan.layer
+    assert layer is not None  # apply() refused a plan without one
     if plan.action == "create":
         await create_layer(
             database_url,
@@ -712,7 +701,7 @@ async def apply(
     layer = plan.layer
     selection = plan.selection
 
-    await _write_layer(database_url, plan, layer, owner)
+    await _write_layer(database_url, plan, owner)
     result = await ingest_documents(
         database_url,
         settings.openai_api_key,
@@ -768,5 +757,5 @@ async def apply(
         notes=notes,
         reason=None,
         exit_code=1 if counts["failed"] > 0 else 0,
-        db_target=db_target(database_url),
+        db_target=url_host_port(database_url),
     )
