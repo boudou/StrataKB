@@ -65,6 +65,15 @@ class Reference(NamedTuple):
     labels: tuple[str, ...]
 
 
+class ClauseMatches(NamedTuple):
+    """The chunks a lookup returns, and the matching sections it did not read."""
+
+    chunks: list[dict[str, Any]]
+    unread: int = 0
+    # The candidate limit stopped the count, so more than unread may match
+    unread_is_minimum: bool = False
+
+
 def _keyword_labels(keyword: str, number: str) -> tuple[str, ...]:
     keyword = keyword.lower()
     number = normalise_label(number)
@@ -189,7 +198,7 @@ def find_references(
 
 async def resolve(
     database_url: str, references: Sequence[Reference], layers: list[str] | None
-) -> list[dict[str, Any]]:
+) -> ClauseMatches:
     """The stored sections the references name, as exact chunks.
 
     Only current documents count (those that still have chunks; an older
@@ -197,7 +206,7 @@ async def resolve(
     The chunks follow the references' order, then the file path; a section
     inside another one returned is left out, as its text is already there.
     At most _MAX_CANDIDATE_SECTIONS sections are read, and the text of at
-    most MAX_EXACT_MATCHES.
+    most MAX_EXACT_MATCHES; the sections past that are counted as unread.
     """
     # Each label ranks by the first reference that names it
     ranks: dict[str, int] = {}
@@ -205,7 +214,7 @@ async def resolve(
         for label in ref.labels:
             ranks.setdefault(label, rank)
     if not ranks:
-        return []
+        return ClauseMatches([])
     from stratakb.core.database import get_pool
 
     pool = await get_pool(database_url)
@@ -248,9 +257,11 @@ async def resolve(
         )
         if not inside:
             kept.append(row)
+    unread = max(len(kept) - MAX_EXACT_MATCHES, 0)
+    unread_is_minimum = len(rows) == _MAX_CANDIDATE_SECTIONS
     kept = kept[:MAX_EXACT_MATCHES]
     if not kept:
-        return []
+        return ClauseMatches([])
 
     text_rows = await pool.fetch(
         """
@@ -267,7 +278,7 @@ async def resolve(
         text = (texts.get(row["id"]) or "").rstrip()
         if text:
             chunks.append(_exact_chunk(row, text))
-    return chunks
+    return ClauseMatches(chunks, unread, unread_is_minimum)
 
 
 def _exact_chunk(row: Any, text: str) -> dict[str, Any]:
@@ -323,30 +334,43 @@ def fit_to_budget(chunk: dict[str, Any], budget: int) -> dict[str, Any]:
     }
 
 
+def fit_clauses(chunks: list[dict[str, Any]], budget: int) -> list[dict[str, Any]]:
+    """Each chunk fit to the budget left, divided by the chunks still to fit, in order.
+
+    A chunk's floor (fit_to_budget) can pass its share, and the later ones then
+    share what is left. None is dropped, even when nothing is left: each of
+    those comes back at its floor, and packing decides what fits.
+    """
+    fitted: list[dict[str, Any]] = []
+    remaining = budget
+    for i, chunk in enumerate(chunks):
+        piece = fit_to_budget(chunk, max(remaining // (len(chunks) - i), 1))
+        fitted.append(piece)
+        remaining -= passage_cost(piece)
+    return fitted
+
+
 async def lookup(
     database_url: str,
     question: str,
     layers: list[str] | None,
     budget: int,
     extra_patterns: Iterable[str | re.Pattern[str]] = (),
-) -> list[dict[str, Any]]:
+) -> ClauseMatches:
     """The exact chunks for the references in question, each fit to its share of budget.
 
-    Returns [] when the question names no section, none resolves, or the
-    lookup fails; retrieval then runs as usual.
+    The chunks are empty when the question names no section, none resolves, or
+    the lookup fails; retrieval then runs as usual.
     """
     references = find_references(question, extra_patterns)
     if not references:
-        return []
+        return ClauseMatches([])
     try:
-        chunks = await resolve(database_url, references, layers)
+        matches = await resolve(database_url, references, layers)
     except Exception as e:
         logger.warning("clause_lookup_failed", error_type=type(e).__name__)
-        return []
-    if not chunks:
-        return []
-    share = max(budget // len(chunks), 1)
-    return [fit_to_budget(c, share) for c in chunks]
+        return ClauseMatches([])
+    return matches._replace(chunks=fit_clauses(matches.chunks, budget))
 
 
 def in_exact_span(

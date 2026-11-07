@@ -15,7 +15,7 @@ from stratakb.core.audit import write_audit_log
 from stratakb.core.auth import require_role
 from stratakb.core.logging import log_tool_call
 from stratakb.learning.pii import scrub_query
-from stratakb.rag.clause_lookup import in_exact_span, without_exact_spans
+from stratakb.rag.clause_lookup import ClauseMatches, in_exact_span, without_exact_spans
 from stratakb.rag.clause_lookup import lookup as lookup_clauses
 from stratakb.rag.confidence import (
     EXTRACTIVE_SENTENCE_THRESHOLD,
@@ -45,6 +45,7 @@ from stratakb.rag.passages import (
     basis_score,
     build_passages,
     cut_clause_note,
+    left_out_note,
     pack_passages,
     sources_from,
 )
@@ -86,7 +87,7 @@ async def _detect_layers(database_url: str, query: str, learning_enabled: bool) 
 
 async def _exact_clauses(
     database_url: str, question: str, layers: list[str] | None, budget: int
-) -> list[dict[str, Any]]:
+) -> ClauseMatches:
     """The sections question names, looked up with the searched layers' structure patterns."""
     from stratakb.knowledge.layers import get_structure_patterns
 
@@ -243,6 +244,7 @@ async def _extract_answer(
     model_name: str,
     budget: int,
     refused_note: str | None,
+    omitted_note: str | None,
 ) -> ExtractiveAnswer:
     """Choose the sentences that answer question from the chunks, and issue their receipt.
 
@@ -252,6 +254,9 @@ async def _extract_answer(
     grounded answer it fails when the documents cannot be read or the model
     cannot load: there is no answer without them.
     refused_note says the caller asked for a mode the layers do not allow.
+    omitted_note says named clauses never reached chunks: it makes a found answer
+    partly_found too, and a not_found answer keeps it, so "not in the documents"
+    does not hide what was not read.
     """
     from stratakb.core.database import get_pool
     from stratakb.knowledge.documents import fetch_cited_documents
@@ -276,7 +281,7 @@ async def _extract_answer(
     logger.info("extractive_answer", candidates=len(candidates), sentences=len(sentences))
     if not sentences:
         legacy_note = LEGACY_ONLY_NOTE if chunks and not ends else None
-        note = " ".join(n for n in (refused_note, legacy_note) if n) or None
+        note = " ".join(n for n in (refused_note, legacy_note, omitted_note) if n) or None
         return ExtractiveAnswer([], None, "not_found", note)
 
     sentences = fit_to_answer_budget(sentences, chunks, documents, budget)
@@ -299,9 +304,9 @@ async def _extract_answer(
     )
     status = answer_status(max(s.score for s in sentences), "rerank")
     gap_note = await asyncio.to_thread(clause_gap_note, chunks, documents, ends, sentences)
-    if gap_note and status == "found":
+    if (gap_note or omitted_note) and status == "found":
         status = "partly_found"
-    note = " ".join(n for n in (refused_note, gap_note) if n) or None
+    note = " ".join(n for n in (refused_note, gap_note, omitted_note) if n) or None
     return ExtractiveAnswer(answer, receipt_id, status, note)
 
 
@@ -427,9 +432,10 @@ def register_rag_tools(
                     confidence = _search_confidence(results)
 
             # A clause or section the query names comes first, verbatim
-            exact = await _exact_clauses(
+            matches = await _exact_clauses(
                 database_url, query, layers, _settings.answer_token_budget
             )
+            exact = matches.chunks
             found = [
                 _search_item(_ask_chunk(r, r.score))
                 for r in results
@@ -603,9 +609,10 @@ def register_rag_tools(
                     layers = None
             # A clause or section the question names comes first, verbatim,
             # looked up in the layers searched; retrieved chunks inside it go
-            exact = await _exact_clauses(
+            matches = await _exact_clauses(
                 database_url, question, layers, _settings.answer_token_budget
             )
+            exact = matches.chunks
             # The best chunks that fit the answer budget; confidence is judged
             # on the reranked chunks, the answer status on what is returned
             chunks = pack_passages(
@@ -614,7 +621,13 @@ def register_rag_tools(
             )
             confidence = collected.confidence
             basis = confidence.basis
-            passages = build_passages(chunks, await _cited_documents(database_url, chunks))
+            # Packing keeps a prefix, so the named clauses past it did not fit
+            left_out = exact[len(chunks):]
+            documents = await _cited_documents(database_url, chunks + left_out)
+            passages = build_passages(chunks, documents)
+            omitted = left_out_note(
+                left_out, documents, matches.unread, matches.unread_is_minimum
+            )
             status = answer_status(
                 max((basis_score(c, basis) for c in chunks), default=0.0), basis
             )
@@ -632,10 +645,13 @@ def register_rag_tools(
                     _settings.reranking_model,
                     _settings.answer_token_budget,
                     refused_note,
+                    omitted,
                 )
                 status = extraction.status
             else:
-                note = cut_clause_note(chunks, passages)
+                note = " ".join(
+                    n for n in (cut_clause_note(chunks, passages), omitted) if n
+                ) or None
                 if note and status == "found":
                     status = "partly_found"
 
@@ -699,7 +715,9 @@ def register_rag_tools(
         the question names ("clause 7.2", "Annex II") is looked up exactly and
         comes first, verbatim, once per document that has it. A named clause over
         its share of the budget comes back cut: a found answer becomes
-        partly_found, with a note naming the clause and the file.
+        partly_found, with a note naming the clause and the file. A named clause
+        that does not fit, or a match past the first 10, is left out: a found
+        answer becomes partly_found, with a note giving the count and the files.
 
         The response: status is found, partly_found or not_found, with a
         next_step for the last two; mode is the mode used; passages lists S1,

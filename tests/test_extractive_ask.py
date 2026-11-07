@@ -17,6 +17,7 @@ from uuid import uuid4
 import pytest
 from mcp.server.fastmcp.exceptions import ToolError
 
+from stratakb.rag.clause_lookup import ClauseMatches
 from stratakb.rag.confidence import RERANK_THRESHOLDS
 from stratakb.rag.extractive import GROUNDED_REFUSED_NOTE, LEGACY_ONLY_NOTE, OCR_WARNING
 from stratakb.rag.passages import ask_chunk
@@ -88,7 +89,11 @@ async def make_layer(settings):
     names = []
 
     async def make(
-        answer_mode: str, *, text_origin: str = "text", text: str = DOC_TEXT
+        answer_mode: str,
+        *,
+        text_origin: str = "text",
+        text: str = DOC_TEXT,
+        relative_path: str = "contracts/acme-msa.md",
     ) -> tuple[str, int]:
         name = f"test_extract_{uuid4().hex[:10]}"
         names.append(name)
@@ -100,7 +105,7 @@ async def make_layer(settings):
         async with pool.acquire() as conn, conn.transaction():
             document_id, _ = await store_document_version(
                 conn, layer_id=layer_id, file_id=None, source_root="/docs",
-                relative_path="contracts/acme-msa.md", text=text, page_map=None,
+                relative_path=relative_path, text=text, page_map=None,
                 text_origin=text_origin,
             )
         return name, document_id
@@ -136,6 +141,14 @@ def _relevant(*words: str, score: float = 0.9):
         return [score if any(w in t for w in words) else 0.05 for t in texts]
 
     return score_pairs
+
+
+def _looked_up(*chunks, **counts):
+    """The clause lookup returns chunks, with any unread counts."""
+    return patch(
+        "stratakb.rag.tools._exact_clauses",
+        AsyncMock(return_value=ClauseMatches(list(chunks), **counts)),
+    )
 
 
 async def _ask(server, results, score_pairs=None, **arguments) -> dict:
@@ -310,7 +323,7 @@ class TestAskExtractive:
         )
         chunk["match"] = "exact"
 
-        with patch("stratakb.rag.tools._exact_clauses", AsyncMock(return_value=[chunk])):
+        with _looked_up(chunk):
             response = await _ask(server, [], layers=[layer])
 
         assert response["status"] == "not_found"
@@ -334,7 +347,7 @@ class TestAskExtractive:
         layer, document_id = await make_layer("extractive", text=text)
         chunk = self._exact_chunk(layer, document_id, text)
 
-        with patch("stratakb.rag.tools._exact_clauses", AsyncMock(return_value=[chunk])):
+        with _looked_up(chunk):
             response = await _ask(server, [], layers=[layer])
 
         assert [a["text"] for a in response["answer"]] == [due, interest]
@@ -350,13 +363,68 @@ class TestAskExtractive:
         layer, document_id = await make_layer("extractive", text=text)
         chunk = fit_to_budget(self._exact_chunk(layer, document_id, text), 500)
 
-        with patch("stratakb.rag.tools._exact_clauses", AsyncMock(return_value=[chunk])):
+        with _looked_up(chunk):
             response = await _ask(server, [], layers=[layer], response_format="detailed")
 
         assert 0 < len(response["answer"]) < 60
         assert response["answer_status"] == "partly_found"
         assert "the rest does not fit in the answer" in response["note"]
         assert "cut" not in response["passages"][0]
+
+    async def test_clause_left_out_by_the_budget_is_named(self, server, settings, make_layer):
+        from stratakb.rag.passages import passage_cost
+
+        due, interest = "Payment is due within ten days.\n", "Interest accrues daily.\n"
+        layer, due_id = await make_layer("extractive", text=due)
+        _, interest_id = await make_layer(
+            "extractive", text=interest, relative_path="contracts/globex-msa.md"
+        )
+        a = self._exact_chunk(layer, due_id, due)
+        b = self._exact_chunk(layer, interest_id, interest)
+        b["clause_path"] = "8 Interest"
+        settings.answer_token_budget = passage_cost(a)
+
+        with _looked_up(a, b):
+            response = await _ask(server, [], _relevant("Payment"), layers=[layer])
+
+        assert [s["text"] for s in response["answer"]] == [due.strip()]
+        assert response["status"] == "partly_found"
+        assert response["note"].startswith("1 named clause left out")
+        assert "8 Interest in contracts/globex-msa.md" in response["note"]
+        assert "only partly quoted" not in response["note"]
+        assert response["receipt_id"].startswith("rcpt_")
+
+    async def test_matches_past_the_cap_make_found_partly_found(self, server, make_layer):
+        due = "Payment is due within ten days.\n"
+        layer, document_id = await make_layer("extractive", text=due)
+        chunk = self._exact_chunk(layer, document_id, due)
+
+        with _looked_up(chunk, unread=3, unread_is_minimum=True):
+            response = await _ask(server, [], _relevant("Payment"), layers=[layer])
+
+        assert response["status"] == "partly_found"
+        assert "More documents match than were read" in response["note"]
+        assert "at least 3 more matching sections" in response["note"]
+
+    async def test_matches_past_the_cap_stay_not_found_with_a_note(self, server, make_layer):
+        text = f"{LONG_BLOCK}\n\nA short line on something else.\n"
+        layer, document_id = await make_layer("extractive", text=text)
+        hit_start = text.index(BLOCK_HIT)
+        chunk = ask_chunk(
+            chunk_id="clause", content=text[hit_start:hit_start + 200], score=1.0,
+            similarity=1.0, layer=layer, source_file="contracts/acme-msa.md", section=None,
+            doc_type="markdown", metadata={}, document_id=document_id, char_start=hit_start,
+            char_end=hit_start + 200, clause_path=None,
+        )
+        chunk["match"] = "exact"
+
+        with _looked_up(chunk, unread=2):
+            response = await _ask(server, [], layers=[layer])
+
+        assert response["status"] == "not_found"
+        assert response["answer"] == []
+        assert "More documents match than were read" in response["note"]
+        assert "2 more matching sections" in response["note"]
 
     async def test_answer_stays_within_the_budget(self, server, settings, make_layer):
         sentences = [f"Clause {i} says ninety {'word ' * 370}here." for i in range(5)]
@@ -565,7 +633,7 @@ class TestModeFromPassages:
 
         with (
             _unrouted(),
-            patch("stratakb.rag.tools._exact_clauses", AsyncMock(return_value=[chunk])),
+            _looked_up(chunk),
         ):
             response = await _ask(server, [_hit(grounded, grounded_id)])
 

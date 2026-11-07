@@ -264,6 +264,39 @@ def cut_clause_note(
     return " ".join(notes) or None
 
 
+def left_out_note(
+    left_out: list[dict[str, Any]],
+    documents: dict[int, dict[str, Any]],
+    unread: int = 0,
+    unread_is_minimum: bool = False,
+) -> str | None:
+    """A note on the named clauses an answer does not hold, or None.
+
+    left_out are the clauses packing dropped, each named with its file as a
+    citation gives it; unread counts the matching sections past the match cap,
+    which were never read.
+    """
+    sentences = []
+    if left_out:
+        items = []
+        for chunk in left_out:
+            citation = cite(chunk, documents.get(chunk.get("document_id")))
+            path = citation["clause_path"]
+            items.append(f"{path} in {citation['file']}" if path else f"{citation['file']}")
+        n = len(left_out)
+        sentences.append(
+            f"{n} named {'clause' if n == 1 else 'clauses'} left out, over the token budget: "
+            f"{'; '.join(items)}. Read the files, or ask for fewer at a time."
+        )
+    if unread:
+        sentences.append(
+            f"More documents match than were read: {'at least ' if unread_is_minimum else ''}"
+            f"{unread} more matching {'section' if unread == 1 else 'sections'} not read. "
+            "Name a layer to narrow the question."
+        )
+    return " ".join(sentences) or None
+
+
 def basis_score(chunk: dict[str, Any], basis: str) -> float:
     """The score confidence judges a strata_ask chunk on, for this basis.
 

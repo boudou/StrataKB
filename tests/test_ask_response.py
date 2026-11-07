@@ -28,6 +28,7 @@ from stratakb.rag.passages import (
     cite,
     cut_clause_note,
     estimate_tokens,
+    left_out_note,
     pack_passages,
     parse_ref,
     passage_cost,
@@ -458,6 +459,41 @@ def test_cut_clause_note_names_only_cut_clauses():
 
     assert cut_clause_note([{}], [passage("7 Fees", "a.md")]) is None
     assert cut_clause_note([], []) is None
+
+
+def test_left_out_note():
+    def chunk(path, file):
+        return {"source_file": file, "clause_path": path}
+
+    assert left_out_note([], {}) is None
+
+    assert left_out_note([chunk("7 Fees", "a.md")], {}) == (
+        "1 named clause left out, over the token budget: 7 Fees in a.md. "
+        "Read the files, or ask for fewer at a time."
+    )
+    two = left_out_note([chunk("7 Fees", "a.md"), chunk(None, "b.md")], {})
+    assert two.startswith("2 named clauses left out, over the token budget: 7 Fees in a.md; b.md. ")
+
+    assert left_out_note([], {}, 1) == (
+        "More documents match than were read: 1 more matching section not read. "
+        "Name a layer to narrow the question."
+    )
+    assert "at least 3 more matching sections" in left_out_note([], {}, 3, True)
+
+    both = left_out_note([chunk("7 Fees", "a.md")], {}, 2)
+    assert both.startswith("1 named clause left out")
+    assert "ask for fewer at a time. More documents match" in both
+    assert "2 more matching sections" in both
+
+
+def test_left_out_note_gives_the_path_a_citation_gives():
+    chunk = {
+        "source_file": "a.md", "clause_path": "7 Fees", "document_id": 1,
+        "char_start": 0, "char_end": 4,
+    }
+    documents = {1: {"text": "text", "page_map": None, "relative_path": "docs/a.md"}}
+
+    assert "7 Fees in docs/a.md." in left_out_note([chunk], documents)
 
 
 class TestSearchResponseShape:
