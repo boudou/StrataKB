@@ -174,6 +174,9 @@ _ANSWER_CONTRACT = (
     "document's front matter or the file's modification time, which can be a checkout or a copy. "
     "A date does not show that documents conflict. Give it beside the answer, not in the draft "
     "you verify: strata_verify checks only passage text.",
+    "A citation's replaced_by names the file that says it replaces this one. Tell the reader, and "
+    "give it beside the answer, not in the draft you verify. It is only what a document declares: "
+    "no label does not mean a passage is current.",
     'When status is not_found, say "not in the documents" and give next_step, even if passages '
     "came back. When it is partly_found, answer what the passages support and say what they "
     "leave open. When it is error, report the error.",

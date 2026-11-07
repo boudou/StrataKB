@@ -681,8 +681,8 @@ def register_rag_tools(
         knowledge base's terminology, runs several searches in parallel,
         reranks the results, and returns the best passages that fit a token
         budget (ANSWER_TOKEN_BUDGET, about 1,500 tokens, each passage's id,
-        ref and citation counted with its text; at most 50 passages). In
-        grounded mode the client composes the answer from the passages and
+        ref and citation counted with its text, except a replaced_by label; at
+        most 50 passages). In grounded mode the client composes the answer from the passages and
         cites them by id. When a passage comes from an extractive layer the
         server answers with the document's own sentences. A clause or section
         the question names ("clause 7.2", "Annex II") is looked up exactly and
@@ -692,7 +692,8 @@ def register_rag_tools(
         next_step for the last two; mode is the mode used; passages lists S1,
         S2, ... in order of relevance, each with its exact text, a ref to the
         span of the stored document, and a citation (file path, page, lines,
-        clause path, layer, date and date_source). interaction_id goes to
+        clause path, layer, date and date_source and, when another file says
+        it replaces this one, replaced_by). interaction_id goes to
         strata_feedback, where passages can be rated by id ({"S1": "useful"}).
 
         In extractive mode answer replaces passages: sentences word for word,

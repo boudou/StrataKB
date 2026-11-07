@@ -318,14 +318,33 @@ async def fetch_cited_documents(
     """Path, page map, text origin, date and text up to the given end of each cited document.
 
     ends maps a document id to the furthest char_end cited in it; only the
-    text before it is read, which is all locate() needs.
+    text before it is read, which is all locate() needs. replaced_by is the
+    path of the first file, by path, in the same layer and source root whose
+    latest version declares that it supersedes this one, or None. Older
+    versions keep their value and their file_id, so only the latest counts.
     """
     if not ends:
         return {}
     rows = await conn.fetch(
         """
         SELECT d.id, d.relative_path, d.page_map, d.text_origin, d.doc_date, d.doc_date_source,
-               left(d.text, x.max_end) AS text
+               left(d.text, x.max_end) AS text,
+               (
+                   SELECT r.relative_path
+                   FROM strata_vectors.documents r
+                   WHERE r.layer_id = d.layer_id
+                     AND r.source_root = d.source_root
+                     AND r.supersedes = d.relative_path
+                     AND r.file_id IS NOT NULL
+                     AND r.version = (
+                         SELECT max(v.version) FROM strata_vectors.documents v
+                         WHERE v.layer_id = r.layer_id
+                           AND v.source_root = r.source_root
+                           AND v.relative_path = r.relative_path
+                     )
+                   ORDER BY r.relative_path
+                   LIMIT 1
+               ) AS replaced_by
         FROM strata_vectors.documents d
         JOIN unnest($1::bigint[], $2::int[]) AS x(id, max_end) ON x.id = d.id
         """,
