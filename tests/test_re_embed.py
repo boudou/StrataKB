@@ -218,6 +218,45 @@ class TestReEmbed:
             assert await _staging_tables(pool) == 0
 
     @pytest.mark.asyncio
+    async def test_re_embed_leaves_no_fixed_size_vector_column_behind(self, db_url):
+        """After a resize the learning tables still take interactions, with no vector column."""
+        from stratakb.core.database import get_pool
+        from stratakb.knowledge.vector_store import re_embed_all_layers
+        from stratakb.learning.store import LearningStore
+
+        pool = await get_pool(db_url)
+        size = await vector_column_size(pool)
+        store = LearningStore(db_url)
+        session = None
+        async with _restoring_size(db_url, pool, size, LAYERS):
+            await _insert_two_layers(db_url, LAYERS, size)
+            with patch(EMBED_TEXTS, new_callable=AsyncMock) as mock:
+                mock.side_effect = _fake_embed(0.2)
+                await re_embed_all_layers(db_url, new_dimensions=size + 8)
+
+            vector_columns = await pool.fetch(
+                "SELECT table_schema, table_name, column_name FROM information_schema.columns "
+                "WHERE udt_name = 'vector' AND table_schema LIKE 'strata%'"
+            )
+            assert [tuple(r) for r in vector_columns] == [
+                ("strata_vectors", "chunks", "embedding")
+            ]
+
+            try:
+                session = await store.get_or_create_session("test_re_embed_user")
+                stored = await store.store_interaction(
+                    session_id=str(session["id"]), query_text="after the resize"
+                )
+                assert stored is not None
+                recent = await store.get_recent_interactions(str(session["id"]))
+                assert [r["query_text"] for r in recent] == ["after the resize"]
+            finally:
+                if session is not None:
+                    await store._execute(
+                        "DELETE FROM strata_learning.query_sessions WHERE id = $1", session["id"]
+                    )
+
+    @pytest.mark.asyncio
     async def test_re_embed_all_layers_rolls_back(self, db_url):
         """A failure part-way leaves the column size and every vector as they were."""
         from stratakb.core.database import get_pool

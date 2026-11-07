@@ -29,7 +29,6 @@ CREATE TABLE IF NOT EXISTS strata_learning.interaction_events (
     id                UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     session_id        UUID REFERENCES strata_learning.query_sessions(id) ON DELETE CASCADE,
     query_text        TEXT NOT NULL,
-    query_embedding   vector(768),
     rewritten_queries JSONB,
     layers_detected   TEXT[],
     layers_searched   TEXT[],

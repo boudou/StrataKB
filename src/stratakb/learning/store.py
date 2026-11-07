@@ -142,7 +142,6 @@ class LearningStore:
         *,
         session_id: str | None,
         query_text: str,
-        query_embedding: list[float] | None = None,
         rewritten_queries: list[str] | None = None,
         layers_detected: list[str] | None = None,
         layers_searched: list[str] | None = None,
@@ -154,22 +153,17 @@ class LearningStore:
         response_time_ms: int | None = None,
     ) -> dict | None:
         """Record a query interaction."""
-        embedding_str = None
-        if query_embedding:
-            embedding_str = "[" + ",".join(str(f) for f in query_embedding) + "]"
-
         rows = await self._fetch(
             """
             INSERT INTO strata_learning.interaction_events
-                (session_id, query_text, query_embedding, rewritten_queries,
+                (session_id, query_text, rewritten_queries,
                  layers_detected, layers_searched, results, result_count,
                  confidence_level, confidence_score, tool_used, response_time_ms)
-            VALUES ($1, $2, $3::vector, $4::jsonb, $5, $6, $7::jsonb, $8, $9, $10, $11, $12)
+            VALUES ($1, $2, $3::jsonb, $4, $5, $6::jsonb, $7, $8, $9, $10, $11)
             RETURNING id, created_at
             """,
             session_id,
             query_text,
-            embedding_str,
             json.dumps(rewritten_queries) if rewritten_queries else None,
             layers_detected,
             layers_searched,
@@ -188,7 +182,7 @@ class LearningStore:
         """Get recent interactions in a session (for signal detection)."""
         rows = await self._fetch(
             """
-            SELECT id, query_text, query_embedding, layers_detected, layers_searched,
+            SELECT id, query_text, layers_detected, layers_searched,
                    confidence_level, confidence_score, results, created_at
             FROM strata_learning.interaction_events
             WHERE session_id = $1

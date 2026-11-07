@@ -298,6 +298,18 @@ MIGRATIONS: list[Migration] = [
         )
         """,
     ),
+    Migration(
+        13,
+        "13_drop_query_embedding.sql",
+        """
+        SELECT NOT EXISTS (
+            SELECT 1 FROM information_schema.columns
+            WHERE table_schema = 'strata_learning'
+              AND table_name = 'interaction_events'
+              AND column_name = 'query_embedding'
+        )
+        """,
+    ),
 ]
 
 # Same definition as in 05_add_folder.sql (tests compare the two)

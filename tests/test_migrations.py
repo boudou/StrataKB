@@ -438,6 +438,45 @@ async def test_applies_missing_12_existing_layers_read_grounded(db_url, restore_
         )
 
 
+async def test_applies_missing_13_drops_query_embedding_and_keeps_rows(db_url, restore_schema):
+    await owner_execute(
+        db_url,
+        """
+        ALTER TABLE strata_learning.interaction_events
+            ADD COLUMN query_embedding vector(768);
+        DELETE FROM strata_core.schema_migrations WHERE version = 13;
+        INSERT INTO strata_learning.interaction_events (query_text)
+        VALUES ('test_mig_query_embedding');
+        """,
+    )
+    try:
+        await migrations.ensure_schema(db_url)
+
+        conn = await asyncpg.connect(db_url)
+        try:
+            column = await conn.fetchval(
+                "SELECT count(*) FROM information_schema.columns "
+                "WHERE table_schema = 'strata_learning' "
+                "AND table_name = 'interaction_events' "
+                "AND column_name = 'query_embedding'"
+            )
+            rows = await conn.fetchval(
+                "SELECT count(*) FROM strata_learning.interaction_events "
+                "WHERE query_text = 'test_mig_query_embedding'"
+            )
+        finally:
+            await conn.close()
+        assert column == 0
+        assert rows == 1
+        assert await recorded_versions(db_url) == ALL_VERSIONS
+    finally:
+        await owner_execute(
+            db_url,
+            "DELETE FROM strata_learning.interaction_events "
+            "WHERE query_text = 'test_mig_query_embedding'",
+        )
+
+
 async def test_applies_missing_07_older_chunks_keep_null_offsets(db_url, restore_schema):
     await owner_execute(
         db_url,
