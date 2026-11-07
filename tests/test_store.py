@@ -81,6 +81,21 @@ async def test_recent_interactions_decode_results(store):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("rows", "expected"),
+    [
+        ([{"results": '[{"chunk_id": "c1"}]'}], [{"chunk_id": "c1"}]),
+        ([{"results": [{"chunk_id": "c1"}]}], [{"chunk_id": "c1"}]),
+        ([{"results": None}], []),
+        ([], None),
+    ],
+)
+async def test_interaction_results_decode_results(store, rows, expected):
+    with patch.object(store, "_fetch", new_callable=AsyncMock, return_value=rows):
+        assert await store.get_interaction_results("i1") == expected
+
+
+@pytest.mark.asyncio
 async def test_rewrite_bypass_returns_all_learned_queries():
     from stratakb.learning.store import LearnedRewrite
     from stratakb.rag.query_rewriter import rewrite_query

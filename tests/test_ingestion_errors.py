@@ -12,7 +12,16 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from tests.helpers import FAKE_EMBEDDING, file_outcomes, ingest, write_file
+from tests.helpers import (
+    FAKE_EMBEDDING,
+    as_admin,
+    call_tool,
+    fake_openai_client,
+    file_outcomes,
+    ingest,
+    openai_settings,
+    write_file,
+)
 
 
 def _denied_read_bytes(name: str):
@@ -28,24 +37,13 @@ def _denied_read_bytes(name: str):
     return read_bytes
 
 
-async def test_tool_reports_read_error(layer, tmp_path):
-    from stratakb.mcp_server import mcp
-
+async def test_tool_reports_read_error(server, layer, tmp_path):
     write_file(tmp_path / "locked.md", "# Locked\n\nLocked content.\n")
     write_file(tmp_path / "a.md", "# Alpha\n\nAlpha content.\n")
-    with (
-        patch("stratakb.core.auth.get_current_user", return_value=("tester", "admin")),
-        patch("stratakb.knowledge.tools.get_current_user", return_value=("tester", "admin")),
-        patch("stratakb.knowledge.tools.write_audit_log", new_callable=AsyncMock),
-        patch(
-            "stratakb.knowledge.ingestion.embed_texts",
-            new_callable=AsyncMock,
-            side_effect=lambda texts, **_: [FAKE_EMBEDDING for _ in texts],
-        ),
-        patch.object(Path, "read_bytes", _denied_read_bytes("locked.md")),
-    ):
-        tool = mcp._tool_manager.get_tool("strata_ingest_documents")
-        result = await tool.fn(layer_name=layer, source_path=str(tmp_path))
+    with as_admin(), patch.object(Path, "read_bytes", _denied_read_bytes("locked.md")):
+        result = await call_tool(
+            server, "strata_ingest_documents", layer_name=layer, source_path=str(tmp_path)
+        )
 
     assert result["status"] == "partial"
     assert result["errors"] == [{
@@ -87,7 +85,7 @@ class TestErrorsWithoutAbsolutePaths:
         assert await _last_error_log(db_url, layer) == expected
 
     async def test_parse_error_names_the_relative_path(self, db_url, layer, tmp_path):
-        from stratakb.knowledge.parsers.pdf_parser import ParsedDocument
+        from stratakb.knowledge.parsers.document import ParsedDocument
 
         write_file(tmp_path / "bad.md", "# Bad\n\nBad content.\n")
         root = tmp_path.resolve()
@@ -207,7 +205,6 @@ class TestLogsWithoutExceptionText:
         from structlog.testing import capture_logs
 
         from stratakb.knowledge.embeddings import embed_texts
-        from tests.helpers import fake_openai_client, openai_settings
 
         marker = "distinctive-91c2-provider-text"
         client = fake_openai_client()

@@ -71,4 +71,4 @@ Published by the ISO 20022 Registration Authority on [iso20022.org](https://www.
 
 ## Writing your own
 
-Copy a preset, change `name`, `display_name`, `description`, `routing_patterns` and `sources` (add `answer_mode: extractive` for a layer that should answer with the documents' own sentences), and point the source paths at your folders. The [main README](../README.md#layers-and-presets) describes every key.
+Copy a preset, change `name`, `display_name`, `description`, `routing_patterns` and `sources` (set `answer_mode: extractive` for a layer that should answer with the documents' own sentences, and `structure_patterns` when your documents number their sections with identifiers of their own, as the SEPA preset does for its attribute definitions, `Identification: AT-R051`, and the ISO 20022 preset for message identifiers such as `pacs.008.001.08`), and point the source paths at your folders. The [main README](../README.md#layers-and-presets) describes every key.

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+from collections.abc import AsyncIterator
+from dataclasses import dataclass, field
 from datetime import datetime
 from urllib.parse import urlsplit
 
@@ -12,6 +14,9 @@ import structlog
 
 logger = structlog.get_logger()
 
+# What fetch_layers_stamp returns: (layer count, newest updated_at)
+Stamp = tuple[int, datetime | None]
+
 # One pool per URL: the SQL tools may connect as a separate read-only role
 _pools: dict[str, asyncpg.Pool] = {}
 # One lock per URL: concurrent first calls wait their turn, and each re-checks _pools,
@@ -19,15 +24,67 @@ _pools: dict[str, asyncpg.Pool] = {}
 _locks: dict[str, asyncio.Lock] = {}
 
 
+@dataclass(frozen=True)
+class UrlParts:
+    """What StrataKB reads from a URL. host is "" and port None when the URL names none."""
+
+    host: str
+    port: int | None
+    database: str  # the path without its leading "/"
+    user: str | None
+    password: str | None = field(default=None, repr=False)
+
+
+def url_parts(url: str) -> UrlParts | None:
+    """The parts of url, or None when it cannot be parsed (an invalid port included)."""
+    try:
+        parts = urlsplit(url)
+        return UrlParts(
+            host=parts.hostname or "",
+            port=parts.port,
+            database=parts.path.lstrip("/"),
+            user=parts.username,
+            password=parts.password,
+        )
+    except ValueError:
+        return None
+
+
+def url_host(url: str) -> str:
+    """The host of url, or "" when it names none or cannot be parsed.
+
+    The port is not read, so an invalid port does not hide the host.
+    """
+    try:
+        return urlsplit(url).hostname or ""
+    except ValueError:
+        return ""
+
+
 def url_host_port(database_url: str) -> str:
     """host:port of a database URL, never its user, password or database name."""
-    try:
-        parts = urlsplit(database_url)
-        host = parts.hostname or "localhost"
-        port = parts.port or 5432
-    except ValueError:
+    parts = url_parts(database_url)
+    if parts is None:
         return "localhost:5432"
-    return f"{host}:{port}"
+    return f"{parts.host or 'localhost'}:{parts.port or 5432}"
+
+
+@contextlib.asynccontextmanager
+async def connect_once(database_url: str, *, timeout: float) -> AsyncIterator[asyncpg.Connection]:
+    """One connection outside the pools, with a deadline at both ends.
+
+    Connects within `timeout` seconds and closes within `timeout` seconds when
+    the body finishes. When the body raises or is cancelled the connection is
+    dropped with terminate(): a graceful close() first cancels a running query
+    over a new connection, which has no deadline.
+    """
+    conn = await asyncpg.connect(database_url, timeout=timeout)
+    try:
+        yield conn
+    except BaseException:
+        conn.terminate()
+        raise
+    await conn.close(timeout=timeout)
 
 
 async def get_pool(database_url: str) -> asyncpg.Pool:
@@ -58,7 +115,7 @@ async def get_pool(database_url: str) -> asyncpg.Pool:
     return pool
 
 
-async def fetch_layers_stamp(database_url: str) -> tuple[int, datetime | None]:
+async def fetch_layers_stamp(database_url: str) -> Stamp:
     """Return (layer count, newest updated_at) of strata_core.knowledge_layers.
 
     Caches compare this stamp to notice layer changes made by any process.

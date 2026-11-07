@@ -418,6 +418,12 @@ class TestMarkdownParser:
         assert "Note: x" in all_text
         assert "prose" in all_text
 
+    def test_sentence_with_colon_is_frontmatter(self, tmp_path):
+        # Pinned on purpose: a front-matter key is anything up to the first ": ",
+        # so a leading block of such lines is dropped as front matter
+        result = self._parse(tmp_path, "---\nStep 1: install it\n---\n# H\n")
+        assert [(p.section_path, p.text) for p in result.pages] == [(["H"], "# H")]
+
     def test_frontmatter_key_with_spaces(self, tmp_path):
         source = "---\ntitle: x\ndate created: 2024\n---\n# H\n\nbody\n"
         result = self._parse(tmp_path, source)
@@ -682,6 +688,33 @@ class TestHTMLParser:
         assert result.pages[0].text.startswith("# Install\n\n")
         assert "link icon" not in result.pages[0].text
         assert "Diagram" in result.pages[0].text
+
+    def test_unclosed_svg_title_in_heading_ends_at_svg_end(self, tmp_path):
+        result = self._parse(
+            tmp_path,
+            "<h1><svg><title>x</svg>Install</h1><p>Step one.</p>"
+            "<h2>Next</h2><p>Step two.</p>",
+        )
+        assert [(p.section_path, p.text) for p in result.pages] == [
+            (["Install"], "# Install\n\nStep one."),
+            (["Install", "Next"], "## Next\n\nStep two."),
+        ]
+
+    def test_unclosed_svg_title_ends_at_heading_end(self, tmp_path):
+        result = self._parse(
+            tmp_path, "<h1>Install<svg><title>icon</h1><p>Step one.</p><h2>Next</h2><p>two</p>"
+        )
+        assert [(p.section_path, p.text) for p in result.pages] == [
+            (["Install"], "# Install\n\nStep one."),
+            (["Install", "Next"], "## Next\n\ntwo"),
+        ]
+
+    def test_unclosed_svg_title_in_body_is_text(self, tmp_path):
+        result = self._parse(tmp_path, "<p>x<svg><title>Chart</svg>y</p><h1>A</h1><p>z</p>")
+        assert [(p.section_path, p.text) for p in result.pages] == [
+            ([], "x\nChart\ny"),
+            (["A"], "# A\n\nz"),
+        ]
 
     def test_title_without_head_element(self, tmp_path):
         result = self._parse(tmp_path, "<!doctype html><title>Doc</title><p>text</p>")

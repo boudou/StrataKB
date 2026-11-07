@@ -1,5 +1,5 @@
-"""Tests for the stratakb command: dispatch, confirmations, exit codes and rendering,
-and the db up / db down subcommands.
+"""Tests for the stratakb command: dispatch, confirmations and exit codes, and the
+db up / db down subcommands.
 
 add_folder.plan and add_folder.apply are patched, and so are the docker calls,
 so no database and no Docker are needed.
@@ -24,9 +24,9 @@ from stratakb.core.migrations import MigrationError
 from stratakb.knowledge import add_folder
 from stratakb.knowledge.add_folder import REPORT_KEYS, Plan, Report
 from stratakb.knowledge.layers import LayerExistsError, LayerValidationError, RootTakenError
+from tests.helpers import ROOT, add_report
 
 DB_URL = "postgresql://strata:secret_pw@db.example:5433/strata"
-ROOT = "C:/work/docs"
 
 # The autouse fixture replaces cli._confirm; keep the real one for its own test
 REAL_CONFIRM = cli._confirm
@@ -56,31 +56,6 @@ def _plan(needs: set[str] | None = None, **overrides) -> Plan:
     return Plan(**values)
 
 
-def _report(**overrides) -> Report:
-    counts = dict.fromkeys(add_folder.OUTCOME_KEYS, 0)
-    counts["added"] = 3
-    values = {
-        "run_id": "r" * 32,
-        "layer": "docs",
-        "created": True,
-        "root": ROOT,
-        "mode": "git",
-        "counts": counts,
-        "skipped_by_reason": {},
-        "excluded_by_reason": {},
-        "files": [
-            {"path": f"f{i}.md", "outcome": "added", "reason": None} for i in range(3)
-        ],
-        "excluded": [],
-        "notes": [],
-        "reason": None,
-        "exit_code": 0,
-        "db_target": "db.example:5433",
-    }
-    values.update(overrides)
-    return Report(**values)
-
-
 @pytest.fixture(autouse=True)
 def cli_env(monkeypatch, tmp_path):
     """No config files, no ./.env, no DATABASE_URL in the environment, no logging
@@ -107,7 +82,7 @@ def cli_env(monkeypatch, tmp_path):
 
 def _patch_service(plan: Plan, report: Report | None = None, apply_error=None):
     """Patch plan() and apply(); returns the context manager pair."""
-    apply_mock = AsyncMock(return_value=report or _report(), side_effect=apply_error)
+    apply_mock = AsyncMock(return_value=report or add_report(), side_effect=apply_error)
     return (
         patch.object(add_folder, "plan", AsyncMock(return_value=plan)),
         patch.object(add_folder, "apply", apply_mock),
@@ -163,6 +138,20 @@ def test_max_file_size_must_be_finite_and_positive(capsys, size):
     plan_mock.assert_not_called()
 
 
+def test_max_file_size_zero_is_refused_once(capsys):
+    plan_mock = AsyncMock()
+    with patch.object(add_folder, "plan", plan_mock):
+        assert cli.main(["add", ROOT, "--max-file-size", "0"]) == 2
+    plan_mock.assert_not_called()
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    message = "must be a finite number above 0"
+    assert captured.err.count(message) == 1
+    assert captured.err.endswith(
+        f"stratakb add: error: argument --max-file-size: {message}: 0\n"
+    )
+
+
 def test_usage_error_with_json_prints_a_refusal(capsys):
     assert cli.main(["add", "--json"]) == 2
     data = json.loads(capsys.readouterr().out)
@@ -180,7 +169,7 @@ def test_add_passes_the_flags_to_the_service():
     assert options.name == "my_docs"
     assert options.description == "D"
     assert options.max_file_size_mb == 2.5
-    assert options.allow_broad is False and options.yes is False
+    assert options.confirmed == frozenset()
 
 
 # ── Exit codes ───────────────────────────────────────────
@@ -196,7 +185,7 @@ def test_exit_0_prints_the_report(capsys):
 
 
 def test_exit_1_when_a_file_failed():
-    report = _report(exit_code=1)
+    report = add_report(exit_code=1)
     code, _, _ = _run(["add", ROOT], report=report)
     assert code == 1
 
@@ -506,67 +495,6 @@ def test_add_leaves_offline_flags_when_local_only_is_off(monkeypatch):
     code, _, _ = _run(["add", ROOT])
     assert code == 0
     assert os.environ["HF_HUB_OFFLINE"] == "0"
-
-
-# ── Rendering ────────────────────────────────────────────
-
-
-def test_json_keys_match_the_interface(capsys):
-    code, _, _ = _run(["add", ROOT, "--json"])
-    assert code == 0
-    data = json.loads(capsys.readouterr().out)
-    assert tuple(data) == REPORT_KEYS
-    assert data["counts"]["added"] == 3
-
-
-def test_json_keeps_non_ascii_paths():
-    report = _report(files=[{"path": "Ünïcode/ταυτότητα.md", "outcome": "added", "reason": None}])
-    text = cli.render_json(report)
-    assert "ταυτότητα.md" in text
-    assert tuple(json.loads(text)) == REPORT_KEYS
-
-
-def test_refusal_json_shape():
-    report = add_folder.refused("broad_path", "Pass --allow-broad.", root=ROOT, layer="docs")
-    data = json.loads(cli.render_json(report))
-    assert tuple(data) == REPORT_KEYS
-    assert data["counts"] == dict.fromkeys(add_folder.OUTCOME_KEYS, 0)
-    assert data["files"] == [] and data["excluded"] == []
-    assert data["created"] is False
-    assert data["reason"] == "broad_path"
-
-
-def test_text_groups_by_reason_with_and_more():
-    files = [{"path": f"src/m{i}.py", "outcome": "skipped", "reason": "code"} for i in range(7)]
-    files.append({"path": ".env.local", "outcome": "skipped", "reason": "secret"})
-    files.append({"path": "bad.pdf", "outcome": "failed", "reason": "parse_error"})
-    counts = dict.fromkeys(add_folder.OUTCOME_KEYS, 0)
-    counts.update(skipped=8, failed=1)
-    report = _report(
-        counts=counts,
-        files=files,
-        excluded=[{"path": ".github/", "reason": "builtin_skip"}],
-        notes=["parse_error: not a PDF"],
-        exit_code=1,
-    )
-    text = cli.render_text(report)
-    assert "  8 skipped" in text
-    assert "  1 failed" in text
-    assert "added" not in text  # zero counts are left out
-    assert "  code (7): src/m0.py, src/m1.py, src/m2.py, src/m3.py, src/m4.py and 2 more" in text
-    assert "  secret (1): .env.local" in text
-    assert "  builtin_skip (1): .github/" in text
-    assert "  bad.pdf (parse_error)" in text
-    assert "  parse_error: not a PDF" in text
-    assert text.rstrip().endswith("what do the docs in docs say about …?")
-
-
-def test_text_quiet_rerun():
-    counts = dict.fromkeys(add_folder.OUTCOME_KEYS, 0)
-    counts["unchanged"] = 4
-    text = cli.render_text(_report(created=False, counts=counts, files=[]))
-    assert text.startswith("Synced layer docs in the database at db.example:5433")
-    assert "  4 unchanged" in text
 
 
 # ── db up / db down ──────────────────────────────────────

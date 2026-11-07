@@ -13,7 +13,6 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Literal
-from urllib.parse import urlsplit
 
 import asyncpg
 
@@ -24,6 +23,7 @@ from stratakb.config import (
     LOCAL_DB_USER,
     local_database_url,
 )
+from stratakb.core.database import connect_once, url_parts
 
 CONTAINER = "stratakb-db"
 VOLUME = "stratakb-data"
@@ -130,17 +130,15 @@ async def _host_port() -> int:
 
 def points_here(database_url: str, port: int) -> bool:
     """True when database_url is the container's database on this port."""
-    try:
-        parts = urlsplit(database_url)
-        return (
-            parts.hostname in _LOCAL_HOSTS
-            and (parts.port or 5432) == port
-            and parts.path.lstrip("/") == LOCAL_DB_NAME
-            and parts.username == LOCAL_DB_USER
-            and parts.password == LOCAL_DB_PASSWORD
-        )
-    except ValueError:
-        return False
+    parts = url_parts(database_url)
+    return (
+        parts is not None
+        and parts.host in _LOCAL_HOSTS
+        and (parts.port or 5432) == port
+        and parts.database == LOCAL_DB_NAME
+        and parts.user == LOCAL_DB_USER
+        and parts.password == LOCAL_DB_PASSWORD
+    )
 
 
 async def _wait_ready(url: str) -> None:
@@ -149,7 +147,8 @@ async def _wait_ready(url: str) -> None:
     last: BaseException | None = None
     while True:
         try:
-            conn = await asyncpg.connect(url, timeout=5)
+            async with connect_once(url, timeout=5):
+                return
         except (
             OSError,
             asyncpg.PostgresConnectionError,
@@ -157,9 +156,6 @@ async def _wait_ready(url: str) -> None:
             asyncpg.InterfaceError,
         ) as e:
             last = e
-        else:
-            await conn.close()
-            return
         if time.monotonic() >= deadline:
             raise LocalDbError(
                 f"The database in {CONTAINER} did not accept connections within "

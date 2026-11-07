@@ -201,7 +201,7 @@ async def re_embed_layer(
     start = time.monotonic()
 
     # The column is shared by every layer: one layer cannot change its size
-    size = await _vector_column_size(pool)
+    size = await vector_column_size(pool)
     if size > 0 and size != new_dimensions:
         raise ValueError(
             f"The vector column holds {size}-dimensional vectors and every layer shares it, "
@@ -214,7 +214,7 @@ async def re_embed_layer(
         async with pool.acquire() as conn, conn.transaction():
             # Holds off an all-layer resize until this batch is written
             await conn.execute("LOCK TABLE strata_vectors.chunks IN ROW EXCLUSIVE MODE")
-            current = await _vector_column_size(conn)
+            current = await vector_column_size(conn)
             if current > 0 and current != new_dimensions:
                 raise RuntimeError(
                     f"The vector column was resized to {current} dimensions while layer "
@@ -434,7 +434,7 @@ async def _swap_in(
         await conn.execute(
             "LOCK TABLE strata_vectors.chunks IN SHARE ROW EXCLUSIVE MODE", timeout=timeout
         )
-        size = await _vector_column_size(conn, timeout=timeout)
+        size = await vector_column_size(conn, timeout=timeout)
         if size != target:
             logger.info("resizing_vector_column", old=size, new=target)
             # USING NULL: the old vectors cannot be cast; the staged ones replace them
@@ -629,7 +629,7 @@ async def _swap_staged(conn, batch_size: int, *, timeout: float | None = None) -
     return counts
 
 
-async def _vector_column_size(conn, *, timeout: float | None = None) -> int:
+async def vector_column_size(conn, *, timeout: float | None = None) -> int:
     """Return the size of the shared embedding column (-1 when it has none).
 
     Takes a pool or a connection: both have fetchval.

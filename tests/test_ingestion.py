@@ -163,12 +163,6 @@ class TestEmbeddings:
 # ==========================================
 
 
-@pytest.fixture
-def db_url():
-    from stratakb.config import get_settings
-    return get_settings().database_url
-
-
 class TestVectorStore:
     @pytest.mark.asyncio
     async def test_insert_and_delete_chunks(self, db_url):
@@ -497,8 +491,6 @@ class TestContextualChunkEnrichment:
 
 
 class TestIngestionToolRegistration:
-    def test_ingest_tool_registered(self):
-        from stratakb.mcp_server import mcp
-
-        tool_names = [t.name for t in mcp._tool_manager.list_tools()]
+    def test_ingest_tool_registered(self, server):
+        tool_names = [t.name for t in server._tool_manager.list_tools()]
         assert "strata_ingest_documents" in tool_names

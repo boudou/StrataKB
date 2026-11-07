@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+from collections.abc import Iterable
 
 import structlog
 
@@ -24,8 +25,9 @@ from stratakb.core.egress import (
     openai_compatible_client,
     unauthorized_detail,
 )
+from stratakb.core.terminal_text import printable_only
 from stratakb.knowledge.embeddings import embedding_local_only_error, resolve_embedding_model
-from stratakb.knowledge.vector_store import _vector_column_size
+from stratakb.knowledge.vector_store import vector_column_size
 
 logger = structlog.get_logger()
 
@@ -76,7 +78,7 @@ def model_listed(model: str, ids: list[str] | set[str]) -> bool:
     return model in ids or f"{model}:latest" in ids
 
 
-def _shown_ids(ids) -> list[str]:
+def _shown_ids(ids: Iterable[object]) -> list[str]:
     """Return the model ids fit for the health report: printable, short, at most 20.
 
     The ids come from the model server and are shown to any viewer, so
@@ -86,7 +88,7 @@ def _shown_ids(ids) -> list[str]:
     for raw in ids:
         if not isinstance(raw, str):
             continue
-        text = "".join(c for c in raw if c.isprintable())
+        text = printable_only(raw)
         if len(text) > _MAX_ID_CHARS:
             text = text[: _MAX_ID_CHARS - 1] + "…"
         if text:
@@ -148,7 +150,7 @@ async def check_vector_column(database_url: str, dimensions: int) -> dict:
     """Compare the vector column's declared size with EMBEDDING_DIMENSIONS."""
     try:
         pool = await get_pool(database_url)
-        size = await asyncio.wait_for(_vector_column_size(pool), _TIMEOUT_SECONDS)
+        size = await asyncio.wait_for(vector_column_size(pool), _TIMEOUT_SECONDS)
     except Exception as e:
         return _unchecked("vector_column_unchecked", f"{_COLUMN_UNREAD}: {type(e).__name__}")
 

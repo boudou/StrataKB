@@ -19,6 +19,7 @@ from stratakb.knowledge.layers import (
     _validate_chunk_config,
     _validate_name,
 )
+from tests.helpers import call_tool
 
 
 # ==========================================
@@ -98,20 +99,16 @@ class TestValidateChunkConfig:
 
 
 class TestToolRegistration:
-    def test_mcp_server_imports_with_knowledge_tools(self):
-        """MCP server should import and register knowledge tools."""
-        from stratakb.mcp_server import mcp
+    def test_mcp_server_imports_with_knowledge_tools(self, server):
+        """MCP server should build and register knowledge tools."""
+        assert server is not None
+        assert server.name == "StrataKB"
 
-        assert mcp is not None
-        assert mcp.name == "StrataKB"
-
-    def test_knowledge_tools_registered(self):
+    def test_knowledge_tools_registered(self, server):
         """All 4 knowledge layer tools should be registered."""
-        from stratakb.mcp_server import mcp
-
         # FastMCP stores tools internally — verify by listing them
         # The tool names should be accessible
-        tool_names = [t.name for t in mcp._tool_manager.list_tools()]
+        tool_names = [t.name for t in server._tool_manager.list_tools()]
         assert "strata_list_knowledge_layers" in tool_names
         assert "strata_create_knowledge_layer" in tool_names
         assert "strata_get_layer_status" in tool_names
@@ -121,13 +118,6 @@ class TestToolRegistration:
 # ==========================================
 # Integration tests (require database)
 # ==========================================
-
-
-@pytest.fixture
-def db_url():
-    """Database URL from settings."""
-    from stratakb.config import get_settings
-    return get_settings().database_url
 
 
 class TestLayerCRUDIntegration:
@@ -270,6 +260,20 @@ class TestLayerCRUDIntegration:
 
         with pytest.raises(LayerValidationError, match="display_name"):
             await create_layer(db_url, name="valid_name", display_name="")
+
+    @pytest.mark.asyncio
+    async def test_create_with_nested_routing_pattern_raises(self, db_url):
+        """A routing pattern that repeats a repeated part is refused, nothing written."""
+        from stratakb.knowledge.layers import create_layer, get_layer_status
+
+        name = "test_nested_routing"
+        await _drop_layers(db_url, name)
+        with pytest.raises(LayerValidationError, match="repeats a repeated part"):
+            await create_layer(
+                db_url, name=name, display_name="Nested", routing_patterns=[r"(a+)+$"]
+            )
+        with pytest.raises(LayerNotFoundError):
+            await get_layer_status(db_url, name=name)
 
 
 # ==========================================
@@ -534,11 +538,10 @@ class TestFolderFieldsIntegration:
         with pytest.raises(LayerValidationError, match="origin"):
             await set_origin(db_url, "test_long_origin", "x" * 101)
 
-    async def test_listing_shows_answer_mode_default_grounded(self, db_url):
+    async def test_listing_shows_answer_mode_default_grounded(self, server, db_url):
         from unittest.mock import AsyncMock, patch
 
         from stratakb.knowledge.layers import create_layer, list_layers
-        from stratakb.mcp_server import mcp
 
         name = "test_answer_mode_default"
         await _drop_layers(db_url, name)
@@ -549,7 +552,8 @@ class TestFolderFieldsIntegration:
             assert next(r for r in rows if r["name"] == name)["answer_mode"] == "grounded"
 
             # The tool passes the stored rows through, so a viewer sees the mode.
-            # The tool's own URL is fixed at import, so it lists the rows read above.
+            # The tool's own URL is fixed when the server is built, so it lists
+            # the rows read above.
             with (
                 patch("stratakb.core.auth.get_current_user", return_value=("u", "viewer")),
                 patch("stratakb.knowledge.tools.get_current_user", return_value=("u", "viewer")),
@@ -559,7 +563,7 @@ class TestFolderFieldsIntegration:
                     return_value=rows,
                 ),
             ):
-                listed = await mcp._tool_manager.get_tool("strata_list_knowledge_layers").fn()
+                listed = await call_tool(server, "strata_list_knowledge_layers")
             layer = next(layer for layer in listed["layers"] if layer["name"] == name)
             assert layer["answer_mode"] == "grounded"
         finally:
@@ -614,11 +618,10 @@ class TestFolderFieldsIntegration:
         finally:
             await _drop_layers(db_url, *names)
 
-    async def test_create_tool_records_manual_origin_and_owner(self, db_url):
+    async def test_create_tool_records_manual_origin_and_owner(self, server, db_url):
         from unittest.mock import AsyncMock, patch
 
         from stratakb.knowledge.layers import get_layer_status
-        from stratakb.mcp_server import mcp
 
         name = "test_tool_origin"
         await _drop_layers(db_url, name)
@@ -631,8 +634,8 @@ class TestFolderFieldsIntegration:
                 ),
                 patch("stratakb.knowledge.tools.write_audit_log", new_callable=AsyncMock),
             ):
-                await mcp.call_tool(
-                    "strata_create_knowledge_layer", {"name": name, "display_name": "Tool"}
+                await call_tool(
+                    server, "strata_create_knowledge_layer", name=name, display_name="Tool"
                 )
             status = await get_layer_status(db_url, name=name)
             assert status["origin"] == "manual"
@@ -666,10 +669,8 @@ class TestLayerFieldsForCaller:
     LAYER = {"name": "x", "origin": "manual", "owner": "u1", "root_path": "/srv/docs"}
 
     @pytest.mark.parametrize("role", ["viewer", "operator"])
-    async def test_below_admin_drops_owner_and_root(self, role):
+    async def test_below_admin_drops_owner_and_root(self, server, role):
         from unittest.mock import AsyncMock, patch
-
-        from stratakb.mcp_server import mcp
 
         with (
             patch("stratakb.core.auth.get_current_user", return_value=("u", role)),
@@ -685,16 +686,14 @@ class TestLayerFieldsForCaller:
                 return_value=dict(self.LAYER),
             ),
         ):
-            listed = await mcp._tool_manager.get_tool("strata_list_knowledge_layers").fn()
-            status = await mcp._tool_manager.get_tool("strata_get_layer_status").fn(name="x")
+            listed = await call_tool(server, "strata_list_knowledge_layers")
+            status = await call_tool(server, "strata_get_layer_status", name="x")
 
         for layer in (listed["layers"][0], status["layer"]):
             assert layer == {"name": "x", "origin": "manual"}
 
-    async def test_admin_sees_owner_and_root(self):
+    async def test_admin_sees_owner_and_root(self, server):
         from unittest.mock import AsyncMock, patch
-
-        from stratakb.mcp_server import mcp
 
         with (
             patch("stratakb.core.auth.get_current_user", return_value=("u", "admin")),
@@ -705,7 +704,7 @@ class TestLayerFieldsForCaller:
                 return_value=dict(self.LAYER),
             ),
         ):
-            status = await mcp._tool_manager.get_tool("strata_get_layer_status").fn(name="x")
+            status = await call_tool(server, "strata_get_layer_status", name="x")
 
         assert status["layer"] == self.LAYER
 
@@ -785,7 +784,11 @@ class TestUpdateLayer:
                 )
             with pytest.raises(LayerValidationError):
                 await update_layer(db_url, name, routing_patterns=["(unclosed"])
-            assert (await get_layer_status(db_url, name=name))["description"] == "kept"
+            with pytest.raises(LayerValidationError, match="repeats a repeated part"):
+                await update_layer(db_url, name, routing_patterns=[r"(\w+\s?)*"])
+            status = await get_layer_status(db_url, name=name)
+            assert status["description"] == "kept"
+            assert status["routing_patterns"] == []
         finally:
             await _drop_layers(db_url, name)
 
@@ -876,12 +879,12 @@ class TestUpdateLayer:
         with pytest.raises(LayerNotFoundError):
             await get_layer(db_url, name="test_get_layer_missing")
 
-    async def test_set_description_rejects_non_string(self, db_url):
+    async def test_set_description_rejects_non_string(self):
         from stratakb.knowledge.layers import set_description
 
         for value in (None, 5):
             with pytest.raises(LayerValidationError, match="description"):
-                await set_description(db_url, "test_any_layer", value)
+                await set_description("postgresql://unused", "test_any_layer", value)
 
 
 class TestWriteColumns:
@@ -932,11 +935,10 @@ class TestMayClaim:
 class TestListRoleCheck:
     """strata_list_knowledge_layers checks the caller's role once per request."""
 
-    async def test_list_checks_role_once(self):
+    async def test_list_checks_role_once(self, server):
         from unittest.mock import AsyncMock, patch
 
         from stratakb.core.auth import check_role
-        from stratakb.mcp_server import mcp
 
         layers = [{"name": f"l{i}", "owner": "u", "root_path": "/r"} for i in range(3)]
         with (
@@ -949,7 +951,7 @@ class TestListRoleCheck:
                 return_value=layers,
             ),
         ):
-            listed = await mcp._tool_manager.get_tool("strata_list_knowledge_layers").fn()
+            listed = await call_tool(server, "strata_list_knowledge_layers")
 
         assert role_check.call_count == 1
         assert [layer["name"] for layer in listed["layers"]] == ["l0", "l1", "l2"]

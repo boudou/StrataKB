@@ -25,7 +25,9 @@ import structlog
 from stratakb.core.database import get_pool
 from stratakb.core.migrations import ensure_schema
 from stratakb.knowledge.documents import (
+    FileScope,
     build_document_text,
+    document_headings,
     page_starts,
     prune_documents,
     store_document_version,
@@ -38,7 +40,7 @@ from stratakb.knowledge.layers import (
     LayerNotFoundError,
     get_layer_status,
 )
-from stratakb.knowledge.parsers.pdf_parser import FlagReason, ParsedDocument
+from stratakb.knowledge.parsers.document import FlagReason, ParsedDocument
 from stratakb.knowledge.parsers.registry import FORMATS, Format
 from stratakb.knowledge.policy import is_secret_name
 from stratakb.knowledge.structure import (
@@ -61,21 +63,20 @@ EMBED_BATCH_SIZE = 100
 _ERROR_MAX_CHARS = 300
 
 Outcome = Literal["added", "updated", "unchanged", "removed", "skipped", "flagged", "failed"]
-Reason = Literal[
-    "deleted", "not_selected", "secret", "no_text",
-    "probably_scanned", "truncated",
-    "read_error", "parse_error", "embed_error",
-]
+SkippedReason = Literal["secret", "no_text"]
+RemovedReason = Literal["deleted", "not_selected", SkippedReason]
+FailedReason = Literal["read_error", "parse_error", "embed_error"]
+Reason = Literal[RemovedReason, FlagReason, FailedReason]
 
 # The reasons each outcome may carry; None: no reason
-REASONS: dict[str, frozenset[str | None]] = {
+REASONS: dict[Outcome, frozenset[Reason | None]] = {
     "added": frozenset({None}),
     "updated": frozenset({None}),
     "unchanged": frozenset({None}),
-    "removed": frozenset({"deleted", "not_selected", "secret", "no_text"}),
-    "skipped": frozenset({"secret", "no_text"}),
+    "removed": frozenset(get_args(RemovedReason)),
+    "skipped": frozenset(get_args(SkippedReason)),
     "flagged": frozenset(get_args(FlagReason)),
-    "failed": frozenset({"read_error", "parse_error", "embed_error"}),
+    "failed": frozenset(get_args(FailedReason)),
 }
 
 
@@ -94,12 +95,15 @@ class FileOutcome:
     count: how many items (rows) the parser's limit left out of a flagged
     file; None when not counted. A count on any other outcome, or below 1,
     raises ValueError.
+    stored: how a flagged file was stored, "added" or "updated"; required on a
+    flagged file, and on any other outcome a value raises ValueError.
     """
 
     relative_path: str
     outcome: Outcome
     reason: Reason | None = None
     count: int | None = None
+    stored: Literal["added", "updated"] | None = None
 
     def __post_init__(self) -> None:
         if self.reason not in REASONS.get(self.outcome, frozenset()):
@@ -110,29 +114,65 @@ class FileOutcome:
             raise ValueError(
                 f"Not a count for this outcome: {self.outcome!r}, {self.count!r}"
             )
+        if self.stored not in (("added", "updated") if self.outcome == "flagged" else (None,)):
+            raise ValueError(
+                f"Not a stored value for this outcome: {self.outcome!r}, {self.stored!r}"
+            )
 
 
 @dataclass
 class IngestionResult:
-    """Result of an ingestion run."""
+    """Result of an ingestion run; files holds what the file counters count."""
 
     layer_name: str
     status: str  # "completed", "partial", "failed"
-    docs_processed: int = 0  # files parsed and stored in this run (added + updated)
-    docs_failed: int = 0
     chunks_created: int = 0
-    files_added: int = 0
-    files_updated: int = 0
-    files_unchanged: int = 0
-    files_removed: int = 0
-    files_skipped: int = 0  # secret-looking names and files without text, not tracked
-    # Files their parser flagged; also counted as added or updated
-    files_flagged: int = 0
     # True when chunks from before per-file tracking were dropped and the layer rebuilt
     rebuilt_legacy: bool = False
     errors: list[dict] = field(default_factory=list)
     files: list[FileOutcome] = field(default_factory=list)
     duration_seconds: float = 0.0
+
+    def _count(self, outcome: Outcome) -> int:
+        return sum(1 for f in self.files if f.outcome == outcome)
+
+    def _count_stored(self, stored: Literal["added", "updated"]) -> int:
+        return sum(1 for f in self.files if f.outcome == stored or f.stored == stored)
+
+    @property
+    def docs_processed(self) -> int:
+        """Files parsed and stored in this run (added + updated)."""
+        return self.files_added + self.files_updated
+
+    @property
+    def docs_failed(self) -> int:
+        return self._count("failed")
+
+    @property
+    def files_added(self) -> int:
+        return self._count_stored("added")
+
+    @property
+    def files_updated(self) -> int:
+        return self._count_stored("updated")
+
+    @property
+    def files_unchanged(self) -> int:
+        return self._count("unchanged")
+
+    @property
+    def files_removed(self) -> int:
+        return self._count("removed")
+
+    @property
+    def files_skipped(self) -> int:
+        """Secret-looking names and files without text, not tracked."""
+        return self._count("skipped")
+
+    @property
+    def files_flagged(self) -> int:
+        """Files their parser flagged; also counted as added or updated."""
+        return self._count("flagged")
 
 
 async def _embed_chunks(
@@ -221,9 +261,7 @@ async def _store_file(
                     chunk.char_start = chunk.char_end = None
             await insert_chunks(database_url, chunks, conn=conn)
             # Only after the insert: until then the current version is unreferenced
-            await prune_documents(
-                conn, layer_id, source_root=source_root, relative_paths=[relative_path]
-            )
+            await prune_documents(conn, [layer_id], files=FileScope(source_root, [relative_path]))
 
 
 async def _remove_files(
@@ -231,21 +269,33 @@ async def _remove_files(
     *,
     layer_id: str,
     source_root: str,
-    files: Sequence[tuple[str, UUID]],
+    relative_paths: Sequence[str],
 ) -> None:
-    """Remove tracked files, given as (relative path, ingested_files id), in one transaction.
+    """Remove tracked files of a layer and root, in one transaction.
 
     Deleting the rows cascades to their chunks and unlinks their documents,
-    so their versions are pruned afterwards.
+    so their versions are pruned afterwards. The rows are locked in id order
+    before anything is deleted, so an ingest of the same file (which locks its
+    row first) and other removers never lock them in the opposite order. The
+    delete targets the locked ids, so a row committed after the lock is left
+    alone.
     """
     async with pool.acquire() as conn, conn.transaction():
+        rows = await conn.fetch(
+            """
+            SELECT id FROM strata_core.ingested_files
+            WHERE layer_id = $1 AND source_root = $2 AND relative_path = ANY($3::text[])
+            ORDER BY id FOR UPDATE
+            """,
+            layer_id,
+            source_root,
+            list(relative_paths),
+        )
         await conn.execute(
             "DELETE FROM strata_core.ingested_files WHERE id = ANY($1::uuid[])",
-            [file_id for _, file_id in files],
+            [r["id"] for r in rows],
         )
-        await prune_documents(
-            conn, layer_id, source_root=source_root, relative_paths=[path for path, _ in files]
-        )
+        await prune_documents(conn, [layer_id], files=FileScope(source_root, relative_paths))
 
 
 async def tracked_files(
@@ -253,13 +303,13 @@ async def tracked_files(
 ) -> dict[str, asyncpg.Record]:
     """The tracked files of a layer and root, keyed by relative path.
 
-    Each row holds id, relative_path and content_hash. The caller has
-    already run ensure_schema.
+    Each row holds relative_path and content_hash. The caller has already run
+    ensure_schema.
     """
     pool = await get_pool(database_url)
     rows = await pool.fetch(
         """
-        SELECT id, relative_path, content_hash FROM strata_core.ingested_files
+        SELECT relative_path, content_hash FROM strata_core.ingested_files
         WHERE layer_id = $1 AND source_root = $2
         """,
         layer_id,
@@ -269,7 +319,12 @@ async def tracked_files(
 
 
 async def clear_layer(database_url: str, layer_name: str) -> None:
-    """Delete every chunk and ingested_files row of a layer, and its unreferenced documents."""
+    """Delete every chunk and ingested_files row of a layer, and its unreferenced documents.
+
+    The layer's file rows are locked in id order before anything is deleted,
+    so an ingest of the same file (which locks its row first) and removers of
+    some of its files never lock them in the opposite order.
+    """
     await ensure_schema(database_url)
     pool = await get_pool(database_url)
     files = 0
@@ -278,16 +333,32 @@ async def clear_layer(database_url: str, layer_name: str) -> None:
             layer_id = await conn.fetchval(
                 "SELECT id FROM strata_core.knowledge_layers WHERE name = $1", layer_name
             )
-            # By name: this also removes legacy chunks that have no file row
+            file_ids = []
+            if layer_id is not None:
+                rows = await conn.fetch(
+                    """
+                    SELECT id FROM strata_core.ingested_files
+                    WHERE layer_id = $1 ORDER BY id FOR UPDATE
+                    """,
+                    layer_id,
+                )
+                file_ids = [r["id"] for r in rows]
+            # Only the locked files' chunks, plus legacy chunks that have no file row:
+            # a file first ingested meanwhile is not cleared
             chunks = await conn.execute(
-                "DELETE FROM strata_vectors.chunks WHERE layer_name = $1", layer_name
+                """
+                DELETE FROM strata_vectors.chunks
+                WHERE layer_name = $1 AND (file_id IS NULL OR file_id = ANY($2::uuid[]))
+                """,
+                layer_name,
+                file_ids,
             )
             if layer_id is not None:
                 deleted = await conn.execute(
-                    "DELETE FROM strata_core.ingested_files WHERE layer_id = $1", layer_id
+                    "DELETE FROM strata_core.ingested_files WHERE id = ANY($1::uuid[])", file_ids
                 )
                 files = int(deleted.split()[-1])
-                await prune_documents(conn, layer_id)
+                await prune_documents(conn, [layer_id])
     # After the commit: the recount runs on another connection
     await _update_layer_stats(database_url, layer_name)
     logger.info(
@@ -402,6 +473,8 @@ async def ingest_documents(
     chunk_config = layer["chunk_config"]
     chunk_size = chunk_config.get("chunk_size", DEFAULT_CHUNK_SIZE)
     chunk_overlap = chunk_config.get("chunk_overlap", DEFAULT_CHUNK_OVERLAP)
+    # The layer's own section starts (set by a preset), compiled once per run
+    structure_patterns = [re.compile(p) for p in layer.get("structure_patterns") or []]
 
     # Step 2: Discover files
     source = Path(source_path)
@@ -465,20 +538,17 @@ async def ingest_documents(
             """Skip a file, or remove it (row and chunks) when it was tracked."""
             if previous is None:
                 result.files.append(FileOutcome(relative_path, "skipped", reason))
-                result.files_skipped += 1
                 return
             await _remove_files(
                 pool,
                 layer_id=layer_id,
                 source_root=source_root,
-                files=[(relative_path, previous["id"])],
+                relative_paths=[relative_path],
             )
             result.files.append(FileOutcome(relative_path, "removed", reason))
-            result.files_removed += 1
 
         def fail(relative_path: str, file_path: Path, error: str, reason: Reason) -> None:
             result.files.append(FileOutcome(relative_path, "failed", reason))
-            result.docs_failed += 1
             error = _file_error(error, file_path=file_path, relative_path=relative_path, root=root)
             result.errors.append({"file": relative_path, "error": error, "reason": reason})
 
@@ -495,7 +565,6 @@ async def ingest_documents(
 
             # A carried hash equal to the tracked one: unchanged, never opened
             if _matches_tracked(carried_hash, previous):
-                result.files_unchanged += 1
                 result.files.append(FileOutcome(relative_path, "unchanged"))
                 continue
 
@@ -511,7 +580,6 @@ async def ingest_documents(
             content_hash = carried_hash or hashlib.sha256(data).hexdigest()
 
             if _matches_tracked(content_hash, previous):
-                result.files_unchanged += 1
                 result.files.append(FileOutcome(relative_path, "unchanged"))
                 continue
 
@@ -542,6 +610,7 @@ async def ingest_documents(
                 layer_name=layer_name,
                 chunk_size=chunk_size,
                 chunk_overlap=chunk_overlap,
+                structure_patterns=structure_patterns,
             )
             if not doc_chunks:
                 await drop(relative_path, previous, "no_text")
@@ -586,18 +655,14 @@ async def ingest_documents(
                 fail(relative_path, file_path, str(e), "embed_error")
                 continue
 
-            flag = parsed.flag
-            if previous is None:
-                result.files_added += 1
+            stored = "added" if previous is None else "updated"
+            if parsed.flag is not None:
+                outcome = FileOutcome(
+                    relative_path, "flagged", parsed.flag.reason, parsed.flag.count, stored
+                )
             else:
-                result.files_updated += 1
-            if flag is not None:
-                result.files_flagged += 1
-                outcome = FileOutcome(relative_path, "flagged", flag.reason, flag.count)
-            else:
-                outcome = FileOutcome(relative_path, "added" if previous is None else "updated")
+                outcome = FileOutcome(relative_path, stored)
             result.files.append(outcome)
-            result.docs_processed += 1
             result.chunks_created += len(doc_chunks)
             done += 1
             if progress is not None:
@@ -607,20 +672,19 @@ async def ingest_documents(
         # or, for a file list, every tracked file that is not in it
         if not single_file:
             gone = [
-                (path, r["id"]) for path, r in tracked.items()
+                path for path in tracked
                 if path not in seen and (files is not None or not (root / path).exists())
             ]
             if gone:
                 await _remove_files(
-                    pool, layer_id=layer_id, source_root=source_root, files=gone
+                    pool, layer_id=layer_id, source_root=source_root, relative_paths=gone
                 )
                 result.files.extend(
                     FileOutcome(
                         path, "removed", "deleted" if not (root / path).exists() else "not_selected"
                     )
-                    for path, _ in gone
+                    for path in gone
                 )
-                result.files_removed += len(gone)
 
         # Step 6: Record ingestion run
         if result.docs_failed == 0:
@@ -747,19 +811,35 @@ class _DocumentMap:
     sections: list[Section]
 
 
-def _map_document(doc: ParsedDocument) -> _DocumentMap:
-    """Build doc's text (documents.build_document_text) and its structure map."""
+def _map_document(
+    doc: ParsedDocument, structure_patterns: Sequence[str | re.Pattern[str]] = ()
+) -> _DocumentMap:
+    """Build doc's text (documents.build_document_text) and its structure map.
+
+    structure_patterns are the layer's own section starts, matched at line
+    starts next to the generic detectors (structure.detect_sections). The
+    headings the parser read outside the text (a PDF outline, Word heading
+    styles) come first.
+    """
     text, page_map = build_document_text(doc)
     fmt = FORMATS.get(Path(doc.source_file).suffix.lower())
     markdown = fmt is not None and fmt.doc_type == "markdown"
-    return _DocumentMap(text, page_map, detect_sections(text, markdown=markdown))
+    sections = detect_sections(
+        text, structure_patterns, markdown=markdown, explicit=document_headings(doc)
+    )
+    return _DocumentMap(text, page_map, sections)
 
 
 def _map_and_chunk(
-    doc: ParsedDocument, *, layer_name: str, chunk_size: int, chunk_overlap: int
+    doc: ParsedDocument,
+    *,
+    layer_name: str,
+    chunk_size: int,
+    chunk_overlap: int,
+    structure_patterns: Sequence[str | re.Pattern[str]] = (),
 ) -> tuple[_DocumentMap, list[ChunkRecord]]:
     """doc's map and its chunks along it; sync, run in a worker thread."""
-    mapped = _map_document(doc)
+    mapped = _map_document(doc, structure_patterns)
     return mapped, _chunk_document(
         doc,
         layer_name=layer_name,
@@ -776,13 +856,14 @@ def _chunk_document(
     chunk_size: int,
     chunk_overlap: int,
     mapped: _DocumentMap | None = None,
+    structure_patterns: Sequence[str | re.Pattern[str]] = (),
 ) -> list[ChunkRecord]:
     """Split a parsed document into chunks along its structure map.
 
     mapped is the document's text and structure map (_map_document, built
-    here when None). The text is cut at every section and page start, and a
-    chunk carries the clause_path of the section it lies in. Without
-    sections, each page is split by size alone.
+    here with structure_patterns when None). The text is cut at every
+    section and page start, and a chunk carries the clause_path of the
+    section it lies in. Without sections, each page is split by size alone.
 
     Each chunk gets char_start and char_end into the document text (see
     documents.build_document_text).
@@ -793,7 +874,7 @@ def _chunk_document(
     doc_type = fmt.doc_type if fmt is not None else ext.lstrip(".") or "unknown"
 
     if mapped is None:
-        mapped = _map_document(doc)
+        mapped = _map_document(doc, structure_patterns)
     text, sections = mapped.text, mapped.sections
     starts = page_starts(doc)
 

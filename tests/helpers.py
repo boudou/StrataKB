@@ -5,22 +5,201 @@ Fixtures live in `tests/conftest.py`; plain functions and constants live here.
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 from pathlib import Path
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock, MagicMock, patch
+from urllib.parse import urlsplit, urlunsplit
+from uuid import uuid4
 
 if TYPE_CHECKING:
+    from mcp.server.fastmcp import FastMCP
+
     from stratakb.config import Settings
+    from stratakb.knowledge.add_folder import Report
 
 FAKE_EMBEDDING = [0.01] * 768
 
+# The tables strata_readonly may read, written out here so the tests catch a
+# change to the list in core/migrations.py
+READONLY_READABLE = (
+    "strata_core.knowledge_layers",
+    "strata_core.ingestion_runs",
+    "strata_core.ingested_files",
+    "strata_vectors.chunks",
+    "strata_vectors.documents",
+)
 
-def write_file(path: Path, text: str) -> Path:
+# The example presets
+
+REPO_DIR = Path(__file__).parent.parent
+EXAMPLES_DIR = REPO_DIR / "examples"
+SEPA_PRESET = EXAMPLES_DIR / "sepa" / "preset.yaml"
+ISO_PRESET = EXAMPLES_DIR / "iso20022" / "preset.yaml"
+PEPS_PRESET = EXAMPLES_DIR / "peps" / "preset.yaml"
+PEPS_SOURCE = EXAMPLES_DIR / "peps" / "source" / "peps"
+EXAMPLE_PEPS = [
+    line.strip()
+    for line in (EXAMPLES_DIR / "peps" / "peps.txt").read_text(encoding="utf-8").splitlines()
+    if line.strip() and not line.startswith("#")
+]
+CLONE_HINT = (
+    "PEPs not fetched; run: "
+    "git clone --depth 1 --filter=blob:none --sparse https://github.com/python/peps.git "
+    "examples/peps/source && "
+    "git -C examples/peps/source sparse-checkout set --no-cone "
+    + " ".join(f"/peps/{name}" for name in EXAMPLE_PEPS)
+    + " (in Git Bash on Windows, put MSYS_NO_PATHCONV=1 in front of the sparse-checkout "
+    "command; otherwise Git Bash rewrites the /peps/... paths and nothing is checked out)"
+)
+
+
+def example_routing_patterns(*presets: Path) -> dict:
+    """The routing patterns of the preset files, compiled as the server compiles them."""
+    from stratakb.knowledge.presets import load_preset
+    from stratakb.rag.layer_detect import compile_patterns
+
+    loaded = [load_preset(path) for path in presets]
+    return compile_patterns({preset.name: preset.routing_patterns for preset in loaded})
+
+
+async def fulltext_hits(pool, layer: str, vector: str, query: str, top_k: int = 3) -> list:
+    """The full-text leg of the hybrid SQL in layer, best first: rows of (id, source_file)."""
+    from stratakb.rag.retriever import _build_hybrid_sql
+
+    sql, params = _build_hybrid_sql(vector, query, [layer], top_k=top_k)
+    return await pool.fetch(
+        f"""
+        SELECT hit.id, chunk.source_file
+        FROM ({sql}) AS hit
+        JOIN strata_vectors.chunks chunk ON chunk.id = hit.id
+        WHERE hit.source = 'fulltext'
+        ORDER BY hit.rank
+        """,
+        *params,
+    )
+
+
+async def call_tool(server: FastMCP, name: str, /, **arguments) -> dict:
+    """Call tool `name` on a built server, through its role and logging decorators."""
+    return await server._tool_manager.get_tool(name).fn(**arguments)
+
+
+def capture_tools(register, *args) -> dict:
+    """Call a register_*_tools function on a mock server; return its tools by name.
+
+    The tools keep their role and logging decorators.
+    """
+    captured = {}
+    mock_mcp = MagicMock()
+
+    def capture_tool(**kwargs):
+        def decorator(fn):
+            captured[getattr(fn, "__wrapped__", fn).__name__] = fn
+            return fn
+        return decorator
+
+    mock_mcp.tool = capture_tool
+    register(mock_mcp, *args)
+    return captured
+
+
+async def call_health(settings: Settings) -> dict:
+    """Call strata_admin_health on a server built from `settings`, database reported up."""
+    from stratakb.mcp_server import build_server
+
+    with (
+        patch("stratakb.config.get_settings", return_value=settings),
+        patch(
+            "stratakb.mcp_server.check_connection",
+            AsyncMock(return_value={"status": "ok"}),
+        ),
+    ):
+        return await call_tool(build_server(settings), "strata_admin_health")
+
+
+def write_file(path: Path, text: str = "# Doc\n\nSome text about the topic.\n") -> Path:
     """Write text to path, creating its parent folders; return path."""
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(text, encoding="utf-8")
     return path
+
+
+def locked_read_bytes(name: str):
+    """A Path.read_bytes that raises PermissionError("locked") for files called name."""
+    original_read = Path.read_bytes
+
+    def read_bytes(self):
+        if self.name == name:
+            raise PermissionError("locked")
+        return original_read(self)
+
+    return read_bytes
+
+
+def docs_folder(tmp_path: Path) -> Path:
+    """A docs folder under tmp_path: three documents, a code file and a secret file."""
+    root = tmp_path / "docs"
+    write_file(root / "README.md", "# Team Docs\n\nHow the team works.\n")
+    write_file(
+        root / "guide" / "setup.md",
+        "# Setup\n\n## 1. Install\n\nRun the installer.\n\n## 2. Configure\n\nSet it up.\n",
+    )
+    write_file(root / "notes.md", "# Notes\n\nMeeting notes.\n")
+    write_file(root / "tool.py", "print('code')\n")
+    write_file(root / "client_secret.json", '{"key": "x"}\n')
+    return root
+
+
+def unique_layer_name() -> str:
+    return f"test_folder_{uuid4().hex[:10]}"
+
+
+def folder_settings(user: str | None = None, *, key: str = "fake-key") -> SimpleNamespace:
+    """The settings add_folder reads; no user means STRATA_USER was not set."""
+    fields = {"strata_user"} if user is not None else set()
+    return SimpleNamespace(
+        strata_user=user or "developer", model_fields_set=fields, openai_api_key=key
+    )
+
+
+# The folder in the stratakb add tests, which need no real one
+ROOT = "C:/work/docs"
+
+
+def add_report(**overrides) -> Report:
+    """The report of a stratakb add that added three files."""
+    from stratakb.knowledge.add_folder import OUTCOME_KEYS, Report
+
+    counts = dict.fromkeys(OUTCOME_KEYS, 0)
+    counts["added"] = 3
+    values = {
+        "run_id": "r" * 32,
+        "layer": "docs",
+        "created": True,
+        "root": ROOT,
+        "mode": "git",
+        "counts": counts,
+        "skipped_by_reason": {},
+        "excluded_by_reason": {},
+        "files": [
+            {"path": f"f{i}.md", "outcome": "added", "reason": None} for i in range(3)
+        ],
+        "excluded": [],
+        "notes": [],
+        "reason": None,
+        "exit_code": 0,
+        "db_target": "db.example:5433",
+    }
+    values.update(overrides)
+    return Report(**values)
+
+
+def fake_embed(texts, **_) -> list[list[float]]:
+    """A side effect for a mocked embed_texts: FAKE_EMBEDDING for every text."""
+    return [FAKE_EMBEDDING for _ in texts]
 
 
 async def ingest_with_texts(db_url: str, layer: str, source: Path, **kwargs):
@@ -29,12 +208,12 @@ async def ingest_with_texts(db_url: str, layer: str, source: Path, **kwargs):
 
     embedded: list[str] = []
 
-    def fake_embed(texts, **_):
+    def recording_embed(texts, **_):
         embedded.extend(texts)
-        return [FAKE_EMBEDDING for _ in texts]
+        return fake_embed(texts)
 
     with patch("stratakb.knowledge.ingestion.embed_texts", new_callable=AsyncMock) as mock:
-        mock.side_effect = fake_embed
+        mock.side_effect = recording_embed
         result = await ingest_documents(
             db_url, "fake-key", layer_name=layer, source_path=str(source), **kwargs
         )
@@ -43,13 +222,62 @@ async def ingest_with_texts(db_url: str, layer: str, source: Path, **kwargs):
 
 async def ingest(db_url: str, layer: str, source: Path, **kwargs):
     """Run ingest_documents with mocked embeddings; return the result."""
-    result, _ = await ingest_with_texts(db_url, layer, source, **kwargs)
-    return result
+    return (await ingest_with_texts(db_url, layer, source, **kwargs))[0]
 
 
 def file_outcomes(result) -> dict[str, tuple[str, str | None]]:
     """Map each file's relative path to its (outcome, reason) in an ingest result."""
     return {f.relative_path: (f.outcome, f.reason) for f in result.files}
+
+
+@contextlib.contextmanager
+def as_admin():
+    """Run an ingest tool as an admin, with the audit log and embeddings mocked."""
+    with (
+        patch("stratakb.core.auth.get_current_user", return_value=("tester", "admin")),
+        patch("stratakb.knowledge.tools.get_current_user", return_value=("tester", "admin")),
+        patch("stratakb.knowledge.tools.write_audit_log", new_callable=AsyncMock),
+        patch(
+            "stratakb.knowledge.ingestion.embed_texts",
+            new_callable=AsyncMock,
+            side_effect=fake_embed,
+        ),
+    ):
+        yield
+
+
+def mock_pool(conn) -> MagicMock:
+    """An asyncpg pool mock whose acquire() yields conn.
+
+    asyncpg's pool.acquire() and conn.transaction() return context managers, not
+    coroutines, so both are regular MagicMocks, not AsyncMocks. The conn's
+    transaction() is set here; a test may set its return_value afterwards.
+    """
+    tx = AsyncMock()
+    tx.__aenter__.return_value = None
+    tx.__aexit__.return_value = False
+    conn.transaction = MagicMock(return_value=tx)
+    ctx = AsyncMock()
+    ctx.__aenter__.return_value = conn
+    ctx.__aexit__.return_value = False
+    pool = MagicMock()
+    pool.acquire.return_value = ctx
+    return pool
+
+
+class LogitModel:
+    """A fake cross-encoder that applies the activation it is given to fixed logits."""
+
+    def __init__(self, logits):
+        self.logits = logits
+        self.activation_fn = None
+
+    def predict(self, pairs, activation_fn=None):
+        import torch
+
+        self.activation_fn = activation_fn
+        logits = torch.tensor(self.logits[: len(pairs)])
+        return activation_fn(logits).numpy() if activation_fn else logits.numpy()
 
 
 def openai_settings(**overrides) -> Settings:
@@ -73,3 +301,272 @@ def fake_openai_client(n: int = 768) -> MagicMock:
         return_value=SimpleNamespace(data=[SimpleNamespace(index=0, embedding=[0.1] * n)])
     )
     return client
+
+
+# The query rewriter
+
+LOCAL_REWRITE_URL = "http://127.0.0.1:11434/v1"
+
+
+def rewrite_settings(**overrides) -> Settings:
+    from stratakb.config import Settings
+
+    values = {"strata_user": "test", "strata_role": "viewer"}
+    values.update(overrides)
+    return Settings(_env_file=None, **values)
+
+
+def compatible_rewrite_settings(**overrides) -> Settings:
+    values = {
+        "query_rewrite_provider": "openai_compatible",
+        "query_rewrite_base_url": LOCAL_REWRITE_URL,
+        "query_rewrite_model": "llama3.2",
+    }
+    values.update(overrides)
+    return rewrite_settings(**values)
+
+
+def openai_reply_client(content) -> MagicMock:
+    """A mocked AsyncOpenAI client whose chat reply carries this content."""
+    response = SimpleNamespace(
+        choices=[SimpleNamespace(message=SimpleNamespace(content=content))]
+    )
+    client = MagicMock()
+    client.chat.completions.create = AsyncMock(return_value=response)
+    return client
+
+
+async def wait_until_blocked_by(
+    pool, blocker_pid: int, waiter: asyncio.Task | None = None, *, timeout: float = 10
+) -> None:
+    """Wait until some other backend is waiting on a lock blocker_pid holds.
+
+    If that does not happen within timeout seconds, or the wait fails, cancel
+    and await waiter (the task expected to block), so no task is left pending.
+    """
+    try:
+        async with asyncio.timeout(timeout):
+            while not await pool.fetchval(
+                "SELECT EXISTS (SELECT 1 FROM pg_stat_activity "
+                "WHERE $1 = ANY(pg_blocking_pids(pid)))",
+                blocker_pid,
+            ):
+                await asyncio.sleep(0.05)
+    except BaseException as exc:
+        if waiter is not None:
+            waiter.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await waiter
+        if isinstance(exc, TimeoutError):
+            raise AssertionError("nothing waited on the lock") from None
+        raise
+
+
+# Extractive answers: a contract, two of its sentences, and a block too long to quote
+
+DOC_TEXT = (
+    "# Master agreement\n"
+    "\n"
+    "Intro line.\n"
+    "\n"
+    "## 7 Termination\n"
+    "\n"
+    "7.2 Either party may end this agreement\n"
+    "with ninety days' written notice. Notice goes by registered letter, e.g. by courier.\n"
+    "\n"
+    "## 8 Payment\n"
+    "\n"
+    "Invoices are due within 30 days. Late payment carries interest.\n"
+)
+NINETY = "7.2 Either party may end this agreement\nwith ninety days' written notice."
+LETTER = "Notice goes by registered letter, e.g. by courier."
+# Lines without end marks: one sentence of 100 KB, the part a chunk hits at its end
+BLOCK_HIT = "the fee for the annex is ninety euros "
+LONG_BLOCK = "item without an end mark\n" * 4200 + BLOCK_HIT * 21
+
+
+# Receipts: a policy document, a quote from it, and a receipt citing that quote
+
+V1_TEXT = (
+    "# Retention\n\nIntro paragraph about the policy.\n\n"
+    "Records are kept for 30 days after closure.\n\nClosing remarks.\n"
+)
+QUOTE = "Records are kept for 30 days after closure."
+
+
+@contextlib.contextmanager
+def as_user(user: str, role: str):
+    """Run as user with role, for the receipt issuer, tool and resource."""
+    with (
+        patch("stratakb.core.auth.get_current_user", return_value=(user, role)),
+        patch("stratakb.rag.receipts.get_current_user", return_value=(user, role)),
+        patch("stratakb.rag.receipt_tools.get_current_user", return_value=(user, role)),
+    ):
+        yield
+
+
+async def latest_document(db_url: str, layer: str, relative_path: str):
+    """The latest stored document row (id, version, text, sha256) of a file in layer."""
+    from stratakb.core.database import get_pool
+
+    pool = await get_pool(db_url)
+    return await pool.fetchrow(
+        """
+        SELECT d.id, d.version, d.text, d.sha256 FROM strata_vectors.documents d
+        JOIN strata_core.knowledge_layers kl ON kl.id = d.layer_id
+        WHERE kl.name = $1 AND d.relative_path = $2
+        ORDER BY d.version DESC LIMIT 1
+        """,
+        layer,
+        relative_path,
+    )
+
+
+async def cite_policy(
+    db_url: str, layer: str, folder: Path,
+    question: str = "How long are records kept?", user: str = "alice",
+):
+    """Ingest policy.md from folder and issue a receipt quoting QUOTE as user.
+
+    Return (receipt_id, document).
+    """
+    from stratakb.rag.receipts import issue_receipt
+
+    (folder / "policy.md").write_text(V1_TEXT, encoding="utf-8")
+    await ingest(db_url, layer, folder)
+    doc = await latest_document(db_url, layer, "policy.md")
+    start = doc["text"].index(QUOTE)
+    with as_user(user, "viewer"):
+        receipt_id = await issue_receipt(
+            db_url,
+            kind="extractive",
+            mode="extractive",
+            question=question,
+            quotes=[
+                {
+                    "document_id": doc["id"],
+                    "char_start": start,
+                    "char_end": start + len(QUOTE),
+                    "clause_path": "Retention",
+                }
+            ],
+            draft="Records are kept for 30 days.",
+        )
+    return receipt_id, doc
+
+
+async def receipt_audit_rows(db_url: str, receipt_id: str) -> list:
+    """The audit rows naming receipt_id, oldest first."""
+    from stratakb.core.database import get_pool
+
+    pool = await get_pool(db_url)
+    return await pool.fetch(
+        "SELECT * FROM strata_core.audit_log WHERE parameters->>'receipt_id' = $1 "
+        "ORDER BY created_at, id",
+        receipt_id,
+    )
+
+
+async def owner_execute(db_url: str, sql: str) -> None:
+    """Run sql on a connection of its own, as the user in db_url."""
+    import asyncpg
+
+    conn = await asyncpg.connect(db_url)
+    try:
+        await conn.execute(sql)
+    finally:
+        await conn.close()
+
+
+async def replay_migrations(db_url: str) -> None:
+    """Run every migration file in order as the user in db_url (they are idempotent)."""
+    from stratakb.core import migrations
+
+    for m in migrations.MIGRATIONS:
+        await owner_execute(db_url, migrations._load_sql(m.file))
+
+
+def url_with_credentials(url: str, user: str, password: str) -> str:
+    """url with only the user and password replaced."""
+    parts = urlsplit(url)
+    host = parts.hostname or ""
+    if ":" in host:
+        host = f"[{host}]"
+    netloc = f"{user}:{password}@{host}" + (f":{parts.port}" if parts.port else "")
+    return urlunsplit(parts._replace(netloc=netloc))
+
+
+@contextlib.asynccontextmanager
+async def login_role_url(db_url: str, role: str):
+    """Create a throwaway login role; yield db_url logged in as it, then drop it.
+
+    Skip the test when the user in db_url may not create roles. Roles are
+    cluster-wide, so role must not clash with another database's tests.
+    """
+    import asyncpg
+    import pytest
+
+    password = uuid4().hex
+    drop = f"""
+        DO $$
+        BEGIN
+            IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '{role}') THEN
+                DROP OWNED BY "{role}";
+                DROP ROLE "{role}";
+            END IF;
+        END $$;
+    """
+    try:
+        await owner_execute(db_url, drop)
+        await owner_execute(db_url, f"CREATE ROLE \"{role}\" LOGIN PASSWORD '{password}'")
+    except asyncpg.InsufficientPrivilegeError:
+        pytest.skip("the owner may not create roles")
+    try:
+        yield url_with_credentials(db_url, role, password)
+    finally:
+        await owner_execute(db_url, drop)
+
+
+async def recorded_versions(db_url: str) -> set[int]:
+    """The migration versions strata_core.schema_migrations records."""
+    import asyncpg
+
+    conn = await asyncpg.connect(db_url)
+    try:
+        rows = await conn.fetch("SELECT version FROM strata_core.schema_migrations")
+    finally:
+        await conn.close()
+    return {row["version"] for row in rows}
+
+
+async def readonly_privileges(db_url: str) -> dict:
+    """What strata_readonly may read in the database at db_url."""
+    import asyncpg
+
+    conn = await asyncpg.connect(db_url)
+    try:
+        tables = {
+            row["t"]: row["readable"]
+            for row in await conn.fetch(
+                """
+                SELECT format('%I.%I', n.nspname, c.relname) AS t,
+                       has_table_privilege('strata_readonly', c.oid, 'SELECT') AS readable
+                FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+                WHERE n.nspname IN ('strata_core', 'strata_vectors', 'strata_learning')
+                  AND c.relkind IN ('r', 'p', 'v', 'm', 'f')
+                """
+            )
+        }
+        learning_usage = await conn.fetchval(
+            "SELECT has_schema_privilege('strata_readonly', 'strata_learning', 'USAGE')"
+        )
+        default_acls = await conn.fetchval(
+            """
+            SELECT count(*) FROM pg_default_acl d
+            CROSS JOIN LATERAL aclexplode(d.defaclacl) a
+            WHERE a.grantee = 'strata_readonly'::regrole
+            """
+        )
+    finally:
+        await conn.close()
+    return {"tables": tables, "learning_usage": learning_usage, "default_acls": default_acls}

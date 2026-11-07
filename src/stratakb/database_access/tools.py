@@ -16,6 +16,7 @@ from mcp.server.fastmcp.exceptions import ToolError
 
 from stratakb.core.audit import write_audit_log
 from stratakb.core.auth import require_role
+from stratakb.core.database import connect_once
 from stratakb.core.logging import log_tool_call
 
 logger = structlog.get_logger()
@@ -117,12 +118,16 @@ def sql_tools_status() -> dict[str, str]:
     return dict(_sql_tools)
 
 
-def _set_sql_tools_status(status: str, reason: str | None = None) -> None:
-    """Record whether the SQL tools are on and, when off, why."""
+def _record_sql_tools_enabled() -> None:
+    """Record that the SQL tools are on."""
     _sql_tools.clear()
-    _sql_tools["status"] = status
-    if reason is not None:
-        _sql_tools["reason"] = reason
+    _sql_tools["status"] = "enabled"
+
+
+def _record_sql_tools_disabled(reason: str) -> None:
+    """Record that the SQL tools are off, and why."""
+    _sql_tools.clear()
+    _sql_tools.update(status="disabled", reason=reason)
 
 
 def _disable_sql_tools(mcp: FastMCP, reason: str) -> None:
@@ -131,7 +136,7 @@ def _disable_sql_tools(mcp: FastMCP, reason: str) -> None:
         # Not registered: no URL, or removed by an earlier check
         with contextlib.suppress(ToolError):
             mcp.remove_tool(name)
-    _set_sql_tools_status("disabled", reason)
+    _record_sql_tools_disabled(reason)
     logger.warning("sql_tools_disabled", reason=reason)
 
 
@@ -143,15 +148,8 @@ async def _unsafe_role_reason(query_database_url: str) -> str | None:
     role it belongs to with set_config('role', ...), even in a read-only
     transaction, and rolsuper is not inherited.
     """
-    conn = await asyncpg.connect(query_database_url)
-    try:
+    async with connect_once(query_database_url, timeout=_CHECK_TIMEOUT) as conn:
         row = await conn.fetchrow(_ROLE_CHECK_QUERY, list(_SERVER_ACCESS_ROLES))
-    except BaseException:
-        # Drop the socket: a graceful close first cancels the stalled query
-        # over a new connection, which has no deadline
-        conn.terminate()
-        raise
-    await conn.close()
     if row["superuser"]:
         return "the READONLY_DATABASE_URL role is a superuser or a member of a superuser role"
     if row["members"]:
@@ -178,7 +176,7 @@ async def secure_sql_tools(mcp: FastMCP, query_database_url: str) -> None:
     if reason:
         _disable_sql_tools(mcp, reason)
         return
-    _set_sql_tools_status("enabled")
+    _record_sql_tools_enabled()
     logger.info("sql_tools_enabled")
 
 
@@ -312,7 +310,7 @@ def register_database_tools(mcp: FastMCP, database_url: str, query_database_url:
         for the strata_vectors.chunks table.
         """
         from stratakb.core.database import get_pool
-        from stratakb.knowledge.vector_store import _vector_column_size
+        from stratakb.knowledge.vector_store import vector_column_size
 
         pool = await get_pool(database_url)
 
@@ -347,7 +345,7 @@ def register_database_tools(mcp: FastMCP, database_url: str, query_database_url:
             total = await pool.fetchval("SELECT count(*) FROM strata_vectors.chunks")
 
             # Embedding dimensions
-            dim = await _vector_column_size(pool)
+            dim = await vector_column_size(pool)
 
             # Indexes
             indexes = await pool.fetch(
@@ -433,7 +431,7 @@ def register_database_tools(mcp: FastMCP, database_url: str, query_database_url:
         _register_sql_tools(mcp, database_url, query_database_url)
     else:
         reason = "READONLY_DATABASE_URL is not set"
-        _set_sql_tools_status("disabled", reason)
+        _record_sql_tools_disabled(reason)
         logger.info("sql_tools_disabled", reason=reason)
 
 
@@ -442,7 +440,7 @@ def _register_sql_tools(mcp: FastMCP, database_url: str, query_database_url: str
 
     `database_url` serves only the audit log.
     """
-    _set_sql_tools_status("enabled")
+    _record_sql_tools_enabled()
 
     @mcp.tool()
     @require_role("operator")

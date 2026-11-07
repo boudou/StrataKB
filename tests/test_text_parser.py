@@ -9,7 +9,7 @@ import pytest
 
 from stratakb.knowledge.parsers.registry import FORMATS, extensions_for
 from stratakb.knowledge.parsers.text_parser import parse_text
-from tests.helpers import ingest
+from tests.helpers import file_outcomes, ingest
 
 
 def test_text_with_content(tmp_path):
@@ -116,7 +116,7 @@ class TestIngestTextFormats:
 
         result = await ingest(db_url, layer, tmp_path)
 
-        outcomes = {f.relative_path: (f.outcome, f.reason) for f in result.files}
+        outcomes = file_outcomes(result)
         assert outcomes["notes.txt"] == ("added", None)
         assert outcomes["guide.rst"] == ("added", None)
         assert outcomes["manual.adoc"] == ("added", None)

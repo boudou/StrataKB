@@ -10,11 +10,14 @@ from __future__ import annotations
 
 import ipaddress
 import os
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Literal
-from urllib.parse import urlsplit
+from typing import TYPE_CHECKING, Literal, NamedTuple
 
 import structlog
+
+from stratakb.config import DEFAULT_QUERY_REWRITE_MODEL
+from stratakb.core.database import url_host
 
 if TYPE_CHECKING:
     from stratakb.config import Settings
@@ -26,8 +29,8 @@ _ANTHROPIC_DEFAULT_URL = "https://api.anthropic.com"
 # Satisfies the SDK's construction check; never sent, see keyless_request_options
 PLACEHOLDER_API_KEY = "unused"
 
-# The QUERY_REWRITE_PROVIDER values; each has one entry in
-# stratakb.rag.query_rewriter.REWRITE_PROVIDERS
+# The QUERY_REWRITE_PROVIDER values; each has one entry in REWRITE_EGRESS below
+# and one in stratakb.rag.query_rewriter.REWRITE_PROVIDERS
 RewriteProviderName = Literal["anthropic", "openai_compatible"]
 ProviderKind = Literal[RewriteProviderName, "embeddings"]
 
@@ -61,17 +64,9 @@ class OutboundProvider:
         }
 
 
-def _host(url: str) -> str:
-    """Return the host of a URL, or "" when it cannot be parsed."""
-    try:
-        return urlsplit(url).hostname or ""
-    except ValueError:
-        return ""
-
-
 def is_loopback(url: str) -> bool:
     """True when the URL's host is this machine (localhost, 127.0.0.0/8, ::1)."""
-    host = _host(url)
+    host = url_host(url)
     if not host:
         return False
     if host == "localhost":
@@ -91,7 +86,7 @@ def _embedding_url(settings: Settings) -> str:
     )
 
 
-def anthropic_url() -> str:
+def _anthropic_url() -> str:
     """The URL query rewriting sends to (the Anthropic SDK reads ANTHROPIC_BASE_URL)."""
     return os.environ.get("ANTHROPIC_BASE_URL") or _ANTHROPIC_DEFAULT_URL
 
@@ -154,30 +149,78 @@ def unauthorized_detail(error: Exception, api_key: str, setting: str) -> str | N
     )
 
 
-def rewrite_provider(
-    settings: Settings, api_key: str | None = None, model: str = ""
-) -> OutboundProvider | None:
-    """Return query rewriting as a provider when it would leave this machine, else None.
+class RewriteRequest(NamedTuple):
+    """What one rewrite would use; every rewrite provider function takes this."""
 
-    Follows the QUERY_REWRITE_PROVIDER entry in REWRITE_PROVIDERS
-    (stratakb.rag.query_rewriter): the rewrite is outbound when that entry
-    would ask a model (its skip_reason is None) at a URL that is not
-    loopback. A value with no entry rewrites nothing, so it is not outbound.
+    settings: Settings
+    anthropic_api_key: str
+    model: str
+
+
+class RewriteEgress(NamedTuple):
+    """What one QUERY_REWRITE_PROVIDER value sends where, and when it would not."""
+
+    name: RewriteProviderName
+    # The setting that turns sending on, for the egress report
+    setting: str
+    # Why nothing would be asked, or None
+    skip_reason: Callable[[RewriteRequest], str | None]
+    # Where the provider's SDK sends by itself; None means QUERY_REWRITE_BASE_URL
+    sdk_url: Callable[[], str] | None = None
+    sends: str = "questions and layer descriptions"
+
+    def url(self, settings: Settings) -> str:
+        """Where the request goes."""
+        return self.sdk_url() if self.sdk_url else settings.query_rewrite_base_url
+
+
+def _anthropic_skip(request: RewriteRequest) -> str | None:
+    return None if request.anthropic_api_key else "no_api_key"
+
+
+def _openai_compatible_skip(request: RewriteRequest) -> str | None:
+    if not request.settings.query_rewrite_base_url:
+        return "no_base_url"
+    if request.model == DEFAULT_QUERY_REWRITE_MODEL:
+        # An Anthropic model name the endpoint would not know: nothing is sent
+        return "model_not_set"
+    return None
+
+
+# Adding a provider: one entry here, its name in RewriteProviderName, and how
+# to ask it in stratakb.rag.query_rewriter.REWRITE_PROVIDERS
+REWRITE_EGRESS: dict[str, RewriteEgress] = {
+    e.name: e
+    for e in (
+        RewriteEgress(
+            name="anthropic",
+            setting="ANTHROPIC_API_KEY",
+            skip_reason=_anthropic_skip,
+            sdk_url=_anthropic_url,
+        ),
+        RewriteEgress(
+            name="openai_compatible",
+            setting="QUERY_REWRITE_BASE_URL",
+            skip_reason=_openai_compatible_skip,
+        ),
+    )
+}
+
+
+def rewrite_skip_reason(entry: RewriteEgress | None, request: RewriteRequest) -> str | None:
+    """Say why no model would be asked to rewrite, or None when one would.
 
     Args:
-        settings: The settings to check.
-        api_key: The Anthropic key the rewrite would use; defaults to ANTHROPIC_API_KEY.
-        model: The model the rewrite would use; defaults to QUERY_REWRITE_MODEL.
+        entry: The QUERY_REWRITE_PROVIDER entry; None when the value has none.
+        request: What the rewrite would use.
     """
-    # Here, not at the top: query_rewriter imports this module
-    from stratakb.rag.query_rewriter import REWRITE_PROVIDERS
-
-    key = settings.anthropic_api_key if api_key is None else api_key
-    entry = REWRITE_PROVIDERS.get(settings.query_rewrite_provider)
     if entry is None:
-        return None
-    if entry.skip_reason(settings, key, model or settings.query_rewrite_model) is not None:
-        return None
+        return "unknown_provider"
+    return entry.skip_reason(request)
+
+
+def outbound_rewrite(entry: RewriteEgress, settings: Settings) -> OutboundProvider | None:
+    """Return a rewrite that would ask a model as a provider, or None at a loopback URL."""
     url = entry.url(settings)
     if is_loopback(url):
         return None
@@ -185,16 +228,33 @@ def rewrite_provider(
         provider=entry.name,
         purpose="query rewriting",
         sends=entry.sends,
-        destination=_host(url) or "unknown host",
+        destination=url_host(url) or "unknown host",
         setting_name=entry.setting,
     )
+
+
+def rewrite_provider(settings: Settings) -> OutboundProvider | None:
+    """Return query rewriting as a provider when it would leave this machine, else None.
+
+    The rewrite is outbound when the QUERY_REWRITE_PROVIDER entry would ask a
+    model at a URL that is not loopback. A value with no entry rewrites
+    nothing, so it is not outbound.
+
+    Args:
+        settings: The settings to check.
+    """
+    entry = REWRITE_EGRESS.get(settings.query_rewrite_provider)
+    request = RewriteRequest(settings, settings.anthropic_api_key, settings.query_rewrite_model)
+    if entry is None or rewrite_skip_reason(entry, request):
+        return None
+    return outbound_rewrite(entry, settings)
 
 
 def embedding_provider(settings: Settings, backend: str = "") -> OutboundProvider | None:
     """Return embedding as a provider when it would leave this machine, else None.
 
-    Any backend other than "local" goes down the OpenAI path, so a misspelt
-    EMBEDDING_BACKEND is outbound too.
+    Any backend other than "local" counts, so a misspelt EMBEDDING_BACKEND is
+    reported as outbound too, even though embedding_key_error refuses it.
 
     Args:
         settings: The settings to check.
@@ -211,7 +271,7 @@ def embedding_provider(settings: Settings, backend: str = "") -> OutboundProvide
         provider="embeddings",
         purpose="embedding",
         sends="documents and questions",
-        destination=_host(url) or "unknown host",
+        destination=url_host(url) or "unknown host",
         setting_name="EMBEDDING_BASE_URL" if by_url else "EMBEDDING_BACKEND",
         setting_value="" if by_url else backend,
     )

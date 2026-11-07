@@ -1,6 +1,8 @@
 import pytest
 from unittest.mock import patch, MagicMock
 
+from tests.helpers import LogitModel
+
 
 def test_rerank_sorts_by_cross_encoder_score():
     """Reranker should sort results by cross-encoder score, not original score."""
@@ -73,21 +75,6 @@ def test_rerank_preserves_chunk_fields():
     assert reranked[0]["rerank_score"] == 0.75  # new score added
 
 
-class _LogitModel:
-    """A fake cross-encoder that applies the activation it is given to fixed logits."""
-
-    def __init__(self, logits):
-        self.logits = logits
-        self.activation_fn = None
-
-    def predict(self, pairs, activation_fn=None):
-        import torch
-
-        self.activation_fn = activation_fn
-        logits = torch.tensor(self.logits[: len(pairs)])
-        return activation_fn(logits).numpy() if activation_fn else logits.numpy()
-
-
 def test_rerank_scores_are_probabilities():
     """Raw logits become relevance probabilities through one sigmoid."""
     from torch import nn
@@ -95,7 +82,7 @@ def test_rerank_scores_are_probabilities():
     from stratakb.rag.reranker import rerank_results
 
     chunks = [{"content": "relevant", "score": 0.5}, {"content": "unrelated", "score": 0.9}]
-    model = _LogitModel([4.0, -4.0])
+    model = LogitModel([4.0, -4.0])
 
     with patch("stratakb.rag.reranker._get_reranker", return_value=model):
         reranked = rerank_results("query", chunks, top_k=2)
@@ -108,10 +95,37 @@ def test_score_pairs_keeps_input_order():
     """score_pairs returns one float per text, in the order the texts came in."""
     from stratakb.rag.reranker import score_pairs
 
-    model = _LogitModel([-1.0, 2.0, 0.0])
+    model = LogitModel([-1.0, 2.0, 0.0])
 
     with patch("stratakb.rag.reranker._get_reranker", return_value=model):
         scores = score_pairs("query", ["a", "b", "c"])
 
     assert all(isinstance(s, float) for s in scores)
     assert [round(s, 4) for s in scores] == [0.2689, 0.8808, 0.5]
+
+
+def test_local_only_message_text():
+    """The local-only message names the cross-encoder repository and the switch."""
+    from stratakb.knowledge.embeddings import _local_only_error
+    from stratakb.rag.reranker import _RERANKING_MODEL_KIND
+
+    assert _local_only_error("scorer", _RERANKING_MODEL_KIND) == (
+        "STRATA_LOCAL_ONLY is on and the reranking model scorer is not installed on this "
+        "machine, so it cannot be downloaded. On a machine that may download, run "
+        "`uv run hf download cross-encoder/scorer`, set RERANKING_MODEL to a folder that "
+        "holds the model, or set RERANKING_ENABLED=false."
+    )
+
+
+def test_offline_message_text():
+    """The offline message lists the ways out with one "or", like the local-only one."""
+    from stratakb.knowledge.embeddings import _offline_error
+    from stratakb.rag.reranker import _RERANKING_MODEL_KIND
+
+    assert _offline_error("scorer", _RERANKING_MODEL_KIND) == (
+        "HF_HUB_OFFLINE or TRANSFORMERS_OFFLINE is set and the reranking model scorer is "
+        "not in the Hugging Face cache, so it cannot be downloaded. Unset both to let "
+        "StrataKB download it, run `uv run hf download cross-encoder/scorer` on a machine "
+        "that may download, set RERANKING_MODEL to a folder that holds the model, or set "
+        "RERANKING_ENABLED=false."
+    )

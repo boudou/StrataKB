@@ -13,11 +13,12 @@ import pytest
 from stratakb.knowledge import policy
 from stratakb.knowledge.ingestion import _chunk_document, _discover_files, _parse_file
 from stratakb.knowledge.parsers.csv_parser import parse_csv
+from stratakb.knowledge.parsers.document import ParsedDocument, ParsedPage
 from stratakb.knowledge.parsers.docx_parser import parse_docx
 from stratakb.knowledge.parsers.html_parser import parse_html
 from stratakb.knowledge.parsers.json_parser import parse_json
 from stratakb.knowledge.parsers.markdown_parser import parse_markdown
-from stratakb.knowledge.parsers.pdf_parser import ParsedDocument, ParsedPage, parse_pdf
+from stratakb.knowledge.parsers.pdf_parser import parse_pdf
 from stratakb.knowledge.parsers.registry import FORMATS, extensions_for
 from stratakb.knowledge.parsers.text_parser import parse_text
 from stratakb.knowledge.parsers.xml_parser import parse_xml

@@ -186,13 +186,6 @@ class TestRedaction:
 # ==========================================
 
 
-@pytest.fixture
-def db_url():
-    from stratakb.config import get_settings
-
-    return get_settings().database_url
-
-
 class TestAuditLogDB:
     @pytest.mark.asyncio
     async def test_write_and_query_audit_log(self, db_url):
@@ -307,10 +300,8 @@ class TestAuditLogDB:
 
 
 class TestToolRoleAssignments:
-    def test_all_tools_registered(self):
-        from stratakb.mcp_server import mcp
-
-        tool_names = [t.name for t in mcp._tool_manager.list_tools()]
+    def test_all_tools_registered(self, server):
+        tool_names = [t.name for t in server._tool_manager.list_tools()]
 
         # Viewer tools
         assert "strata_admin_health" in tool_names
@@ -323,11 +314,9 @@ class TestToolRoleAssignments:
         assert "strata_ingest_documents" in tool_names
         assert "strata_admin_audit_log" in tool_names
 
-    def test_viewer_tools_accessible_by_viewer(self):
+    def test_viewer_tools_accessible_by_viewer(self, server):
         """Viewer-role tools should not raise for viewer users."""
         # Verified via the require_role decorator unit tests above
         # This test confirms the tools are registered (smoke test)
-        from stratakb.mcp_server import mcp
-
-        tool_names = [t.name for t in mcp._tool_manager.list_tools()]
+        tool_names = [t.name for t in server._tool_manager.list_tools()]
         assert len(tool_names) >= 7  # At least 7 tools registered

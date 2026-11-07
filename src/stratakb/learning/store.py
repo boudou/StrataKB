@@ -23,6 +23,11 @@ _rewrite_cache: TTLCache = TTLCache(maxsize=200, ttl=3600)
 _synonym_cache: TTLCache = TTLCache(maxsize=500, ttl=3600)
 
 
+def _decode_results(value):
+    """An interaction's results column: asyncpg returns JSONB as text."""
+    return json.loads(value) if isinstance(value, str) else value
+
+
 @dataclass
 class LearnedRewrite:
     """A learned query rewrite pattern."""
@@ -59,7 +64,7 @@ class LearningStore:
                 rows = await conn.fetch(sql, *args)
             return [dict(r) for r in rows]
         except Exception as e:
-            logger.debug("learning_store_fetch_failed", error=str(e))
+            logger.warning("learning_store_fetch_failed", error_type=type(e).__name__)
             return []
 
     async def _execute(self, sql: str, *args) -> str | None:
@@ -72,7 +77,20 @@ class LearningStore:
             async with pool.acquire() as conn:
                 return await conn.execute(sql, *args)
         except Exception as e:
-            logger.debug("learning_store_execute_failed", error=str(e))
+            logger.warning("learning_store_execute_failed", error_type=type(e).__name__)
+            return None
+
+    async def _transaction(self, *statements: tuple) -> list[str] | None:
+        """Run (sql, *args) statements in one transaction and return their statuses.
+
+        Returns None if it fails, and then none of them took effect.
+        """
+        try:
+            pool = await get_pool(self.database_url)
+            async with pool.acquire() as conn, conn.transaction():
+                return [await conn.execute(sql, *args) for sql, *args in statements]
+        except Exception as e:
+            logger.warning("learning_store_transaction_failed", error_type=type(e).__name__)
             return None
 
     # ── Sessions ──────────────────────────────────────────────
@@ -129,7 +147,6 @@ class LearningStore:
         *,
         session_id: str | None,
         query_text: str,
-        query_embedding: list[float] | None = None,
         rewritten_queries: list[str] | None = None,
         layers_detected: list[str] | None = None,
         layers_searched: list[str] | None = None,
@@ -141,22 +158,17 @@ class LearningStore:
         response_time_ms: int | None = None,
     ) -> dict | None:
         """Record a query interaction."""
-        embedding_str = None
-        if query_embedding:
-            embedding_str = "[" + ",".join(str(f) for f in query_embedding) + "]"
-
         rows = await self._fetch(
             """
             INSERT INTO strata_learning.interaction_events
-                (session_id, query_text, query_embedding, rewritten_queries,
+                (session_id, query_text, rewritten_queries,
                  layers_detected, layers_searched, results, result_count,
                  confidence_level, confidence_score, tool_used, response_time_ms)
-            VALUES ($1, $2, $3::vector, $4::jsonb, $5, $6, $7::jsonb, $8, $9, $10, $11, $12)
+            VALUES ($1, $2, $3::jsonb, $4, $5, $6::jsonb, $7, $8, $9, $10, $11)
             RETURNING id, created_at
             """,
             session_id,
             query_text,
-            embedding_str,
             json.dumps(rewritten_queries) if rewritten_queries else None,
             layers_detected,
             layers_searched,
@@ -175,7 +187,7 @@ class LearningStore:
         """Get recent interactions in a session (for signal detection)."""
         rows = await self._fetch(
             """
-            SELECT id, query_text, query_embedding, layers_detected, layers_searched,
+            SELECT id, query_text, layers_detected, layers_searched,
                    confidence_level, confidence_score, results, created_at
             FROM strata_learning.interaction_events
             WHERE session_id = $1
@@ -185,10 +197,8 @@ class LearningStore:
             session_id,
             limit,
         )
-        # asyncpg returns JSONB as text
         for row in rows:
-            if isinstance(row.get("results"), str):
-                row["results"] = json.loads(row["results"])
+            row["results"] = _decode_results(row.get("results"))
         return rows
 
     async def get_interaction_results(self, interaction_id: str) -> list[dict] | None:
@@ -199,11 +209,7 @@ class LearningStore:
         )
         if not rows:
             return None
-        results = rows[0]["results"]
-        # asyncpg returns JSONB as text
-        if isinstance(results, str):
-            results = json.loads(results)
-        return results or []
+        return _decode_results(rows[0]["results"]) or []
 
     # ── Feedback ──────────────────────────────────────────────
 
@@ -490,37 +496,26 @@ class LearningStore:
         """Reset learning data. If layer is given (even ""), only that layer.
 
         Runs as one transaction: returns None if it fails, and then nothing
-        was deleted.
+        was deleted. A layer reset also returns how many rows it deleted.
         """
         _rewrite_cache.clear()
         _synonym_cache.clear()
-        try:
-            pool = await get_pool(self.database_url)
-            async with pool.acquire() as conn, conn.transaction():
-                if layer is not None:
-                    await conn.execute(
-                        "DELETE FROM strata_learning.learned_rewrites WHERE $1 = ANY(layers)",
-                        layer,
-                    )
-                    await conn.execute(
-                        "DELETE FROM strata_learning.query_synonyms WHERE layer = $1", layer
-                    )
-                    await conn.execute(
-                        "DELETE FROM strata_learning.layer_affinity_scores WHERE layer_name = $1",
-                        layer,
-                    )
-                else:
-                    await conn.execute(
-                        "TRUNCATE strata_learning.feedback_signals,"
-                        " strata_learning.interaction_events,"
-                        " strata_learning.query_sessions,"
-                        " strata_learning.learned_rewrites,"
-                        " strata_learning.query_synonyms,"
-                        " strata_learning.layer_affinity_scores CASCADE"
-                    )
-        except Exception as e:
-            logger.debug("learning_store_reset_failed", error=str(e))
+        if layer is None:
+            statuses = await self._transaction((
+                "TRUNCATE strata_learning.feedback_signals,"
+                " strata_learning.interaction_events,"
+                " strata_learning.query_sessions,"
+                " strata_learning.learned_rewrites,"
+                " strata_learning.query_synonyms,"
+                " strata_learning.layer_affinity_scores CASCADE",
+            ))
+            return None if statuses is None else {"reset": "all"}
+        statuses = await self._transaction(
+            ("DELETE FROM strata_learning.learned_rewrites WHERE $1 = ANY(layers)", layer),
+            ("DELETE FROM strata_learning.query_synonyms WHERE layer = $1", layer),
+            ("DELETE FROM strata_learning.layer_affinity_scores WHERE layer_name = $1", layer),
+        )
+        if statuses is None:
             return None
-        if layer is not None:
-            return {"reset": "layer", "layer": layer}
-        return {"reset": "all"}
+        deleted = sum(int(status.split()[-1]) for status in statuses)
+        return {"reset": "layer", "layer": layer, "deleted": deleted}

@@ -4,27 +4,37 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-from typing import TYPE_CHECKING
+import os
+from unittest.mock import patch
+from urllib.parse import urlsplit, urlunsplit
 from uuid import uuid4
 
 import asyncpg
 import pytest
 
-if TYPE_CHECKING:
-    from mcp.server.fastmcp import FastMCP
-
 # Asserts in the shared helpers report like asserts in a test module.
 pytest.register_assert_rewrite("tests.helpers")
 
 
-async def call_tool(server: FastMCP, name: str, /, **arguments) -> dict:
-    """Call tool `name` on a built server, through its role and logging decorators."""
-    return await server._tool_manager.get_tool(name).fn(**arguments)
+@pytest.fixture
+def no_sdk_env(monkeypatch):
+    """Keep SDK keys, base-URL overrides and the rewrite model from the shell out of a test."""
+    for name in (
+        "OPENAI_API_KEY",
+        "OPENAI_BASE_URL",
+        "ANTHROPIC_BASE_URL",
+        "QUERY_REWRITE_MODEL",
+    ):
+        monkeypatch.delenv(name, raising=False)
 
 
 @pytest.fixture
 def server():
-    """A StrataKB server built from the environment's settings."""
+    """A StrataKB server built from the environment's settings.
+
+    Call its tools with `tests.helpers.call_tool`. A module may define its own
+    `server` fixture, which overrides this one; it must also yield a built server.
+    """
     from stratakb.config import get_settings
     from stratakb.mcp_server import build_server
 
@@ -33,12 +43,39 @@ def server():
 
 @pytest.fixture
 def db_url():
-    """The test database URL from the environment's settings.
-
-    A module may define its own `db_url` fixture, which overrides this one.
-    """
+    """The test database URL from the environment's settings."""
     from stratakb.config import get_settings
     return get_settings().database_url
+
+
+@pytest.fixture
+def folder_db_url(db_url):
+    """db_url, for a test that adds a tmp_path folder.
+
+    tmp_path can sit under a system folder (%LOCALAPPDATA%): treat it as normal.
+    """
+    with patch("stratakb.knowledge.add_folder.broad_reason", return_value=None):
+        yield db_url
+
+
+@pytest.fixture
+async def cleanup(db_url):
+    """Layer names to delete after the test."""
+    from stratakb.knowledge.layers import LayerNotFoundError, delete_layer
+
+    names: list[str] = []
+    yield names
+    for name in names:
+        with contextlib.suppress(LayerNotFoundError):
+            await delete_layer(db_url, name=name)
+
+
+@pytest.fixture
+def isolated_git(monkeypatch, tmp_path):
+    """Keep the machine's git config and any repository above tmp_path out of the tests."""
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", os.devnull)
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path.parent))
 
 
 @pytest.fixture
@@ -96,6 +133,92 @@ async def vacuumed_chunks():
     conn = await asyncpg.connect(get_settings().database_url)
     try:
         await conn.execute("VACUUM strata_vectors.chunks")
+    finally:
+        await conn.close()
+
+
+@pytest.fixture
+def clear_checked():
+    """Forget which databases ensure_schema has checked, before and after a test."""
+    from stratakb.core import migrations
+
+    migrations._checked.clear()
+    yield
+    migrations._checked.clear()
+
+
+@pytest.fixture
+async def restore_schema(db_url):
+    """Put the shared test schema back after a test that drops parts of it.
+
+    Replays every migration file as the owner, so the restore does not depend on
+    ensure_schema working, then records the versions.
+    """
+    from stratakb.core import migrations
+    from tests.helpers import replay_migrations
+
+    yield
+    await replay_migrations(db_url)
+    migrations._checked.clear()
+    await migrations.ensure_schema(db_url)
+
+
+async def _new_database(db_url: str, name: str):
+    """Yield the URL of a new, empty database name next to db_url, then drop it."""
+    from tests.helpers import owner_execute
+
+    parts = urlsplit(db_url)
+    try:
+        await owner_execute(db_url, f'DROP DATABASE IF EXISTS "{name}" WITH (FORCE)')
+        await owner_execute(db_url, f'CREATE DATABASE "{name}"')
+    except asyncpg.InsufficientPrivilegeError:
+        pytest.skip("the owner may not create databases")
+    try:
+        yield urlunsplit(parts._replace(path=f"/{name}"))
+    finally:
+        await owner_execute(db_url, f'DROP DATABASE IF EXISTS "{name}" WITH (FORCE)')
+
+
+@pytest.fixture
+async def fresh_url(db_url):
+    """URL of a new, empty database next to db_url, dropped afterwards."""
+    parts = urlsplit(db_url)
+    async for url in _new_database(db_url, f"{parts.path.lstrip('/')}_fresh"):
+        yield url
+
+
+@pytest.fixture
+async def reserved_url(db_url):
+    """URL of a new, empty database named template_<db_url's database>, dropped afterwards."""
+    parts = urlsplit(db_url)
+    async for url in _new_database(db_url, f"template_{parts.path.lstrip('/')}"):
+        yield url
+
+
+@pytest.fixture
+async def probe_url(db_url):
+    """URL for a new login role with no privileges on the StrataKB schemas."""
+    from tests.helpers import login_role_url
+
+    role = f"strata_probe_{urlsplit(db_url).path.lstrip('/')}"
+    async with login_role_url(db_url, role) as url:
+        yield url
+
+
+@pytest.fixture
+async def superuser_conn(db_url):
+    """A connection to db_url; skip unless it is reachable and its role is a superuser."""
+    try:
+        conn = await asyncpg.connect(db_url, timeout=5)
+    except Exception:
+        pytest.skip("database not reachable")
+    try:
+        superuser = await conn.fetchval(
+            "SELECT rolsuper FROM pg_roles WHERE rolname = current_user"
+        )
+        if not superuser:
+            pytest.skip("DATABASE_URL role is not a superuser")
+        yield conn
     finally:
         await conn.close()
 

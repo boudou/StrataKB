@@ -215,8 +215,8 @@ def test_cached_load_builds_no_message(embeddings, reranker):
     unexpected = MagicMock(side_effect=AssertionError("message built on success"))
     with (
         patch("stratakb.config.get_settings", return_value=_settings()),
-        patch.object(embeddings, "_missing_model_error", unexpected),
-        patch.object(embeddings, "_offline_error", unexpected),
+        patch.object(embeddings, "_folder_error", unexpected),
+        patch.object(embeddings, "_download_blocked_error", unexpected),
         patch.dict(sys.modules, {"sentence_transformers": fake}),
     ):
         embeddings._get_local_model(_EMBEDDING)

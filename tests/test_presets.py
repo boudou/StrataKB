@@ -13,11 +13,13 @@ from stratakb.knowledge.presets import (
     dry_run_parse,
     load_preset,
 )
-
-EXAMPLES_DIR = Path(__file__).parent.parent / "examples"
-SEPA_PRESET = EXAMPLES_DIR / "sepa" / "preset.yaml"
-ISO_PRESET = EXAMPLES_DIR / "iso20022" / "preset.yaml"
-PEPS_PRESET = EXAMPLES_DIR / "peps" / "preset.yaml"
+from tests.helpers import (
+    ISO_PRESET,
+    PEPS_PRESET,
+    SEPA_PRESET,
+    call_tool,
+    example_routing_patterns,
+)
 
 
 def _write_preset(tmp_path: Path, body: str) -> Path:
@@ -36,6 +38,7 @@ def _stored_layer(preset, **overrides) -> dict:
         "metadata_schema": preset.metadata_schema,
         "chunk_config": preset.chunk_config,
         "routing_patterns": preset.routing_patterns,
+        "structure_patterns": preset.structure_patterns,
         "answer_mode": "grounded",
         **overrides,
     }
@@ -104,6 +107,53 @@ class TestLoadPreset:
             "  - {name: docs, path: docs}\n"
         ))
         with pytest.raises(LayerValidationError, match="routing pattern"):
+            load_preset(path)
+
+    @pytest.mark.parametrize("pattern", ["'(\\w+\\s?)*'", "'\\b(a+)+\\b'"])
+    def test_nested_routing_pattern_refused(self, tmp_path, pattern):
+        # A nested unbounded repeat could stall a search on a long question
+        path = _write_preset(tmp_path, (
+            "name: runbooks\n"
+            "display_name: Ops Runbooks\n"
+            f"routing_patterns: [{pattern}]\n"
+            "sources:\n"
+            "  - {name: docs, path: docs}\n"
+        ))
+        with pytest.raises(LayerValidationError, match="routing pattern.*repeats a repeated part"):
+            load_preset(path)
+
+    def test_structure_patterns_loaded(self, tmp_path):
+        assert load_preset(SEPA_PRESET).structure_patterns == [
+            "^Identification:\\s*(?P<label>AT-[A-Z]?\\d{1,3})\\b",
+        ]
+        assert load_preset(ISO_PRESET).structure_patterns == [
+            "^(?P<label>(?:pain|pacs|camt)\\.\\d{3}\\.\\d{3}\\.\\d{2})\\b",
+        ]
+        path = _write_preset(tmp_path, (
+            "name: runbooks\n"
+            "display_name: Ops Runbooks\n"
+            "sources:\n"
+            "  - {name: docs, path: docs}\n"
+        ))
+        assert load_preset(path).structure_patterns == []
+
+    @pytest.mark.parametrize("pattern, message", [
+        ("'(unclosed'", "structure pattern"),
+        ("'\\s*'", "empty line"),
+        ("42", "list of strings"),
+        # Nested unbounded repeats could stall an ingest on a long line
+        ("'^(?P<label>(AT-\\d+)+)'", "repeats a repeated part"),
+        ("'^(\\w+\\s?)*:'", "repeats a repeated part"),
+    ])
+    def test_invalid_structure_pattern_refused(self, tmp_path, pattern, message):
+        path = _write_preset(tmp_path, (
+            "name: runbooks\n"
+            "display_name: Ops Runbooks\n"
+            f"structure_patterns: [{pattern}]\n"
+            "sources:\n"
+            "  - {name: docs, path: docs}\n"
+        ))
+        with pytest.raises(LayerValidationError, match=message):
             load_preset(path)
 
     def test_source_without_path_rejected(self, tmp_path):
@@ -176,13 +226,6 @@ class TestLoadPreset:
 class TestPepsRouting:
     """The PEPs preset's routing patterns, compiled as the server compiles them."""
 
-    @staticmethod
-    def _patterns(*paths: Path) -> dict:
-        from stratakb.rag.layer_detect import compile_patterns
-
-        presets = [load_preset(p) for p in paths]
-        return compile_patterns({p.name: p.routing_patterns for p in presets})
-
     @pytest.mark.parametrize("query", [
         "PEP 8",
         "pep-484",
@@ -194,7 +237,7 @@ class TestPepsRouting:
     def test_routed(self, query):
         from stratakb.rag.layer_detect import detect_layers
 
-        assert detect_layers(query, self._patterns(PEPS_PRESET)) == ["python_peps"]
+        assert detect_layers(query, example_routing_patterns(PEPS_PRESET)) == ["python_peps"]
 
     @pytest.mark.parametrize(
         "query", ["pepper", "step 8", "pep 12345", "general payments question"]
@@ -202,12 +245,12 @@ class TestPepsRouting:
     def test_not_routed(self, query):
         from stratakb.rag.layer_detect import detect_layers
 
-        assert detect_layers(query, self._patterns(PEPS_PRESET)) == []
+        assert detect_layers(query, example_routing_patterns(PEPS_PRESET)) == []
 
     def test_alongside_the_other_examples(self):
         from stratakb.rag.layer_detect import detect_layers
 
-        patterns = self._patterns(SEPA_PRESET, ISO_PRESET, PEPS_PRESET)
+        patterns = example_routing_patterns(SEPA_PRESET, ISO_PRESET, PEPS_PRESET)
         assert detect_layers("PEP 8 line length", patterns) == ["python_peps"]
         assert "python_peps" not in detect_layers("pacs.008 settlement amount", patterns)
 
@@ -285,7 +328,7 @@ class TestCreatePresetLayer:
 
     async def test_new_layer_without_answer_mode_is_grounded(self):
         preset = load_preset(SEPA_PRESET)
-        assert preset.answer_mode is None
+        preset.answer_mode = None
         with patch(
             "stratakb.knowledge.presets.create_layer", new_callable=AsyncMock
         ) as mock_create:
@@ -294,6 +337,46 @@ class TestCreatePresetLayer:
 
         assert result == {"status": "created", "layer": {"name": "sepa"}, "changes": []}
         assert mock_create.call_args.kwargs["answer_mode"] == "grounded"
+        assert mock_create.call_args.kwargs["structure_patterns"] == preset.structure_patterns
+
+    async def test_structure_patterns_stored(self, tmp_path):
+        import contextlib
+
+        from stratakb.config import get_settings
+        from stratakb.knowledge.layers import (
+            LayerNotFoundError,
+            delete_layer,
+            get_layer_status,
+            list_layers,
+        )
+
+        db_url = get_settings().database_url
+        name = "test_preset_structure"
+        body = (
+            f"name: {name}\n"
+            "display_name: Structure\n"
+            "structure_patterns: [{patterns}]\n"
+            "sources:\n"
+            "  - {{name: docs, path: docs}}\n"
+        )
+        path = _write_preset(tmp_path, body.format(patterns="'(?P<label>AT-\\d+)\\b'"))
+        with contextlib.suppress(LayerNotFoundError):
+            await delete_layer(db_url, name=name)
+        try:
+            result = await create_preset_layer(db_url, load_preset(path))
+            assert result["layer"]["structure_patterns"] == ["(?P<label>AT-\\d+)\\b"]
+            listed = next(layer for layer in await list_layers(db_url) if layer["name"] == name)
+            assert listed["structure_patterns"] == ["(?P<label>AT-\\d+)\\b"]
+
+            # Applying the preset again brings the patterns up to the YAML
+            _write_preset(tmp_path, body.format(patterns="'(?P<label>DS-\\d+)\\b'"))
+            again = await create_preset_layer(db_url, load_preset(path))
+            assert again["changes"] == ["structure_patterns"]
+            stored = await get_layer_status(db_url, name=name)
+            assert stored["structure_patterns"] == ["(?P<label>DS-\\d+)\\b"]
+        finally:
+            with contextlib.suppress(LayerNotFoundError):
+                await delete_layer(db_url, name=name)
 
     async def _create_existing(self, existing_origin, existing_mode="grounded", preset=None,
                                update_error=None, **stored):
@@ -389,7 +472,11 @@ class TestCreatePresetLayer:
         self.mock_update.assert_not_awaited()
 
     async def test_missing_answer_mode_keeps_layer_mode(self):
-        result = await self._create_existing("preset:sepa", existing_mode="extractive")
+        preset = load_preset(SEPA_PRESET)
+        preset.answer_mode = None
+        result = await self._create_existing(
+            "preset:sepa", existing_mode="extractive", preset=preset
+        )
 
         assert result["status"] == "exists"
         self.mock_update.assert_not_awaited()
@@ -447,18 +534,9 @@ RUNBOOKS_YAML = (
 class TestReapplyPresetIntegration:
     """Applying a preset again brings its layer up to the YAML (require database)."""
 
-    @pytest.fixture
-    async def db_url(self):
-        import contextlib
-
-        from stratakb.config import get_settings
-        from stratakb.knowledge.layers import LayerNotFoundError, delete_layer
-
-        db_url = get_settings().database_url
-        yield db_url
-        for name in ("test_preset_reapply", "test_preset_manual", "test_preset_race"):
-            with contextlib.suppress(LayerNotFoundError):
-                await delete_layer(db_url, name=name)
+    @pytest.fixture(autouse=True)
+    def _delete_named_layers(self, cleanup):
+        cleanup.extend(("test_preset_reapply", "test_preset_manual", "test_preset_race"))
 
     async def test_reapply_updates_stored_settings(self, db_url, tmp_path):
         import contextlib
@@ -577,6 +655,7 @@ class TestPresetLayerChanges:
         ("metadata_schema", {"old": True}),
         ("chunk_config", {"chunk_size": 1, "chunk_overlap": 0, "splitting_strategy": "x"}),
         ("routing_patterns", ["old"]),
+        ("structure_patterns", []),
     ])
     def test_one_setting_changed(self, key, stored):
         from stratakb.knowledge.presets import preset_layer_changes
@@ -601,11 +680,16 @@ class TestPresetLayerChanges:
         from stratakb.knowledge.presets import preset_layer_changes
 
         preset = load_preset(SEPA_PRESET)
-        assert preset.answer_mode is None
+        preset.answer_mode = None
         stored = _stored_layer(preset, answer_mode="extractive")
         assert preset_layer_changes(stored, preset) == []
         preset.answer_mode = "grounded"
         assert preset_layer_changes(stored, preset) == ["answer_mode"]
+
+    def test_example_presets_answer_mode(self):
+        assert load_preset(SEPA_PRESET).answer_mode == "grounded"
+        assert load_preset(ISO_PRESET).answer_mode == "grounded"
+        assert load_preset(PEPS_PRESET).answer_mode is None
 
 
 class TestApplyPresetTool:
@@ -618,13 +702,7 @@ class TestApplyPresetTool:
             patch("stratakb.knowledge.tools.get_current_user", return_value=("tester", "admin")),
         )
 
-    async def _call(self, **kwargs):
-        from stratakb.mcp_server import mcp
-
-        tool = mcp._tool_manager.get_tool("strata_apply_preset")
-        return await tool.fn(preset_path=str(SEPA_PRESET), **kwargs)
-
-    async def test_other_origin_returns_error_without_ingest(self):
+    async def test_other_origin_returns_error_without_ingest(self, server):
         auth, tools_auth = self._admin()
         with (
             auth, tools_auth,
@@ -637,13 +715,13 @@ class TestApplyPresetTool:
             patch("stratakb.knowledge.presets.ingest_preset", new_callable=AsyncMock) as ingest,
             patch("stratakb.knowledge.tools.write_audit_log", new_callable=AsyncMock) as audit,
         ):
-            result = await self._call()
+            result = await call_tool(server, "strata_apply_preset", preset_path=str(SEPA_PRESET))
 
         assert result == {"status": "error", "error": "not ours"}
         ingest.assert_not_awaited()
         audit.assert_not_awaited()
 
-    async def test_layer_error_returns_error(self):
+    async def test_layer_error_returns_error(self, server):
         auth, tools_auth = self._admin()
         with (
             auth, tools_auth,
@@ -656,13 +734,13 @@ class TestApplyPresetTool:
             patch("stratakb.knowledge.presets.ingest_preset", new_callable=AsyncMock) as ingest,
             patch("stratakb.knowledge.tools.write_audit_log", new_callable=AsyncMock) as audit,
         ):
-            result = await self._call()
+            result = await call_tool(server, "strata_apply_preset", preset_path=str(SEPA_PRESET))
 
         assert result == {"status": "error", "error": "display_name is required."}
         ingest.assert_not_awaited()
         audit.assert_not_awaited()
 
-    async def test_real_run_reports_layer_changes(self):
+    async def test_real_run_reports_layer_changes(self, server):
         auth, tools_auth = self._admin()
         with (
             auth, tools_auth,
@@ -679,13 +757,13 @@ class TestApplyPresetTool:
             ),
             patch("stratakb.knowledge.tools.write_audit_log", new_callable=AsyncMock),
         ):
-            result = await self._call()
+            result = await call_tool(server, "strata_apply_preset", preset_path=str(SEPA_PRESET))
 
         assert result["status"] == "completed"
         assert result["layer"] == "updated"
         assert result["layer_changes"] == ["description"]
 
-    async def _audited_run(self, layer_result):
+    async def _audited_run(self, server, layer_result):
         auth, tools_auth = self._admin()
         with (
             auth, tools_auth,
@@ -702,22 +780,24 @@ class TestApplyPresetTool:
             ),
             patch("stratakb.knowledge.tools.write_audit_log", new_callable=AsyncMock) as audit,
         ):
-            await self._call()
+            await call_tool(server, "strata_apply_preset", preset_path=str(SEPA_PRESET))
         audit.assert_awaited_once()
         return audit.await_args.kwargs["result_summary"]
 
-    async def test_audit_names_changed_settings(self):
+    async def test_audit_names_changed_settings(self, server):
         summary = await self._audited_run(
+            server,
             {"status": "updated", "changes": ["description", "routing_patterns"], "message": ""}
         )
         assert summary == (
             "Layer 'sepa': updated (description, routing_patterns), ingested 4 docs, 31 chunks"
         )
 
-    async def test_audit_has_no_setting_values(self):
+    async def test_audit_has_no_setting_values(self, server):
         description = load_preset(SEPA_PRESET).description
         assert description
         summary = await self._audited_run(
+            server,
             {"status": "updated", "changes": ["description"], "message": "ZZ-old-description-7f3"}
         )
         assert "(description)" in summary
@@ -725,11 +805,11 @@ class TestApplyPresetTool:
         assert description not in summary
 
     @pytest.mark.parametrize("status", ["created", "exists"])
-    async def test_audit_unchanged_without_changes(self, status):
-        summary = await self._audited_run({"status": status, "changes": [], "message": ""})
+    async def test_audit_unchanged_without_changes(self, server, status):
+        summary = await self._audited_run(server, {"status": status, "changes": [], "message": ""})
         assert summary == f"Layer 'sepa': {status}, ingested 4 docs, 31 chunks"
 
-    async def _dry_run(self, stored=None, side_effect=None):
+    async def _dry_run(self, server, stored=None, side_effect=None):
         auth, tools_auth = self._admin()
         with (
             auth, tools_auth,
@@ -740,58 +820,60 @@ class TestApplyPresetTool:
                 side_effect=side_effect,
             ),
         ):
-            return await self._call(dry_run=True)
+            return await call_tool(
+                server, "strata_apply_preset", preset_path=str(SEPA_PRESET), dry_run=True
+            )
 
-    async def test_dry_run_would_update(self):
+    async def test_dry_run_would_update(self, server):
         preset = load_preset(SEPA_PRESET)
         stored = _stored_layer(
             preset, origin="preset:sepa", description="Old", routing_patterns=["old"]
         )
-        result = await self._dry_run(stored)
+        result = await self._dry_run(server, stored)
 
         assert result["status"] == "dry_run_complete"
         assert result["layer_check"] == {
             "status": "would_update", "changes": ["description", "routing_patterns"],
         }
 
-    async def test_dry_run_would_claim(self):
+    async def test_dry_run_would_claim(self, server):
         # The real run writes the origin of a matching layer that has none
         preset = load_preset(SEPA_PRESET)
-        result = await self._dry_run(_stored_layer(preset))
+        result = await self._dry_run(server, _stored_layer(preset))
 
         assert result["layer_check"] == {"status": "would_claim", "changes": []}
 
-    async def test_dry_run_unclaimed_would_update(self):
+    async def test_dry_run_unclaimed_would_update(self, server):
         preset = load_preset(SEPA_PRESET)
-        result = await self._dry_run(_stored_layer(preset, description="Old"))
+        result = await self._dry_run(server, _stored_layer(preset, description="Old"))
 
         assert result["layer_check"] == {"status": "would_update", "changes": ["description"]}
 
-    async def test_dry_run_own_layer_unchanged(self):
+    async def test_dry_run_own_layer_unchanged(self, server):
         preset = load_preset(SEPA_PRESET)
-        result = await self._dry_run(_stored_layer(preset, origin="preset:sepa"))
+        result = await self._dry_run(server, _stored_layer(preset, origin="preset:sepa"))
 
         assert result["layer_check"] == {"status": "unchanged", "changes": []}
 
-    async def test_dry_run_would_create(self):
+    async def test_dry_run_would_create(self, server):
         from stratakb.knowledge.layers import LayerNotFoundError
 
-        result = await self._dry_run(side_effect=LayerNotFoundError("missing"))
+        result = await self._dry_run(server, side_effect=LayerNotFoundError("missing"))
 
         assert result["layer_check"] == {"status": "would_create", "changes": []}
 
-    async def test_dry_run_refused(self):
-        result = await self._dry_run({"origin": "manual"})
+    async def test_dry_run_refused(self, server):
+        result = await self._dry_run(server, {"origin": "manual"})
 
         assert result["layer_check"]["status"] == "refused"
         assert result["layer_check"]["changes"] == []
 
-    async def test_dry_run_unknown_when_lookup_fails(self):
-        result = await self._dry_run(side_effect=OSError("connection refused"))
+    async def test_dry_run_unknown_when_lookup_fails(self, server):
+        result = await self._dry_run(server, side_effect=OSError("connection refused"))
 
         assert result["layer_check"] == {"status": "unknown", "changes": []}
 
-    async def test_dry_run_check_times_out(self):
+    async def test_dry_run_check_times_out(self, server):
         import asyncio
         import time
 
@@ -800,7 +882,7 @@ class TestApplyPresetTool:
 
         with patch("stratakb.knowledge.tools._LAYER_CHECK_TIMEOUT_S", 0.05):
             started = time.monotonic()
-            result = await self._dry_run(side_effect=hang)
+            result = await self._dry_run(server, side_effect=hang)
             elapsed = time.monotonic() - started
 
         assert result["layer_check"] == {"status": "unknown", "changes": []}
@@ -857,9 +939,7 @@ class TestApplyPresetScript:
 
 
 class TestPresetToolRegistration:
-    def test_apply_preset_tool_registered(self):
-        from stratakb.mcp_server import mcp
-
-        tool_names = [t.name for t in mcp._tool_manager.list_tools()]
+    def test_apply_preset_tool_registered(self, server):
+        tool_names = [t.name for t in server._tool_manager.list_tools()]
         assert "strata_apply_preset" in tool_names
         assert "strata_setup_sepa_layer" not in tool_names

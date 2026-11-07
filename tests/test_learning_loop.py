@@ -14,7 +14,8 @@ import pytest
 
 from stratakb.learning.promoter import Promoter
 from stratakb.learning.store import LearningStore
-from stratakb.rag.passages import AskResult
+from stratakb.rag.confidence import Confidence
+from stratakb.rag.passages import AskResult, SearchResponse
 
 
 @pytest.fixture
@@ -52,15 +53,11 @@ def _tracker(store):
 
 
 def _ask_returning(queries, level, layers=None):
-    async def ask(question, layers_arg, include_sources, top_k):
+    async def ask(question, layers_arg, include_sources, top_k, mode=None):
         return AskResult(
             question=question,
             queries_used=queries,
-            confidence={
-                "level": level,
-                "top_score": 0.9 if level == "high" else 0.3,
-                "basis": "similarity",
-            },
+            confidence=Confidence(level, 0.9 if level == "high" else 0.3, 1, "similarity"),
             chunks=[{"chunk_id": "c1", "score": 0.5, "layer": "sepa", "source_file": "a.md"}],
             passages=[],
             status="found" if level == "high" else "not_found",
@@ -72,13 +69,12 @@ def _ask_returning(queries, level, layers=None):
 
 def _search_returning(layers=None):
     async def search(query, layers_arg, top_k, metadata_filter):
-        result = {
-            "status": "ok",
-            "results": [{"chunk_id": "c1", "score": 0.4, "layer": "x", "source_file": "a.md"}],
-        }
-        if layers:
-            result["auto_detected_layers"] = layers
-        return result
+        return SearchResponse(
+            query=query,
+            confidence=Confidence("low", 0.3, 0, "similarity"),
+            results=[{"chunk_id": "c1", "score": 0.4, "layer": "x", "source_file": "a.md"}],
+            auto_detected_layers=layers or [],
+        )
 
     return search
 
@@ -133,7 +129,7 @@ async def test_correct_layer_feedback_steers_routing(store, tag):
 
     result = await tracker.track_search(_search_returning(["iso20022"]), question, None, 5, None)
     await store.store_feedback(
-        result["interaction_id"], "explicit", "correct_layer", -0.3, {"correct_layer": "sepa"}
+        result.interaction_id, "explicit", "correct_layer", -0.3, {"correct_layer": "sepa"}
     )
 
     await Promoter(store).update_layer_affinities()

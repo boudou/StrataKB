@@ -17,14 +17,37 @@ from stratakb.core.logging import log_tool_call
 from stratakb.learning.pii import scrub_query
 from stratakb.rag.clause_lookup import in_exact_span, without_exact_spans
 from stratakb.rag.clause_lookup import lookup as lookup_clauses
-from stratakb.rag.confidence import answer_status, score_confidence, similarity_or_zero
+from stratakb.rag.confidence import (
+    EXTRACTIVE_SENTENCE_THRESHOLD,
+    Confidence,
+    answer_status,
+    score_confidence,
+    similarity_or_zero,
+)
+from stratakb.rag.extractive import (
+    LEGACY_ONLY_NOTE,
+    SENTENCE_REACH,
+    answer_item,
+    candidate_sentences,
+    clause_gap_note,
+    effective_mode,
+    fit_to_answer_budget,
+    select_sentences,
+)
 from stratakb.rag.passages import (
+    AnswerMode,
     AskResult,
+    ExtractiveAnswer,
     ResponseFormat,
+    SearchResponse,
+    ToolFailure,
     ask_chunk,
+    basis_score,
     build_passages,
     pack_passages,
+    sources_from,
 )
+from stratakb.rag.receipts import issue_receipt
 
 if TYPE_CHECKING:
     from stratakb.config import Settings
@@ -60,13 +83,48 @@ async def _detect_layers(database_url: str, query: str, learning_enabled: bool) 
     )
 
 
+async def _exact_clauses(
+    database_url: str, question: str, layers: list[str] | None, budget: int
+) -> list[dict[str, Any]]:
+    """The sections question names, looked up with the searched layers' structure patterns."""
+    from stratakb.knowledge.layers import get_structure_patterns
+
+    try:
+        patterns = await get_structure_patterns(database_url, layers)
+    except Exception as e:
+        logger.warning("structure_patterns_unavailable", error_type=type(e).__name__)
+        patterns = []
+    return await lookup_clauses(database_url, question, layers, budget, patterns)
+
+
+async def _answer_mode(
+    database_url: str,
+    requested: AnswerMode | None,
+    chunks: list[dict[str, Any]],
+    searched_layers: list[str] | None,
+) -> tuple[str, str | None]:
+    """The mode an answer runs in, judged on the passages it hands back, and any note.
+
+    With no passages there is nothing to loosen: the mode asked for, else the
+    strictest of the layers searched. Modes are read from the table on each call.
+    """
+    from stratakb.knowledge.layers import get_answer_modes
+
+    if chunks:
+        layers = sorted({c["layer"] for c in chunks})
+        return effective_mode(requested, await get_answer_modes(database_url, layers))
+    if requested:
+        return requested, None
+    return effective_mode(None, await get_answer_modes(database_url, searched_layers))
+
+
 def _routing_fallback_reason(
-    result_count: int, top_k: int, confidence: dict[str, Any]
+    result_count: int, top_k: int, confidence: Confidence
 ) -> str | None:
     """Decide whether an automatically routed search needs to broaden its scope."""
     if result_count < max(1, min(top_k, 50)):
         return "insufficient_results"
-    if confidence["level"] == "low":
+    if confidence.level == "low":
         return "low_confidence"
     return None
 
@@ -116,13 +174,12 @@ def _fuse_query_results(
 class _Collected(NamedTuple):
     """One strata_ask retrieval: candidates found, chunks kept, their confidence.
 
-    basis names the scale the chunks were judged on: similarity or rerank.
+    confidence.basis names the scale the chunks were judged on: similarity or rerank.
     """
 
     candidate_count: int
     chunks: list[dict[str, Any]]
-    confidence: dict[str, Any]
-    basis: str
+    confidence: Confidence
 
 
 def _ask_chunk(r: SearchResult, score: float) -> dict[str, Any]:
@@ -144,6 +201,15 @@ def _ask_chunk(r: SearchResult, score: float) -> dict[str, Any]:
     )
 
 
+def _cited_ends(chunks: list[dict[str, Any]], reach: int = 0) -> dict[int, int]:
+    """Each cited document's id and how far to read it: its furthest span's end, plus reach."""
+    ends: dict[int, int] = {}
+    for c in chunks:
+        if c.get("document_id") is not None and c.get("char_end") is not None:
+            ends[c["document_id"]] = max(ends.get(c["document_id"], 0), c["char_end"] + reach)
+    return ends
+
+
 async def _cited_documents(
     database_url: str, chunks: list[dict[str, Any]]
 ) -> dict[int, dict[str, Any]]:
@@ -152,10 +218,7 @@ async def _cited_documents(
     A chunk without offsets cites no document. When the read fails, the
     passages are cited by file name only.
     """
-    ends: dict[int, int] = {}
-    for c in chunks:
-        if c.get("document_id") is not None and c.get("char_end") is not None:
-            ends[c["document_id"]] = max(ends.get(c["document_id"], 0), c["char_end"])
+    ends = _cited_ends(chunks)
     if not ends:
         return {}
     try:
@@ -168,6 +231,75 @@ async def _cited_documents(
     except Exception as e:
         logger.warning("cited_documents_fetch_failed", error_type=type(e).__name__)
         return {}
+
+
+async def _extract_answer(
+    database_url: str,
+    question: str,
+    chunks: list[dict[str, Any]],
+    model_name: str,
+    budget: int,
+    refused_note: str | None,
+) -> ExtractiveAnswer:
+    """Choose the sentences that answer question from the chunks, and issue their receipt.
+
+    The best that fit the token budget are kept. Below the threshold, or with
+    nothing to quote, the answer is not_found and has no receipt. A named clause
+    with a part left out makes a found answer partly_found, with a note. Unlike a
+    grounded answer it fails when the documents cannot be read or the model
+    cannot load: there is no answer without them.
+    refused_note says the caller asked for a mode the layers do not allow.
+    """
+    from stratakb.core.database import get_pool
+    from stratakb.knowledge.documents import fetch_cited_documents
+
+    ends = _cited_ends(chunks, SENTENCE_REACH)
+    documents: dict[int, dict[str, Any]] = {}
+    if ends:
+        pool = await get_pool(database_url)
+        async with pool.acquire() as conn:
+            documents = await fetch_cited_documents(conn, ends)
+    # Splitting and scoring are CPU-bound: kept off the event loop
+    candidates = await asyncio.to_thread(candidate_sentences, chunks, documents, ends)
+    try:
+        sentences = await asyncio.to_thread(
+            select_sentences, question, candidates, EXTRACTIVE_SENTENCE_THRESHOLD, model_name
+        )
+    except Exception as e:
+        logger.warning("extractive_scoring_failed", error_type=type(e).__name__)
+        raise RuntimeError(
+            f"Extractive mode needs the reranker model; see Troubleshooting. {e}"
+        ) from e
+    logger.info("extractive_answer", candidates=len(candidates), sentences=len(sentences))
+    if not sentences:
+        legacy_note = LEGACY_ONLY_NOTE if chunks and not ends else None
+        note = " ".join(n for n in (refused_note, legacy_note) if n) or None
+        return ExtractiveAnswer([], None, "not_found", note)
+
+    sentences = fit_to_answer_budget(sentences, chunks, documents, budget)
+    answer = [answer_item(s, chunks, documents) for s in sentences]
+    receipt_id = await issue_receipt(
+        database_url,
+        kind="extractive",
+        mode="extractive",
+        question=question,
+        quotes=[
+            {
+                "document_id": s.document_id,
+                "char_start": s.start,
+                "char_end": s.end,
+                "clause_path": item["citation"]["clause_path"],
+            }
+            for s, item in zip(sentences, answer, strict=True)
+        ],
+        tool_name="strata_ask",
+    )
+    status = answer_status(max(s.score for s in sentences), "rerank")
+    gap_note = await asyncio.to_thread(clause_gap_note, chunks, documents, ends, sentences)
+    if gap_note and status == "found":
+        status = "partly_found"
+    note = " ".join(n for n in (refused_note, gap_note) if n) or None
+    return ExtractiveAnswer(answer, receipt_id, status, note)
 
 
 def _search_item(chunk: dict[str, Any]) -> dict[str, Any]:
@@ -191,19 +323,7 @@ def _search_item(chunk: dict[str, Any]) -> dict[str, Any]:
     return item
 
 
-def _basis_score(chunk: dict[str, Any], basis: str) -> float:
-    """The score confidence judges a strata_ask chunk on, for this basis.
-
-    An exact clause match is the passage asked for: it scores 1.0.
-    """
-    if chunk.get("match") == "exact":
-        return 1.0
-    if basis == "rerank":
-        return chunk["rerank_score"]
-    return similarity_or_zero(chunk["similarity"])
-
-
-def _search_confidence(results: list[SearchResult]) -> dict[str, Any]:
+def _search_confidence(results: list[SearchResult]) -> Confidence:
     """Judge strata_search results on cosine similarity, never the fused score.
 
     The fused score is divided by the top score, so the best result is
@@ -224,43 +344,47 @@ def register_rag_tools(
 ) -> None:
     """Register RAG search tools on the MCP server.
 
-    `settings` are the server's; without them the tracker uses the
-    environment's settings, read once here.
+    `settings` are the server's: search, ask, rewriting, the query embedding,
+    raw-query audit and the tracker all use them. Without them the tracker
+    uses the environment's settings, read once here, and the tools read them
+    on each call.
     """
+
+    def _current_settings() -> Settings:
+        """The server's settings; without any, the environment's, read per call."""
+        if settings is not None:
+            return settings
+        from stratakb.config import get_settings
+
+        return get_settings()
 
     # Initialize learning tracker
     _tracker = None
     try:
-        if settings is None:
-            from stratakb.config import get_settings
-            settings = get_settings()
-        if settings.learning_enabled:
+        tracker_settings = _current_settings()
+        if tracker_settings.learning_enabled:
             from stratakb.learning.store import LearningStore
             from stratakb.learning.tracker import Tracker
-            _tracker = Tracker(LearningStore(database_url), settings)
-    except Exception:
-        pass
+            _tracker = Tracker(LearningStore(database_url), tracker_settings)
+    except Exception as e:
+        logger.warning("learning_tracker_unavailable", error_type=type(e).__name__)
 
     async def _search(
         query: str,
         layers: list[str] | None,
         top_k: int,
         metadata_filter: dict[str, str] | None,
-    ) -> dict:
+    ) -> SearchResponse | ToolFailure:
         """Run strata_search; the tool below documents the arguments."""
-        from stratakb.config import get_settings
         from stratakb.knowledge.embeddings import embedding_key_error
         from stratakb.rag.retriever import search_chunks
 
-        _settings = get_settings()
+        _settings = _current_settings()
         if err := embedding_key_error(_settings, openai_api_key):
-            return {"status": "error", "error": err}
+            return ToolFailure(err)
 
         if not query or not query.strip():
-            return {
-                "status": "error",
-                "error": "Query cannot be empty.",
-            }
+            return ToolFailure("Query cannot be empty.")
 
         try:
             # NLP layer detection — auto-detect layers if not explicitly specified
@@ -280,6 +404,7 @@ def register_rag_tools(
                 layers=layers,
                 top_k=top_k,
                 metadata_filter=metadata_filter,
+                settings=_settings,
             )
 
             confidence = _search_confidence(results)
@@ -290,12 +415,13 @@ def register_rag_tools(
                     results = await search_chunks(
                         database_url, openai_api_key, query,
                         layers=None, top_k=top_k, metadata_filter=metadata_filter,
+                        settings=_settings,
                     )
                     layers = None
                     confidence = _search_confidence(results)
 
             # A clause or section the query names comes first, verbatim
-            exact = await lookup_clauses(
+            exact = await _exact_clauses(
                 database_url, query, layers, _settings.answer_token_budget
             )
             found = [
@@ -320,23 +446,15 @@ def register_rag_tools(
                 result_summary=f"Found {len(items)} results",
             )
 
-            response = {
-                "status": "ok",
-                "query": query,
-                "confidence": confidence,
-                "results": items,
-                "total": len(items),
-            }
-            if detected_layers:
-                response["auto_detected_layers"] = detected_layers
-            if fallback_reason:
-                response["routing_fallback"] = {
-                    "reason": fallback_reason, "searched_layers": "all",
-                }
-
-            return response
+            return SearchResponse(
+                query=query,
+                confidence=confidence,
+                results=items,
+                auto_detected_layers=detected_layers,
+                routing_fallback=fallback_reason,
+            )
         except Exception as e:
-            return {"status": "error", "error": str(e)}
+            return ToolFailure(str(e))
 
     @mcp.tool()
     @require_role("viewer")
@@ -370,20 +488,19 @@ def register_rag_tools(
                            Examples: {"doc_type": "pdf"}, {"doc_type": "xsd"}
         """
         if _tracker:
-            return await _tracker.track_search(_search, query, layers, top_k, metadata_filter)
-        return await _search(query, layers, top_k, metadata_filter)
+            result = await _tracker.track_search(_search, query, layers, top_k, metadata_filter)
+        else:
+            result = await _search(query, layers, top_k, metadata_filter)
+        return result.to_dict()
 
     async def _ask(
         question: str,
         layers: list[str] | None,
         include_sources: bool,
         top_k: int,
-    ) -> AskResult | dict:
-        """Run strata_ask; the tool below documents the arguments.
-
-        An error comes back as {"status": "error", "error": ...}.
-        """
-        from stratakb.config import get_settings
+        mode: AnswerMode | None = None,
+    ) -> AskResult | ToolFailure:
+        """Run strata_ask; the tool below documents the arguments."""
         from stratakb.rag.query_rewriter import (
             build_domain_context,
             rewrite_configured,
@@ -391,10 +508,10 @@ def register_rag_tools(
         )
         from stratakb.rag.retriever import search_chunks
 
-        _settings = get_settings()
+        _settings = _current_settings()
 
         if not question or not question.strip():
-            return {"status": "error", "error": "Question cannot be empty."}
+            return ToolFailure("Question cannot be empty.")
 
         try:
             # Auto-detect layers if not specified
@@ -429,6 +546,7 @@ def register_rag_tools(
                 anthropic_api_key=_settings.anthropic_api_key,
                 learning_store=learning_store,
                 domain_context=domain_context,
+                settings=_settings,
             )
 
             async def _collect(
@@ -437,7 +555,7 @@ def register_rag_tools(
                 async def _run_search(q: str) -> list[SearchResult]:
                     return await search_chunks(
                         database_url, openai_api_key, q,
-                        layers=search_layers, top_k=top_k,
+                        layers=search_layers, top_k=top_k, settings=_settings,
                     )
 
                 batch_results = await asyncio.gather(*(_run_search(q) for q in queries))
@@ -463,9 +581,9 @@ def register_rag_tools(
                     chunks = candidates
                     basis = "similarity"
                 confidence = score_confidence(
-                    [_basis_score(c, basis) for c in chunks], basis=basis
+                    [basis_score(c, basis) for c in chunks], basis=basis
                 )
-                return _Collected(len(candidates), chunks, confidence, basis)
+                return _Collected(len(candidates), chunks, confidence)
 
             collected = await _collect(layers)
             fallback_reason = None
@@ -478,7 +596,7 @@ def register_rag_tools(
                     layers = None
             # A clause or section the question names comes first, verbatim,
             # looked up in the layers searched; retrieved chunks inside it go
-            exact = await lookup_clauses(
+            exact = await _exact_clauses(
                 database_url, question, layers, _settings.answer_token_budget
             )
             # The best chunks that fit the answer budget; confidence is judged
@@ -488,27 +606,26 @@ def register_rag_tools(
                 _settings.answer_token_budget,
             )
             confidence = collected.confidence
-            basis = collected.basis
+            basis = confidence.basis
             passages = build_passages(chunks, await _cited_documents(database_url, chunks))
             status = answer_status(
-                max((_basis_score(c, basis) for c in chunks), default=0.0), basis
+                max((basis_score(c, basis) for c in chunks), default=0.0), basis
             )
+            sources = sources_from(chunks, basis) if include_sources else None
 
-            sources = None
-            if include_sources:
-                sources = []
-                seen_sources = set()
-                for c in chunks:
-                    source_key = f"{c['layer']}:{c['source_file']}:{c['section']}"
-                    if source_key not in seen_sources:
-                        seen_sources.add(source_key)
-                        sources.append({
-                            "layer": c["layer"],
-                            "file": c["source_file"],
-                            "section": c["section"],
-                            "doc_type": c["doc_type"],
-                            "relevance_score": _basis_score(c, basis),
-                        })
+            # Judged on the passages handed back, not on the layers searched
+            used_mode, refused_note = await _answer_mode(database_url, mode, chunks, layers)
+            extraction = None
+            if used_mode == "extractive":
+                extraction = await _extract_answer(
+                    database_url,
+                    question,
+                    chunks,
+                    _settings.reranking_model,
+                    _settings.answer_token_budget,
+                    refused_note,
+                )
+                status = extraction.status
 
             # Audit
             await write_audit_log(
@@ -521,10 +638,11 @@ def register_rag_tools(
                     "queries_used": len(queries),
                     "routing_fallback": bool(fallback_reason),
                     "exact_matches": len(exact),
+                    "mode": used_mode,
                 },
                 result_summary=(
                     f"{collected.candidate_count} chunks, {len(passages)} passages, "
-                    f"confidence={confidence['level']}"
+                    f"confidence={confidence.level}"
                 ),
             )
 
@@ -538,10 +656,11 @@ def register_rag_tools(
                 sources=sources,
                 auto_detected_layers=detected,
                 routing_fallback=fallback_reason,
+                extraction=extraction,
             )
 
         except Exception as e:
-            return {"status": "error", "error": str(e)}
+            return ToolFailure(str(e))
 
     @mcp.tool()
     @require_role("viewer")
@@ -552,6 +671,7 @@ def register_rag_tools(
         include_sources: bool = True,
         top_k: int = 10,
         response_format: ResponseFormat = "concise",
+        mode: AnswerMode | None = None,
     ) -> dict:
         """Ask a question of the knowledge base and get cited passages to answer from.
 
@@ -559,18 +679,25 @@ def register_rag_tools(
         knowledge base's terminology, runs several searches in parallel,
         reranks the results, and returns the best passages that fit a token
         budget (ANSWER_TOKEN_BUDGET, about 1,500 tokens, each passage's id,
-        ref and citation counted with its text; at most 50 passages). The
-        server does not write an answer; the client composes it from the
-        passages and cites them by id. A clause or section the question
-        names ("clause 7.2", "Annex II") is looked up exactly and comes
-        first, verbatim, once per document that has it.
+        ref and citation counted with its text; at most 50 passages). In
+        grounded mode the client composes the answer from the passages and
+        cites them by id. When a passage comes from an extractive layer the
+        server answers with the document's own sentences. A clause or section
+        the question names ("clause 7.2", "Annex II") is looked up exactly and
+        comes first, verbatim, once per document that has it.
 
         The response: status is found, partly_found or not_found, with a
-        next_step for the last two; mode is grounded; passages lists S1, S2,
-        ... in order of relevance, each with its exact text, a ref to the span
-        of the stored document, and a citation (file path, page, lines, clause
-        path, layer). interaction_id goes to strata_feedback, where passages
-        can be rated by id ({"S1": "useful"}).
+        next_step for the last two; mode is the mode used; passages lists S1,
+        S2, ... in order of relevance, each with its exact text, a ref to the
+        span of the stored document, and a citation (file path, page, lines,
+        clause path, layer). interaction_id goes to strata_feedback, where
+        passages can be rated by id ({"S1": "useful"}).
+
+        In extractive mode answer replaces passages: sentences word for word,
+        each with its ref, citation and text_origin, plus a receipt_id (open it
+        with strata_get_receipt). Give them as they are, do not rephrase them.
+        not_found means no sentence was relevant enough or short enough to
+        quote: do not guess.
 
         Args:
             question: Natural language question.
@@ -585,12 +712,14 @@ def register_rag_tools(
                    token budget then trims them.
             response_format: "concise" (default) or "detailed", which adds scores,
                     confidence, query variants, chunk ids and metadata.
+            mode: "extractive" asks for the document's own sentences on any layer.
+                  "grounded" cannot loosen a result holding a passage from an
+                  extractive layer: the answer stays extractive and a note says so.
         """
         if _tracker:
-            result = await _tracker.track_ask(_ask, question, layers, include_sources, top_k)
+            result = await _tracker.track_ask(
+                _ask, question, layers, include_sources, top_k, mode
+            )
         else:
-            result = await _ask(question, layers, include_sources, top_k)
-        if not isinstance(result, AskResult):
-            # The error dict, returned as it is
-            return result
-        return result.detailed() if response_format == "detailed" else result.concise()
+            result = await _ask(question, layers, include_sources, top_k, mode)
+        return result.to_dict(response_format)

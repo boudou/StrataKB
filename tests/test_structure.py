@@ -19,9 +19,9 @@ import pytest
 from stratakb.knowledge.documents import build_document_text
 from stratakb.knowledge.ingestion import _chunk_document, _map_document, _parse_file
 from stratakb.knowledge.structure import PATH_SEPARATOR, chunk_spans, detect_sections
+from tests.helpers import FAKE_EMBEDDING, call_tool, ingest
 
 FIXTURES = Path(__file__).parent / "fixtures"
-FAKE_EMBEDDING = [0.01] * 768
 
 
 def _document_text(name: str) -> str:
@@ -270,6 +270,233 @@ def test_extra_pattern_adds_sections():
     ]
 
 
+def test_extra_pattern_nests_under_numbered_clauses():
+    # A numbered rulebook: the attributes sit inside clause 4.1, and the
+    # numbering goes on after them
+    text = (
+        "4 Business requirements\n\n"
+        "4.1 Attributes\n\n"
+        "AT-01 The IBAN of the Originator\n\nText.\n\n"
+        "AT-02 The name of the Originator\n\nText.\n\n"
+        "4.2 Data sets\n\nText.\n\n"
+        "5 Security\n\nText.\n"
+    )
+    plain = detect_sections(text)
+    assert [s.path for s in plain] == [
+        "4 Business requirements",
+        "4 Business requirements > 4.1 Attributes",
+        "4 Business requirements > 4.2 Data sets",
+        "5 Security",
+    ]
+
+    sections = detect_sections(text, [r"^(?P<label>AT-R?\d{1,3})\b"])
+    assert [(s.label, s.path) for s in sections] == [
+        ("4", "4 Business requirements"),
+        ("4.1", "4 Business requirements > 4.1 Attributes"),
+        ("at-01", "4 Business requirements > 4.1 Attributes > AT-01 The IBAN of the Originator"),
+        ("at-02", "4 Business requirements > 4.1 Attributes > AT-02 The name of the Originator"),
+        ("4.2", "4 Business requirements > 4.2 Data sets"),
+        ("5", "5 Security"),
+    ]
+    at01, at02, s42 = sections[2], sections[3], sections[4]
+    assert at01.char_end == at02.char_start
+    assert at02.char_end == s42.char_start
+    assert sections[1].char_end == s42.char_start
+
+
+_RUNBOOKS = (
+    "# Runbooks\n\n"
+    "RB-01 Restart the queue\n\n"
+    "1. Stop the consumer.\n\n"
+    "2. Restart the broker.\n\n"
+    "RB-02 Fail over the database\n\n"
+    "Promote the replica.\n\n"
+    "RB-03 Rotate keys\n\n"
+    "Run the script.\n"
+)
+_RB = [r"^(?P<label>RB-\d+)\b"]
+
+
+def test_extra_pattern_section_with_loose_list_markdown():
+    # The loose list inside RB-01 is not a clause, and it does not push the
+    # next runbooks below RB-01
+    sections = detect_sections(_RUNBOOKS, _RB, markdown=True)
+    assert [s.path for s in sections] == [
+        "Runbooks",
+        "Runbooks > RB-01 Restart the queue",
+        "Runbooks > RB-02 Fail over the database",
+        "Runbooks > RB-03 Rotate keys",
+    ]
+    rb01, rb02 = sections[1], sections[2]
+    assert rb01.char_end == rb02.char_start
+
+
+def test_extra_pattern_section_with_numbered_list_plain_text():
+    # In plain text the list items are clauses of RB-01, and RB-02 and RB-03
+    # stay siblings of RB-01
+    sections = detect_sections(_RUNBOOKS, _RB)
+    rb = [s.path for s in sections if s.label.startswith("rb-")]
+    assert rb == [
+        "Runbooks > RB-01 Restart the queue",
+        "Runbooks > RB-02 Fail over the database",
+        "Runbooks > RB-03 Rotate keys",
+    ]
+    for s in sections:
+        if s.label in ("1", "2"):
+            assert s.path.startswith("Runbooks > RB-01 Restart the queue > ")
+    rb01 = next(s for s in sections if s.label == "rb-01")
+    rb02 = next(s for s in sections if s.label == "rb-02")
+    assert rb01.char_end == rb02.char_start
+
+
+def test_extra_pattern_list_then_outer_clause_continues():
+    # A list inside an attribute does not stop the outer numbering: 4.2
+    # still continues 4.1
+    text = (
+        "4 Business requirements\n\n"
+        "4.1 Attributes\n\n"
+        "AT-01 The IBAN of the Originator\n\n"
+        "1. First rule.\n\n2. Second rule.\n\n"
+        "AT-02 The name of the Originator\n\nText.\n\n"
+        "4.2 Data sets\n\nText.\n"
+    )
+    at = [r"^(?P<label>AT-R?\d{1,3})\b"]
+    expected = [
+        "4 Business requirements",
+        "4 Business requirements > 4.1 Attributes",
+        "4 Business requirements > 4.1 Attributes > AT-01 The IBAN of the Originator",
+        "4 Business requirements > 4.1 Attributes > AT-02 The name of the Originator",
+        "4 Business requirements > 4.2 Data sets",
+    ]
+    sections = detect_sections(text, at, markdown=True)
+    assert [s.path for s in sections] == expected
+    # In plain text the rules are clauses of AT-01
+    plain = detect_sections(text, at)
+    assert [s.path for s in plain if s.label not in ("1", "2")] == expected
+    at01 = expected[2]
+    assert [s.path for s in plain if s.label in ("1", "2")] == [
+        f"{at01} > 1 First rule",
+        f"{at01} > 2 Second rule",
+    ]
+
+
+_AT = [r"^(?P<label>AT-R?\d{1,3})\b"]
+
+
+@pytest.mark.parametrize(
+    ("after", "expected_after"),
+    [
+        ("4.2 Data sets", "Rulebook > 4 Business > 4.2 Data sets"),
+        ("5 Security", "Rulebook > 5 Security"),
+    ],
+)
+def test_extra_pattern_list_in_last_attribute_then_outer_clause_markdown(after, expected_after):
+    # The list in the last attribute is an ordered list, even when the next
+    # line is a clause of the outer numbering
+    text = (
+        "# Rulebook\n\n4 Business\n\n4.1 Attributes\n\n"
+        "AT-01 Name\n\nText.\n\n"
+        "AT-02 Amount\n\n1. Rule one.\n\n2. Rule two.\n\n"
+        f"{after}\n\nText.\n"
+    )
+    sections = detect_sections(text, _AT, markdown=True)
+    assert [s.path for s in sections] == [
+        "Rulebook",
+        "Rulebook > 4 Business",
+        "Rulebook > 4 Business > 4.1 Attributes",
+        "Rulebook > 4 Business > 4.1 Attributes > AT-01 Name",
+        "Rulebook > 4 Business > 4.1 Attributes > AT-02 Amount",
+        expected_after,
+    ]
+
+
+@pytest.mark.parametrize("markdown", [True, False])
+@pytest.mark.parametrize(
+    ("clause", "steps", "attr_path", "next_clause"),
+    [
+        # Five steps under 4.1: step 5 would also continue clause 4
+        ("4 Payments\n\n4.1 Credit", 5,
+         "4 Payments > 4.1 Credit > AT-02 BIC", ("4.2 Debit", "4 Payments > 4.2 Debit")),
+        # Three steps under clause 2: step 3 would also continue clause 2
+        ("2 Payments", 3,
+         "2 Payments > AT-02 BIC", ("3 Debit", "3 Debit")),
+    ],
+)
+def test_extra_pattern_list_number_continuing_outer_clause_stays_in_section(
+    markdown, clause, steps, attr_path, next_clause
+):
+    # A list step whose number happens to continue the outer numbering is
+    # still a step of the section's list
+    body = "".join(f"{n}. Step {n}.\n\n" for n in range(1, steps + 1))
+    text = (
+        f"{clause}\n\nAT-01 The IBAN\n\n{body}"
+        f"AT-02 BIC\n\nText.\n\n{next_clause[0]}\n\nText.\n"
+    )
+    sections = detect_sections(text, _AT, markdown=markdown)
+    by_label = {s.label: s.path for s in sections}
+    assert by_label["at-02"] == attr_path
+    assert by_label[next_clause[0].split()[0]] == next_clause[1]
+    at01 = by_label["at-01"]
+    steps_found = [s.path for s in sections if s.path.startswith(f"{at01} > ")]
+    if markdown:
+        assert steps_found == []
+    else:
+        assert steps_found == [f"{at01} > {n} Step {n}" for n in range(1, steps + 1)]
+
+
+@pytest.mark.parametrize(
+    "attribute_body",
+    [
+        "text\n",
+        # A loose list in the last attribute, then the outer clause
+        "1. a.\n\n2. b.\n",
+    ],
+)
+def test_extra_pattern_does_not_split_outer_numbering_markdown(attribute_body):
+    # 4. / 4.1 / 5. is one numbering with a subclause, not an ordered list:
+    # the attribute between 4.1 and 5. must not cut it in two, or '5.'
+    # alone reads as a list and clause 5 disappears
+    text = (
+        "# R\n\n4. Business\n\n4.1 Attributes\n\n"
+        f"AT-01 X\n\n{attribute_body}\n"
+        "5. Security\n\ntext\n"
+    )
+    plain = detect_sections(text.replace("AT-01 X\n\n", ""), markdown=True)
+    assert "R > 5 Security" in [s.path for s in plain]
+
+    sections = detect_sections(text, _AT, markdown=True)
+    assert [s.path for s in sections] == [
+        "R",
+        "R > 4 Business",
+        "R > 4 Business > 4.1 Attributes",
+        "R > 4 Business > 4.1 Attributes > AT-01 X",
+        "R > 5 Security",
+    ]
+    at01, security = sections[3], sections[4]
+    assert at01.char_end == security.char_start
+
+
+def test_extra_pattern_matches_an_indented_line():
+    # PDF text often indents a table's first column
+    text = "Attributes\n==========\n\n   AT-44 The amount\n\nText.\n\n\tAT-45 The date\n\nText.\n"
+    sections = detect_sections(text, _AT)
+    assert [(s.label, s.path) for s in sections] == [
+        ("attributes", "Attributes"),
+        ("at-44", "Attributes > AT-44 The amount"),
+        ("at-45", "Attributes > AT-45 The date"),
+    ]
+    assert sections[1].char_start == text.index("   AT-44")
+
+
+def test_extra_pattern_reads_only_a_line_start():
+    # An id far into a very long line is not read: the line is not a section
+    line = "x" * 300 + " AT-44"
+    assert detect_sections(f"{line}\n", [r"^.*?(?P<label>AT-\d+)"]) == []
+    assert [s.label for s in detect_sections("x AT-44\n", [r"^.*?(?P<label>AT-\d+)"])] == [
+        "at-44"
+    ]
+
+
 def test_markdown_loose_list_is_not_a_clause():
     guide = (
         "# Guide\n\nIntro.\n\n1. Install the tool\n\nRun it once.\n\n"
@@ -383,7 +610,7 @@ def test_fallback_without_structure(tmp_path):
 
 
 def test_pages_are_cuts_and_keep_their_numbers():
-    from stratakb.knowledge.parsers.pdf_parser import ParsedDocument, ParsedPage
+    from stratakb.knowledge.parsers.document import ParsedDocument, ParsedPage
 
     doc = ParsedDocument(
         source_file="c.pdf",
@@ -480,12 +707,6 @@ def test_prose_clause_keeps_its_own_chunk():
 
 
 @pytest.fixture
-def db_url():
-    from stratakb.config import get_settings
-    return get_settings().database_url
-
-
-@pytest.fixture
 async def layer(db_url):
     from stratakb.knowledge.layers import LayerNotFoundError, create_layer, delete_layer
 
@@ -499,16 +720,6 @@ async def layer(db_url):
     yield name
     with contextlib.suppress(LayerNotFoundError):
         await delete_layer(db_url, name=name)
-
-
-async def _ingest(db_url: str, layer: str, source: Path):
-    from stratakb.knowledge.ingestion import ingest_documents
-
-    with patch("stratakb.knowledge.ingestion.embed_texts", new_callable=AsyncMock) as mock:
-        mock.side_effect = lambda texts, **_: [FAKE_EMBEDDING for _ in texts]
-        return await ingest_documents(
-            db_url, "fake-key", layer_name=layer, source_path=str(source)
-        )
 
 
 async def _stored(db_url: str, layer: str):
@@ -544,7 +755,7 @@ async def test_ingest_stores_the_map_and_clause_paths(db_url, layer, tmp_path):
     src.mkdir()
     shutil.copy(FIXTURES / "contract.md", src / "contract.md")
 
-    result = await _ingest(db_url, layer, src)
+    result = await ingest(db_url, layer, src)
     assert result.docs_failed == 0
     sections, chunks = await _stored(db_url, layer)
 
@@ -569,7 +780,7 @@ async def test_ingest_stores_the_map_and_clause_paths(db_url, layer, tmp_path):
         (FIXTURES / "contract.md").read_text(encoding="utf-8") + "\nAnnex III\n\nMore.\n",
         encoding="utf-8",
     )
-    await _ingest(db_url, layer, src)
+    await ingest(db_url, layer, src)
     sections, chunks = await _stored(db_url, layer)
     assert {r["document_id"] for r in sections} == {c["document_id"] for c in chunks}
     assert [r["label"] for r in sections][-2:] == ["annex ii", "annex iii"]
@@ -583,7 +794,7 @@ async def test_search_results_carry_the_clause_path_into_citations(db_url, layer
     src = tmp_path / "docs"
     src.mkdir()
     shutil.copy(FIXTURES / "contract.md", src / "contract.md")
-    await _ingest(db_url, layer, src)
+    await ingest(db_url, layer, src)
     _, chunks = await _stored(db_url, layer)
     stored = {c["content"]: c["clause_path"] for c in chunks}
 
@@ -642,7 +853,7 @@ async def test_ingest_builds_text_once_off_the_loop(db_url, layer, tmp_path):
         patch.object(ingestion, "detect_sections",
                      spy("detect_sections", ingestion.detect_sections)),
     ):
-        result = await _ingest(db_url, layer, src)
+        result = await ingest(db_url, layer, src)
 
     assert result.docs_processed == 2
     names = [name for name, _ in off_loop]
@@ -659,16 +870,68 @@ async def test_ingest_markdown_loose_list_stores_no_section(db_url, layer, tmp_p
         "Some intro.\n\n1. Install the tool\n\nRun it once.\n\n2. Configure it\n\nEdit the file.\n",
         encoding="utf-8",
     )
-    result = await _ingest(db_url, layer, src)
+    result = await ingest(db_url, layer, src)
     assert result.docs_processed == 1
     sections, chunks = await _stored(db_url, layer)
     assert sections == []
     assert chunks and all(c["clause_path"] is None for c in chunks)
 
 
-async def test_apply_preset_dry_run_runs_in_a_thread():
+SEPA_STYLE = (
+    "Attributes\n==========\n\n"
+    "Identification: AT-44\n"
+    "Name: The amount of the credit transfer in euro\n"
+    "Description: The amount is given in euro, with two decimals. It covers the transfer.\n\n"
+    "Identification: AT-45\n"
+    "Name: The requested execution date of the instruction\n"
+    "Description: The date on which the Originator's bank debits the account.\n"
+)
+
+
+async def test_preset_pattern_adds_sections(db_url, layer, tmp_path):
+    from stratakb.knowledge.layers import create_layer, delete_layer
+    from stratakb.knowledge.presets import load_preset
+
+    patterns = load_preset(
+        Path(__file__).parent.parent / "examples" / "sepa" / "preset.yaml"
+    ).structure_patterns
+    src = tmp_path / "docs"
+    src.mkdir()
+    (src / "rulebook.txt").write_text(SEPA_STYLE, encoding="utf-8")
+
+    # A layer without patterns is unchanged: the attributes are body text
+    await ingest(db_url, layer, src)
+    sections, chunks = await _stored(db_url, layer)
+    assert [r["label"] for r in sections] == ["attributes"]
+    assert {c["clause_path"] for c in chunks} == {"Attributes"}
+
+    name = f"test_struct_{uuid4().hex[:10]}"
+    await create_layer(
+        db_url,
+        name=name,
+        display_name="Test Structure Patterns",
+        chunk_config={"chunk_size": 200, "chunk_overlap": 40},
+        structure_patterns=patterns,
+    )
+    try:
+        result = await ingest(db_url, name, src)
+        assert result.docs_failed == 0
+        sections, chunks = await _stored(db_url, name)
+        assert [(r["label"], r["path"]) for r in sections] == [
+            ("attributes", "Attributes"),
+            ("at-44", "Attributes > Identification: AT-44"),
+            ("at-45", "Attributes > Identification: AT-45"),
+        ]
+        at44 = next(r for r in sections if r["label"] == "at-44")
+        assert SEPA_STYLE.index("Identification: AT-44") == at44["char_start"]
+        assert any(c["clause_path"] == sections[1]["path"] for c in chunks)
+        assert any(c["clause_path"] == sections[2]["path"] for c in chunks)
+    finally:
+        await delete_layer(db_url, name=name)
+
+
+async def test_apply_preset_dry_run_runs_in_a_thread(server):
     from stratakb.knowledge import presets
-    from stratakb.mcp_server import mcp
 
     threads: list[bool] = []
     real = presets.dry_run_parse
@@ -678,7 +941,6 @@ async def test_apply_preset_dry_run_runs_in_a_thread():
         return real(*args, **kwargs)
 
     preset_path = Path(__file__).parent.parent / "examples" / "sepa" / "preset.yaml"
-    tool = mcp._tool_manager.get_tool("strata_apply_preset")
     with (
         patch("stratakb.core.auth.get_current_user", return_value=("tester", "admin")),
         patch("stratakb.knowledge.tools.get_current_user", return_value=("tester", "admin")),
@@ -689,7 +951,9 @@ async def test_apply_preset_dry_run_runs_in_a_thread():
             return_value={"status": "would_create", "changes": []},
         ),
     ):
-        result = await tool.fn(preset_path=str(preset_path), dry_run=True)
+        result = await call_tool(
+            server, "strata_apply_preset", preset_path=str(preset_path), dry_run=True
+        )
 
     assert result["status"] == "dry_run_complete"
     assert threads == [True]

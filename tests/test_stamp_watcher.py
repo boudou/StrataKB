@@ -11,47 +11,77 @@ from stratakb.core.stamp_watcher import StampWatcher
 URL = "postgresql://example/db"
 
 
-async def test_first_read_records_and_change_clears():
-    watcher = StampWatcher("test_cache")
+def _make_watcher(fetch: AsyncMock) -> tuple[StampWatcher, MagicMock, MagicMock]:
+    """A watcher with test event names; returns it, its clear mock and its clock mock."""
     clear = MagicMock()
-    fetch = AsyncMock(side_effect=[(1, None), (1, None), (2, None)])
+    clock = MagicMock(return_value=100.0)
+    watcher = StampWatcher(
+        clear,
+        cleared_event="test_cache_cleared",
+        failed_event="test_cache_stamp_failed",
+        clock=clock,
+        fetch=fetch,
+    )
+    return watcher, clear, clock
 
-    await watcher.check(URL, clear, now=100.0, fetch=fetch)
-    await watcher.check(URL, clear, now=103.0, fetch=fetch)
+
+async def test_first_read_records_and_change_clears():
+    fetch = AsyncMock(side_effect=[(1, None), (1, None), (2, None)])
+    watcher, clear, clock = _make_watcher(fetch)
+
+    await watcher.check(URL)
+    clock.return_value = 103.0
+    await watcher.check(URL)
     clear.assert_not_called()
 
+    clock.return_value = 106.0
     with capture_logs() as logs:
-        await watcher.check(URL, clear, now=106.0, fetch=fetch)
+        await watcher.check(URL)
     clear.assert_called_once()
     assert [e["event"] for e in logs] == ["test_cache_cleared"]
 
 
 async def test_reads_at_most_every_two_seconds_per_url():
-    watcher = StampWatcher("test_cache")
     fetch = AsyncMock(return_value=(1, None))
+    watcher, _, clock = _make_watcher(fetch)
 
-    await watcher.check(URL, MagicMock(), now=100.0, fetch=fetch)
-    await watcher.check(URL, MagicMock(), now=101.9, fetch=fetch)
+    await watcher.check(URL)
+    clock.return_value = 101.9
+    await watcher.check(URL)
     assert fetch.await_count == 1
 
-    await watcher.check("postgresql://other/db", MagicMock(), now=101.9, fetch=fetch)
+    await watcher.check("postgresql://other/db")
     assert fetch.await_count == 2
 
-    await watcher.check(URL, MagicMock(), now=102.0, fetch=fetch)
+    clock.return_value = 102.0
+    await watcher.check(URL)
     assert fetch.await_count == 3
 
 
 async def test_failed_read_logs_and_keeps_cache():
-    watcher = StampWatcher("test_cache")
-    clear = MagicMock()
     fetch = AsyncMock(side_effect=OSError("down"))
+    watcher, clear, _ = _make_watcher(fetch)
 
     with capture_logs() as logs:
-        await watcher.check(URL, clear, now=100.0, fetch=fetch)
+        await watcher.check(URL)
     clear.assert_not_called()
     assert logs == [
         {"event": "test_cache_stamp_failed", "log_level": "warning", "error_type": "OSError"}
     ]
+
+
+async def test_reset_forgets_stamps_and_read_times():
+    fetch = AsyncMock(side_effect=[(1, None), (2, None)])
+    watcher, clear, _ = _make_watcher(fetch)
+
+    await watcher.check(URL)
+    watcher.reset()
+
+    # Same clock reading: only the reset allows this read, and it only records
+    await watcher.check(URL)
+    assert fetch.await_count == 2
+    clear.assert_not_called()
+    assert watcher.stamps == {URL: (2, None)}
 
 
 async def test_owners_watch_separately():
@@ -59,5 +89,6 @@ async def test_owners_watch_separately():
     from stratakb.rag import retriever
 
     assert retriever._watcher is not layers_mod._watcher
-    assert retriever._stamps is retriever._watcher.stamps
-    assert layers_mod._checked_at is layers_mod._watcher.checked_at
+    assert retriever._watcher.stamps is not layers_mod._watcher.stamps
+    assert retriever._watcher.cleared_event == "query_cache_cleared"
+    assert layers_mod._watcher.failed_event == "routing_cache_stamp_failed"

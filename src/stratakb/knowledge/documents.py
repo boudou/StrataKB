@@ -12,13 +12,15 @@ import hashlib
 import json
 from bisect import bisect_right
 from collections.abc import Sequence
+from dataclasses import dataclass
 from pathlib import Path
+from uuid import UUID
 
 import asyncpg
 import structlog
 
-from stratakb.knowledge.parsers.pdf_parser import ParsedDocument
-from stratakb.knowledge.structure import Section
+from stratakb.knowledge.parsers.document import ParsedDocument
+from stratakb.knowledge.structure import Heading, Section
 
 logger = structlog.get_logger()
 
@@ -60,6 +62,20 @@ def build_document_text(doc: ParsedDocument) -> tuple[str, list[list[int]] | Non
     return text, page_map
 
 
+def document_headings(doc: ParsedDocument) -> list[Heading]:
+    """The headings the parser read outside the text (a PDF outline, Word
+    heading styles), with their offsets in the document text.
+
+    Offsets are those of build_document_text's text; the list is empty for
+    formats whose parser reports none.
+    """
+    return [
+        heading._replace(offset=start + heading.offset)
+        for start, page in zip(page_starts(doc), doc.pages, strict=True)
+        for heading in page.headings
+    ]
+
+
 async def store_document_version(
     conn: asyncpg.Connection,
     *,
@@ -85,6 +101,8 @@ async def store_document_version(
     file wait until the first caller's transaction ends, and then read the
     version it committed. The function opens its own transaction (a savepoint
     inside the caller's), so the lock holds until the outermost one ends.
+    A version that a concurrent prune deletes while this call waits on it is
+    not reused: the call reads the latest version again.
     """
     sha256 = hashlib.sha256(text.encode("utf-8")).hexdigest()
     async with conn.transaction():
@@ -93,23 +111,26 @@ async def store_document_version(
             _VERSION_LOCK_NAMESPACE,
             _version_lock_key(layer_id, source_root, relative_path),
         )
-        latest = await conn.fetchrow(
-            """
-            SELECT id, version, sha256 FROM strata_vectors.documents
-            WHERE layer_id = $1 AND source_root = $2 AND relative_path = $3
-            ORDER BY version DESC LIMIT 1
-            """,
-            layer_id,
-            source_root,
-            relative_path,
-        )
-        if latest is not None and latest["sha256"] == sha256:
-            await conn.execute(
-                "UPDATE strata_vectors.documents SET file_id = $2 WHERE id = $1",
+        while True:
+            latest = await conn.fetchrow(
+                """
+                SELECT id, version, sha256 FROM strata_vectors.documents
+                WHERE layer_id = $1 AND source_root = $2 AND relative_path = $3
+                ORDER BY version DESC LIMIT 1
+                """,
+                layer_id,
+                source_root,
+                relative_path,
+            )
+            if latest is None or latest["sha256"] != sha256:
+                break
+            # No row back: a prune deleted this version while we waited on it
+            if await conn.fetchval(
+                "UPDATE strata_vectors.documents SET file_id = $2 WHERE id = $1 RETURNING id",
                 latest["id"],
                 file_id,
-            )
-            return latest["id"], latest["version"]
+            ) is not None:
+                return latest["id"], latest["version"]
 
         version = 1 if latest is None else latest["version"] + 1
         document_id = await conn.fetchval(
@@ -168,17 +189,28 @@ def _version_lock_key(layer_id: str, source_root: str, relative_path: str) -> in
     return int.from_bytes(hashlib.sha256(identity).digest()[:4], "big", signed=True)
 
 
+@dataclass(frozen=True)
+class FileScope:
+    """Some files of one layer: their source root and their paths relative to it."""
+
+    source_root: str
+    relative_paths: Sequence[str]
+
+
 async def prune_documents(
     conn: asyncpg.Connection,
-    layer_id: str,
+    layer_ids: Sequence[str | UUID],
     *,
-    source_root: str | None = None,
-    relative_paths: Sequence[str] | None = None,
+    files: FileScope | None = None,
 ) -> int:
     """Delete documents that no chunk and no receipt references; return the count.
 
-    Without source_root and relative_paths the whole layer is swept; with
-    them, only those files' versions. Pass both or neither.
+    Without files the whole of each layer in layer_ids is swept; with them,
+    only those files' versions, and layer_ids must then hold exactly one layer
+    (a file belongs to one). Several layers are swept in one statement, so
+    their versions are locked in one id order across layers, the order a
+    receipt locks the versions it cites (sweeping them one by one could
+    deadlock).
 
     Two statements, because a lone DELETE that waits on an uncommitted
     reference still deletes once it commits: its checks keep the snapshot taken
@@ -189,13 +221,13 @@ async def prune_documents(
     between. The function opens its own transaction (a savepoint inside the
     caller's), so the locks hold until the outermost one ends.
     """
-    if (source_root is None) != (relative_paths is None):
-        raise ValueError("Pass both source_root and relative_paths, or neither")
+    if files is not None and len(layer_ids) != 1:
+        raise ValueError("A file scope needs exactly one layer")
     scope = ""
-    args: list = [layer_id]
-    if source_root is not None:
+    args: list = [list(layer_ids)]
+    if files is not None:
         scope = "AND d.source_root = $2 AND d.relative_path = ANY($3::text[])"
-        args += [source_root, list(relative_paths)]
+        args += [files.source_root, list(files.relative_paths)]
     unreferenced = """
           AND NOT EXISTS (
               SELECT 1 FROM strata_vectors.chunks c WHERE c.document_id = d.id
@@ -208,7 +240,7 @@ async def prune_documents(
         rows = await conn.fetch(
             f"""
             SELECT d.id FROM strata_vectors.documents d
-            WHERE d.layer_id = $1 {scope} {unreferenced}
+            WHERE d.layer_id = ANY($1::uuid[]) {scope} {unreferenced}
             ORDER BY d.id
             FOR UPDATE OF d
             """,
@@ -229,7 +261,7 @@ async def prune_documents(
 async def fetch_cited_documents(
     conn: asyncpg.Connection, ends: dict[int, int]
 ) -> dict[int, dict]:
-    """Path, page map and text up to the given end of each cited document.
+    """Path, page map, text origin and text up to the given end of each cited document.
 
     ends maps a document id to the furthest char_end cited in it; only the
     text before it is read, which is all locate() needs.
@@ -238,7 +270,7 @@ async def fetch_cited_documents(
         return {}
     rows = await conn.fetch(
         """
-        SELECT d.id, d.relative_path, d.page_map, left(d.text, x.max_end) AS text
+        SELECT d.id, d.relative_path, d.page_map, d.text_origin, left(d.text, x.max_end) AS text
         FROM strata_vectors.documents d
         JOIN unnest($1::bigint[], $2::int[]) AS x(id, max_end) ON x.id = d.id
         """,

@@ -15,6 +15,7 @@ from stratakb.rag.retriever import (
     _supports_iterative_scan,
     fuse_rrf,
 )
+from tests.helpers import mock_pool
 
 
 def test_rrf_fusion_combines_scores():
@@ -104,19 +105,6 @@ def test_reserve_keyword_slots_negative_slots_act_as_zero():
 # ==========================================
 
 
-def _mock_pool(conn):
-    tx = AsyncMock()
-    tx.__aenter__.return_value = None
-    tx.__aexit__.return_value = False
-    conn.transaction = MagicMock(return_value=tx)
-    ctx = AsyncMock()
-    ctx.__aenter__.return_value = conn
-    ctx.__aexit__.return_value = False
-    pool = MagicMock()
-    pool.acquire.return_value = ctx
-    return pool
-
-
 def _chunk_row(chunk_id, similarity=0.5):
     return {
         "id": uuid.UUID(chunk_id), "content": "text", "layer_name": "docs",
@@ -142,7 +130,7 @@ async def test_hybrid_search_sets_statement_timeout_and_logs_keyword_only():
 
     with capture_logs() as logs:
         results = await _hybrid_search(
-            _mock_pool(conn), "AC04", "[1.0]", ["docs"], 2, None, settings
+            mock_pool(conn), "AC04", "[1.0]", ["docs"], 2, None, settings
         )
 
     statements = [c.args[0] for c in conn.execute.call_args_list]
@@ -167,9 +155,9 @@ async def test_vector_search_sets_statement_timeout():
     with patch(
         "stratakb.rag.retriever.embed_texts", new_callable=AsyncMock, return_value=[[0.01] * 768]
     ), patch(
-        "stratakb.rag.retriever.get_pool", new_callable=AsyncMock, return_value=_mock_pool(conn)
+        "stratakb.rag.retriever.get_pool", new_callable=AsyncMock, return_value=mock_pool(conn)
     ), patch(
-        "stratakb.rag.retriever.fetch_layers_stamp", new_callable=AsyncMock, return_value=(0, None)
+        "stratakb.rag.retriever._watcher.fetch", new_callable=AsyncMock, return_value=(0, None)
     ), patch("stratakb.config.get_settings", return_value=settings):
         await search_chunks("postgresql://test", "sk-test", "timeout probe")
 
@@ -183,7 +171,7 @@ async def test_search_fetch_sets_search_settings_in_one_transaction():
     conn.fetch.return_value = ["row"]
 
     rows = await _search_fetch(
-        _mock_pool(conn), SimpleNamespace(hnsw_ef_search=40), "SELECT 1", [7]
+        mock_pool(conn), SimpleNamespace(hnsw_ef_search=40), "SELECT 1", [7]
     )
 
     statements = [c.args[0] for c in conn.execute.call_args_list]
@@ -202,7 +190,7 @@ async def test_search_fetch_turns_on_iterative_scan_on_pgvector_08():
     conn.fetch.return_value = []
     conn.fetchval.return_value = "0.8.0"
 
-    await _search_fetch(_mock_pool(conn), SimpleNamespace(hnsw_ef_search=40), "SELECT 1", [])
+    await _search_fetch(mock_pool(conn), SimpleNamespace(hnsw_ef_search=40), "SELECT 1", [])
 
     statements = [c.args[0] for c in conn.execute.call_args_list]
     assert statements == [
@@ -221,8 +209,8 @@ async def test_search_fetch_skips_iterative_scan_on_old_pgvector_and_warns_once(
     settings = SimpleNamespace(hnsw_ef_search=40)
 
     with capture_logs() as logs:
-        await _search_fetch(_mock_pool(conn), settings, "SELECT 1", [])
-        await _search_fetch(_mock_pool(conn), settings, "SELECT 1", [])
+        await _search_fetch(mock_pool(conn), settings, "SELECT 1", [])
+        await _search_fetch(mock_pool(conn), settings, "SELECT 1", [])
 
     statements = [c.args[0] for c in conn.execute.call_args_list]
     assert not any("iterative_scan" in s for s in statements)
@@ -275,7 +263,7 @@ async def test_hybrid_search_parses_json_string_metadata():
         hybrid_keyword_weight=0.3, hybrid_keyword_slots=1,
     )
 
-    results = await _hybrid_search(_mock_pool(conn), "q", "[1.0]", None, 3, None, settings)
+    results = await _hybrid_search(mock_pool(conn), "q", "[1.0]", None, 3, None, settings)
 
     assert results[0].metadata == {"k": "v"}
     assert results[0].source_section == ""

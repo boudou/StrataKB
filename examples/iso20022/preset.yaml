@@ -28,6 +28,14 @@ routing_patterns:
   - '\bmessage\s+definition\s+reports?\b'
   - '\bxsd\b'
 
+# A line starting with a message identifier (pacs.008.001.08) starts a section
+# labelled by it, so "show pacs.008.001.08" finds that message's part of a report
+structure_patterns:
+  - '^(?P<label>(?:pain|pacs|camt)\.\d{3}\.\d{3}\.\d{2})\b'
+
+# Tables, code lists and schemas have lines without end marks, which extractive does not quote
+answer_mode: grounded
+
 sources:
   - name: message_definitions
     path: message_definitions

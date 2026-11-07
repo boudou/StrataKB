@@ -16,12 +16,7 @@ from stratakb.knowledge.selection import select_files
 needs_git = pytest.mark.skipif(shutil.which("git") is None, reason="git is not installed")
 
 
-@pytest.fixture(autouse=True)
-def isolated_git(monkeypatch, tmp_path):
-    """Keep the machine's git config and any repository above tmp_path out of the tests."""
-    monkeypatch.setenv("GIT_CONFIG_GLOBAL", os.devnull)
-    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
-    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path.parent))
+pytestmark = pytest.mark.usefixtures("isolated_git")
 
 
 def _write(path: Path, text: str = "# doc\n") -> Path:

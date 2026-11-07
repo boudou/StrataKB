@@ -1,16 +1,14 @@
 """Tests for cache freshness: the query and routing caches clear when the layers change.
 
-All tests need the database; embeddings are mocked and time.monotonic is
-patched per module, never globally.
+All tests need the database; embeddings are mocked and each owner's watcher
+gets a test clock, so time.monotonic is never patched.
 """
 
 from __future__ import annotations
 
 import asyncio
-import contextlib
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
-from uuid import uuid4
 
 import asyncpg
 import pytest
@@ -19,33 +17,10 @@ from structlog.testing import capture_logs
 from stratakb.knowledge import layers as layers_mod
 from stratakb.rag import retriever
 from stratakb.rag.cache import QueryCache
+from tests.helpers import FAKE_EMBEDDING, fake_embed, ingest
 
-FAKE_EMBEDDING = [0.01] * 768
 SENTINEL_RESULTS = ["cached-result"]
 SENTINEL_ROUTING = {"patterns": {}, "descriptions": {"sentinel": "Sentinel"}}
-
-
-@pytest.fixture
-def db_url():
-    from stratakb.config import get_settings
-    return get_settings().database_url
-
-
-@pytest.fixture
-async def layer(db_url):
-    """A fresh layer with a unique name, deleted afterwards."""
-    from stratakb.knowledge.layers import LayerNotFoundError, create_layer, delete_layer
-
-    name = f"test_fresh_{uuid4().hex[:10]}"
-    await create_layer(
-        db_url,
-        name=name,
-        display_name="Test Fresh",
-        chunk_config={"chunk_size": 500, "chunk_overlap": 50},
-    )
-    yield name
-    with contextlib.suppress(LayerNotFoundError):
-        await delete_layer(db_url, name=name)
 
 
 @pytest.fixture(autouse=True)
@@ -53,9 +28,8 @@ def _reset_caches(monkeypatch):
     """Fresh caches and stamp state in both modules, before and after each test."""
 
     def reset():
-        for mod in (retriever, layers_mod):
-            mod._stamps.clear()
-            mod._checked_at.clear()
+        retriever._watcher.reset()
+        layers_mod._watcher.reset()
         layers_mod._routing_cache.clear()
 
     reset()
@@ -66,12 +40,13 @@ def _reset_caches(monkeypatch):
 
 @pytest.fixture
 def clock():
-    """Patch time.monotonic in both modules; set clock.value to move time."""
+    """Give both watchers a test clock; set clock.value to move time."""
     state = MagicMock()
     state.value = 100.0
-    with patch("stratakb.rag.retriever.time") as t1, patch("stratakb.knowledge.layers.time") as t2:
-        t1.monotonic.side_effect = lambda: state.value
-        t2.monotonic.side_effect = lambda: state.value
+    with (
+        patch.object(retriever._watcher, "clock", lambda: state.value),
+        patch.object(layers_mod._watcher, "clock", lambda: state.value),
+    ):
         yield state
 
 
@@ -88,8 +63,8 @@ def _caches_empty() -> bool:
 
 
 async def _check_both(db_url: str) -> None:
-    await retriever._maybe_clear(db_url)
-    await layers_mod._maybe_clear(db_url)
+    await retriever._watcher.check(db_url)
+    await layers_mod._watcher.check(db_url)
 
 
 async def _execute_elsewhere(db_url: str, sql: str, *args) -> None:
@@ -177,15 +152,11 @@ async def test_no_stamp_read_within_two_seconds(db_url, layer, clock):
     from stratakb.core.database import fetch_layers_stamp
 
     with (
-        patch(
-            "stratakb.rag.retriever.fetch_layers_stamp",
-            new_callable=AsyncMock,
-            wraps=fetch_layers_stamp,
+        patch.object(
+            retriever._watcher, "fetch", new_callable=AsyncMock, wraps=fetch_layers_stamp
         ) as r_stamp,
-        patch(
-            "stratakb.knowledge.layers.fetch_layers_stamp",
-            new_callable=AsyncMock,
-            wraps=fetch_layers_stamp,
+        patch.object(
+            layers_mod._watcher, "fetch", new_callable=AsyncMock, wraps=fetch_layers_stamp
         ) as l_stamp,
     ):
         await _check_both(db_url)
@@ -224,7 +195,7 @@ async def test_interrupted_ingest_bumps_updated_at(db_url, layer, tmp_path):
         calls += 1
         if calls == 2:
             raise asyncio.CancelledError
-        return [FAKE_EMBEDDING for _ in texts]
+        return fake_embed(texts)
 
     with (
         patch("stratakb.knowledge.ingestion.embed_texts", side_effect=embed),
@@ -243,17 +214,10 @@ async def test_interrupted_ingest_bumps_updated_at(db_url, layer, tmp_path):
 
 
 async def test_failed_record_run_bumps_updated_at(db_url, layer, tmp_path):
-    from stratakb.knowledge.ingestion import ingest_documents
-
     _write_files(tmp_path / "docs", 2)
     before = (await _layer_row(db_url, layer))["updated_at"]
 
     with (
-        patch(
-            "stratakb.knowledge.ingestion.embed_texts",
-            new_callable=AsyncMock,
-            side_effect=lambda texts, **_: [FAKE_EMBEDDING for _ in texts],
-        ),
         patch(
             "stratakb.knowledge.ingestion._record_run",
             new_callable=AsyncMock,
@@ -261,9 +225,7 @@ async def test_failed_record_run_bumps_updated_at(db_url, layer, tmp_path):
         ),
         pytest.raises(RuntimeError, match="boom"),
     ):
-        await ingest_documents(
-            db_url, "fake-key", layer_name=layer, source_path=str(tmp_path / "docs")
-        )
+        await ingest(db_url, layer, tmp_path / "docs")
 
     row = await _layer_row(db_url, layer)
     assert row["updated_at"] > before
@@ -272,17 +234,10 @@ async def test_failed_record_run_bumps_updated_at(db_url, layer, tmp_path):
 
 
 async def test_clear_layer_recounts(db_url, layer, tmp_path):
-    from stratakb.knowledge.ingestion import clear_layer, ingest_documents
+    from stratakb.knowledge.ingestion import clear_layer
 
     _write_files(tmp_path / "docs", 1)
-    with patch(
-        "stratakb.knowledge.ingestion.embed_texts",
-        new_callable=AsyncMock,
-        side_effect=lambda texts, **_: [FAKE_EMBEDDING for _ in texts],
-    ):
-        await ingest_documents(
-            db_url, "fake-key", layer_name=layer, source_path=str(tmp_path / "docs")
-        )
+    await ingest(db_url, layer, tmp_path / "docs")
     before = await _layer_row(db_url, layer)
     assert before["chunk_count"] > 0
 
@@ -303,15 +258,11 @@ async def test_failed_stamp_read_serves_cache(db_url, layer, clock):
     clock.value = 103.0
 
     with (
-        patch(
-            "stratakb.rag.retriever.fetch_layers_stamp",
-            new_callable=AsyncMock,
-            side_effect=OSError("down"),
+        patch.object(
+            retriever._watcher, "fetch", new_callable=AsyncMock, side_effect=OSError("down")
         ),
-        patch(
-            "stratakb.knowledge.layers.fetch_layers_stamp",
-            new_callable=AsyncMock,
-            side_effect=OSError("down"),
+        patch.object(
+            layers_mod._watcher, "fetch", new_callable=AsyncMock, side_effect=OSError("down")
         ),
         patch(
             "stratakb.rag.retriever.embed_texts",

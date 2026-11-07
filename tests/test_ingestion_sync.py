@@ -11,7 +11,16 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from tests.helpers import FAKE_EMBEDDING, file_outcomes, ingest_with_texts, write_file
+from tests.helpers import (
+    FAKE_EMBEDDING,
+    as_admin,
+    call_tool,
+    file_outcomes,
+    ingest,
+    ingest_with_texts,
+    locked_read_bytes,
+    write_file,
+)
 
 
 async def _chunks(db_url: str, layer: str) -> list:
@@ -69,7 +78,7 @@ class TestSync:
 
         write_file(tmp_path / "a.md", "# Alpha\n\nAlpha content.\n")
         write_file(tmp_path / "sub" / "b.md", "# Beta\n\nBeta content.\n")
-        await ingest_with_texts(db_url, layer, tmp_path)
+        await ingest(db_url, layer, tmp_path)
         layer_id = (await get_layer(db_url, name=layer))["id"]
         source_root = tmp_path.resolve().as_posix()
 
@@ -84,7 +93,7 @@ class TestSync:
     async def test_edit_replaces_only_that_file(self, db_url, layer, tmp_path):
         write_file(tmp_path / "a.md", "# Alpha\n\nAlpha content.\n")
         b = write_file(tmp_path / "b.md", "# Beta\n\nBeta content.\n")
-        await ingest_with_texts(db_url, layer, tmp_path)
+        await ingest(db_url, layer, tmp_path)
         before = _ids_by_file(await _chunks(db_url, layer))
 
         write_file(b, "# Beta\n\nBeta content, edited with new restore steps.\n")
@@ -100,10 +109,10 @@ class TestSync:
     async def test_deleted_file_is_removed(self, db_url, layer, tmp_path):
         write_file(tmp_path / "a.md", "# Alpha\n\nAlpha content.\n")
         b = write_file(tmp_path / "sub" / "b.md", "# Beta\n\nBeta content.\n")
-        await ingest_with_texts(db_url, layer, tmp_path)
+        await ingest(db_url, layer, tmp_path)
 
         b.unlink()
-        result, _ = await ingest_with_texts(db_url, layer, tmp_path)
+        result = await ingest(db_url, layer, tmp_path)
 
         assert result.files_removed == 1
         assert {r["source_file"] for r in await _chunks(db_url, layer)} == {"a.md"}
@@ -113,7 +122,7 @@ class TestSync:
         write_file(tmp_path / "a" / "readme.md", "# A\n\nReadme of service A.\n")
         write_file(tmp_path / "b" / "readme.md", "# B\n\nReadme of service B.\n")
 
-        result, _ = await ingest_with_texts(db_url, layer, tmp_path)
+        result = await ingest(db_url, layer, tmp_path)
 
         assert result.files_added == 2
         assert {r["source_file"] for r in await _chunks(db_url, layer)} == {
@@ -130,8 +139,8 @@ class TestSync:
         write_file(x / "readme.md", "# X\n\nFolder X content.\n")
         write_file(y / "readme.md", "# Y\n\nFolder Y content.\n")
 
-        await ingest_with_texts(db_url, layer, x)
-        result, _ = await ingest_with_texts(db_url, layer, y)
+        await ingest(db_url, layer, x)
+        result = await ingest(db_url, layer, y)
 
         assert result.files_added == 1
         assert result.files_removed == 0
@@ -143,7 +152,7 @@ class TestSync:
         doc = write_file(
             tmp_path / "codes.json", '{"code": "AC01", "meaning": "Incorrect account"}'
         )
-        await ingest_with_texts(db_url, layer, tmp_path)
+        await ingest(db_url, layer, tmp_path)
         before = _ids_by_file(await _chunks(db_url, layer))["codes.json"]
 
         write_file(doc, '{"code": "AC01", "meaning": ')
@@ -159,10 +168,10 @@ class TestSync:
     async def test_single_file_never_removes(self, db_url, layer, tmp_path):
         a = write_file(tmp_path / "a.md", "# Alpha\n\nAlpha content.\n")
         b = write_file(tmp_path / "b.md", "# Beta\n\nBeta content.\n")
-        await ingest_with_texts(db_url, layer, tmp_path)
+        await ingest(db_url, layer, tmp_path)
 
         b.unlink()
-        result, _ = await ingest_with_texts(db_url, layer, a)
+        result = await ingest(db_url, layer, a)
 
         assert result.files_unchanged == 1
         assert result.files_removed == 0
@@ -173,8 +182,8 @@ class TestSync:
         other = write_file(
             tmp_path.parent / f"{tmp_path.name}_other" / "o.md", "# Other\n\nOther.\n"
         )
-        await ingest_with_texts(db_url, layer, tmp_path)
-        await ingest_with_texts(db_url, layer, other.parent)
+        await ingest(db_url, layer, tmp_path)
+        await ingest(db_url, layer, other.parent)
         before = {r["id"] for r in await _chunks(db_url, layer)}
 
         result, embedded = await ingest_with_texts(db_url, layer, tmp_path, replace_all=True)
@@ -196,8 +205,8 @@ class TestSync:
         write_file(x / "two.md", "# Two\n\nFirst folder again.\n")
         write_file(y / "three.md", "# Three\n\nSecond folder.\n")
 
-        await ingest_with_texts(db_url, layer, x)
-        result, _ = await ingest_with_texts(db_url, layer, y)
+        await ingest(db_url, layer, x)
+        result = await ingest(db_url, layer, y)
 
         status = await get_layer_status(db_url, name=layer)
         assert result.docs_processed == 1
@@ -215,27 +224,15 @@ class TestSync:
             )
         ])
 
-        first, _ = await ingest_with_texts(db_url, layer, tmp_path)
+        first = await ingest(db_url, layer, tmp_path)
         assert first.rebuilt_legacy is True
         assert first.files_added == 1
         rows = await _chunks(db_url, layer)
         assert rows and all(r["file_id"] is not None for r in rows)
 
-        second, _ = await ingest_with_texts(db_url, layer, tmp_path)
+        second = await ingest(db_url, layer, tmp_path)
         assert second.rebuilt_legacy is False
         assert second.files_unchanged == 1
-
-
-def _locked_read_bytes(name: str):
-    """A Path.read_bytes that raises PermissionError("locked") for files called name."""
-    original_read = Path.read_bytes
-
-    def read_bytes(self):
-        if self.name == name:
-            raise PermissionError("locked")
-        return original_read(self)
-
-    return read_bytes
 
 
 class TestPolicyAndEmpty:
@@ -282,11 +279,11 @@ class TestPolicyAndEmpty:
         write_file(tmp_path / "secrets.yaml", "token: abc\nowner: ops\n")
         write_file(tmp_path / "a.md", "# Alpha\n\nAlpha content.\n")
         with patch("stratakb.knowledge.ingestion.is_secret_name", return_value=False):
-            first, _ = await ingest_with_texts(db_url, layer, tmp_path)
+            first = await ingest(db_url, layer, tmp_path)
         assert first.files_added == 2
         assert "secrets.yaml" in _ids_by_file(await _chunks(db_url, layer))
 
-        result, _ = await ingest_with_texts(db_url, layer, tmp_path)
+        result = await ingest(db_url, layer, tmp_path)
 
         assert file_outcomes(result)["secrets.yaml"] == ("removed", "secret")
         assert result.files_removed == 1
@@ -300,7 +297,7 @@ class TestPolicyAndEmpty:
         write_file(tmp_path / "blank.json", "  \n\t\n")
         write_file(tmp_path / "a.md", "# Alpha\n\nAlpha content.\n")
 
-        result, _ = await ingest_with_texts(db_url, layer, tmp_path)
+        result = await ingest(db_url, layer, tmp_path)
 
         outcomes = file_outcomes(result)
         for name in ("empty.md", "zero.csv", "blank.json"):
@@ -316,7 +313,7 @@ class TestPolicyAndEmpty:
         write_file(tmp_path / "blank.html", "<html><body><p> </p></body></html>")
         write_file(tmp_path / "a.md", "# Alpha\n\nAlpha content.\n")
 
-        result, _ = await ingest_with_texts(db_url, layer, tmp_path)
+        result = await ingest(db_url, layer, tmp_path)
 
         outcomes = file_outcomes(result)
         assert outcomes["codes.csv"] == ("skipped", "no_text")
@@ -331,10 +328,10 @@ class TestPolicyAndEmpty:
     async def test_tracked_csv_losing_its_rows_removed(self, db_url, layer, tmp_path):
         codes = write_file(tmp_path / "codes.csv", "Code,Name\nA1,Alpha\n")
         write_file(tmp_path / "b.md", "# Beta\n\nBeta content.\n")
-        await ingest_with_texts(db_url, layer, tmp_path)
+        await ingest(db_url, layer, tmp_path)
 
         write_file(codes, "Code,Name\n")
-        result, _ = await ingest_with_texts(db_url, layer, tmp_path)
+        result = await ingest(db_url, layer, tmp_path)
 
         assert file_outcomes(result)["codes.csv"] == ("removed", "no_text")
         assert result.files_removed == 1
@@ -345,10 +342,10 @@ class TestPolicyAndEmpty:
     async def test_tracked_file_becoming_empty_removed(self, db_url, layer, tmp_path):
         a = write_file(tmp_path / "a.md", "# Alpha\n\nAlpha content.\n")
         write_file(tmp_path / "b.md", "# Beta\n\nBeta content.\n")
-        await ingest_with_texts(db_url, layer, tmp_path)
+        await ingest(db_url, layer, tmp_path)
 
         write_file(a, "")
-        result, _ = await ingest_with_texts(db_url, layer, tmp_path)
+        result = await ingest(db_url, layer, tmp_path)
 
         assert file_outcomes(result)["a.md"] == ("removed", "no_text")
         assert result.files_removed == 1
@@ -360,7 +357,7 @@ class TestPolicyAndEmpty:
         from stratakb.knowledge import ingestion
 
         bad = write_file(tmp_path / "bad.md", "# Bad\n\nFirst version.\n")
-        await ingest_with_texts(db_url, layer, tmp_path)
+        await ingest(db_url, layer, tmp_path)
         before = _ids_by_file(await _chunks(db_url, layer))["bad.md"]
 
         write_file(bad, "# Bad\n\nSecond version.\n")
@@ -373,7 +370,7 @@ class TestPolicyAndEmpty:
             return original_parse(file_path)
 
         with patch("stratakb.knowledge.ingestion._parse_file", side_effect=raising_parse):
-            result, _ = await ingest_with_texts(db_url, layer, tmp_path)
+            result = await ingest(db_url, layer, tmp_path)
 
         outcomes = file_outcomes(result)
         assert outcomes["bad.md"] == ("failed", "parse_error")
@@ -389,8 +386,8 @@ class TestPolicyAndEmpty:
         write_file(tmp_path / "locked.md", "# Locked\n\nLocked content.\n")
         write_file(tmp_path / "a.md", "# Alpha\n\nAlpha content.\n")
 
-        with patch.object(Path, "read_bytes", _locked_read_bytes("locked.md")):
-            result, _ = await ingest_with_texts(db_url, layer, tmp_path)
+        with patch.object(Path, "read_bytes", locked_read_bytes("locked.md")):
+            result = await ingest(db_url, layer, tmp_path)
 
         outcomes = file_outcomes(result)
         assert outcomes["locked.md"] == ("failed", "read_error")
@@ -401,12 +398,12 @@ class TestPolicyAndEmpty:
 
     async def test_tracked_file_unreadable_keeps_chunks(self, db_url, layer, tmp_path):
         locked = write_file(tmp_path / "locked.md", "# Locked\n\nFirst version.\n")
-        await ingest_with_texts(db_url, layer, tmp_path)
+        await ingest(db_url, layer, tmp_path)
         before = _ids_by_file(await _chunks(db_url, layer))["locked.md"]
 
         write_file(locked, "# Locked\n\nSecond version.\n")
-        with patch.object(Path, "read_bytes", _locked_read_bytes("locked.md")):
-            result, _ = await ingest_with_texts(db_url, layer, tmp_path)
+        with patch.object(Path, "read_bytes", locked_read_bytes("locked.md")):
+            result = await ingest(db_url, layer, tmp_path)
 
         assert file_outcomes(result)["locked.md"] == ("failed", "read_error")
         assert _ids_by_file(await _chunks(db_url, layer))["locked.md"] == before
@@ -416,10 +413,10 @@ class TestPolicyAndEmpty:
 
         write_file(tmp_path / "a.md", "# Alpha\n\nAlpha content.\n")
         b = write_file(tmp_path / "sub" / "b.md", "# Beta\n\nBeta content.\n")
-        await ingest_with_texts(db_url, layer, tmp_path)
+        await ingest(db_url, layer, tmp_path)
 
         b.unlink()
-        result, _ = await ingest_with_texts(db_url, layer, tmp_path)
+        result = await ingest(db_url, layer, tmp_path)
 
         assert FileOutcome("sub/b.md", "removed", "deleted") in result.files
         assert FileOutcome("a.md", "unchanged") in result.files
@@ -428,7 +425,8 @@ class TestPolicyAndEmpty:
 
 def _pdf_doc(page_lengths: list[int], total_pages: int):
     """A parsed PDF with one text page per length; the parser drops pages without text."""
-    from stratakb.knowledge.parsers.pdf_parser import ParsedDocument, ParsedPage, scanned_flag
+    from stratakb.knowledge.parsers.document import ParsedDocument, ParsedPage
+    from stratakb.knowledge.parsers.pdf_parser import scanned_flag
 
     doc = ParsedDocument(
         source_file="scan.pdf",
@@ -457,7 +455,7 @@ class TestScannedPdf:
             return original_parse(file_path)
 
         with patch("stratakb.knowledge.ingestion._parse_file", side_effect=fake_parse):
-            result, _ = await ingest_with_texts(db_url, layer, root)
+            result = await ingest(db_url, layer, root)
         return result
 
     async def test_one_of_four_pages_flagged(self, db_url, layer, tmp_path):
@@ -542,7 +540,7 @@ class TestTruncatedCsv:
 
     async def _ingest_capped(self, db_url, layer, root: Path):
         with patch("stratakb.knowledge.parsers.csv_parser.MAX_ROWS", 2):
-            result, _ = await ingest_with_texts(db_url, layer, root)
+            result = await ingest(db_url, layer, root)
         return result
 
     async def test_over_limit_flagged_and_stored(self, db_url, layer, tmp_path):
@@ -555,7 +553,7 @@ class TestTruncatedCsv:
 
         outcomes = file_outcomes(result)
         assert outcomes["codes.csv"] == ("flagged", "truncated")
-        assert FileOutcome("codes.csv", "flagged", "truncated", 1) in result.files
+        assert FileOutcome("codes.csv", "flagged", "truncated", 1, stored="added") in result.files
         assert outcomes["a.md"] == ("added", None)
         assert result.files_flagged == 1
         assert result.files_added == 2
@@ -582,7 +580,7 @@ class TestTruncatedCsv:
 
         write_file(codes, _csv(["B1", "B2", "B3", "B4"]))
         second = await self._ingest_capped(db_url, layer, tmp_path)
-        assert FileOutcome("codes.csv", "flagged", "truncated", 2) in second.files
+        assert FileOutcome("codes.csv", "flagged", "truncated", 2, stored="updated") in second.files
         assert second.files_updated == 1
         assert second.files_flagged == 1
 
@@ -595,7 +593,7 @@ class TestTruncatedCsv:
 async def test_parser_flag_reaches_the_outcome(db_url, layer, tmp_path):
     """The ingest loop copies any parser's flag into the outcome, whatever the format."""
     from stratakb.knowledge.ingestion import FileOutcome
-    from stratakb.knowledge.parsers.pdf_parser import ParsedDocument, ParsedPage, ParserFlag
+    from stratakb.knowledge.parsers.document import ParsedDocument, ParsedPage, ParserFlag
 
     write_file(tmp_path / "a.md", "# Alpha\n\nAlpha content.\n")
     doc = ParsedDocument(
@@ -606,18 +604,24 @@ async def test_parser_flag_reaches_the_outcome(db_url, layer, tmp_path):
     )
 
     with patch("stratakb.knowledge.ingestion._parse_file", return_value=doc):
-        result, _ = await ingest_with_texts(db_url, layer, tmp_path)
+        result = await ingest(db_url, layer, tmp_path)
 
-    assert FileOutcome("a.md", "flagged", "truncated", 7) in result.files
+    assert FileOutcome("a.md", "flagged", "truncated", 7, stored="added") in result.files
     assert result.files_flagged == 1
     assert result.files_added == 1
 
 
-async def test_tool_returns_files_skipped():
-    from stratakb.knowledge.ingestion import IngestionResult
-    from stratakb.mcp_server import mcp
+async def test_tool_returns_files_skipped(server):
+    from stratakb.knowledge.ingestion import FileOutcome, IngestionResult
 
-    fake = IngestionResult(layer_name="x", status="completed", files_skipped=2)
+    fake = IngestionResult(
+        layer_name="x",
+        status="completed",
+        files=[
+            FileOutcome("a.md", "skipped", "secret"),
+            FileOutcome("b.md", "skipped", "no_text"),
+        ],
+    )
     with (
         patch("stratakb.core.auth.get_current_user", return_value=("tester", "admin")),
         patch("stratakb.knowledge.tools.get_current_user", return_value=("tester", "admin")),
@@ -628,18 +632,22 @@ async def test_tool_returns_files_skipped():
         ),
         patch("stratakb.knowledge.tools.write_audit_log", new_callable=AsyncMock),
     ):
-        tool = mcp._tool_manager.get_tool("strata_ingest_documents")
-        result = await tool.fn(layer_name="x", source_path="y")
+        result = await call_tool(
+            server, "strata_ingest_documents", layer_name="x", source_path="y"
+        )
 
     assert result["status"] == "completed"
     assert result["files_skipped"] == 2
 
 
-async def test_tool_returns_files_flagged():
-    from stratakb.knowledge.ingestion import IngestionResult
-    from stratakb.mcp_server import mcp
+async def test_tool_returns_files_flagged(server):
+    from stratakb.knowledge.ingestion import FileOutcome, IngestionResult
 
-    fake = IngestionResult(layer_name="x", status="completed", files_added=1, files_flagged=1)
+    fake = IngestionResult(
+        layer_name="x",
+        status="completed",
+        files=[FileOutcome("a.csv", "flagged", "truncated", stored="added")],
+    )
     with (
         patch("stratakb.core.auth.get_current_user", return_value=("tester", "admin")),
         patch("stratakb.knowledge.tools.get_current_user", return_value=("tester", "admin")),
@@ -650,87 +658,54 @@ async def test_tool_returns_files_flagged():
         ),
         patch("stratakb.knowledge.tools.write_audit_log", new_callable=AsyncMock),
     ):
-        tool = mcp._tool_manager.get_tool("strata_ingest_documents")
-        result = await tool.fn(layer_name="x", source_path="y")
+        result = await call_tool(
+            server, "strata_ingest_documents", layer_name="x", source_path="y"
+        )
 
     assert result["status"] == "completed"
     assert result["files_flagged"] == 1
     assert result["files_added"] == 1
+    assert result["flagged"] == [{"file": "a.csv", "reason": "truncated", "count": None}]
 
 
-def test_file_outcome_rejects_values_outside_the_set():
-    from stratakb.knowledge.ingestion import REASONS, FileOutcome
+async def test_tool_lists_flagged_csv_with_the_rows_left_out(server, db_url, layer, tmp_path):
+    write_file(tmp_path / "codes.csv", _csv(["A1", "A2", "A3", "A4", "A5"]))
+    write_file(tmp_path / "a.md", "# Alpha\n\nAlpha content.\n")
 
-    for outcome, reason in [
-        ("addded", None),
-        ("failed", "read_eror"),
-        ("added", "secret"),
-        ("failed", None),
-    ]:
-        with pytest.raises(ValueError, match="Not an ingest outcome and reason"):
-            FileOutcome("a.md", outcome, reason)
-    for outcome, reasons in REASONS.items():
-        for reason in reasons:
-            assert FileOutcome("a.md", outcome, reason).reason == reason
-    for outcome, reason, count in [
-        ("added", None, 3),
-        ("failed", "parse_error", 1),
-        ("flagged", "truncated", 0),
-    ]:
-        with pytest.raises(ValueError, match="Not a count for this outcome"):
-            FileOutcome("a.md", outcome, reason, count)
-    assert FileOutcome("a.md", "flagged", "truncated", 5).count == 5
-    assert FileOutcome("a.md", "flagged", "probably_scanned").count is None
+    with as_admin(), patch("stratakb.knowledge.parsers.csv_parser.MAX_ROWS", 2):
+        result = await call_tool(
+            server, "strata_ingest_documents", layer_name=layer, source_path=str(tmp_path)
+        )
+
+    assert result["flagged"] == [{"file": "codes.csv", "reason": "truncated", "count": 3}]
 
 
-def test_flagged_outcome_reasons_match_the_parser_literal():
-    from typing import get_args
+async def test_tool_flagged_is_none_without_flagged_files(server, db_url, layer, tmp_path):
+    write_file(tmp_path / "a.md", "# Alpha\n\nAlpha content.\n")
 
-    from stratakb.knowledge.ingestion import REASONS
-    from stratakb.knowledge.parsers.pdf_parser import FlagReason
+    with as_admin():
+        result = await call_tool(
+            server, "strata_ingest_documents", layer_name=layer, source_path=str(tmp_path)
+        )
 
-    assert REASONS["flagged"] == set(get_args(FlagReason))
-
-
-def test_reasons_cover_the_literals():
-    from typing import get_args
-
-    from stratakb.knowledge.ingestion import REASONS, Outcome, Reason
-
-    assert set(REASONS) == set(get_args(Outcome))
-    assert {r for rs in REASONS.values() for r in rs} - {None} == set(get_args(Reason))
+    assert result["status"] == "completed"
+    assert result["flagged"] is None
 
 
-def test_outcome_keys_follow_outcome():
-    from typing import get_args
+def test_tool_description_names_the_csv_row_limit():
+    from mcp.server.fastmcp import FastMCP
 
-    from stratakb.knowledge.add_folder import OUTCOME_KEYS
-    from stratakb.knowledge.ingestion import Outcome
+    from stratakb.knowledge.parsers import csv_parser
+    from stratakb.knowledge.tools import register_knowledge_tools
 
-    assert OUTCOME_KEYS == get_args(Outcome) == (
-        "added", "updated", "unchanged", "removed", "skipped", "flagged", "failed",
-    )
+    def description() -> str:
+        mcp = FastMCP("test")
+        register_knowledge_tools(mcp, "postgresql://unused")
+        return mcp._tool_manager.get_tool("strata_ingest_documents").description
 
-
-@pytest.mark.parametrize(
-    ("suffix", "data", "expected"),
-    [
-        (".md", b"", True),
-        (".pdf", b"", True),
-        (".md", b"  \n\t", True),
-        (".txt", b"\xef\xbb\xbf  ", True),
-        (None, b"   ", True),
-        (".md", b"x", False),
-        (".pdf", b"   ", False),
-        (".docx", b"\n", False),
-    ],
-)
-def test_has_no_text(suffix, data, expected):
-    from stratakb.knowledge.ingestion import _has_no_text
-    from stratakb.knowledge.parsers.registry import FORMATS
-
-    fmt = FORMATS[suffix] if suffix is not None else None
-    assert _has_no_text(fmt, data) is expected
+    assert f"A CSV over {csv_parser.MAX_ROWS:,} rows" in description()
+    with patch.object(csv_parser, "MAX_ROWS", 1_234):
+        assert "A CSV over 1,234 rows" in description()
 
 
 def _entries(root: Path, *relative_paths: str, carry_hash: bool = False) -> list:
@@ -756,11 +731,9 @@ class TestFileList:
 
         write_file(tmp_path / "a.md", "# Alpha\n\nAlpha content.\n")
         write_file(tmp_path / "sub" / "b.md", "# Beta\n\nBeta content.\n")
-        await ingest_with_texts(db_url, layer, tmp_path)
+        await ingest(db_url, layer, tmp_path)
 
-        result, _ = await ingest_with_texts(
-            db_url, layer, tmp_path, files=_entries(tmp_path, "a.md")
-        )
+        result = await ingest(db_url, layer, tmp_path, files=_entries(tmp_path, "a.md"))
 
         assert result.status == "completed"
         assert FileOutcome("sub/b.md", "removed", "not_selected") in result.files
@@ -775,21 +748,19 @@ class TestFileList:
 
         write_file(tmp_path / "a.md", "# Alpha\n\nAlpha content.\n")
         b = write_file(tmp_path / "b.md", "# Beta\n\nBeta content.\n")
-        await ingest_with_texts(db_url, layer, tmp_path)
+        await ingest(db_url, layer, tmp_path)
         b.unlink()
 
-        result, _ = await ingest_with_texts(
-            db_url, layer, tmp_path, files=_entries(tmp_path, "a.md")
-        )
+        result = await ingest(db_url, layer, tmp_path, files=_entries(tmp_path, "a.md"))
 
         assert FileOutcome("b.md", "removed", "deleted") in result.files
 
     async def test_empty_list_removes_all(self, db_url, layer, tmp_path):
         write_file(tmp_path / "a.md", "# Alpha\n\nAlpha content.\n")
         write_file(tmp_path / "b.md", "# Beta\n\nBeta content.\n")
-        await ingest_with_texts(db_url, layer, tmp_path)
+        await ingest(db_url, layer, tmp_path)
 
-        result, _ = await ingest_with_texts(db_url, layer, tmp_path, files=[])
+        result = await ingest(db_url, layer, tmp_path, files=[])
 
         assert result.status == "completed"
         assert result.files_removed == 2
@@ -798,7 +769,7 @@ class TestFileList:
         assert await _chunks(db_url, layer) == []
 
     async def test_empty_list_nothing_tracked_completes(self, db_url, layer, tmp_path):
-        result, _ = await ingest_with_texts(db_url, layer, tmp_path, files=[])
+        result = await ingest(db_url, layer, tmp_path, files=[])
 
         assert result.status == "completed"
         assert result.errors == []
@@ -808,9 +779,7 @@ class TestFileList:
         write_file(tmp_path / "a.md", "# Alpha\n\nAlpha content.\n")
         write_file(tmp_path / "other.md", "# Other\n\nNot listed.\n")
 
-        result, _ = await ingest_with_texts(
-            db_url, layer, tmp_path, files=_entries(tmp_path, "a.md")
-        )
+        result = await ingest(db_url, layer, tmp_path, files=_entries(tmp_path, "a.md"))
 
         assert file_outcomes(result) == {"a.md": ("added", None)}
         assert [f["relative_path"] for f in await _files(db_url, layer)] == ["a.md"]
@@ -822,8 +791,8 @@ class TestFileList:
 
         # Only the module's name: asyncpg's login uses hashlib.sha256 too
         with patch("stratakb.knowledge.ingestion.hashlib") as mock_hashlib:
-            first, _ = await ingest_with_texts(db_url, layer, tmp_path, files=entries)
-            second, _ = await ingest_with_texts(db_url, layer, tmp_path, files=entries)
+            first = await ingest(db_url, layer, tmp_path, files=entries)
+            second = await ingest(db_url, layer, tmp_path, files=entries)
 
         mock_hashlib.sha256.assert_not_called()
         assert first.files_added == 2
@@ -834,10 +803,10 @@ class TestFileList:
     async def test_carried_unchanged_hash_never_opens(self, db_url, layer, tmp_path):
         write_file(tmp_path / "a.md", "# Alpha\n\nAlpha content.\n")
         entries = _entries(tmp_path, "a.md", carry_hash=True)
-        await ingest_with_texts(db_url, layer, tmp_path, files=entries)
+        await ingest(db_url, layer, tmp_path, files=entries)
 
         with patch.object(Path, "read_bytes", side_effect=AssertionError("opened")):
-            result, _ = await ingest_with_texts(db_url, layer, tmp_path, files=entries)
+            result = await ingest(db_url, layer, tmp_path, files=entries)
 
         assert file_outcomes(result) == {"a.md": ("unchanged", None)}
 
@@ -845,7 +814,7 @@ class TestFileList:
         write_file(tmp_path / "a.md", "# Alpha\n\nAlpha content.\n")
 
         with pytest.raises(ValueError, match="replace_all"):
-            await ingest_with_texts(
+            await ingest(
                 db_url, layer, tmp_path, files=_entries(tmp_path, "a.md"), replace_all=True
             )
 
@@ -855,20 +824,20 @@ class TestFileList:
 
         entry = FileEntry(relative_path=bad, size=1, path=tmp_path / "x.md")
         with pytest.raises(ValueError, match="relative"):
-            await ingest_with_texts(db_url, layer, tmp_path, files=[entry])
+            await ingest(db_url, layer, tmp_path, files=[entry])
 
     async def test_file_source_path_raises(self, db_url, layer, tmp_path):
         a = write_file(tmp_path / "a.md", "# Alpha\n\nAlpha content.\n")
 
         with pytest.raises(ValueError, match="folder"):
-            await ingest_with_texts(db_url, layer, a, files=_entries(tmp_path, "a.md"))
+            await ingest(db_url, layer, a, files=_entries(tmp_path, "a.md"))
 
     async def test_progress_calls(self, db_url, layer, tmp_path):
         write_file(tmp_path / "a.md", "# Alpha\n\nAlpha content.\n")
         b = write_file(tmp_path / "b.md", "# Beta\n\nBeta content.\n")
         calls: list[tuple[int, int]] = []
 
-        await ingest_with_texts(
+        await ingest(
             db_url, layer, tmp_path,
             files=_entries(tmp_path, "a.md", "b.md", carry_hash=True),
             progress=lambda done, total: calls.append((done, total)),
@@ -877,7 +846,7 @@ class TestFileList:
 
         calls.clear()
         write_file(b, "# Beta\n\nBeta content, edited.\n")
-        await ingest_with_texts(
+        await ingest(
             db_url, layer, tmp_path,
             files=_entries(tmp_path, "a.md", "b.md", carry_hash=True),
             progress=lambda done, total: calls.append((done, total)),
@@ -888,7 +857,7 @@ class TestFileList:
         write_file(tmp_path / "a.md", "# Alpha\n\nAlpha content.\n")
         calls: list[tuple[int, int]] = []
 
-        await ingest_with_texts(db_url, layer, tmp_path, progress=lambda d, t: calls.append((d, t)))
+        await ingest(db_url, layer, tmp_path, progress=lambda d, t: calls.append((d, t)))
 
         assert calls == [(1, 1)]
 
@@ -905,7 +874,7 @@ class TestFileList:
             ),
             pytest.raises(asyncpg.InterfaceError),
         ):
-            await ingest_with_texts(db_url, layer, tmp_path, files=_entries(tmp_path, "a.md"))
+            await ingest(db_url, layer, tmp_path, files=_entries(tmp_path, "a.md"))
 
     async def test_store_runtime_error_is_embed_error(self, db_url, layer, tmp_path):
         write_file(tmp_path / "a.md", "# Alpha\n\nAlpha content.\n")
@@ -915,33 +884,24 @@ class TestFileList:
             new_callable=AsyncMock,
             side_effect=RuntimeError("constraint"),
         ):
-            result, _ = await ingest_with_texts(
-                db_url, layer, tmp_path, files=_entries(tmp_path, "a.md")
-            )
+            result = await ingest(db_url, layer, tmp_path, files=_entries(tmp_path, "a.md"))
 
         assert file_outcomes(result)["a.md"] == ("failed", "embed_error")
         assert result.status == "failed"
 
-    async def test_root_form_matches_mcp_route(self, db_url, layer, tmp_path, monkeypatch):
+    async def test_root_form_matches_mcp_route(
+        self, server, db_url, layer, tmp_path, monkeypatch
+    ):
         from stratakb.knowledge.selection import select_files
-        from stratakb.mcp_server import mcp
 
         monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path.parent))
         write_file(tmp_path / "a.md", "# Alpha\n\nAlpha content.\n")
         write_file(tmp_path / "sub" / "b.md", "# Beta\n\nBeta content.\n")
 
-        with (
-            patch("stratakb.core.auth.get_current_user", return_value=("tester", "admin")),
-            patch("stratakb.knowledge.tools.get_current_user", return_value=("tester", "admin")),
-            patch("stratakb.knowledge.tools.write_audit_log", new_callable=AsyncMock),
-            patch(
-                "stratakb.knowledge.ingestion.embed_texts",
-                new_callable=AsyncMock,
-                side_effect=lambda texts, **_: [FAKE_EMBEDDING for _ in texts],
-            ),
-        ):
-            tool = mcp._tool_manager.get_tool("strata_ingest_documents")
-            first = await tool.fn(layer_name=layer, source_path=str(tmp_path))
+        with as_admin():
+            first = await call_tool(
+                server, "strata_ingest_documents", layer_name=layer, source_path=str(tmp_path)
+            )
         assert first["files_added"] == 2
 
         result, embedded = await ingest_with_texts(

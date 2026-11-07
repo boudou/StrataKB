@@ -21,13 +21,15 @@ from stratakb.rag.clause_lookup import (
     Reference,
     find_references,
     fit_to_budget,
+    question_pattern,
+    unanchored,
     without_exact_spans,
 )
 from stratakb.rag.passages import passage_cost
 from stratakb.rag.retriever import SearchResult
+from tests.helpers import ingest
 
 FIXTURES = Path(__file__).parent / "fixtures"
-FAKE_EMBEDDING = [0.01] * 768
 CLAUSE_PATH = "2 Termination > 2.2 Termination for cause"
 
 
@@ -67,6 +69,61 @@ class TestFindReferences:
     def test_preset_pattern(self):
         assert _labels("show AT-44") == []
         assert _labels("show AT-44", [r"(?P<label>AT-\d+)\b"]) == [("at-44",)]
+
+    def test_preset_pattern_anchored_to_a_line_start(self):
+        # Ingestion matches the pattern at a line start; in a question the id
+        # stands anywhere, but still at a word start
+        anchored = r"^(?P<label>AT-R?\d{1,3})\b"
+        assert _labels("show AT-44 and AT-R1", [anchored]) == [("at-44",), ("at-r1",)]
+        assert _labels("see FLAT-12", [anchored]) == []
+        assert _labels("show AT-44", [r"(?i)^(?P<label>at-\d+)"]) == [("at-44",)]
+
+    def test_preset_pattern_with_context_looks_for_its_label(self):
+        # The SEPA pattern needs 'Identification:' at ingest; a question
+        # names the attribute alone
+        sepa = r"^Identification:\s*(?P<label>AT-[A-Z]?\d{1,3})\b"
+        assert _labels("show AT-R051 and AT-44", [sepa]) == [("at-r051",), ("at-44",)]
+        assert _labels("see FLAT-12 or AT-R0512x", [sepa]) == []
+        iso = r"^(?P<label>(?:pain|pacs|camt)\.\d{3}\.\d{3}\.\d{2})\b"
+        assert _labels("what is in pacs.008.001.08?", [iso]) == [("pacs.008.001.08",)]
+
+    def test_question_pattern(self):
+        assert question_pattern(r"^Id:\s*(?P<label>AT-\d+)\b") == r"(?<!\w)(?P<label>AT-\d+)(?!\w)"
+        assert question_pattern(r"(?i)^x (?P<label>[^)\]]+(a|b))") == (
+            r"(?i)(?<!\w)(?P<label>[^)\]]+(a|b))(?!\w)"
+        )
+        assert question_pattern(r"^AT-\d+") == r"(?<!\w)AT-\d+"
+        # A label group that refers to another group falls back to the whole pattern
+        assert _labels("show AT-1AT", [r"^(AT)-(?P<label>\d+\1)"]) == [("1at",)]
+
+    def test_unanchored(self):
+        assert unanchored(r"^AT-\d+") == r"(?<!\w)AT-\d+"
+        assert unanchored(r"(?i)^at") == r"(?i)(?<!\w)at"
+        assert unanchored(r"AT-\d+") == r"AT-\d+"
+        assert unanchored(r"a^b") == r"a^b"
+
+    def test_reference_past_the_cap_is_not_read(self):
+        pattern = [r"^(?P<label>AT-\d+)\b"]
+        assert _labels("filler " * 400 + "show AT-44", pattern) == []
+        assert _labels("show AT-44 " + "filler " * 400, pattern) == [("at-44",)]
+        # Characters 1998-2002 hold AT-44: the cut must not leave AT-4
+        question = "x" * 1997 + " AT-44 and more"
+        assert _labels(question, pattern) == []
+        assert _labels("clause 7.2 " + "filler " * 15_000) == [("7.2", "clause 7.2")]
+
+    def test_patterns_read_at_most_the_cap(self):
+        from stratakb.rag.layer_detect import MAX_PATTERN_QUESTION_CHARS
+
+        class Recorder:
+            lengths: list[int] = []
+
+            def finditer(self, text):
+                self.lengths.append(len(text))
+                return iter(())
+
+        recorder = Recorder()
+        assert find_references("word " * 20_000, [recorder]) == []
+        assert recorder.lengths and max(recorder.lengths) <= MAX_PATTERN_QUESTION_CHARS
 
     def test_year_is_not_a_reference(self):
         assert find_references("what changed in 2026") == []
@@ -109,6 +166,7 @@ def test_fit_to_budget_keeps_offsets():
     assert text.startswith(trimmed["content"])
     assert trimmed["char_end"] - trimmed["char_start"] == len(trimmed["content"])
     assert not trimmed["content"].endswith((" ", "wor"))
+    assert trimmed["cut"] is True
     assert fit_to_budget(_exact("short"), budget)["content"] == "short"
 
 
@@ -181,14 +239,8 @@ async def _make_layer(db_url: str) -> str:
     return name
 
 
-async def _ingest(db_url: str, layer: str, source: Path) -> None:
-    from stratakb.knowledge.ingestion import ingest_documents
-
-    with patch("stratakb.knowledge.ingestion.embed_texts", new_callable=AsyncMock) as mock:
-        mock.side_effect = lambda texts, **_: [FAKE_EMBEDDING for _ in texts]
-        result = await ingest_documents(
-            db_url, "fake-key", layer_name=layer, source_path=str(source)
-        )
+async def _ingest_ok(db_url: str, layer: str, source: Path) -> None:
+    result = await ingest(db_url, layer, source)
     assert result.docs_failed == 0
 
 
@@ -206,8 +258,8 @@ async def layers(settings, tmp_path):
     double.mkdir()
     shutil.copy(FIXTURES / "contract.md", double / "acme.md")
     shutil.copy(FIXTURES / "contract.md", double / "globex.md")
-    await _ingest(db_url, one, single)
-    await _ingest(db_url, two, double)
+    await _ingest_ok(db_url, one, single)
+    await _ingest_ok(db_url, two, double)
     yield one, two
     for name in (one, two):
         with contextlib.suppress(LayerNotFoundError):
@@ -365,7 +417,7 @@ async def test_resolve_caps_a_label_many_documents_share(settings, tmp_path):
     for name in names:
         shutil.copy(FIXTURES / "contract.md", tmp_path / name)
     try:
-        await _ingest(db_url, layer, tmp_path)
+        await _ingest_ok(db_url, layer, tmp_path)
 
         chunks = await resolve(db_url, find_references("clause 2.2"), [layer])
 
@@ -391,6 +443,73 @@ def test_exact_chunk_has_the_ask_chunk_shape():
 
     assert list(exact) == [*retrieved, "match"]
     assert exact["char_end"] == 14
+
+
+_RULEBOOK = (
+    "Attributes\n==========\n\n"
+    "Identification: AT-44\n"
+    "Name: The amount of the credit transfer in euro\n"
+    "Description: The amount is given in euro, with two decimals.\n\n"
+    "Identification: AT-45\n"
+    "Name: The requested execution date\n"
+    "Description: The date on which the bank debits the account.\n"
+)
+
+
+@pytest.fixture
+async def rulebook_layer(settings, tmp_path):
+    """A layer with the SEPA preset's attribute pattern, holding one rulebook text."""
+    from stratakb.knowledge.layers import LayerNotFoundError, create_layer, delete_layer
+    from stratakb.knowledge.presets import load_preset
+
+    db_url = settings.database_url
+    name = f"test_clause_{uuid4().hex[:10]}"
+    sepa = Path(__file__).parent.parent / "examples" / "sepa" / "preset.yaml"
+    await create_layer(
+        db_url, name=name, display_name="Test Rulebook",
+        chunk_config={"chunk_size": 200, "chunk_overlap": 40},
+        structure_patterns=load_preset(sepa).structure_patterns,
+    )
+    src = tmp_path / "rulebook"
+    src.mkdir()
+    (src / "rulebook.txt").write_text(_RULEBOOK, encoding="utf-8")
+    await _ingest_ok(db_url, name, src)
+    yield name
+    with contextlib.suppress(LayerNotFoundError):
+        await delete_layer(db_url, name=name)
+
+
+class TestLayerPatternLookup:
+    @pytest.mark.parametrize(
+        ("tool", "arguments"),
+        [("strata_ask", {"question": "what does AT-44 say"}),
+         ("strata_search", {"query": "show AT-44"})],
+    )
+    async def test_layer_pattern_finds_the_attribute(
+        self, server, rulebook_layer, tool, arguments
+    ):
+        response, _ = await _call(server, tool, [], layers=[rulebook_layer], **arguments)
+
+        start = _RULEBOOK.index("Identification: AT-44")
+        expected = _RULEBOOK[start:_RULEBOOK.index("Identification: AT-45")].rstrip()
+        if tool == "strata_ask":
+            first = response["passages"][0]
+            assert first["text"] == expected
+            assert first["citation"]["clause_path"] == "Attributes > Identification: AT-44"
+        else:
+            first = response["results"][0]
+            assert first["match"] == "exact"
+            assert first["content"] == expected
+
+    async def test_other_layers_patterns_are_not_used(self, server, rulebook_layer, layers):
+        # The contract layer has no patterns, so AT-44 names nothing there
+        contract_layer, _ = layers
+        response, _ = await _call(
+            server, "strata_search", [_retrieved(contract_layer)],
+            query="show AT-44", layers=[contract_layer],
+        )
+
+        assert [r["content"] for r in response["results"]] == ["retrieved text"]
 
 
 class TestSearchClause:

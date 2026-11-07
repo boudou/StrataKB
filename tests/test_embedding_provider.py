@@ -8,7 +8,9 @@ Tests cover:
 - strata_search, strata_ingest_documents and strata_apply_preset need no OpenAI key
   with a base URL
 - is_model_cached needs config.json and the weights, and never downloads
-- The OpenAI path refuses an empty key without a base URL, whatever the backend name
+- The OpenAI path refuses an empty key without a base URL
+- An unknown backend is refused with or without a key, before any file is read
+- The local-only and offline messages share one template
 """
 
 from __future__ import annotations
@@ -20,7 +22,7 @@ import pytest
 
 from stratakb.config import Settings
 from stratakb.core.egress import PLACEHOLDER_API_KEY
-from tests.helpers import fake_openai_client, openai_settings
+from tests.helpers import capture_tools, fake_openai_client, openai_settings
 
 BASE_URL = "http://127.0.0.1:11434/v1"
 
@@ -129,16 +131,45 @@ class TestCustomEndpoint:
         client_cls.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_misspelt_backend_without_key_is_refused(self):
+    @pytest.mark.parametrize("api_key", ["", "sk-openai"])
+    async def test_misspelt_backend_is_refused_with_or_without_key(self, api_key):
         from stratakb.knowledge.embeddings import embed_texts
 
         with (
             patch("stratakb.config.get_settings", return_value=openai_settings()),
             patch("openai.AsyncOpenAI") as client_cls,
-            pytest.raises(ValueError, match="API key"),
+            pytest.raises(ValueError, match="Unknown embedding backend opnai"),
         ):
-            await embed_texts(["x"], api_key="", backend="opnai")
+            await embed_texts(["x"], api_key=api_key, backend="opnai")
         client_cls.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("api_key", ["", "sk-openai"])
+    async def test_ingest_refuses_unknown_backend_before_reading_files(self, api_key):
+        from stratakb.knowledge.tools import register_knowledge_tools
+
+        fn = capture_tools(register_knowledge_tools, "postgresql://test", api_key)[
+            "strata_ingest_documents"
+        ]
+        ingest = AsyncMock()
+        with (
+            patch(
+                "stratakb.config.get_settings",
+                return_value=openai_settings(embedding_backend="opnai"),
+            ),
+            patch("stratakb.knowledge.ingestion.ingest_documents", ingest),
+        ):
+            result = await fn(layer_name="docs", source_path="/tmp/docs")
+        assert result["status"] == "error"
+        assert "Unknown embedding backend opnai" in result["error"]
+        assert "EMBEDDING_BACKEND" in result["error"]
+        ingest.assert_not_awaited()
+
+    def test_unknown_backend_is_named_before_the_local_only_refusal(self):
+        from stratakb.knowledge.embeddings import embedding_key_error
+
+        settings = openai_settings(embedding_backend="opnai", strata_local_only=True)
+        assert "Unknown embedding backend opnai" in embedding_key_error(settings, "sk-openai")
 
 
 class TestDimensionCheck:
@@ -182,28 +213,12 @@ class TestResolveEmbeddingModel:
         assert resolve_embedding_model("openai", "nomic-embed-text") == "nomic-embed-text"
 
 
-def _capture_tools(register, *args) -> dict:
-    mock_mcp = MagicMock()
-    captured = {}
-
-    def capture_tool():
-        def decorator(fn):
-            name = getattr(fn, "__name__", None) or getattr(fn, "__wrapped__", fn).__name__
-            captured[name] = fn
-            return fn
-        return decorator
-
-    mock_mcp.tool = capture_tool
-    register(mock_mcp, *args)
-    return captured
-
-
 class TestToolKeyChecks:
     @pytest.mark.asyncio
     async def test_search_needs_no_openai_key_with_base_url(self):
         from stratakb.rag.tools import register_rag_tools
 
-        fn = _capture_tools(register_rag_tools, "postgresql://test", "")["strata_search"]
+        fn = capture_tools(register_rag_tools, "postgresql://test", "")["strata_search"]
         search = AsyncMock(return_value=[])
         with (
             patch(
@@ -234,7 +249,7 @@ class TestToolKeyChecks:
         from stratakb.knowledge.ingestion import IngestionResult
         from stratakb.knowledge.tools import register_knowledge_tools
 
-        fn = _capture_tools(register_knowledge_tools, "postgresql://test", "")[
+        fn = capture_tools(register_knowledge_tools, "postgresql://test", "")[
             "strata_ingest_documents"
         ]
         ingest = AsyncMock(return_value=IngestionResult(layer_name="docs", status="completed"))
@@ -259,7 +274,7 @@ class TestToolKeyChecks:
     async def test_apply_preset_needs_no_openai_key_with_base_url(self):
         from stratakb.knowledge.tools import register_knowledge_tools
 
-        fn = _capture_tools(register_knowledge_tools, "postgresql://test", "")[
+        fn = capture_tools(register_knowledge_tools, "postgresql://test", "")[
             "strata_apply_preset"
         ]
         preset = str(Path(__file__).parent.parent / "examples" / "sepa" / "preset.yaml")
@@ -294,6 +309,29 @@ class TestToolKeyChecks:
 # ── is_model_cached ──────────────────────────────────────
 
 
+def test_local_only_message_text():
+    from stratakb.knowledge.embeddings import EMBEDDING_MODEL_KIND, _local_only_error
+
+    assert _local_only_error("all-mpnet-base-v2", EMBEDDING_MODEL_KIND) == (
+        "STRATA_LOCAL_ONLY is on and the embedding model all-mpnet-base-v2 is not installed "
+        "on this machine, so it cannot be downloaded. On a machine that may download, run "
+        "`uv run hf download sentence-transformers/all-mpnet-base-v2`, or set EMBEDDING_MODEL "
+        "to a folder that holds the model."
+    )
+
+
+def test_offline_message_text():
+    from stratakb.knowledge.embeddings import EMBEDDING_MODEL_KIND, _offline_error
+
+    assert _offline_error("all-mpnet-base-v2", EMBEDDING_MODEL_KIND) == (
+        "HF_HUB_OFFLINE or TRANSFORMERS_OFFLINE is set and the embedding model "
+        "all-mpnet-base-v2 is not in the Hugging Face cache, so it cannot be downloaded. "
+        "Unset both to let StrataKB download it, run "
+        "`uv run hf download sentence-transformers/all-mpnet-base-v2` on a machine that may "
+        "download, or set EMBEDDING_MODEL to a folder that holds the model."
+    )
+
+
 def _fake_hub_cache(cache: Path, repo: str, files: list[str]) -> None:
     """Lay out a Hugging Face cache entry holding these files."""
     entry = cache / f"models--{repo.replace('/', '--')}"
@@ -316,45 +354,55 @@ def _fake_hub_cache(cache: Path, repo: str, files: list[str]) -> None:
     ],
 )
 def test_is_model_cached_needs_config_and_weights(tmp_path, monkeypatch, files, expected):
-    from stratakb.knowledge.embeddings import is_model_cached
+    from stratakb.knowledge.embeddings import EMBEDDING_MODEL_KIND, is_model_cached
 
     _fake_hub_cache(tmp_path, "sentence-transformers/tiny-model", files)
     monkeypatch.setenv("SENTENCE_TRANSFORMERS_HOME", str(tmp_path))
-    assert is_model_cached("tiny-model") is expected
+    assert is_model_cached("tiny-model", EMBEDDING_MODEL_KIND) is expected
 
 
 def test_is_model_cached_keeps_an_owner_prefix(tmp_path, monkeypatch):
-    from stratakb.knowledge.embeddings import is_model_cached
+    from stratakb.knowledge.embeddings import EMBEDDING_MODEL_KIND, is_model_cached
 
     _fake_hub_cache(tmp_path, "acme/embedder", ["config.json", "model.safetensors"])
     monkeypatch.setenv("SENTENCE_TRANSFORMERS_HOME", str(tmp_path))
-    assert is_model_cached("acme/embedder") is True
-    assert is_model_cached("embedder") is False
+    assert is_model_cached("acme/embedder", EMBEDDING_MODEL_KIND) is True
+    assert is_model_cached("embedder", EMBEDDING_MODEL_KIND) is False
+
+
+def test_is_model_cached_looks_in_the_organization_of_the_kind(tmp_path, monkeypatch):
+    from stratakb.knowledge.embeddings import EMBEDDING_MODEL_KIND, is_model_cached
+    from stratakb.rag.reranker import _RERANKING_MODEL_KIND
+
+    _fake_hub_cache(tmp_path, "cross-encoder/scorer", ["config.json", "model.safetensors"])
+    monkeypatch.setenv("SENTENCE_TRANSFORMERS_HOME", str(tmp_path))
+    assert is_model_cached("scorer", _RERANKING_MODEL_KIND) is True
+    assert is_model_cached("scorer", EMBEDDING_MODEL_KIND) is False
 
 
 def test_is_model_cached_accepts_a_local_folder(tmp_path):
-    from stratakb.knowledge.embeddings import is_model_cached
+    from stratakb.knowledge.embeddings import EMBEDDING_MODEL_KIND, is_model_cached
 
-    assert is_model_cached(str(tmp_path)) is True
+    assert is_model_cached(str(tmp_path), EMBEDDING_MODEL_KIND) is True
 
 
 @pytest.mark.parametrize("folder", [r"C:\no\such\folder", "/no/such/folder", "./mpnet"])
 def test_is_model_cached_counts_a_folder_path(folder):
-    from stratakb.knowledge.embeddings import is_model_cached
+    from stratakb.knowledge.embeddings import EMBEDDING_MODEL_KIND, is_model_cached
 
     lookup = MagicMock(side_effect=AssertionError("a folder path looked up the hub cache"))
     with patch("huggingface_hub.try_to_load_from_cache", lookup):
-        assert is_model_cached(folder) is True
+        assert is_model_cached(folder, EMBEDDING_MODEL_KIND) is True
     lookup.assert_not_called()
 
 
 def test_is_model_cached_uses_the_default_cache_without_the_variable(monkeypatch):
-    from stratakb.knowledge.embeddings import is_model_cached
+    from stratakb.knowledge.embeddings import EMBEDDING_MODEL_KIND, is_model_cached
 
     monkeypatch.delenv("SENTENCE_TRANSFORMERS_HOME", raising=False)
     lookup = MagicMock(return_value="/cache/file")
     with patch("huggingface_hub.try_to_load_from_cache", lookup):
-        assert is_model_cached("all-mpnet-base-v2") is True
+        assert is_model_cached("all-mpnet-base-v2", EMBEDDING_MODEL_KIND) is True
     repo, filename = lookup.call_args_list[0].args
     assert repo == "sentence-transformers/all-mpnet-base-v2"
     assert filename == "config.json"
@@ -362,16 +410,16 @@ def test_is_model_cached_uses_the_default_cache_without_the_variable(monkeypatch
 
 
 def test_is_model_cached_is_false_on_any_error():
-    from stratakb.knowledge.embeddings import is_model_cached
+    from stratakb.knowledge.embeddings import EMBEDDING_MODEL_KIND, is_model_cached
 
     with patch("huggingface_hub.try_to_load_from_cache", side_effect=OSError("disk")):
-        assert is_model_cached("all-mpnet-base-v2") is False
+        assert is_model_cached("all-mpnet-base-v2", EMBEDDING_MODEL_KIND) is False
 
 
 def test_is_model_cached_never_downloads(tmp_path, monkeypatch):
-    from stratakb.knowledge.embeddings import is_model_cached
+    from stratakb.knowledge.embeddings import EMBEDDING_MODEL_KIND, is_model_cached
 
     monkeypatch.setenv("SENTENCE_TRANSFORMERS_HOME", str(tmp_path))
     monkeypatch.delenv("HF_HUB_OFFLINE", raising=False)
-    assert is_model_cached("not-there") is False
+    assert is_model_cached("not-there", EMBEDDING_MODEL_KIND) is False
     assert list(tmp_path.iterdir()) == []

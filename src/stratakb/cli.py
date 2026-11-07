@@ -10,8 +10,8 @@
 Each subcommand is a subparser and a handler; a new one adds both and
 nothing else. The command owns the terminal (prompts, progress, the report
 and the exit code); add_folder makes every decision. stdout carries only
-the report; prompts, progress and hints go to stderr. `add` never imports
-the server.
+the report; prompts, progress and hints go to stderr. `add` and `receipt`
+never import the server.
 """
 
 from __future__ import annotations
@@ -19,7 +19,6 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
-import json
 import os
 import sys
 from collections.abc import Callable, Sequence
@@ -27,6 +26,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, NamedTuple
 
 import structlog
+
+from stratakb.core.terminal_text import one_line, terminal_safe_json, visible
 
 if TYPE_CHECKING:
     from stratakb.core.local_db import DownOutcome, UpState
@@ -60,6 +61,51 @@ class _ArgumentParser(argparse.ArgumentParser):
         raise _UsageError(self.format_usage(), f"{self.prog}: error: {message}")
 
 
+# ── Confirmation needs of add ────────────────────────────
+
+
+def _broad_path_text(plan: Plan) -> str:
+    return f"{plan.root} is a broad path ({plan.broad_why})."
+
+
+def _large_run_text(plan: Plan) -> str:
+    return (
+        f"This run adds or updates {plan.added_or_updated} files "
+        f"({plan.work_bytes / 1_000_000:.1f} MB) "
+        f"and removes {plan.planned.get('removed', 0)}."
+    )
+
+
+class _Need(NamedTuple):
+    """A confirmation need of add_folder.plan: how the command confirms it."""
+
+    name: str  # as in Plan.needs and Options.confirmed
+    flag: str  # the command-line flag that confirms it
+    help: str
+    text: Callable[[Plan], str]  # what needs confirming, in one sentence
+    question: str  # the prompt after the text
+
+
+# In the order they are asked. A row only says how to confirm a need:
+# add_folder.plan() must also detect it and add its name to Plan.needs.
+_NEEDS = (
+    _Need(
+        name="broad_path",
+        flag="--allow-broad",
+        help="allow a drive root, the home folder or a system folder",
+        text=_broad_path_text,
+        question="Add it anyway?",
+    ),
+    _Need(
+        name="large_run",
+        flag="--yes",
+        help="go ahead with a large run without asking",
+        text=_large_run_text,
+        question="Continue?",
+    ),
+)
+
+
 def _parser() -> _ArgumentParser:
     from stratakb.config import LOCAL_DB_PORT
 
@@ -90,7 +136,9 @@ def _parser() -> _ArgumentParser:
         help="skip files larger than this many megabytes (default: 50)",
     )
     for need in _NEEDS:
-        add.add_argument(need.flag, dest=need.option, action="store_true", help=need.help)
+        add.add_argument(
+            need.flag, dest="confirmed", action="append_const", const=need.name, help=need.help
+        )
     add.add_argument("--json", action="store_true", help="print the report as JSON")
 
     db = commands.add_parser(
@@ -130,6 +178,8 @@ def _size_mb(text: str) -> float:
         raise argparse.ArgumentTypeError(f"not a number: {text}") from None
     from stratakb.knowledge.add_folder import max_file_size_error
 
+    # Here as well as in add_folder.plan(): a bad value is a usage error of the
+    # command line, reported before the command needs a database
     err = max_file_size_error(size)
     if err is not None:
         raise argparse.ArgumentTypeError(f"{err}: {text}")
@@ -346,50 +396,6 @@ def _down_text(outcome: DownOutcome) -> str:
 # ── add ──────────────────────────────────────────────────
 
 
-def _broad_path_text(plan: Plan) -> str:
-    return f"{plan.root} is a broad path ({plan.broad_why})."
-
-
-def _large_run_text(plan: Plan) -> str:
-    return (
-        f"This run adds or updates {plan.added_or_updated} files "
-        f"({plan.work_bytes / 1_000_000:.1f} MB) "
-        f"and removes {plan.planned.get('removed', 0)}."
-    )
-
-
-class _Need(NamedTuple):
-    """A confirmation need of add_folder.plan: how the command confirms it."""
-
-    name: str  # as in Plan.needs
-    flag: str  # the command-line flag that confirms it
-    option: str  # the Options field the flag sets
-    help: str
-    text: Callable[[Plan], str]  # what needs confirming, in one sentence
-    question: str  # the prompt after the text
-
-
-# In the order they are asked
-_NEEDS = (
-    _Need(
-        "broad_path",
-        "--allow-broad",
-        "allow_broad",
-        "allow a drive root, the home folder or a system folder",
-        _broad_path_text,
-        "Add it anyway?",
-    ),
-    _Need(
-        "large_run",
-        "--yes",
-        "yes",
-        "go ahead with a large run without asking",
-        _large_run_text,
-        "Continue?",
-    ),
-)
-
-
 def _run_add(args: argparse.Namespace) -> int:
     from stratakb.config import config_file_missing, dotenv_warning, get_settings
     from stratakb.core.logging import configure_logging
@@ -441,7 +447,7 @@ def _finish(report: Report, args: argparse.Namespace) -> int:
     """Print the report and return its exit code."""
     if args.json:
         if report.reason is not None and report.hint:
-            _err(report.hint)
+            _err(one_line(report.hint))
         _out(render_json(report))
     elif report.reason is not None:
         _err(render_text(report))
@@ -455,7 +461,7 @@ async def _add(args: argparse.Namespace, settings: Any, root: str) -> Report:
 
     root is the folder as shown until the plan resolves it.
     """
-    from stratakb.core.database import close_pool
+    from stratakb.core.database import close_pool, url_host_port
     from stratakb.core.migrations import MigrationError, ensure_schema
     from stratakb.knowledge import add_folder
     from stratakb.knowledge.layers import (
@@ -465,7 +471,7 @@ async def _add(args: argparse.Namespace, settings: Any, root: str) -> Report:
     )
 
     url = settings.database_url
-    target = add_folder.db_target(url)
+    target = url_host_port(url)
     layer: str | None = None
 
     def refuse(
@@ -485,7 +491,7 @@ async def _add(args: argparse.Namespace, settings: Any, root: str) -> Report:
         name=args.name,
         description=args.description,
         max_file_size_mb=args.max_file_size,
-        **{need.option: getattr(args, need.option) for need in _NEEDS},
+        confirmed=frozenset(args.confirmed or ()),
     )
     progress = _Progress() if _isatty(sys.stderr) else None
     try:
@@ -541,7 +547,7 @@ def _confirmations(plan: Plan, options: Options) -> tuple[set[str], tuple[str, s
     for need in _NEEDS:
         if need.name not in plan.needs:
             continue
-        if getattr(options, need.option):
+        if need.name in options.confirmed:
             confirmed.add(need.name)
             continue
         if not _stdin_is_tty():
@@ -559,10 +565,14 @@ def _model_notice(plan: Plan, settings: Any) -> None:
         return
     if not plan.added_or_updated:
         return
-    from stratakb.knowledge.embeddings import is_model_cached, resolve_embedding_model
+    from stratakb.knowledge.embeddings import (
+        EMBEDDING_MODEL_KIND,
+        is_model_cached,
+        resolve_embedding_model,
+    )
 
     model = resolve_embedding_model("local", settings.embedding_model)
-    if not is_model_cached(model):
+    if not is_model_cached(model, EMBEDDING_MODEL_KIND):
         _err(f"Downloading the embedding model {model} (first run only)…")
 
 
@@ -615,7 +625,7 @@ def _run_receipt(args: argparse.Namespace) -> int:
         return _receipt_failed(str(e), args, e.exit_code)
 
     if args.json:
-        _out(json.dumps({"status": "ok", "receipt": receipt}, ensure_ascii=False, indent=2))
+        _out(terminal_safe_json({"status": "ok", "receipt": receipt}, indent=2))
     else:
         _out(render_receipt(receipt))
     return EXIT_OK
@@ -631,9 +641,8 @@ class _ReceiptOpenError(Exception):
 
 async def _open_receipt(url: str, receipt_id: str, user_id: str, role: str) -> dict:
     """open_receipt, with every failure turned into a _ReceiptOpenError."""
-    from stratakb.core.database import close_pool
+    from stratakb.core.database import close_pool, url_host_port
     from stratakb.core.migrations import MigrationError
-    from stratakb.knowledge.add_folder import db_target
     from stratakb.rag.receipts import ReceiptAccessError, open_receipt
 
     try:
@@ -641,7 +650,8 @@ async def _open_receipt(url: str, receipt_id: str, user_id: str, role: str) -> d
     except ReceiptAccessError as e:
         raise _ReceiptOpenError(str(e), EXIT_FAILED) from None
     except _connection_errors() as e:
-        raise _ReceiptOpenError(_unreachable_message(db_target(url), e), EXIT_DATABASE) from None
+        message = _unreachable_message(url_host_port(url), e)
+        raise _ReceiptOpenError(message, EXIT_DATABASE) from None
     except MigrationError as e:
         raise _ReceiptOpenError(str(e), EXIT_DATABASE) from None
     except Exception as e:
@@ -654,9 +664,9 @@ async def _open_receipt(url: str, receipt_id: str, user_id: str, role: str) -> d
 
 def _receipt_failed(message: str, args: argparse.Namespace, exit_code: int) -> int:
     """One line on stderr; with --json, the tool's error form on stdout too."""
-    _err(message)
+    _err(visible(message))
     if args.json:
-        _out(json.dumps({"status": "error", "error": message}, ensure_ascii=False))
+        _out(terminal_safe_json({"status": "error", "error": message}))
     return exit_code
 
 
@@ -678,13 +688,24 @@ def _group_lines(pairs: list[tuple[str, str | None]]) -> list[str]:
     return lines
 
 
+def _flagged_line(row: dict) -> str:
+    """One flagged file: its reason, and how much was left out when the parser counted."""
+    left_out = "" if row["count"] is None else f", {row['count']:,} left out"
+    return f"  {row['path']} ({row['reason']}{left_out})"
+
+
 def render_text(report: Report) -> str:
-    """The report for a person to read."""
+    """The report for a person to read.
+
+    Each entry of lines is one report line, escaped once at the end
+    (stratakb.core.terminal_text), so no field reaches the terminal with its
+    control characters and a newline in a file name starts no new line.
+    """
     if report.reason is not None:
         text = f"Not added ({report.reason})"
         if report.layer:
             text += f", layer {report.layer}"
-        return f"{text}: {report.hint}" if report.hint else text
+        return one_line(f"{text}: {report.hint}" if report.hint else text)
 
     verb = "Created" if report.created else "Synced"
     lines = [f"{verb} layer {report.layer} in the database at {report.db_target}"]
@@ -700,6 +721,10 @@ def render_text(report: Report) -> str:
     if excluded:
         lines.append("Excluded:")
         lines.extend(_group_lines(excluded))
+    flagged = [f for f in report.files if f["outcome"] == "flagged"]
+    if flagged:
+        lines.append("Flagged:")
+        lines.extend(_flagged_line(f) for f in flagged)
     failed = [f for f in report.files if f["outcome"] == "failed"]
     if failed:
         lines.append("Failed:")
@@ -710,66 +735,59 @@ def render_text(report: Report) -> str:
     lines.append(
         f"Next: ask in your MCP client: what do the docs in {report.layer} say about …?"
     )
-    return "\n".join(lines)
+    return "\n".join(one_line(line) for line in lines)
 
 
-def _visible(value: Any) -> str:
-    """Text safe for a terminal: control characters become visible escapes.
-
-    Document text, file names and the caller's question and draft can carry
-    ANSI or OSC sequences, a carriage return or a backspace that would hide
-    or rewrite what is shown. Newlines and tabs stay.
-    """
-    out = []
-    for char in str(value):
-        if char.isprintable() or char in "\n\t":
-            out.append(char)
-        elif ord(char) <= 0xFF:
-            out.append(f"\\x{ord(char):02x}")
-        else:
-            out.append(f"\\u{ord(char):04x}")
-    return "".join(out)
+def _verification_line(verification: dict[str, Any]) -> str:
+    """The stored result of strata_verify, as --json carries it."""
+    return (
+        f"Verification: {verification['result']} "
+        f"(quotes checked: {verification['quotes']}, facts checked: {verification['facts']}, "
+        f"flags: {verification['flags']})"
+    )
 
 
 def render_receipt(receipt: dict) -> str:
-    """A receipt for a person to read: each quote marked >>> <<< in its context."""
+    """A receipt for a person to read: each quote marked >>> <<< in its context.
+
+    The whole text is escaped once at the end (stratakb.core.terminal_text),
+    so no field reaches the terminal with its control characters.
+    """
     from stratakb.rag.receipts import CONTEXT_CHARS
 
-    v = _visible
-    lines = [
-        f"Receipt {v(receipt['receipt_id'])} ({v(receipt['kind'])}, {v(receipt['mode'])} mode)"
-    ]
-    layers = ", ".join(v(layer) for layer in receipt["layers"]) or "none"
-    lines.append(f"Issued {v(receipt['issued_at'])} by {v(receipt['issued_by'])}; layers: {layers}")
+    lines = [f"Receipt {receipt['receipt_id']} ({receipt['kind']}, {receipt['mode']} mode)"]
+    layers = ", ".join(str(layer) for layer in receipt["layers"]) or "none"
+    lines.append(f"Issued {receipt['issued_at']} by {receipt['issued_by']}; layers: {layers}")
     if receipt.get("question"):
-        lines.append(f"Question: {v(receipt['question'])}")
+        lines.append(f"Question: {receipt['question']}")
     if receipt.get("draft"):
-        lines.append(f"Draft: {v(receipt['draft'])}")
+        lines.append(f"Draft: {receipt['draft']}")
+    if receipt.get("verification"):
+        lines.append(_verification_line(receipt["verification"]))
     for position, quote in enumerate(receipt["quotes"], start=1):
-        where = [f"layer {v(quote['layer'])}", f"v{v(quote['version'])}"]
+        where = [f"layer {quote['layer']}", f"v{quote['version']}"]
         if quote.get("clause_path"):
-            where.append(f"clause {v(quote['clause_path'])}")
-        where.append(f"chars {v(quote['char_start'])}-{v(quote['char_end'])}")
+            where.append(f"clause {quote['clause_path']}")
+        where.append(f"chars {quote['char_start']}-{quote['char_end']}")
         lines.append("")
-        lines.append(
-            f"[{position}] {v(quote['file'])} ({', '.join(where)}): {v(quote['status'])}"
-        )
+        lines.append(f"[{position}] {quote['file']} ({', '.join(where)}): {quote['status']}")
         if quote.get("note"):
-            lines.append(f"    {v(quote['note'])}")
+            lines.append(f"    {quote['note']}")
         # An ellipsis where the shown context stops short of the text around it
         before = "…" if len(quote["context_before"]) == CONTEXT_CHARS else ""
         after = "…" if len(quote["context_after"]) == CONTEXT_CHARS else ""
         shown = (
-            f"{before}{v(quote['context_before'])}>>> {v(quote['quote'])} <<<"
-            f"{v(quote['context_after'])}{after}"
+            f"{before}{quote['context_before']}>>> {quote['quote']} <<<"
+            f"{quote['context_after']}{after}"
         )
-        lines.extend(f"    {line}".rstrip() for line in shown.splitlines())
+        # Split on newlines only: a carriage return or form feed is shown escaped
+        lines.extend(f"    {line}".rstrip(" \t") for line in shown.removesuffix("\n").split("\n"))
     if not receipt["quotes"]:
         lines.append("No quotes.")
-    return "\n".join(lines)
+    return visible("\n".join(lines))
 
 
 def render_json(report: Report) -> str:
     """The report as one JSON object with exactly the REPORT_KEYS."""
-    return json.dumps(report.as_dict(), ensure_ascii=False, indent=2)
+    return terminal_safe_json(report.as_dict(), indent=2)
 

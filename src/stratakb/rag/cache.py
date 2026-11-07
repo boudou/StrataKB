@@ -1,7 +1,7 @@
 """Query result cache with TTL for the StrataKB RAG pipeline.
 
 LRU + TTL cache keyed by (query, layers, top_k, metadata_filter). Cleared whole
-by the retriever when the layers stamp changes (see retriever._maybe_clear).
+by the retriever when the layers stamp changes (see core/stamp_watcher.py).
 """
 from __future__ import annotations
 

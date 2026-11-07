@@ -14,6 +14,7 @@ Example (see examples/ for complete presets):
     description: SEPA rulebooks, implementation guidelines and reason codes.
     chunk_config: {chunk_size: 1500, chunk_overlap: 200}
     routing_patterns: ['\\bsepa\\b', '\\bsct\\s*inst\\b']
+    structure_patterns: ['(?P<label>AT-\\d{2,3})\\b']   # extra section starts
     answer_mode: grounded    # or extractive; grounded for a new layer when left out
     sources:
       - name: rulebooks
@@ -43,6 +44,7 @@ from stratakb.knowledge.layers import (
     _validate_metadata_schema,
     _validate_name,
     _validate_routing_patterns,
+    _validate_structure_patterns,
     create_layer,
     get_layer,
     may_claim,
@@ -73,6 +75,8 @@ class LayerPreset:
     metadata_schema: dict = field(default_factory=dict)
     chunk_config: dict = field(default_factory=dict)
     routing_patterns: list[str] = field(default_factory=list)
+    # Regular expressions that start a section at a line start, at ingestion
+    structure_patterns: list[str] = field(default_factory=list)
     # None: a new layer gets DEFAULT_ANSWER_MODE, an existing layer keeps its mode
     answer_mode: str | None = None
     sources: list[SourceGroup] = field(default_factory=list)
@@ -100,6 +104,7 @@ def load_preset(preset_path: str | Path) -> LayerPreset:
     display_name = _validate_display_name(data["display_name"])
     chunk_config = _validate_chunk_config(data.get("chunk_config") or {})
     routing_patterns = _validate_routing_patterns(data.get("routing_patterns") or [])
+    structure_patterns = _validate_structure_patterns(data.get("structure_patterns") or [])
     answer_mode = data.get("answer_mode")
     if answer_mode is not None:
         answer_mode = _validate_answer_mode(answer_mode)
@@ -127,6 +132,7 @@ def load_preset(preset_path: str | Path) -> LayerPreset:
         metadata_schema=metadata_schema,
         chunk_config=chunk_config,
         routing_patterns=routing_patterns,
+        structure_patterns=structure_patterns,
         answer_mode=answer_mode,
         sources=sources,
         root=root,
@@ -221,6 +227,7 @@ def _parse_source_group(preset: LayerPreset, root: Path, group: SourceGroup) -> 
             layer_name=preset.name,
             chunk_size=preset.chunk_config["chunk_size"],
             chunk_overlap=preset.chunk_config["chunk_overlap"],
+            structure_patterns=preset.structure_patterns,
         )
         stats["parsed"] += 1
         stats["chunks"] += len(chunks)
@@ -242,6 +249,7 @@ def _preset_settings(preset: LayerPreset) -> dict:
         "metadata_schema": preset.metadata_schema,
         "chunk_config": preset.chunk_config,
         "routing_patterns": preset.routing_patterns,
+        "structure_patterns": preset.structure_patterns,
     }
     if preset.answer_mode is not None:
         settings["answer_mode"] = preset.answer_mode
@@ -327,6 +335,7 @@ async def create_preset_layer(database_url: str, preset: LayerPreset) -> dict:
             chunk_config=preset.chunk_config,
             routing_patterns=preset.routing_patterns,
             answer_mode=preset.answer_mode or DEFAULT_ANSWER_MODE,
+            structure_patterns=preset.structure_patterns,
             origin=origin,
         )
         return {"status": "created", "layer": layer, "changes": []}

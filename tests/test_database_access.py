@@ -13,14 +13,12 @@ Tests cover:
 
 from __future__ import annotations
 
-from contextlib import asynccontextmanager
 from unittest.mock import AsyncMock, MagicMock
-from urllib.parse import urlsplit, urlunsplit
 from uuid import uuid4
 
 import pytest
 
-from tests.conftest import call_tool
+from tests.helpers import call_tool, login_role_url, mock_pool
 
 
 # ==========================================
@@ -112,7 +110,7 @@ class TestSQLValidation:
 # ==========================================
 
 
-def _mock_pool(rows=None, fail=None):
+def _read_only_pool(rows=None, fail=None):
     """A pool whose connection records the calls _fetch_read_only makes."""
     tr = MagicMock()
     tr.start = AsyncMock()
@@ -122,15 +120,12 @@ def _mock_pool(rows=None, fail=None):
     cursor.fetch = AsyncMock(return_value=rows or [], side_effect=fail)
 
     conn = MagicMock()
-    conn.transaction.return_value = tr
     conn.execute = AsyncMock()
     conn.cursor = AsyncMock(return_value=cursor)
 
-    ctx = MagicMock()
-    ctx.__aenter__ = AsyncMock(return_value=conn)
-    ctx.__aexit__ = AsyncMock(return_value=False)
-    pool = MagicMock()
-    pool.acquire.return_value = ctx
+    pool = mock_pool(conn)
+    # _fetch_read_only starts and rolls back by hand, not with `async with`
+    conn.transaction.return_value = tr
     return pool, conn, tr, cursor
 
 
@@ -139,7 +134,7 @@ class TestFetchReadOnly:
     async def test_runs_in_read_only_transaction_with_local_timeout(self):
         from stratakb.database_access.tools import _fetch_read_only
 
-        pool, conn, tr, cursor = _mock_pool(rows=[{"x": 1}])
+        pool, conn, tr, cursor = _read_only_pool(rows=[{"x": 1}])
         rows = await _fetch_read_only(pool, "SELECT $1::int AS x", ["1"], 1001)
 
         assert rows == [{"x": 1}]
@@ -153,7 +148,7 @@ class TestFetchReadOnly:
     async def test_always_rolls_back(self):
         from stratakb.database_access.tools import _fetch_read_only
 
-        pool, _, tr, _ = _mock_pool()
+        pool, _, tr, _ = _read_only_pool()
         await _fetch_read_only(pool, "SELECT 1", [], 10)
         tr.rollback.assert_awaited_once()
 
@@ -161,7 +156,7 @@ class TestFetchReadOnly:
     async def test_rolls_back_on_error(self):
         from stratakb.database_access.tools import _fetch_read_only
 
-        pool, _, tr, _ = _mock_pool(fail=RuntimeError("boom"))
+        pool, _, tr, _ = _read_only_pool(fail=RuntimeError("boom"))
         with pytest.raises(RuntimeError):
             await _fetch_read_only(pool, "SELECT 1", [], 10)
         tr.rollback.assert_awaited_once()
@@ -193,12 +188,6 @@ class TestQueryError:
 # ==========================================
 # Integration tests (require DB)
 # ==========================================
-
-
-@pytest.fixture
-def db_url():
-    from stratakb.config import get_settings
-    return get_settings().database_url
 
 
 @pytest.fixture
@@ -323,21 +312,26 @@ async def _hang(*args, **kwargs):
     await asyncio.Event().wait()
 
 
-def _fake_connect(row=None, error=None):
+def _fake_connect(row=None, *, query_error=None, connect_error=None):
     """Patch asyncpg.connect in the tools module; return (patcher, conn).
 
-    `row` is the role check's result, an exception it raises, or a function
-    standing in for it; `error` is what connect raises, or a function.
+    `row` is the role check's result; `query_error` is what the check raises,
+    or a function standing in for it; `connect_error` is what connect raises,
+    or a function.
     """
     from unittest.mock import patch
 
     conn = MagicMock()
-    if isinstance(row, BaseException) or callable(row):
-        conn.fetchrow = AsyncMock(side_effect=row)
+    if query_error is not None:
+        conn.fetchrow = AsyncMock(side_effect=query_error)
     else:
         conn.fetchrow = AsyncMock(return_value=row or _SAFE_ROW)
     conn.close = AsyncMock()
-    connect = AsyncMock(side_effect=error) if error else AsyncMock(return_value=conn)
+    connect = (
+        AsyncMock(side_effect=connect_error)
+        if connect_error is not None
+        else AsyncMock(return_value=conn)
+    )
     return patch("stratakb.database_access.tools.asyncpg.connect", connect), conn
 
 
@@ -380,15 +374,31 @@ class TestSqlToolsGate:
         assert _tool_names(_server()) >= _SQL_TOOL_NAMES
         assert sql_tools_status() == {"status": "enabled"}
 
-    async def _secure(self, server, row=None, error=None):
+    async def _secure(self, server, row=None, *, query_error=None, connect_error=None):
         from structlog.testing import capture_logs
 
         from stratakb.database_access.tools import secure_sql_tools
 
-        patcher, conn = _fake_connect(row, error)
+        patcher, conn = _fake_connect(
+            row, query_error=query_error, connect_error=connect_error
+        )
         with patcher, capture_logs() as logs:
             await secure_sql_tools(server, _FAKE_URL)
         return logs, conn
+
+    async def _secure_stalled(self, server, **stall):
+        """Run the check with a 0.05 s deadline and assert it ended within 1 s."""
+        import time
+        from unittest.mock import patch
+
+        started = time.monotonic()
+        with patch("stratakb.database_access.tools._CHECK_TIMEOUT", 0.05):
+            logs, conn = await self._secure(server, **stall)
+        assert time.monotonic() - started < 1
+        self._assert_disabled(
+            server, logs, "could not check the READONLY_DATABASE_URL role: TimeoutError"
+        )
+        return conn
 
     def _assert_disabled(self, server, logs, reason_part):
         from stratakb.database_access.tools import sql_tools_status
@@ -423,7 +433,9 @@ class TestSqlToolsGate:
     @pytest.mark.asyncio
     async def test_unreachable_role_removes_sql_tools(self):
         server = _server()
-        logs, _ = await self._secure(server, error=OSError("connection refused"))
+        logs, _ = await self._secure(
+            server, connect_error=OSError("connection refused")
+        )
         self._assert_disabled(
             server, logs, "could not check the READONLY_DATABASE_URL role: OSError"
         )
@@ -431,7 +443,7 @@ class TestSqlToolsGate:
     @pytest.mark.asyncio
     async def test_failed_check_query_terminates_connection(self):
         server = _server()
-        logs, conn = await self._secure(server, RuntimeError("boom"))
+        logs, conn = await self._secure(server, query_error=RuntimeError("boom"))
         self._assert_disabled(server, logs, "could not check")
         conn.terminate.assert_called_once()
         conn.close.assert_not_awaited()
@@ -439,17 +451,8 @@ class TestSqlToolsGate:
     @pytest.mark.asyncio
     async def test_stalled_query_fails_closed(self):
         """A query that never returns ends the check within the timeout."""
-        import time
-        from unittest.mock import patch
-
         server = _server()
-        started = time.monotonic()
-        with patch("stratakb.database_access.tools._CHECK_TIMEOUT", 0.05):
-            logs, conn = await self._secure(server, _hang)
-        assert time.monotonic() - started < 1
-        self._assert_disabled(
-            server, logs, "could not check the READONLY_DATABASE_URL role: TimeoutError"
-        )
+        conn = await self._secure_stalled(server, query_error=_hang)
         # Dropped, not closed: a graceful close would wait on the stalled server
         conn.terminate.assert_called_once()
         conn.close.assert_not_awaited()
@@ -457,17 +460,8 @@ class TestSqlToolsGate:
     @pytest.mark.asyncio
     async def test_stalled_connect_fails_closed(self):
         """A connection that never opens ends the check within the timeout."""
-        import time
-        from unittest.mock import patch
-
         server = _server()
-        started = time.monotonic()
-        with patch("stratakb.database_access.tools._CHECK_TIMEOUT", 0.05):
-            logs, _ = await self._secure(server, error=_hang)
-        assert time.monotonic() - started < 1
-        self._assert_disabled(
-            server, logs, "could not check the READONLY_DATABASE_URL role: TimeoutError"
-        )
+        await self._secure_stalled(server, connect_error=_hang)
 
     @pytest.mark.asyncio
     async def test_safe_role_keeps_sql_tools(self):
@@ -523,178 +517,110 @@ class TestSqlToolsGate:
         }
 
 
-@asynccontextmanager
-async def _probe_roles(db_url: str):
+@pytest.fixture
+async def probe_roles(db_url, superuser_conn):
     """Login roles for the role check; yields {"member": url, "plain": url}.
 
     "member" is granted a NOLOGIN superuser role, "plain" is not. Roles are
     cluster-wide and other databases share the cluster, so each name carries a
     random suffix, and every role is dropped on the way out.
     """
-    import asyncpg
-
-    try:
-        conn = await asyncpg.connect(db_url, timeout=5)
-    except Exception:
-        pytest.skip("database not reachable")
     suffix = uuid4().hex[:10]
     su, member, plain = f"su_{suffix}", f"member_{suffix}", f"plain_{suffix}"
-    password = uuid4().hex
     try:
-        superuser = await conn.fetchval(
-            "SELECT rolsuper FROM pg_roles WHERE rolname = current_user"
-        )
-        if not superuser:
-            pytest.skip("DATABASE_URL role is not a superuser")
-        try:
-            await conn.execute(f"CREATE ROLE {su} NOLOGIN SUPERUSER")
-            await conn.execute(f"CREATE ROLE {member} LOGIN PASSWORD '{password}'")
-            await conn.execute(f"GRANT {su} TO {member}")
-            await conn.execute(f"CREATE ROLE {plain} LOGIN PASSWORD '{password}'")
-            yield {
-                "member": _url_as(db_url, member, password),
-                "plain": _url_as(db_url, plain, password),
-            }
-        finally:
-            # Members before the role they were granted
-            for role in (member, plain, su):
-                await conn.execute(f"DROP ROLE IF EXISTS {role}")
+        await superuser_conn.execute(f"CREATE ROLE {su} NOLOGIN SUPERUSER")
+        async with (
+            login_role_url(db_url, member) as member_url,
+            login_role_url(db_url, plain) as plain_url,
+        ):
+            await superuser_conn.execute(f"GRANT {su} TO {member}")
+            yield {"member": member_url, "plain": plain_url}
     finally:
-        await conn.close()
-
-
-def _url_as(db_url: str, user: str, password: str) -> str:
-    """db_url with only the user and password replaced."""
-    parts = urlsplit(db_url)
-    host = parts.hostname or ""
-    if ":" in host:
-        host = f"[{host}]"
-    netloc = f"{user}:{password}@{host}" + (f":{parts.port}" if parts.port else "")
-    return urlunsplit(parts._replace(netloc=netloc))
+        # After the members, which leave first
+        await superuser_conn.execute(f"DROP ROLE IF EXISTS {su}")
 
 
 class TestSqlToolsGateDatabase:
     """The role check against the real database."""
 
     @pytest.mark.asyncio
+    @pytest.mark.usefixtures("superuser_conn")
     async def test_real_superuser_url_refused(self, db_url):
-        import asyncpg
-
         from stratakb.database_access.tools import secure_sql_tools
-
-        try:
-            conn = await asyncpg.connect(db_url, timeout=5)
-        except Exception:
-            pytest.skip("database not reachable")
-        try:
-            superuser = await conn.fetchval(
-                "SELECT rolsuper FROM pg_roles WHERE rolname = current_user"
-            )
-        finally:
-            await conn.close()
-        if not superuser:
-            pytest.skip("DATABASE_URL role is not a superuser")
 
         server = _server(db_url)
         await secure_sql_tools(server, db_url)
         assert _tool_names(server) == _FIXED_TOOLS
 
     @pytest.mark.asyncio
-    async def test_member_of_superuser_role_detected(self, db_url):
+    async def test_member_of_superuser_role_detected(self, superuser_conn):
         """A role granted a superuser role can reach it with set_config('role', ...)."""
-        import asyncpg
-
         from stratakb.database_access.tools import _ROLE_CHECK_QUERY, _SERVER_ACCESS_ROLES
 
+        conn = superuser_conn
+        owner = await conn.fetchval("SELECT current_user")
+        tr = conn.transaction()
+        await tr.start()
         try:
-            conn = await asyncpg.connect(db_url, timeout=5)
-        except Exception:
-            pytest.skip("database not reachable")
-        try:
-            superuser = await conn.fetchval(
-                "SELECT rolsuper FROM pg_roles WHERE rolname = current_user"
-            )
-            if not superuser:
-                pytest.skip("DATABASE_URL role is not a superuser")
-            owner = await conn.fetchval("SELECT current_user")
-            tr = conn.transaction()
-            await tr.start()
-            try:
-                # Roles and grants vanish with the rollback
-                await conn.execute("CREATE ROLE strata_probe_member NOLOGIN NOSUPERUSER")
-                await conn.execute("CREATE ROLE strata_probe_plain NOLOGIN NOSUPERUSER")
-                await conn.execute(f'GRANT "{owner}" TO strata_probe_member')
+            # Roles and grants vanish with the rollback
+            await conn.execute("CREATE ROLE strata_probe_member NOLOGIN NOSUPERUSER")
+            await conn.execute("CREATE ROLE strata_probe_plain NOLOGIN NOSUPERUSER")
+            await conn.execute(f'GRANT "{owner}" TO strata_probe_member')
 
-                await conn.execute("SET LOCAL SESSION AUTHORIZATION strata_probe_member")
-                row = await conn.fetchrow(_ROLE_CHECK_QUERY, list(_SERVER_ACCESS_ROLES))
-                assert row["superuser"] is True
+            await conn.execute("SET LOCAL SESSION AUTHORIZATION strata_probe_member")
+            row = await conn.fetchrow(_ROLE_CHECK_QUERY, list(_SERVER_ACCESS_ROLES))
+            assert row["superuser"] is True
 
-                await conn.execute("SET LOCAL SESSION AUTHORIZATION strata_probe_plain")
-                row = await conn.fetchrow(_ROLE_CHECK_QUERY, list(_SERVER_ACCESS_ROLES))
-                assert row["superuser"] is False
-                assert row["members"] is None
-            finally:
-                await tr.rollback()
+            await conn.execute("SET LOCAL SESSION AUTHORIZATION strata_probe_plain")
+            row = await conn.fetchrow(_ROLE_CHECK_QUERY, list(_SERVER_ACCESS_ROLES))
+            assert row["superuser"] is False
+            assert row["members"] is None
         finally:
-            await conn.close()
+            await tr.rollback()
 
     @pytest.mark.asyncio
-    async def test_server_access_member_detected(self, db_url):
+    async def test_server_access_member_detected(self, superuser_conn):
         """A role granted a server-access role is named by the same query."""
-        import asyncpg
-
         from stratakb.database_access.tools import _ROLE_CHECK_QUERY, _SERVER_ACCESS_ROLES
 
+        conn = superuser_conn
+        tr = conn.transaction()
+        await tr.start()
         try:
-            conn = await asyncpg.connect(db_url, timeout=5)
-        except Exception:
-            pytest.skip("database not reachable")
-        try:
-            superuser = await conn.fetchval(
-                "SELECT rolsuper FROM pg_roles WHERE rolname = current_user"
-            )
-            if not superuser:
-                pytest.skip("DATABASE_URL role is not a superuser")
-            tr = conn.transaction()
-            await tr.start()
-            try:
-                # Roles and grants vanish with the rollback
-                await conn.execute("CREATE ROLE strata_probe_reader NOLOGIN NOSUPERUSER")
-                await conn.execute("GRANT pg_read_server_files TO strata_probe_reader")
+            # Roles and grants vanish with the rollback
+            await conn.execute("CREATE ROLE strata_probe_reader NOLOGIN NOSUPERUSER")
+            await conn.execute("GRANT pg_read_server_files TO strata_probe_reader")
 
-                await conn.execute("SET LOCAL SESSION AUTHORIZATION strata_probe_reader")
-                row = await conn.fetchrow(_ROLE_CHECK_QUERY, list(_SERVER_ACCESS_ROLES))
-                assert row["superuser"] is False
-                assert row["members"] == ["pg_read_server_files"]
-            finally:
-                await tr.rollback()
+            await conn.execute("SET LOCAL SESSION AUTHORIZATION strata_probe_reader")
+            row = await conn.fetchrow(_ROLE_CHECK_QUERY, list(_SERVER_ACCESS_ROLES))
+            assert row["superuser"] is False
+            assert row["members"] == ["pg_read_server_files"]
         finally:
-            await conn.close()
+            await tr.rollback()
 
     @pytest.mark.asyncio
-    async def test_login_role_in_superuser_role_refused(self, db_url):
+    async def test_login_role_in_superuser_role_refused(self, probe_roles):
         """rolsuper is not inherited: a login role granted a superuser role is refused,
         and the same login role without that grant keeps the SQL tools."""
         from structlog.testing import capture_logs
 
         from stratakb.database_access.tools import secure_sql_tools, sql_tools_status
 
-        async with _probe_roles(db_url) as urls:
-            member = _server(urls["member"])
-            with capture_logs() as logs:
-                await secure_sql_tools(member, urls["member"])
-            assert _tool_names(member) == _FIXED_TOOLS
-            disabled = [e for e in logs if e["event"] == "sql_tools_disabled"]
-            assert len(disabled) == 1
-            assert "is a superuser or a member of a superuser role" in disabled[0]["reason"]
-            status = sql_tools_status()
-            assert status["status"] == "disabled"
-            assert "is a superuser or a member of a superuser role" in status["reason"]
+        member = _server(probe_roles["member"])
+        with capture_logs() as logs:
+            await secure_sql_tools(member, probe_roles["member"])
+        assert _tool_names(member) == _FIXED_TOOLS
+        disabled = [e for e in logs if e["event"] == "sql_tools_disabled"]
+        assert len(disabled) == 1
+        assert "is a superuser or a member of a superuser role" in disabled[0]["reason"]
+        status = sql_tools_status()
+        assert status["status"] == "disabled"
+        assert "is a superuser or a member of a superuser role" in status["reason"]
 
-            plain = _server(urls["plain"])
-            await secure_sql_tools(plain, urls["plain"])
-            assert _tool_names(plain) == _FIXED_TOOLS | _SQL_TOOL_NAMES
-            assert sql_tools_status() == {"status": "enabled"}
+        plain = _server(probe_roles["plain"])
+        await secure_sql_tools(plain, probe_roles["plain"])
+        assert _tool_names(plain) == _FIXED_TOOLS | _SQL_TOOL_NAMES
+        assert sql_tools_status() == {"status": "enabled"}
 
     @pytest.mark.asyncio
     async def test_real_readonly_role_accepted(self):

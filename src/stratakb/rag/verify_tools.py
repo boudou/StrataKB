@@ -23,7 +23,7 @@ from stratakb.core.database import get_pool
 from stratakb.core.logging import log_tool_call
 from stratakb.core.migrations import ensure_schema
 from stratakb.knowledge.layers import DEFAULT_CHUNK_SIZE
-from stratakb.rag.passages import ChunkRef, DocumentRef, parse_ref
+from stratakb.rag.passages import ChunkRef, DocumentRef, parse_ref, passage_id
 from stratakb.rag.receipts import ReceiptError, issue_receipt, readable_layers
 from stratakb.rag.verify import MAX_FLAGS, Flag, check
 
@@ -71,10 +71,11 @@ async def _resolve(database_url: str, refs: list[str]) -> list[_Passage]:
     """
     parsed: list[tuple[str, str, DocumentRef | ChunkRef]] = []
     for n, ref in enumerate(refs, start=1):
+        pid = passage_id(n)
         target = parse_ref(ref)
         if target is None:
-            raise _RefusedError(_NOT_READABLE.format(pid=f"S{n}", ref=ref[:40]))
-        parsed.append((f"S{n}", ref, target))
+            raise _RefusedError(_NOT_READABLE.format(pid=pid, ref=ref[:40]))
+        parsed.append((pid, ref, target))
 
     documents = [t for _, _, t in parsed if isinstance(t, DocumentRef)]
     chunk_ids = sorted({t.chunk_id for _, _, t in parsed if isinstance(t, ChunkRef)})

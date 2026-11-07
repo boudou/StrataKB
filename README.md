@@ -10,13 +10,13 @@ Point it at your documentation, organise it in layers, and query it from any MCP
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![PRs welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](CONTRIBUTING.md)
 
-[Quick start](#quick-start) · [How it works](#how-it-works) · [Layers and presets](#layers-and-presets) · [Tools](#tools) · [Configuration](#configuration) · [Glossary](#glossary) · [Roadmap](#roadmap)
+[Quick start](#quick-start) · [How it works](#how-it-works) · [Layers and presets](#layers-and-presets) · [Answers you can prove](#answers-you-can-prove) · [Tools](#tools) · [Configuration](#configuration) · [Glossary](#glossary) · [Roadmap](#roadmap)
 
 </div>
 
 StrataKB turns folders of your documents into a knowledge base that your AI tools can ask through the Model Context Protocol (MCP). Each folder becomes a **layer**: a searchable collection named after the folder. One PostgreSQL database holds every layer, so a whole team can share one server, with roles and an audit log.
 
-StrataKB finds the passages that answer a question and names the files they come from; your MCP client writes the answer from them.
+StrataKB finds the passages that answer a question and names the files they come from; your MCP client writes the answer from them, or, on a layer set to extractive, the server answers with the document's own sentences.
 
 ## Quick start
 
@@ -72,7 +72,7 @@ Replace /path/to/StrataKB with the folder you cloned into, then restart the clie
 
 ### 4. Ask
 
-Ask your client a question about the documents, for example *"How do we fail over the database?"*. The client calls StrataKB's `strata_ask` tool, gets back the passages that match and the files they come from, and writes the answer.
+Ask your client a question about the documents, for example *"How do we fail over the database?"*. The client calls StrataKB's `strata_ask` tool, gets back the passages that match and the files they come from, and writes the answer. The server tells the client to answer only from those passages, cite them and check the answer, and a checked answer comes with a receipt you can open with `uv run stratakb receipt <id>`.
 
 No documents at hand? Try the [Python PEPs example](#try-an-example-preset).
 
@@ -82,6 +82,7 @@ The reference below explains how StrataKB works, every tool and every setting; t
 
 - **Knowledge layers**: create a layer per domain at runtime, each with its own chunking and routing rules; no code changes to add a new domain
 - **Layer presets**: describe a layer and its source folders in one YAML file, then build or rebuild it in one call
+- **Answers you can prove**: cited passages, a check of the quotes and facts in a drafted answer, the document's own sentences where paraphrase is not acceptable, and a receipt to open outside the chat; see [Answers you can prove](#answers-you-can-prove)
 - **Hybrid retrieval**: pgvector HNSW similarity plus PostgreSQL full-text search, fused with Reciprocal Rank Fusion, then reranked by a cross-encoder
 - **Query routing**: when no layers are given, questions are routed to the right layers by each layer's patterns. A routed search that finds fewer results than asked for, or only low-confidence ones, runs again across all layers, and the result says so (`routing_fallback`, with the reason; in `strata_ask` only with `response_format: "detailed"`). Layers you name yourself are never broadened
 - **Query rewriting** (optional): with an Anthropic API key or any OpenAI-compatible endpoint (including a local Ollama), `strata_ask` expands a question into several searches in the knowledge base's own terminology
@@ -129,14 +130,28 @@ flowchart LR
     z -->|"no"| p["Parse<br/>per format"]
     p -->|"no text"| t
     p --> sm["Structure map<br/>(headings, numbered clauses)"] --> c["Chunk inside each section<br/>(the file's own text)"] --> x["Add context for the embedding only<br/>[layer > file > headings or Page N]"] --> e["Embed"] --> v[("Store the document text<br/>(new version if it changed)<br/>and that file's chunks")]
-    p -.->|"scanned-looking PDF,<br/>CSV over 10,000 rows"| fl["Stored, reported<br/>as flagged"]
+    p -.->|"scanned-looking PDF,<br/>CSV over 10,000 rows,<br/>OpenAPI schema over 15 properties"| fl["Stored, reported<br/>as flagged"]
     h -->|"can't read"| fe["Failed, keeps earlier chunks<br/>(read_error, parse_error)"]
     p -->|"parser rejects"| fe
 ```
 
-Ingesting a folder again is a sync: unchanged files are skipped, changed files are replaced, new files are added, and files deleted from that folder are removed. Other folders in the same layer are left alone. Files whose names look like secrets (`.env`, `client_secret.json`, `id_rsa`, `*.pem`) are skipped without being opened, and one ingested earlier is removed. Empty files are reported as no text rather than as failures. A PDF that looks scanned (fewer than half its pages have text, or under 200 characters per page on average) is stored for the text it has and reported as flagged. A CSV file over 10,000 rows is stored for its first 10,000 rows and reported as flagged (`truncated`); the log says how many rows were left out. A CSV row with fewer fields than the header is stored with the values it has; one with more keeps the extra values, labelled by position (`Column 4`). A column with an empty header is labelled by position too (`Column 2`), and a header name used twice gets a number on its second use (`Name (2)`), so no value is lost. A file that cannot be read (locked, or no permission) or that its parser rejects is reported as failed and keeps its earlier chunks; the rest of the run carries on.
+Ingesting a folder again is a sync: unchanged files are skipped, changed files are replaced, new files are added, and files deleted from that folder are removed. Other folders in the same layer are left alone. Files whose names look like secrets (`.env`, `client_secret.json`, `id_rsa`, `*.pem`) are skipped without being opened, and one ingested earlier is removed. Empty files are reported as no text rather than as failures. A PDF that looks scanned (fewer than half its pages have text, or under 200 characters per page on average) is stored for the text it has and reported as flagged. A CSV file over 10,000 rows is stored for its first 10,000 rows and reported as flagged (`truncated`), with how many rows were left out. An OpenAPI file lists the first 15 properties of each schema and says how many more there are; when a schema is cut this way the file is reported as flagged (`truncated`), counting the properties left out over the whole file, because those properties are not searchable. A CSV row with fewer fields than the header is stored with the values it has; one with more keeps the extra values, labelled by position (`Column 4`). A column with an empty header is labelled by position too (`Column 2`), and a header name used twice gets a number on its second use (`Name (2)`), so no value is lost. A file that cannot be read (locked, or no permission) or that its parser rejects is reported as failed and keeps its earlier chunks; the rest of the run carries on.
 
-Every file gets an outcome, and most outcomes a reason. `stratakb add --json` lists both for every file; `strata_ingest_documents` returns the counts, and each failed file in `errors` with its reason and a short message. Errors returned and kept in the run history name a file by its path relative to the ingested folder, not its absolute path. The ingest logs on stderr name a failure by its error type, not its message. `stratakb add` also reports the reasons of its own file selection (such as `code` or `ignored_by_gitignore`) for files it never reads.
+Every file gets an outcome, and most outcomes a reason. `stratakb add --json` lists both for every file, with a `count` that is null unless a flagged file's parser counted what it left out; `strata_ingest_documents` returns the counts, each failed file in `errors` with its reason and a short message, and each flagged file in `flagged` (null when there are none):
+
+```json
+"flagged": [{"file": "codes.csv", "reason": "truncated", "count": 1234}]
+```
+
+`stratakb add` prints the flagged files in a `Flagged:` section after `Excluded:`, and leaves the section out when there are none:
+
+```text
+Flagged:
+  codes.csv (truncated, 1,234 left out)
+  scan.pdf (probably_scanned)
+```
+
+Errors returned and kept in the run history name a file by its path relative to the ingested folder, not its absolute path. The ingest logs on stderr name a failure by its error type, not its message. `stratakb add` also reports the reasons of its own file selection (such as `code` or `ignored_by_gitignore`) for files it never reads.
 
 | Outcome | Reasons |
 |---|---|
@@ -150,11 +165,12 @@ Each stored chunk is the document's own text as its parser extracted it (for Mar
 
 Each file's extracted text is stored once as a document, and every chunk records where in that text it sits (a character range, from which the page and the line range follow), so a passage can be located and checked against its source. Lines count from the start of the page for PDFs and from the start of the document for other formats. When a file's text changes, the next ingest stores it as a new version; versions that no chunk and no receipt uses any more are removed. Chunks ingested before this was added have no position until their file changes or the layer is rebuilt (`replace_all=True`).
 
-Chunks follow the document's structure. Each document gets a structure map: its headings and numbered clauses, each with a path such as `7 Termination > 7.2 Termination for cause` and the range of the text it covers, found without any configuration. The map recognises Markdown, reStructuredText and AsciiDoc headings (and so the headings the other parsers write, such as one per XSD type), numbered headings (`4.3.2`, `7.`, `7(2)(b)`) and keyword headings (`Article 12`, `Section 3`, `Annex II`). A numbered line counts as a clause only when it continues the numbering (`7.3` or `8` after `7.2`) and follows a blank line, a heading or the end of a sentence, so a numbered list inside a clause, or a wrapped line that starts with `30 days` or `Article 6`, is not one. In Markdown, a run of `1.` `2.` lines with no subclause (`1.1`) among them is an ordered list, not clauses, and adds nothing to the map. Front matter (a leading `---` block of `key: value` lines) is never read as a heading, in any format. Table-of-contents entries are skipped, whichever pattern they match, so the body's clauses keep their numbers. A chunk never crosses a section boundary (or a PDF page): a short section is one chunk, and a section longer than `chunk_size` is split, with every piece keeping the section's path. A heading with no text of its own before its first subsection (`7. Termination` directly followed by `7.1 …`) is not stored as a chunk of its own: it joins the subsection's chunk, which carries the subsection's path (`7 Termination > 7.1 …`). It stays on its own when a page starts at the subsection, so a Markdown `##` heading directly followed by a `###` one still gives a short chunk. The path of the innermost section is stored with each chunk (`clause_path`); text before the first heading has none. A document with no detectable structure is split by size alone, as before. Chunks ingested before this was added have no clause path until their file changes or the layer is rebuilt (`replace_all=True`).
+Chunks follow the document's structure. Each document gets a structure map: its headings and numbered clauses, each with a path such as `7 Termination > 7.2 Termination for cause` and the range of the text it covers, found without any configuration. The map recognises Markdown, reStructuredText and AsciiDoc headings (and so the headings the other parsers write, such as one per XSD type), numbered headings (`4.3.2`, `7.`, `7(2)(b)`) and keyword headings (`Article 12`, `Section 3`, `Annex II`). PDF and Word files also carry structure outside their text, and the map reads it first: each entry of a PDF's outline (its bookmarks) starts a section on its page, at the line that holds its title as a heading (`Payment`, or `7. Payment` with its number, also when the title wraps over two or three lines; a mention of the title in a sentence does not count), or at the page's start when no line does, and each Word paragraph styled as a heading (`Heading 1` to `Heading 9`, under any name a localized Word gives them, or any style with an outline level) starts a section at that depth. When the heading line carries a clause number or keyword (`1.1 Scope` under the bookmark `Scope`), the section keeps that number as its label, so a lookup by clause number still finds it; a heading that is only a number (`Article 6`, `Annex II`) shows it once and has no title of its own. These sections nest by the outline or the styles, and the headings and clauses found in the text nest inside them, so a contract whose clause titles carry no numbers still gets its structure. Only the first 10,000 outline entries, nine levels deep, are read; a PDF with more is stored with its full text and reported as flagged (`truncated`). A Word file's paragraphs and tables keep their order in the text, so a table stays in the section it belongs to. A numbered line counts as a clause only when it continues the numbering (`7.3` or `8` after `7.2`) and follows a blank line, a heading or the end of a sentence, so a numbered list inside a clause, or a wrapped line that starts with `30 days` or `Article 6`, is not one. Some domains name their sections with identifiers no generic rule can know, such as the SEPA rulebook attributes `AT-44`: a layer preset can list `structure_patterns`, regular expressions matched at the start of a line (past any indent, and against its first 200 characters only), and every line one matches starts a section one level below the innermost open heading or clause (an `AT-01` line inside clause `4.1` gets the path `4 … > 4.1 … > AT-01 …`), which ends at the next match or at the next heading or clause at that level or above (`4.2` continues the numbering under `4`), labelled by the pattern's named group `label` (or the whole match). A numbered list inside such a section (the steps of a runbook) belongs to that section only, so the next match is still its sibling. A pattern that does not compile, that matches an empty line, or that repeats a repeated part (such as `(\w+\s?)*`, which can take very long on some lines) is refused when the preset is loaded. The same patterns serve exact lookups: asking `strata_search` or `strata_ask` to "show AT-R051" finds that section in the layers searched, wherever the identifier stands in the question within its first 2,000 characters. The SEPA example preset ships one for the attribute definitions of the EPC rulebooks (`Identification: AT-R051`), the ISO 20022 preset one for message identifiers (`pacs.008.001.08`); a layer without patterns uses the generic rules only. In Markdown, a run of `1.` `2.` lines with no subclause (`1.1`) among them is an ordered list, not clauses, and adds nothing to the map; a pattern section between them (`4.1`, `AT-01`, `5.`) does not break the numbering into such a run. Front matter (a leading `---` block of `key: value` lines) is never read as a heading, in any format. Table-of-contents entries are skipped, whichever pattern they match, so the body's clauses keep their numbers. A chunk never crosses a section boundary (or a PDF page): a short section is one chunk, and a section longer than `chunk_size` is split, with every piece keeping the section's path. A heading with no text of its own before its first subsection (`7. Termination` directly followed by `7.1 …`) is not stored as a chunk of its own: it joins the subsection's chunk, which carries the subsection's path (`7 Termination > 7.1 …`). It stays on its own when a page starts at the subsection, so a Markdown `##` heading directly followed by a `###` one still gives a short chunk. The path of the innermost section is stored with each chunk (`clause_path`); text before the first heading has none. A document with no detectable structure is split by size alone, as before. Chunks ingested before this was added have no clause path until their file changes or the layer is rebuilt (`replace_all=True`).
 
 ```mermaid
 flowchart LR
-    t["Document text"] --> d{"Headings or<br/>numbered clauses?"}
+    o["PDF outline,<br/>Word heading styles"] --> d
+    t["Document text"] --> d{"Headings, numbered clauses<br/>or the layer's structure patterns?"}
     d -->|"yes"| m["Structure map:<br/>path and range per section"] --> s["Cut at every section start;<br/>a bare heading joins its first subsection;<br/>split long sections by size"] --> c["Chunks with<br/>clause_path"]
     d -->|"no"| z["Split by size"] --> c2["Chunks without<br/>clause_path"]
 ```
@@ -170,7 +186,7 @@ flowchart LR
     o -->|"high"| f["found"]
     o -->|"medium"| pf["partly_found<br/>+ next step"]
     o -->|"low or none"| nf["not_found<br/>+ next step"]
-    f & pf & nf --> a["Your MCP client<br/>writes the answer"]
+    f & pf & nf --> a["Your MCP client writes the answer (grounded),<br/>or the server returns the document's<br/>own sentences (extractive)"]
 ```
 
 **Learn**
@@ -206,7 +222,7 @@ flowchart LR
     apply --> report["Report and exit code"]
 ```
 
-A drive root, your home folder (or a folder above it) and system folders need `--allow-broad`; a run that adds, updates or removes more than 2,000 files, adds or updates more than 500 MB, or removes at least 10 files that are more than half of the layer's files, needs `--yes`. At a terminal the command asks instead; in a script it refuses and names the flag. Exit codes: `0` done, `1` some files failed (the rest are stored), `2` refused, a usage error, or `STRATA_LOCAL_ONLY` blocks the embedding path (nothing written), `3` the database is unreachable or its schema can't be updated, `130` interrupted (stored files stay; the next run carries on). The first run with the `local` backend downloads the embedding model and says so.
+A drive root, your home folder (or a folder above it) and system folders need `--allow-broad`; a run that adds, updates or removes more than 2,000 files, adds or updates more than 500 MB, or removes at least 10 files that are more than half of the layer's files, needs `--yes`. At a terminal the command asks instead; in a script it refuses and names the flag. Exit codes: `0` done, `1` some files failed (the rest are stored), `2` refused, a usage error, or `STRATA_LOCAL_ONLY` blocks the embedding path (nothing written), `3` the database is unreachable or its schema can't be updated, `130` interrupted (stored files stay; the next run carries on). The first run with the `local` backend downloads the embedding model and says so. The report shows control characters from file names and layer names as escapes such as `\x1b` or `\n`, and keeps one line per file, so a file name cannot hide or rewrite what your terminal shows.
 
 `stratakb` with no command, or `stratakb serve`, starts the MCP server, as `python -m stratakb` does.
 
@@ -226,6 +242,8 @@ chunk_config: {chunk_size: 1200, chunk_overlap: 150}
 routing_patterns:            # questions matching any of these search this layer first
   - '\brunbooks?\b'
   - '\b(failover|incident|on-?call)\b'
+structure_patterns:          # optional: a line starting with a match starts a section
+  - '^(?P<label>RB-\d+)\b'   # 'RB-12 Restart the queue' becomes section 'RB-12'
 answer_mode: grounded        # or extractive; grounded for a new layer when left out
 sources:
   - name: runbooks
@@ -237,7 +255,7 @@ sources:
 
 Apply it with `scripts/apply_preset.py` or the `strata_apply_preset` tool. Ready-made presets are in [examples/](examples/README.md): Python PEPs (the quickest to try), SEPA payments and ISO 20022 messaging.
 
-Edit the preset and apply it again to change the layer: the layer takes the preset's `display_name`, `description`, `metadata_schema`, `chunk_config`, `routing_patterns` and `answer_mode`, the result lists the settings that changed (`layer_changes`), and the chunks are rebuilt from the sources. There is no need to delete the layer first. A layer with the same name that was not made by this preset (one made with `stratakb add`, `strata_create_knowledge_layer` or another preset) is refused and left unchanged; rename the preset's `name` or delete that layer. `strata_apply_preset` with `dry_run=true` also lists the settings that would change (`layer_check`), or `would_claim` when a layer with no recorded origin already matches the preset and would be marked as made by it, or `unknown` when the database does not answer within 5 seconds, while the script's `--dry-run` only parses the files and needs no database.
+Edit the preset and apply it again to change the layer: the layer takes the preset's `display_name`, `description`, `metadata_schema`, `chunk_config`, `routing_patterns`, `structure_patterns` and `answer_mode`, the result lists the settings that changed (`layer_changes`), and the chunks are rebuilt from the sources. There is no need to delete the layer first. A layer with the same name that was not made by this preset (one made with `stratakb add`, `strata_create_knowledge_layer` or another preset) is refused and left unchanged; rename the preset's `name` or delete that layer. `strata_apply_preset` with `dry_run=true` also lists the settings that would change (`layer_check`), or `would_claim` when a layer with no recorded origin already matches the preset and would be marked as made by it, or `unknown` when the database does not answer within 5 seconds, while the script's `--dry-run` only parses the files and needs no database.
 
 ```mermaid
 flowchart TD
@@ -252,11 +270,11 @@ flowchart TD
 
 The layer's **description** also tells the query rewriter which terminology the layer uses, so a clear description improves `strata_ask`.
 
-The layer's **answer_mode** says how its questions are to be answered: `grounded` (the default) means your client writes the answer from the cited passages; `extractive` is for layers where paraphrase is not acceptable, answered with the document's own sentences. Any other value is refused. `strata_list_knowledge_layers` shows each layer's mode, applying a preset again sets the mode of an existing layer when the preset gives one (a preset without `answer_mode` leaves the layer's mode alone), and layers created before this setting read as `grounded`. The server records the mode but does not act on it yet: extractive answers are on the [roadmap](#roadmap).
+The layer's **answer_mode** says how an answer holding its passages is given: `grounded` (the default) means your client writes the answer from the cited passages; `extractive` is for layers where paraphrase is not acceptable, answered with the document's own sentences. Any other value is refused. `strata_create_knowledge_layer` takes the same `answer_mode`. `strata_list_knowledge_layers` shows each layer's mode, applying a preset again sets the mode of an existing layer when the preset gives one (a preset without `answer_mode` leaves the layer's mode alone), and layers created before this setting read as `grounded`. See [extractive answers](#extractive-answers) for what the mode does.
 
 ### Try an example preset
 
-The repository also ships three example presets. The quickest to try is Python PEPs: git fetches eight PEPs in a few seconds, with no account:
+The repository also ships three example presets. The quickest to try is Python PEPs: git fetches a handful of PEPs in a few seconds, with no account:
 
 ```bash
 git clone --depth 1 --filter=blob:none --sparse https://github.com/python/peps.git examples/peps/source
@@ -267,17 +285,51 @@ uv run python scripts/apply_preset.py examples/peps/preset.yaml             # cr
 
 Then ask from your client, for example *"How long should a line of Python be?"*. The SEPA preset includes a small sample of reason codes, so it works before you download anything (ask *"What does reject reason AC04 mean?"*); the ISO 20022 preset needs the downloaded schemas. [examples/README.md](examples/README.md) has the PEPs options (all PEPs, updates, Git Bash on Windows) and lists where to download the SEPA rulebooks and ISO 20022 documents.
 
+## Answers you can prove
+
+Every claim in an answer can be checked against the document it came from. How the answer is written depends on the mode, which the layer's `answer_mode` chooses:
+
+- **Grounded** (the default): your client writes the answer from the passages, cites them by id and checks the draft with `strata_verify`. The response is [the cited passages](#what-strata_ask-returns), and [the check](#checking-a-drafted-answer) issues a receipt when it passes.
+- **Extractive**: for text that must not be paraphrased, the server [answers with the document's own sentences](#extractive-answers) and a receipt, and your client shows them as they are.
+
+```mermaid
+flowchart TD
+    Q[Question] --> A[strata_ask]
+    A --> S{status}
+    S -->|not_found| N["Say: not in the documents"]
+    S -->|"found, partly_found"| M{mode}
+    M -->|grounded| W["Client writes the answer<br/>from the passages, cites [S1]"] --> V[strata_verify]
+    V -->|flagged| W
+    V -->|verified| R[Receipt]
+    M -->|extractive| X["Server returns the document's<br/>own sentences, shown as they are"] --> R
+```
+
+**The answer contract** is what the server tells the client's model to do, in the instructions it sends when a client connects:
+
+- Answer only from the passages `strata_ask` returns, never from its own knowledge.
+- Cite every claim by passage id, and copy numbers, dates, amounts, codes and clause numbers verbatim.
+- In grounded mode, call `strata_verify` before showing the answer, and fix or drop what it flags. A flag of kind `passage` (a span too wide to check, for example) cannot be fixed by rewriting, so the client says the answer is unverified.
+- In extractive mode, show `answer` verbatim, with each sentence's citation and any note or warning.
+- Show the receipt id when there is one. A `not_found`, a flagged draft and a grounded answer not yet verified have none.
+- When the status is `not_found`, say "not in the documents" and give `next_step`, even if passages came back. When it is `partly_found`, answer what the passages support and say what they leave open. When it is `error`, report the error.
+
+Clients that show MCP prompts also offer the same steps as the prompt `answer_from_documents`, with a `question` and optional comma-separated `layers`. The prompt reads no data and needs no database; the tools it names make their usual role checks.
+
+**The limits.** The instructions are a request to the client, not something the server can enforce: a client can ignore them, skip the check or retype a quote. What you can rely on is the receipt, which holds what the server itself read from the documents and, for a checked answer, the draft it checked. `strata_verify` checks quotes, numbers, dates, amounts, codes and clause references. It does not catch a paraphrase that changes the meaning without changing a fact; for layers where that is not acceptable, use `answer_mode: extractive`.
+
+**Opening a receipt.** Use `strata_get_receipt`, the resource `strata://receipts/{receipt_id}` or the command line, `uv run stratakb receipt <id>` ([what it prints](#checking-a-drafted-answer)). Each quote appears in its surrounding text, marked current, changed or gone. Receipts are kept for `RECEIPT_RETENTION_DAYS` (90 by default).
+
 ## Tools
 
 | Tool | Role | What it does |
 | --- | --- | --- |
-| `strata_ask` | viewer | Rewrites a question, searches in parallel, reranks, and returns found, partly found or not found with the best passages, each with its file, page, lines and headings ([what it returns](#what-strata_ask-returns)) |
+| `strata_ask` | viewer | Rewrites a question, searches in parallel, reranks, and returns found, partly found or not found with the best passages, each with its file, page, lines and headings ([what it returns](#what-strata_ask-returns)). When a passage returned comes from an extractive layer, or with `mode: "extractive"`, it answers with [the document's own sentences](#extractive-answers) and a receipt |
 | `strata_verify` | viewer | Checks a drafted answer against the passages it cites: every quote, number, date, amount, code and clause reference must be in them. A verified draft gets a receipt ([checking a drafted answer](#checking-a-drafted-answer)) |
 | `strata_search` | viewer | Hybrid search for exact terms and identifiers, with optional layer and metadata filters, and a confidence level; a clause or section the query names (`clause 7.2`) comes first, verbatim |
 | `strata_list_knowledge_layers` | viewer | Lists layers with document and chunk counts |
 | `strata_get_layer_status` | viewer | One layer's configuration and ingestion history |
-| `strata_get_receipt` | viewer | Opens a receipt (`rcpt_…`, also the resource `strata://receipts/{receipt_id}`): the stored quotes of an answer, each in its surrounding document text, marked current, changed (with the newer version) or gone (its file was removed from its folder or its layer was deleted). Open to whoever asked, to admins, and to anyone who may read every cited layer, for `RECEIPT_RETENTION_DAYS` (90 by default). From the command line: `stratakb receipt <id>`. Receipts are issued by `strata_verify`; extractive answers will issue them too ([roadmap](#roadmap)) |
-| `strata_feedback` | viewer | Rates a result as helpful or not, per answer or per passage (`S1`) or chunk |
+| `strata_get_receipt` | viewer | Opens a receipt (`rcpt_…`, also the resource `strata://receipts/{receipt_id}`): the stored quotes of an answer, each in its surrounding document text, marked current, changed (with the newer version) or gone (its file was removed from its folder or its layer was deleted). Open to whoever asked, to admins, and to anyone who may read every cited layer, for `RECEIPT_RETENTION_DAYS` (90 by default). From the command line: `stratakb receipt <id>`. Receipts are issued by `strata_verify` and by [extractive answers](#extractive-answers) |
+| `strata_feedback` | viewer | Rates a result as helpful or not, per answer or per passage (`S1`) or chunk (`useful`, `wrong` or `outdated`) |
 | `strata_learning_stats` | viewer | What the learning system has recorded and learned |
 | `strata_whoami` | viewer | Your identity and role |
 | `strata_admin_health` | viewer | Database, pgvector and schema status, the local-only switch, the providers that receive data, whether the SQL tools are on, and the embedding model and vector column checks |
@@ -301,9 +353,11 @@ On the stdio transport, `STRATA_USER` and `STRATA_ROLE` set who you are. Whoever
 
 The `stratakb add` command has no role check: whoever can reach the database with `DATABASE_URL` can add a folder. Each run writes one audit entry with the tool name `cli:add`, the folder, the run id and the counts per outcome (no file names). Its user is `STRATA_USER` when you set it, otherwise `os:` plus your login name, a name nobody verified.
 
-`strata_search` and `strata_ask` each write one audit entry with the first 200 characters of the query or question, with IBANs, BICs and account numbers replaced by placeholders (`[IBAN_REDACTED]`, `[BIC_REDACTED]`, `[ACCT_REDACTED]`), plus the layers searched and whether routing fell back. `AUDIT_STORE_RAW_QUERIES=true` keeps the question as written; `LEARNING_STORE_RAW_QUERIES` has no effect on the audit log.
+`strata_search` and `strata_ask` each write one audit entry with the first 200 characters of the query or question, with IBANs, BICs and account numbers replaced by placeholders (`[IBAN_REDACTED]`, `[BIC_REDACTED]`, `[ACCT_REDACTED]`), plus the layers searched and whether routing fell back; for `strata_ask` also the answer mode used. `AUDIT_STORE_RAW_QUERIES=true` keeps the question as written; `LEARNING_STORE_RAW_QUERIES` has no effect on the audit log.
 
-`strata_feedback` and `strata_reset_learning` each write one audit entry. A feedback entry holds the interaction id and the rating, not the suggested query or layer, and names only the extras (layer correction, better query, chunk ratings) that were stored; a reset entry names the layer, or says it reset everything. A reset runs as one transaction: if it fails in the database, nothing is deleted, and the tool returns an error and writes no audit entry. An empty `layer` is refused; omit it for a global reset.
+`strata_feedback` and `strata_reset_learning` each write one audit entry. A feedback entry holds the interaction id and the rating, not the suggested query or layer, and names only the extras (layer correction, better query, chunk ratings) that were stored; a reset entry names the layer, or says it reset everything. A reset runs as one transaction: if it fails in the database, nothing is deleted, and the tool returns an error and writes no audit entry. An empty `layer` is refused; omit it for a global reset. A `layer` is trimmed of surrounding spaces, and the result gives the number of rows `deleted`, with a `message` when that is 0 because the layer has no learning data or does not exist.
+
+A chunk rating other than `useful`, `wrong` or `outdated` refuses the whole `strata_feedback` call: it stores nothing, and the error lists the allowed values. When the rating is stored but an extra is not, the status stays `ok`, and `not_stored` and `warning` name each extra that failed (`correct_layer`, `better_query`, `chunk rating S2`). A failed learning read or write logs a warning with the error type only, never the error text.
 
 Each `strata_apply_preset` run writes one audit entry with the layer, whether it was created, updated or already up to date, the names of the settings that changed (never their values) and the number of documents and chunks ingested. A refused run writes none.
 
@@ -334,12 +388,67 @@ By default the answer is short: a status, the mode and the passages, each with i
 ```
 
 - `status` is `found` when the best passage scores high, `partly_found` when it scores medium, and `not_found` when it scores low or nothing came back. The last two add a `next_step`, such as adding a folder with `stratakb add` when no layer covers the question. The thresholds are the provisional ones of [Confidence](#glossary).
-- `mode` is `grounded`: the client writes the answer from the passages and cites them by id.
-- A question that names a clause or section (`clause 7.2`, `Article 12`, `§ 4`, `Annex II`, or a bare `4.3.2` or `7(2)(b)`) is looked up exactly in the [structure map](#how-it-works) of the layers searched: that section's text comes back first, verbatim, with its citation and `status` `found`, cut at a word when it would pass the budget. When the same number exists in several documents, each one comes back, cited by its file. The search's own passages follow, without the parts already inside the section. A reference that matches no section (a bare `7.2` that is a version or an amount) changes nothing. `strata_search` puts the same sections first among its results, marked `"match": "exact"`. Exact passages have no chunk id, so `strata_feedback` cannot rate them by passage id yet.
+- `mode` is the mode used. In `grounded` the client writes the answer from the passages and cites them by id; in `extractive` the server [answers with the document's own sentences](#extractive-answers).
+- A question that names a clause or section (`clause 7.2`, `Article 12`, `§ 4`, `Annex II`, or a bare `4.3.2` or `7(2)(b)`) is looked up exactly in the [structure map](#how-it-works) of the layers searched (only the first 2,000 characters of a question are read for references): that section's text comes back first, verbatim, with its citation and `status` `found`, cut at a word when it would pass the budget. When the same number exists in several documents, each one comes back, cited by its file. The search's own passages follow, without the parts already inside the section. A reference that matches no section (a bare `7.2` that is a version or an amount) changes nothing. `strata_search` puts the same sections first among its results, marked `"match": "exact"`. Exact passages have no chunk id, so `strata_feedback` cannot rate them by passage id yet.
 - The passages come best first and fill a budget of about 1,500 tokens (`ANSWER_TOKEN_BUDGET`), each passage's id, ref and citation counted with its text; the first passage always comes back, at most 50 come back, and `top_k` (default 10) only bounds the search before that.
 - Each passage's `text` is the stored document's own text. `ref` names its span in the stored document (`d<document id>:<start>-<end>`), or the chunk (`c<chunk id>`) for a chunk ingested before documents were stored. The citation has the file's path relative to the ingested folder, the page (PDFs; `page_end` too when the passage spans pages), the line range (from the page's start for PDFs) and the clause path from the structure map (for a chunk without one, such as one stored before the map existed or text before the first heading, the parser's heading path when it has one). A chunk ingested before documents were stored is cited by its file name, without lines.
-- `interaction_id` goes to `strata_feedback`, which takes passage ids for every passage returned: `{"S1": "useful", "S2": "wrong"}`.
+- `interaction_id` goes to `strata_feedback`, which takes passage ids for every passage returned except an exact clause match: `{"S1": "useful", "S2": "wrong"}`. Naming an exact passage refuses the call with an unknown passage id error.
 - `response_format: "detailed"` returns everything as well: `confidence`, the query variants (`queries_used`), `retrieved_chunks` with their ids, scores and metadata, `sources`, with `status` `ok` and the found, partly found or not found in `answer_status`.
+
+### Extractive answers
+
+For text that must not be paraphrased, the server answers with the document's own sentences, chosen without a language model. Nothing is rewritten, so nothing can be paraphrased wrongly, and nothing leaves the machine that a grounded answer would not send.
+
+```mermaid
+flowchart LR
+    P["Best passages"] --> S["Whole sentences<br/>they touch"]
+    S --> C["Cross-encoder scores<br/>each against the question"]
+    C --> T{"Any at or above<br/>the threshold?"}
+    T -->|yes| A["Up to 5 sentences within the budget,<br/>word for word, and a receipt"]
+    T -->|no| N["not_found:<br/>no answer, no guess"]
+```
+
+```json
+{
+  "status": "found",
+  "mode": "extractive",
+  "answer": [
+    {
+      "text": "7.2 Either party may end this agreement\nwith ninety days' written notice.",
+      "ref": "d42:1830-1905",
+      "passage": "S1",
+      "citation": {
+        "file": "contracts/acme-msa.md",
+        "page": null,
+        "lines": "30-31",
+        "clause_path": "Master agreement > 7 Termination",
+        "layer": "contracts"
+      },
+      "text_origin": "text"
+    }
+  ],
+  "receipt_id": "rcpt_…",
+  "interaction_id": "…"
+}
+```
+
+```mermaid
+flowchart TD
+    P{"Passages to<br/>hand back?"} -->|yes| E{"Any from an extractive layer,<br/>or mode: extractive asked?"}
+    E -->|yes| X[extractive]
+    E -->|no| G[grounded]
+    P -->|no| N["not_found, in the mode asked for,<br/>else the strictest of the layers searched"]
+```
+
+- **When it applies:** the mode follows the passages the answer hands back, after reranking and the token budget. The answer is extractive when any returned passage comes from an extractive layer, exact clause matches included, or when the call passes `mode: "extractive"`. A result with passages from grounded layers only stays grounded, whichever layers were searched, so adding an extractive layer does not change the answers that do not use it. `mode: "grounded"` cannot loosen a result holding a passage from an extractive layer: the answer stays extractive and a `note` says so. With no passages, `not_found` reports the mode asked for, or else extractive if one of the layers searched is.
+- **Each `text`** is exactly the span `ref` names in the stored document, whole sentences only, even when a passage starts or stops inside one. A wrapped line stays in its sentence; headings are left out; abbreviations and clause numbers (`e.g.`, `No.`, `7.2`) do not end one. A sentence from scanned text has `text_origin` `ocr` and a `warning` to check the original page.
+- **Long blocks are not quoted.** Lines without end marks (a price list, a schedule, a log, YAML) run together as one sentence until a blank line, heading or list item. A span over 2,000 characters is never cut and never returned, so a question that only such a block could answer is `not_found`. The best sentences that fit `ANSWER_TOKEN_BUDGET` are returned; the rest are left out.
+- **`receipt_id`** opens the quotes with `strata_get_receipt`. No sentence, no receipt.
+- **`status`** is judged on the sentences, on the same thresholds as above. `not_found` means no sentence that can be quoted scored at or above the threshold, which is the medium one of [Confidence](#glossary) and just as provisional.
+- **A clause the question names** (`clause 7.2`) is quoted sentence by sentence up to the budget, without needing the model. When part of it is left out, because a sentence is too long to quote or the rest is over the budget, the status is `partly_found` and a `note` names the clause and says why.
+- **Passages stored before documents were kept** cannot be quoted: when they are all that matched, the answer is `not_found` with the `note` "Re-ingest this layer to enable extractive answers."
+- **The model:** sentences are scored by the reranking model (`RERANKING_MODEL`), also when `RERANKING_ENABLED=false`. When it cannot load, the call fails with an error rather than answering without it.
+- With `response_format: "detailed"` each sentence also has its `score`, and everything a detailed answer holds comes along, `passages` included.
 
 ### Checking a drafted answer
 
@@ -365,8 +474,8 @@ flowchart LR
 - **Facts:** every number, date, amount, percentage, code (such as `AC01`, `pacs.008` or an IBAN) and clause reference outside the quotes must appear in at least one passage. Both sides are normalised: `30 days` matches `thirty (30) days`, `1,000.00` matches `1000`, `EUR 1.000,00` matches `1000 EUR`, and `2026-11-04` matches `4 November 2026`. An amount matches only an amount or a plain number, never a day count, clause number or year. A date such as `04/11/2026`, which could be either day or month first, only matches as written. The `1.` and `2)` of a numbered list are not facts.
 - **Citations:** an `[S5]` when four passages were given is flagged.
 - The result is `verified` with a `receipt_id` (open it with `strata_get_receipt`), or `flagged` with a list of flags, each naming the text, why, and the passages searched, for example `"13 days" not found in S1–S4`. At most 50 flags are listed; `more_flags` counts the rest. The receipt keeps the passages and the draft, with IBANs, BICs and account numbers in the draft replaced by placeholders.
-- Both checks run in Python, without a model: nothing leaves the machine. They catch a changed quote, number, date, amount, code or clause, not a paraphrase that changes the meaning without changing a fact. For layers where that is not acceptable, use `answer_mode: extractive` ([roadmap](#roadmap)).
-- Each call writes one audit entry (`verify`) with counts and, when verified, the receipt id; never the draft.
+- Both checks run in Python, without a model: nothing leaves the machine. They catch a changed quote, number, date, amount, code or clause, not a paraphrase that changes the meaning without changing a fact. For layers where that is not acceptable, use [`answer_mode: extractive`](#extractive-answers).
+- Each call with passages and within the limits (50 passages, a draft of 50,000 characters) writes one audit entry (`verify`) with counts and, when verified, the receipt id; never the draft.
 
 To check an answer outside the chat, open its receipt from the command line:
 
@@ -375,7 +484,9 @@ uv run stratakb receipt rcpt_…          # each quote marked >>> <<< in its con
 uv run stratakb receipt rcpt_… --json   # the same data as strata_get_receipt
 ```
 
-It makes the same access check as `strata_get_receipt`, with `STRATA_USER` and `STRATA_ROLE` as on stdio, and writes the same audit entry with the tool name `cli:receipt`. An unknown receipt, or one you may not open, exits with code `1` and one line on stderr; an unreachable database exits with `3`. The text form shows control characters from documents, file names, questions and drafts as escapes such as `\x1b`, so a document cannot hide or rewrite what your terminal shows.
+The receipt of a verified draft also prints the verification result in one line, such as `Verification: verified (quotes checked: 2, facts checked: 1, flags: 0)`.
+
+It makes the same access check as `strata_get_receipt`, with `STRATA_USER` and `STRATA_ROLE` as on stdio, and writes the same audit entry with the tool name `cli:receipt`. An unknown receipt, or one you may not open, exits with code `1` and one line on stderr; an unreachable database exits with `3`. The text form shows control characters from documents, file names, questions and drafts as escapes such as `\x1b`, so a document cannot hide or rewrite what your terminal shows. The `--json` forms of `stratakb receipt` and `stratakb add` write them as JSON escapes such as `\u009b` (also DEL and bidi overrides such as U+202E, written as `\u202e`), so the output stays valid JSON and decodes to the original text.
 
 ## Configuration
 
@@ -394,7 +505,7 @@ flowchart LR
 | `DATABASE_URL` | `postgresql://strata:…@127.0.0.1:5433/strata` | PostgreSQL connection |
 | `READONLY_DATABASE_URL` | | Connection for `strata_db_query` and `strata_db_explain`; point it at the `strata_readonly` role from `db/03_readonly_role.sql`. Empty means the two tools are off; a superuser, or a member of a superuser or server-access role (such as the Docker `strata` user) is refused |
 | `STRATA_USER`, `STRATA_ROLE` | `developer`, `viewer` | Identity and role on stdio |
-| `EMBEDDING_BACKEND` | `local` | `local` (sentence-transformers) or `openai` (OpenAI, or the OpenAI-compatible server in `EMBEDDING_BASE_URL`) |
+| `EMBEDDING_BACKEND` | `local` | `local` (sentence-transformers) or `openai` (OpenAI, or the OpenAI-compatible server in `EMBEDDING_BASE_URL`); searches and ingests refuse any other value |
 | `EMBEDDING_MODEL` | `all-mpnet-base-v2` | Embedding model; the `openai` backend uses `text-embedding-3-large` unless set |
 | `EMBEDDING_DIMENSIONS` | `768` | Must match the model and the `vector(…)` column; vectors of another length are refused, and `strata_admin_health` reports a column of another size |
 | `EMBEDDING_BASE_URL` | | `openai` backend: an OpenAI-compatible server, ending in `/v1` (for example `http://127.0.0.1:11434/v1`); empty means OpenAI |
@@ -410,7 +521,7 @@ flowchart LR
 | `HYBRID_RRF_K` | `60` | RRF constant |
 | `HYBRID_KEYWORD_SLOTS` | `1` | Results kept for the best full-text matches, so an exact term the embedding misses still comes back (at most `top_k` − 1; `0` turns it off) |
 | `HNSW_EF_SEARCH` | `40` | Recall versus latency for the vector index |
-| `RERANKING_ENABLED` | `true` | Cross-encoder reranking in `strata_ask` |
+| `RERANKING_ENABLED` | `true` | Cross-encoder reranking in `strata_ask`. Extractive answers score their sentences with the same model even when this is off |
 | `RERANKING_MODEL` | `cross-encoder/ms-marco-MiniLM-L-6-v2` | Reranker |
 | `RERANKING_CANDIDATE_MULTIPLIER` | `3` | `strata_ask` reranks `top_k` times this many candidates |
 | `ANSWER_TOKEN_BUDGET` | `1500` | How much text `strata_ask` returns: the best passages that fit this many tokens (about four characters each), citations included; the first passage always comes back |
@@ -499,7 +610,7 @@ The URL ends in `/v1`, and `QUERY_REWRITE_MODEL` must name a model the endpoint 
 
 ## Where your data goes
 
-By default nothing leaves this machine except what you choose to send: your documents stay in PostgreSQL, and the embedding and reranking models run in-process. Each other path is off until a setting turns it on.
+By default nothing leaves this machine except what you choose to send: your documents stay in PostgreSQL, and the embedding and reranking models run in-process. Each other path is off until a setting turns it on, except the model download from Hugging Face on first use, which sends nothing about your documents.
 
 ```mermaid
 flowchart LR
@@ -514,7 +625,7 @@ flowchart LR
     hf["Hugging Face"] -.->|"model files on first use,<br/>nothing about your documents"| models
 ```
 
-Dotted paths are off by default and blocked by `STRATA_LOCAL_ONLY=true`.
+Dotted paths are blocked by `STRATA_LOCAL_ONLY=true`. The rewrite and embedding paths are off by default; the Hugging Face download runs by default when a model is not in the cache.
 
 | Path | What leaves | Turned on by | Blocked by `STRATA_LOCAL_ONLY` |
 | --- | --- | --- | --- |
@@ -524,13 +635,13 @@ Dotted paths are off by default and blocked by `STRATA_LOCAL_ONLY=true`.
 | Rewrite endpoint on another host | Questions and layer descriptions | `QUERY_REWRITE_PROVIDER=openai_compatible` with `QUERY_REWRITE_BASE_URL` pointing off this machine and `QUERY_REWRITE_MODEL` set | Yes |
 | Rewrite endpoint on this machine | Questions and layer descriptions, to `127.0.0.1`, `::1` or `localhost` | `QUERY_REWRITE_PROVIDER=openai_compatible` with `QUERY_REWRITE_BASE_URL` and `QUERY_REWRITE_MODEL` set | No |
 | OpenAI embeddings | Documents and questions | `EMBEDDING_BACKEND=openai` without `EMBEDDING_BASE_URL` | Yes |
-| Embedding server on another host | Documents and questions | `EMBEDDING_BASE_URL` pointing off this machine | Yes |
-| Embedding server on this machine | Documents and questions, to `127.0.0.1`, `::1` or `localhost` | `EMBEDDING_BASE_URL` | No |
+| Embedding server on another host | Documents and questions | `EMBEDDING_BACKEND=openai` with `EMBEDDING_BASE_URL` pointing off this machine | Yes |
+| Embedding server on this machine | Documents and questions, to `127.0.0.1`, `::1` or `localhost` | `EMBEDDING_BACKEND=openai` with `EMBEDDING_BASE_URL` on this machine | No |
 | Hugging Face downloads | Nothing about your documents; model files come in | The first start, the first `stratakb add` and the first `strata_ask` | Yes |
 
-With `STRATA_LOCAL_ONLY=true` the server refuses to start while any blocked path is configured, and the error names each setting that caused it. The embedding calls and query rewriting check the switch again on every call, so a key added later is refused too. The Hugging Face libraries run offline and load the embedding and reranking models from local files only; a model that is not installed fails with a message that says how to install it (`uv run hf download <model>` on a machine that may download, or `EMBEDDING_MODEL` / `RERANKING_MODEL` set to a folder that holds it). The switch does not cover the database: `DATABASE_URL` may point at a team server on purpose. `stratakb add` checks the embedding path before it starts: with a blocked one configured it refuses with exit `2` (`reason` `local_only` in `--json`), names the setting and writes nothing. It does not check query rewriting, which it never uses. The OpenAI and Anthropic SDKs also read `OPENAI_BASE_URL` and `ANTHROPIC_BASE_URL`; StrataKB treats them as the destination of those paths, and `STRATA_LOCAL_ONLY` checks them too. Requests to `EMBEDDING_BASE_URL` and `QUERY_REWRITE_BASE_URL` never carry `OPENAI_API_KEY`, `OPENAI_ADMIN_KEY`, `OPENAI_ORG_ID` or `OPENAI_PROJECT_ID`.
+With `STRATA_LOCAL_ONLY=true` the server refuses to start while any blocked path is configured, and the error names each setting that caused it. `strata_search`, `strata_ask` and query rewriting use the embedding, search, rewrite and answer settings the server started with: editing those in a config file while the server runs changes nothing for them until you restart it. Three things are read from the config files later: `STRATA_USER` and `STRATA_ROLE` on every tool call, the cache settings when the cache is first built, and the switch itself when a model has to be loaded and is not in the cache. `strata_ingest_documents` and `strata_apply_preset` still read the config files on each call and check the switch there, so a key added later is refused. The Hugging Face libraries run offline and load the embedding and reranking models from local files only; a model that is not installed fails with a message that says how to install it (`uv run hf download <model>` on a machine that may download, or `EMBEDDING_MODEL` / `RERANKING_MODEL` set to a folder that holds it). The switch does not cover the database: `DATABASE_URL` may point at a team server on purpose. `stratakb add` checks the embedding path before it starts: with a blocked one configured it refuses with exit `2` (`reason` `local_only` in `--json`), names the setting and writes nothing. It does not check query rewriting, which it never uses. The OpenAI and Anthropic SDKs also read `OPENAI_BASE_URL` and `ANTHROPIC_BASE_URL`; StrataKB treats them as the destination of those paths, and `STRATA_LOCAL_ONLY` checks them too. Requests to `EMBEDDING_BASE_URL` and `QUERY_REWRITE_BASE_URL` never carry `OPENAI_API_KEY`, `OPENAI_ADMIN_KEY`, `OPENAI_ORG_ID` or `OPENAI_PROJECT_ID`.
 
-`strata_admin_health` always lists the switch (`local_only`) and the active outbound providers (`outbound`: provider, purpose, what it sends, destination host and the setting that turns it on), whether the switch is on or not. It never shows keys, credentials, paths or ports.
+`strata_admin_health` always lists the switch (`local_only`) and the active outbound providers (`outbound`: provider, purpose, what it sends, destination host and the setting that turns it on), whether the switch is on or not. It never shows keys, credentials, paths or ports. The report shows the settings the server started with.
 
 With `EMBEDDING_BASE_URL` set (and `EMBEDDING_BACKEND` not `local`), the server also asks that server for its model list once at startup. The request carries `EMBEDDING_API_KEY` (no `Authorization` header when it is empty) and nothing about your documents, and with `STRATA_LOCAL_ONLY=true` it is only sent to a server on this machine.
 
@@ -538,16 +649,20 @@ StrataKB cannot control what your MCP client's language model does with the retr
 
 ## Glossary
 
+- **Answer contract**: what the server tells the client's model to do with an answer: use only the returned passages, cite them, copy facts verbatim, check the draft and show the receipt. See [Answers you can prove](#answers-you-can-prove).
 - **Chunk**: a passage of a document, cut along its headings or structure. Search returns chunks, each with its file and section.
 - **Confidence**: `high`, `medium` or `low`, returned with every `strata_search` result and with `strata_ask` in `response_format: "detailed"`; a low one comes with a warning. `strata_ask`'s detailed `confidence`, and the one the learning loop stores, is judged on all reranked chunks before the budget trims them; its `found`, `partly_found` or `not_found` is read from the best returned passage's score on the same thresholds. It is judged on the reranker's relevance probability (0 to 1) or, with reranking off, on each chunk's `similarity` (how similar the question and the chunk are by meaning); the result says which (`basis`: `rerank` or `similarity`). Each detailed `strata_ask` chunk carries `score` (its merged rank, best 1.0), `similarity`, `rerank_score` (null with reranking off), `source_file` and `section`, and each source's `relevance_score` is the score confidence was judged on. `strata_search` results carry each chunk's `similarity` (with hybrid search on, the default, its `score` is the fused rank, where the best result is always 1.0), and `strata_search` judges its confidence on that similarity (`basis` `similarity`), never on the fused `score`; a chunk without an embedding counts as similarity 0. The learning loop stores the confidence the tool returned, and each stored result keeps its `similarity`. The thresholds are provisional until the evaluation suite measures them.
 - **Embedding**: a list of numbers that stands for a chunk's meaning, so similar meanings get similar numbers. The embedding model (`all-mpnet-base-v2` by default) makes them; the vector column stores them (`EMBEDDING_DIMENSIONS`, 768 by default).
+- **Extractive answer**: an answer made of the document's own sentences, chosen by the server without a language model. See [Extractive answers](#extractive-answers).
+- **Grounded answer**: an answer your client writes from the cited passages and checks with `strata_verify`. See [Checking a drafted answer](#checking-a-drafted-answer).
 - **HNSW**: the pgvector index that finds similar embeddings quickly; `HNSW_EF_SEARCH` trades recall for speed.
 - **Hybrid search**: a search by meaning (embeddings) and a search by words (PostgreSQL full-text search), merged into one list with RRF.
 - **interaction_id**: the id on each search and ask result while learning is on; pass it to `strata_feedback` to rate the result.
 - **Layer**: a named collection of documents, usually one folder or one domain, with its own chunking and routing rules.
 - **Query rewriting**: optional; a language model turns a question into several searches in the layer's own terms. Learned rewrites are reused without the model.
+- **Receipt**: the stored record of a verified or extractive answer (`rcpt_…`), which shows its quotes in their documents and whether those have changed since. See [Answers you can prove](#answers-you-can-prove).
 - **Reranking**: in `strata_ask`, a second model (a cross-encoder, `RERANKING_MODEL`) reads the question with each candidate chunk and puts the best first.
-- **Routing patterns**: a layer's regular expressions. When a question names no layers, those whose patterns match are searched first.
+- **Routing patterns**: a layer's regular expressions. When a question names no layers, those whose patterns match its first 2,000 characters are searched first. A pattern that does not compile or that repeats a repeated part (such as `(\w+\s?)*`) is refused when the layer is created or updated or the preset is loaded, and skipped if a layer already holds one.
 - **RRF** (Reciprocal Rank Fusion): how hybrid search merges its two lists by rank, weighted by `HYBRID_SEMANTIC_WEIGHT` and `HYBRID_KEYWORD_WEIGHT`, with the constant `HYBRID_RRF_K`. The best full-text matches keep `HYBRID_KEYWORD_SLOTS` places in the results, because a chunk found only by words would otherwise rank below every chunk found by meaning. `strata_ask` merges the results of its searches (one per rewritten query) the same way, by rank with `HYBRID_RRF_K`: a chunk several searches find comes first, and ties go to the more similar chunk.
 - **top_k**: how many chunks a tool returns: 5 by default for `strata_search`; for `strata_ask` (10 by default) how many each search returns before `ANSWER_TOKEN_BUDGET` trims them.
 
@@ -556,12 +671,12 @@ StrataKB cannot control what your MCP client's language model does with the retr
 ```
 db/                   03_readonly_role.sql (SQL tools role, applied with psql)
 examples/             Example layer presets (Python PEPs, SEPA, ISO 20022)
-scripts/              apply_preset.py, backup_restore.py
+scripts/              apply_preset.py, backup_restore.py, and the pull request checks check_repo_rules.py and ruff_changed_lines.py
 src/stratakb/
-  cli.py              The stratakb command: add a folder, start a local database, or start the server
+  cli.py              The stratakb command: add a folder, start a local database, open a receipt, or start the server
   mcp_server.py       MCP server: admin and user tools
   core/               Database pool, roles, audit log, logging, schema migrations, local database in Docker
-    sql/              Schema, applied in version order by the server: 01_init, 02_learning, then the 04–12 upgrades
+    sql/              Schema, applied in version order by the server: 01_init, 02_learning, then the 04–13 upgrades
   knowledge/          Layers, presets, ingestion pipeline, structure map, parsers, embeddings, vector store
     add_folder.py     Turns one folder into one layer and keeps it in sync
   rag/                Retriever (hybrid + RRF), reranker, cache, routing, query rewriter, cited passages, receipts, verify, tools
@@ -585,31 +700,19 @@ uv run stratakb --help         # the commands and their flags
 
 Without a running database, the integration tests fail with a connection error and the rest pass. `docker compose` and `stratakb db up` both use port 5433, so run one at a time, or pass `--port` to `stratakb db up`. Both containers (`strata-postgres` and `stratakb-db`) start again with Docker unless they were stopped, so on a machine with both on 5433 they race for the port at every Docker start. Stop the one you don't use (`stratakb db down` or `docker compose stop`) and it stays stopped, or give `stratakb db up --port` another port when it creates the container.
 
-`scripts/backup_restore.py` backs up the whole database or exports and imports a single layer, through `docker exec` in the `strata-postgres` container; `DB_CONTAINER=stratakb-db` points it at the `stratakb db up` database. A layer export holds its configuration, file tracking, stored document text and chunks, so adding the same folder again after an import finds its files unchanged; receipts are only in a full backup.
+`scripts/backup_restore.py` backs up the whole database or exports and imports a single layer, through `docker exec` in the `strata-postgres` container; `DB_CONTAINER=stratakb-db` points it at the `stratakb db up` database. A layer export holds its configuration, file tracking, stored document text and chunks, so adding the same folder again after an import finds its files unchanged; receipts are only in a full backup. An export keeps the folder's absolute path. When the folder sits elsewhere on the target machine, run `import-layer` there with `--root <folder>` so the layer points at the new path and its files still count as unchanged. An import stops, changing nothing, when another layer holds the folder it would use and names that layer (`--root` with a free folder gets past this), and when the file has a newer export format than the script reads.
+
+**Import only files you made or trust.** `restore` and `import-layer` feed the file to `psql` with the database owner's rights, so a crafted file can do anything in the database.
 
 ## Roadmap
 
 The target: ask your own documents (contracts, rulebooks, specs, runbooks) and get answers you can **prove**, without learning how retrieval works and without sending private data anywhere you did not choose. Work is grouped into [milestones](https://github.com/boudou/StrataKB/milestones):
 
 1. **Five-minute start**: add a folder in one step, a one-command local mode, any OpenAI-compatible model provider, and a clear statement of where data goes.
-2. **Answers you can prove** (planned): every claim can be checked against its source, so you can be sure the model did not make it up.
-   - Each passage comes with its exact location: file, page, line range and clause (`7 Termination > 7.2`), and documents are chunked along their clauses and sections.
-   - **Grounded mode** (available): your client writes the answer, and `strata_verify` checks that every quote, number, date, amount, code and clause reference in it appears in the cited passages.
-   - **Extractive mode:** for layers where paraphrase is not acceptable, the server answers with the document's own sentences, chosen without a language model.
-   - **Receipts:** every verified or extractive answer gets a receipt you can open outside the chat, showing the quotes in context and whether the document changed since.
-   - An honest "not found" instead of a confident guess, and smaller responses that cost fewer tokens.
+2. **[Answers you can prove](#answers-you-can-prove)** (available): every claim can be checked against its source. Still to come: an evaluation suite that measures the provisional not-found thresholds, and structured tool output with failures reported as real tool errors.
 3. **Team server**: Streamable HTTP, real identities, per-layer access.
 4. **Daily use and sync**: a command line for daily use, connectors (git first), scanned PDFs.
 5. **Depth**: exact-lookup catalogs, cross-document references, source code.
-
-```mermaid
-flowchart LR
-    Q[Question] --> A[strata_ask]
-    A --> P["Passages with<br/>exact locations"]
-    P --> G{Layer mode}
-    G -->|grounded| W[Client writes answer] --> V[strata_verify] --> R[Receipt]
-    G -->|extractive| X["Server returns the<br/>document's own sentences"] --> R
-```
 
 The product goal, the goals every change is checked against and the order of work are in [docs/IMPROVEMENTS.md](docs/IMPROVEMENTS.md).
 

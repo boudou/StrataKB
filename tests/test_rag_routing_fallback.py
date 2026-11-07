@@ -3,25 +3,14 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock
 
 import pytest
 
 from stratakb.config import Settings
 from stratakb.rag.retriever import SearchResult, _hybrid_search
 from stratakb.rag.tools import register_rag_tools
-
-
-class _ToolCollector:
-    def __init__(self):
-        self.tools = {}
-
-    def tool(self):
-        def register(fn):
-            self.tools[fn.__name__] = fn
-            return fn
-
-        return register
+from tests.helpers import capture_tools, mock_pool
 
 
 @pytest.fixture
@@ -39,11 +28,12 @@ def tools(monkeypatch):
     )
     monkeypatch.setattr("stratakb.config.get_settings", lambda: settings)
     monkeypatch.setattr("stratakb.rag.tools.write_audit_log", AsyncMock())
+    monkeypatch.setattr(
+        "stratakb.knowledge.layers.get_answer_modes", AsyncMock(return_value=["grounded"])
+    )
     detect = AsyncMock(return_value=[])
     monkeypatch.setattr("stratakb.rag.tools._detect_layers", detect)
-    collector = _ToolCollector()
-    register_rag_tools(collector, "postgresql://test")
-    return collector.tools, settings, detect
+    return capture_tools(register_rag_tools, "postgresql://test"), settings, detect
 
 
 def _result(name, layer, *, score=1.0, similarity=0.9, doc_type="markdown"):
@@ -181,7 +171,7 @@ async def test_ask_falls_back_after_deduplicating_rewritten_queries(tools, monke
         "stratakb.rag.query_rewriter.rewrite_query", AsyncMock(return_value=["one", "two"])
     )
 
-    async def search(_db, _key, _query, *, layers, top_k):
+    async def search(_db, _key, _query, *, layers, top_k, settings):
         if layers:
             return [_result("first", "routed")]
         return [_result("first", "routed"), _result("second", "other", score=0.9)]
@@ -251,12 +241,6 @@ async def test_hybrid_search_keeps_cosine_similarity_separate_from_rrf_rank():
             }
         ],
     ]
-    transaction = AsyncMock()
-    conn.transaction = MagicMock(return_value=transaction)
-    acquired = AsyncMock()
-    acquired.__aenter__.return_value = conn
-    pool = MagicMock()
-    pool.acquire.return_value = acquired
     settings = SimpleNamespace(
         hnsw_ef_search=40,
         hybrid_rrf_k=60,
@@ -265,6 +249,7 @@ async def test_hybrid_search_keeps_cosine_similarity_separate_from_rrf_rank():
         hybrid_keyword_slots=1,
     )
 
+    pool = mock_pool(conn)
     results = await _hybrid_search(pool, "question", "[1,0]", ["routed"], 1, None, settings)
 
     assert results[0].score == 1.0
@@ -342,3 +327,55 @@ async def test_search_confidence_counts_missing_similarity_as_zero(tools, monkey
     response = await registered["strata_search"]("accounting guide", top_k=1)
 
     assert response["confidence"]["warning"].startswith("No results found")
+
+
+@pytest.mark.asyncio
+async def test_search_response_keys_in_order(tools, monkeypatch):
+    registered, _, detect = tools
+    detect.return_value = ["routed"]
+    monkeypatch.setattr(
+        "stratakb.rag.retriever.search_chunks",
+        AsyncMock(return_value=[_result("weak", "routed", similarity=0.1)]),
+    )
+
+    response = await registered["strata_search"]("accounting guide", top_k=1)
+
+    assert list(response) == [
+        "status", "query", "confidence", "results", "total",
+        "auto_detected_layers", "routing_fallback",
+    ]
+    assert list(response["confidence"]) == [
+        "level", "top_score", "relevant_sources", "basis", "warning",
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("tool", "text", "error"),
+    [
+        ("strata_ask", " ", "Question cannot be empty."),
+        ("strata_search", " ", "Query cannot be empty."),
+    ],
+)
+async def test_empty_input_returns_the_error_dict(tools, tool, text, error):
+    registered, _, _ = tools
+
+    assert await registered[tool](text) == {"status": "error", "error": error}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("tool", "kwargs"),
+    [
+        ("strata_ask", {}),
+        ("strata_ask", {"response_format": "detailed"}),
+        ("strata_search", {}),
+    ],
+)
+async def test_failed_search_returns_the_error_dict(tools, monkeypatch, tool, kwargs):
+    registered, _, _ = tools
+    monkeypatch.setattr(
+        "stratakb.rag.retriever.search_chunks", AsyncMock(side_effect=RuntimeError("boom"))
+    )
+
+    assert await registered[tool]("question", **kwargs) == {"status": "error", "error": "boom"}

@@ -10,13 +10,18 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import functools
+import json
 import threading
 from contextlib import asynccontextmanager
+from typing import Annotated
 
 import structlog
 from mcp.server.fastmcp import FastMCP
+from pydantic import Field
 
-from stratakb.config import Settings, config_file_missing, dotenv_warning, get_settings
+# get_settings is imported where it is called, never here: a module-level binding
+# made while a test patches stratakb.config.get_settings keeps the mock for good
+from stratakb.config import Settings, config_file_missing, dotenv_warning
 from stratakb.core.audit import query_audit_log, write_audit_log
 from stratakb.core.auth import require_role
 from stratakb.core.database import check_connection, close_pool, get_pool
@@ -147,13 +152,32 @@ def _preload_embedding_model_sync(model_name: str) -> None:
         logger.warning("embedding_preload_failed", error=str(e))
 
 
+# The answer contract: the instructions and the prompt both list these rules
+_ANSWER_CONTRACT = (
+    "Answer only from the passages strata_ask returns, never from your own knowledge.",
+    'Cite every claim by passage id, as [S1]; write a quote as "..." [S1].',
+    "Copy numbers, dates, amounts, codes and clause numbers verbatim.",
+    "Follow the mode in the response. In grounded mode write the answer, then call strata_verify "
+    "before showing it, with the draft and every returned passage's ref in order (the first is "
+    "S1). When the result is flagged, fix or drop the flagged claims and verify again. A flag of "
+    "kind passage cannot be fixed by rewriting: say the answer is unverified.",
+    "In extractive mode show answer verbatim, each sentence with its citation, and any note or "
+    "warning.",
+    "Always show the receipt id when there is one: receipt_id from strata_verify, or from "
+    "strata_ask in extractive mode. strata_get_receipt opens it.",
+    'When status is not_found, say "not in the documents" and give next_step, even if passages '
+    "came back. When it is partly_found, answer what the passages support and say what they "
+    "leave open. When it is error, report the error.",
+)
+
 _INSTRUCTIONS = (
-    "StrataKB is a knowledge base of documents organised in layers, one per "
-    "domain (for example a standard, a product's docs or a team's runbooks). "
-    "Use strata_ask to answer questions with cited context, strata_search for "
-    "exact terms and identifiers, strata_verify to check a drafted answer's "
-    "quotes and facts against the cited passages, and strata_list_knowledge_layers "
-    "to see what the knowledge base covers. Admin tools create layers, ingest documents and "
+    "StrataKB is a knowledge base of documents organised in layers, one per domain (for example "
+    "a standard, a product's docs or a team's runbooks). Use strata_ask to answer questions, and "
+    "follow these rules:\n"
+    + "\n".join(f"- {rule}" for rule in _ANSWER_CONTRACT)
+    + "\nUse strata_search for exact terms and identifiers and strata_list_knowledge_layers to "
+    "see what the knowledge base covers. With response_format detailed, the found, partly_found "
+    "or not_found status is in answer_status. Admin tools create layers, ingest documents and "
     "apply layer presets."
 )
 
@@ -176,7 +200,29 @@ def build_server(settings: Settings) -> FastMCP:
     register_database_tools(mcp, settings.database_url, settings.readonly_database_url)
     register_learning_tools(mcp, settings.database_url)
     _register_admin_tools(mcp, settings)
+    _register_prompts(mcp)
     return mcp
+
+
+def _register_prompts(mcp: FastMCP) -> None:
+    """Register the MCP prompts."""
+
+    @mcp.prompt(name="answer_from_documents", title="Answer from documents")
+    async def answer_from_documents(
+        question: Annotated[str, Field(description="The question to answer")],
+        layers: Annotated[str | None, Field(description="Layer names, comma-separated")] = None,
+    ) -> str:
+        """Answer a question from the knowledge base, with citations and a receipt."""
+        names = [name.strip() for name in (layers or "").split(",") if name.strip()]
+        call = (
+            f"Call strata_ask with this question and layers={json.dumps(names)}."
+            if names
+            else "Call strata_ask with this question."
+        )
+        steps = (call, *_ANSWER_CONTRACT)
+        return f"Question: {question}\n\n" + "\n".join(
+            f"{number}. {step}" for number, step in enumerate(steps, 1)
+        )
 
 
 def _register_admin_tools(mcp: FastMCP, settings: Settings) -> None:
@@ -201,10 +247,10 @@ def _register_admin_tools(mcp: FastMCP, settings: Settings) -> None:
         startup: whether the server in EMBEDDING_BASE_URL lists the embedding
         model, and whether the vector column's size matches EMBEDDING_DIMENSIONS.
         A missing model or a size mismatch turns overall to degraded; restart
-        the server after fixing either.
+        the server after fixing either. The report shows the settings the
+        server started with.
         """
         result: dict[str, object] = {}
-        current = get_settings()
 
         # Check database
         db_status = await check_connection(settings.database_url)
@@ -226,8 +272,8 @@ def _register_admin_tools(mcp: FastMCP, settings: Settings) -> None:
         result["overall"] = "ok" if all_ok else "degraded"
 
         # Where data goes (host names and setting names only, never values)
-        result["local_only"] = current.strata_local_only
-        result["outbound"] = [p.report() for p in outbound_providers(current)]
+        result["local_only"] = settings.strata_local_only
+        result["outbound"] = [p.report() for p in outbound_providers(settings)]
 
         # SQL tools: on only with a safe READONLY_DATABASE_URL role
         result["sql_tools"] = sql_tools_status()
@@ -366,6 +412,8 @@ def _register_admin_tools(mcp: FastMCP, settings: Settings) -> None:
 def main(settings: Settings | None = None) -> None:
     """Run the StrataKB MCP server, built from `settings` (default: the environment)."""
     if settings is None:
+        from stratakb.config import get_settings
+
         settings = get_settings()
 
     # Configure structured logging (centralized)
@@ -383,18 +431,6 @@ def main(settings: Settings | None = None) -> None:
     # lifespan warms up the DB, then starts the embedding model load in the
     # background so the client gets its first answer at once
     build_server(settings).run(transport="stdio")
-
-
-def __getattr__(name: str) -> FastMCP:
-    """Return a new server built from the current settings for `mcp`.
-
-    Builds a new server on every access and never caches it: a cached server
-    would fix the database URL for the whole process again. Exists only until
-    the tests build their own servers with build_server.
-    """
-    if name == "mcp":
-        return build_server(get_settings())
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 if __name__ == "__main__":

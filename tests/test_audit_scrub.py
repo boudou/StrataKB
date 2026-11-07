@@ -9,6 +9,7 @@ import pytest
 
 from stratakb.config import Settings
 from stratakb.rag.tools import _audit_text, register_rag_tools
+from tests.helpers import capture_tools
 
 IBAN = "GR1601101250000000012300695"
 QUESTION = f"why was {IBAN} rejected?"
@@ -16,18 +17,6 @@ SCRUBBED = "why was [IBAN_REDACTED] rejected?"
 
 # (audit_store_raw_queries, learning_store_raw_queries)
 SETTING_CASES = [(False, False), (False, True), (True, False)]
-
-
-class _ToolCollector:
-    def __init__(self):
-        self.tools = {}
-
-    def tool(self):
-        def register(fn):
-            self.tools[fn.__name__] = fn
-            return fn
-
-        return register
 
 
 def _settings(audit_raw: bool, learning_raw: bool, user: str = "test-user") -> Settings:
@@ -47,9 +36,7 @@ def _register(monkeypatch, settings: Settings, database_url: str) -> dict:
     monkeypatch.setattr("stratakb.config.get_settings", lambda: settings)
     monkeypatch.setattr("stratakb.rag.tools._detect_layers", AsyncMock(return_value=[]))
     monkeypatch.setattr("stratakb.rag.retriever.search_chunks", AsyncMock(return_value=[]))
-    collector = _ToolCollector()
-    register_rag_tools(collector, database_url)
-    return collector.tools
+    return capture_tools(register_rag_tools, database_url)
 
 
 class TestAuditedQuestion:
@@ -71,6 +58,9 @@ class TestAuditedQuestion:
     async def test_ask_entry(self, monkeypatch, audit_raw, learning_raw):
         audit = AsyncMock()
         monkeypatch.setattr("stratakb.rag.tools.write_audit_log", audit)
+        monkeypatch.setattr(
+            "stratakb.knowledge.layers.get_answer_modes", AsyncMock(return_value=["grounded"])
+        )
         tools = _register(monkeypatch, _settings(audit_raw, learning_raw), "postgresql://test")
 
         await tools["strata_ask"](question=QUESTION, layers=["sepa"])
@@ -111,12 +101,6 @@ class TestAuditText:
         assert "[IBAN_REDACTED]" in stored
         assert "GR16" not in stored
         assert len(stored) <= 200
-
-
-@pytest.fixture
-def db_url():
-    from stratakb.config import get_settings
-    return get_settings().database_url
 
 
 class TestStoredEntry:

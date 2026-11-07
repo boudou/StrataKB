@@ -8,9 +8,8 @@ from __future__ import annotations
 
 import asyncio
 import time
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from typing import Any
 
 import structlog
 
@@ -18,7 +17,14 @@ from stratakb.config import Settings
 from stratakb.learning.pii import scrub_query
 from stratakb.learning.signals import detect_reformulation, detect_layer_switch, detect_follow_up
 from stratakb.learning.store import LearningStore
-from stratakb.rag.passages import MAX_PASSAGES, AskResult
+from stratakb.rag.confidence import Confidence
+from stratakb.rag.passages import (
+    MAX_PASSAGES,
+    AnswerMode,
+    AskResult,
+    SearchResponse,
+    ToolFailure,
+)
 
 logger = structlog.get_logger()
 
@@ -28,7 +34,7 @@ class _Recorded:
     """What the learning loop records from one tool result."""
 
     chunks: list[dict]
-    confidence: dict
+    confidence: Confidence
     detected_layers: list[str] | None
     rewritten_queries: list[str] | None
 
@@ -42,30 +48,25 @@ def _ask_fields(result: AskResult) -> _Recorded:
     )
 
 
-def _search_fields(result: dict) -> _Recorded:
+def _search_fields(result: SearchResponse) -> _Recorded:
     return _Recorded(
-        chunks=result.get("results", []),
-        confidence=result.get("confidence", {}),
-        detected_layers=result.get("auto_detected_layers"),
+        chunks=result.results,
+        confidence=result.confidence,
+        detected_layers=result.auto_detected_layers or None,
         rewritten_queries=None,
     )
 
 
 @dataclass(frozen=True)
-class _TrackedTool:
+class _TrackedTool[R: AskResult | SearchResponse]:
     """What differs between the tracked tools: name and how to read the result."""
 
     name: str
-    read: Callable[[Any], _Recorded]
+    read: Callable[[R], _Recorded]
 
 
 _ASK = _TrackedTool("strata_ask", _ask_fields)
 _SEARCH = _TrackedTool("strata_search", _search_fields)
-
-
-def _is_error(result: AskResult | dict) -> bool:
-    """A tool's error comes back as a dict whose status is not ok."""
-    return isinstance(result, dict) and result.get("status") != "ok"
 
 
 class Tracker:
@@ -78,34 +79,37 @@ class Tracker:
 
     async def track_ask(
         self,
-        original_fn,
+        original_fn: Callable[..., Awaitable[AskResult | ToolFailure]],
         question: str,
         layers: list[str] | None = None,
         include_sources: bool = True,
         top_k: int = 10,
-    ) -> AskResult | dict:
+        mode: AnswerMode | None = None,
+    ) -> AskResult | ToolFailure:
         """Wrap strata_ask with tracking; adds interaction_id to the result."""
-        return await self._track(_ASK, original_fn, question, layers, include_sources, top_k)
+        return await self._track(
+            _ASK, original_fn, question, layers, include_sources, top_k, mode
+        )
 
     async def track_search(
         self,
-        original_fn,
+        original_fn: Callable[..., Awaitable[SearchResponse | ToolFailure]],
         query: str,
         layers: list[str] | None = None,
         top_k: int = 5,
         metadata_filter: dict | None = None,
-    ) -> dict:
+    ) -> SearchResponse | ToolFailure:
         """Wrap strata_search with tracking; adds interaction_id to the result."""
         return await self._track(_SEARCH, original_fn, query, layers, top_k, metadata_filter)
 
-    async def _track(
+    async def _track[R: AskResult | SearchResponse](
         self,
-        tool: _TrackedTool,
-        original_fn,
+        tool: _TrackedTool[R],
+        original_fn: Callable[..., Awaitable[R | ToolFailure]],
         query: str,
         layers: list[str] | None,
         *args,
-    ) -> AskResult | dict:
+    ) -> R | ToolFailure:
         """Run a tool with its arguments in order and record the ok result."""
         if not self._settings.learning_enabled:
             return await original_fn(query, layers, *args)
@@ -114,7 +118,7 @@ class Tracker:
         result = await original_fn(query, layers, *args)
         elapsed_ms = int((time.monotonic() - start) * 1000)
 
-        if _is_error(result):
+        if not result.ok:
             return result
 
         recorded = tool.read(result)
@@ -127,26 +131,22 @@ class Tracker:
             layers_detected=detected,
             rewritten_queries=recorded.rewritten_queries,
             chunks=recorded.chunks,
-            confidence_level=recorded.confidence.get("level"),
-            confidence_score=recorded.confidence.get("top_score"),
+            confidence_level=recorded.confidence.level,
+            confidence_score=recorded.confidence.top_score,
             response_time_ms=elapsed_ms,
         )
 
         return result
 
-    async def _record_safely(self, result: AskResult | dict, **kwargs) -> None:
+    async def _record_safely(self, result: AskResult | SearchResponse, **kwargs) -> None:
         """Record the interaction and add its id to the result; tracking never fails the tool."""
         try:
             interaction_id = await self._record(**kwargs)
         except Exception as e:
             logger.warning("learning_record_failed", error=str(e))
             return
-        if not interaction_id:
-            return
-        if isinstance(result, AskResult):
+        if interaction_id:
             result.interaction_id = interaction_id
-        else:
-            result["interaction_id"] = interaction_id
 
     async def _record(
         self,

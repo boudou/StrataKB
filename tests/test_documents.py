@@ -6,6 +6,7 @@ real pipeline against the database with embeddings mocked.
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import hashlib
 import json
@@ -16,14 +17,9 @@ from uuid import uuid4
 
 import pytest
 
-FIXTURES = Path(__file__).parent / "fixtures"
-FAKE_EMBEDDING = [0.01] * 768
+from tests.helpers import FAKE_EMBEDDING, ingest, wait_until_blocked_by
 
-
-@pytest.fixture
-def db_url():
-    from stratakb.config import get_settings
-    return get_settings().database_url
+FIXTURES =Path(__file__).parent / "fixtures"
 
 
 @pytest.fixture
@@ -41,16 +37,6 @@ async def layer(db_url):
     yield name
     with contextlib.suppress(LayerNotFoundError):
         await delete_layer(db_url, name=name)
-
-
-async def _ingest(db_url: str, layer: str, source: Path, **kwargs):
-    from stratakb.knowledge.ingestion import ingest_documents
-
-    with patch("stratakb.knowledge.ingestion.embed_texts", new_callable=AsyncMock) as mock:
-        mock.side_effect = lambda texts, **_: [FAKE_EMBEDDING for _ in texts]
-        return await ingest_documents(
-            db_url, "fake-key", layer_name=layer, source_path=str(source), **kwargs
-        )
 
 
 async def _documents(db_url: str, layer: str) -> list:
@@ -122,6 +108,22 @@ async def _store_bare_document(
         )
 
 
+async def _file_rows(db_url: str, layer: str) -> dict:
+    """The layer's ingested_files ids, keyed by relative path."""
+    from stratakb.core.database import get_pool
+
+    pool = await get_pool(db_url)
+    rows = await pool.fetch(
+        """
+        SELECT f.relative_path, f.id FROM strata_core.ingested_files f
+        JOIN strata_core.knowledge_layers kl ON kl.id = f.layer_id
+        WHERE kl.name = $1
+        """,
+        layer,
+    )
+    return {r["relative_path"]: r["id"] for r in rows}
+
+
 def _copy(name: str, dest: Path) -> Path:
     dest.mkdir(parents=True, exist_ok=True)
     return Path(shutil.copy(FIXTURES / name, dest / name))
@@ -130,7 +132,7 @@ def _copy(name: str, dest: Path) -> Path:
 class TestOffsets:
     async def test_offsets_match_markdown(self, db_url, layer, tmp_path):
         _copy("test_document.md", tmp_path)
-        result = await _ingest(db_url, layer, tmp_path)
+        result = await ingest(db_url, layer, tmp_path)
         assert result.status == "completed"
 
         docs = await _assert_offsets_match(db_url, layer)
@@ -142,7 +144,7 @@ class TestOffsets:
         (tmp_path / "loop.md").write_text(
             "# Loop\n\n" + "Retry the failover drill. " * 150 + "\n", encoding="utf-8"
         )
-        await _ingest(db_url, layer, tmp_path)
+        await ingest(db_url, layer, tmp_path)
 
         docs = await _assert_offsets_match(db_url, layer)
         spans = [(c["char_start"], c["char_end"]) for c in await _chunks(db_url, layer)]
@@ -155,7 +157,7 @@ class TestOffsets:
 
     async def test_offsets_match_pdf(self, db_url, layer, tmp_path):
         _copy("test_doc.pdf", tmp_path)
-        result = await _ingest(db_url, layer, tmp_path)
+        result = await ingest(db_url, layer, tmp_path)
         assert result.status == "completed"
 
         docs = await _assert_offsets_match(db_url, layer)
@@ -175,7 +177,7 @@ class TestOffsets:
         (tmp_path / "config.json").write_text(
             json.dumps({"service": "orders", "retries": 3}), encoding="utf-8"
         )
-        result = await _ingest(db_url, layer, tmp_path)
+        result = await ingest(db_url, layer, tmp_path)
         assert result.status == "completed"
 
         docs = await _assert_offsets_match(db_url, layer)
@@ -184,7 +186,7 @@ class TestOffsets:
     async def test_text_origin_is_text(self, db_url, layer, tmp_path):
         for name in ("test_document.md", "test_doc.pdf", "test_page.html", "reason_codes.csv"):
             _copy(name, tmp_path)
-        await _ingest(db_url, layer, tmp_path)
+        await ingest(db_url, layer, tmp_path)
 
         docs = await _documents(db_url, layer)
         assert len(docs) == 4
@@ -198,7 +200,7 @@ class TestLocate:
         from stratakb.knowledge.documents import locate
 
         _copy("test_doc.pdf", tmp_path)
-        await _ingest(db_url, layer, tmp_path)
+        await ingest(db_url, layer, tmp_path)
         doc = (await _documents(db_url, layer))[0]
 
         on_page_2 = [
@@ -221,7 +223,7 @@ class TestLocate:
         (tmp_path / "guide.md").write_text(
             "# Title\n\nline one\nline two\n\n## Sub\n\nline three\n", encoding="utf-8"
         )
-        await _ingest(db_url, layer, tmp_path)
+        await ingest(db_url, layer, tmp_path)
         doc = (await _documents(db_url, layer))[0]
         text = doc["text"]
 
@@ -246,7 +248,7 @@ class TestLocate:
 class TestBuildText:
     def test_pages_joined_and_page_map_uses_page_numbers(self):
         from stratakb.knowledge.documents import build_document_text, page_starts
-        from stratakb.knowledge.parsers.pdf_parser import ParsedDocument, ParsedPage
+        from stratakb.knowledge.parsers.document import ParsedDocument, ParsedPage
 
         # Page 2 was empty and dropped by the parser
         doc = ParsedDocument(
@@ -261,7 +263,7 @@ class TestBuildText:
 
     def test_no_page_map_for_other_formats(self):
         from stratakb.knowledge.documents import build_document_text
-        from stratakb.knowledge.parsers.pdf_parser import ParsedDocument, ParsedPage
+        from stratakb.knowledge.parsers.document import ParsedDocument, ParsedPage
 
         doc = ParsedDocument(source_file="a.md", pages=[ParsedPage("# A", 1, "a.md")])
         assert build_document_text(doc) == ("# A", None)
@@ -272,10 +274,10 @@ class TestVersions:
         from stratakb.knowledge.selection import FileEntry
 
         path = _copy("test_document.md", tmp_path)
-        await _ingest(db_url, layer, tmp_path)
+        await ingest(db_url, layer, tmp_path)
         before = await _documents(db_url, layer)
 
-        result = await _ingest(db_url, layer, tmp_path)
+        result = await ingest(db_url, layer, tmp_path)
         assert result.files_unchanged == 1
         # A carried hash that differs from the tracked one forces a re-parse
         # and re-store; the text is the same, so the version is kept
@@ -283,7 +285,7 @@ class TestVersions:
             relative_path="test_document.md", size=path.stat().st_size, path=path,
             sha256="0" * 64,
         )
-        result = await _ingest(db_url, layer, tmp_path, files=[entry])
+        result = await ingest(db_url, layer, tmp_path, files=[entry])
         assert result.files_updated == 1
 
         after = await _documents(db_url, layer)
@@ -296,11 +298,11 @@ class TestVersions:
     async def test_reingest_changed_bumps_version(self, db_url, layer, tmp_path):
         path = tmp_path / "guide.md"
         path.write_text("# Guide\n\nFirst text about failover.\n", encoding="utf-8")
-        await _ingest(db_url, layer, tmp_path)
+        await ingest(db_url, layer, tmp_path)
         (v1,) = await _documents(db_url, layer)
 
         path.write_text("# Guide\n\nSecond text about restores.\n", encoding="utf-8")
-        result = await _ingest(db_url, layer, tmp_path)
+        result = await ingest(db_url, layer, tmp_path)
         assert result.files_updated == 1
 
         # Version 1 has no chunks left, so it is pruned
@@ -321,8 +323,8 @@ class TestVersions:
         b.parent.mkdir()
         a.write_text("# A\n\nAlpha text about failover.\n", encoding="utf-8")
         b.write_text("# B\n\nBeta text about restores.\n", encoding="utf-8")
-        await _ingest(db_url, layer, a)
-        await _ingest(db_url, layer, b)
+        await ingest(db_url, layer, a)
+        await ingest(db_url, layer, b)
 
         async def versions() -> dict:
             from stratakb.core.database import get_pool
@@ -347,14 +349,14 @@ class TestVersions:
         assert {k: v[0] for k, v in (await versions()).items()} == {root_a: 1, root_b: 1}
 
         a.write_text("# A\n\nAlpha text, now about backups.\n", encoding="utf-8")
-        await _ingest(db_url, layer, a)
+        await ingest(db_url, layer, a)
         after = await versions()
         assert after[root_a][0] == 2 and "backups" in after[root_a][1]
         assert after[root_b][0] == 1 and "restores" in after[root_b][1]
 
         # A's new text equal to B's: A gets its own version 3, B keeps its row
         a.write_text(b.read_text(encoding="utf-8"), encoding="utf-8")
-        await _ingest(db_url, layer, a)
+        await ingest(db_url, layer, a)
         after = await versions()
         assert after[root_a][0] == 3
         assert after[root_b][0] == 1
@@ -364,11 +366,11 @@ class TestVersions:
         (tmp_path / "a.md").write_text("# A\n\nAlpha.\n", encoding="utf-8")
         b = tmp_path / "b.md"
         b.write_text("# B\n\nBeta.\n", encoding="utf-8")
-        await _ingest(db_url, layer, tmp_path)
+        await ingest(db_url, layer, tmp_path)
         assert len(await _documents(db_url, layer)) == 2
 
         b.unlink()
-        await _ingest(db_url, layer, tmp_path)
+        await ingest(db_url, layer, tmp_path)
         assert [d["relative_path"] for d in await _documents(db_url, layer)] == ["a.md"]
 
     async def test_store_prunes_only_its_own_file(self, db_url, layer, tmp_path):
@@ -378,9 +380,9 @@ class TestVersions:
 
         b = tmp_path / "b.md"
         b.write_text("# B\n\nFirst text about failover.\n", encoding="utf-8")
-        await _ingest(db_url, layer, b)
+        await ingest(db_url, layer, b)
         b.write_text("# B\n\nSecond text about restores.\n", encoding="utf-8")
-        await _ingest(db_url, layer, b)
+        await ingest(db_url, layer, b)
 
         docs = await _documents(db_url, layer)
         assert [(d["relative_path"], d["version"]) for d in docs] == [("a.md", 1), ("b.md", 2)]
@@ -390,12 +392,12 @@ class TestVersions:
         (tmp_path / "a.md").write_text("# A\n\nAlpha.\n", encoding="utf-8")
         b = tmp_path / "b.md"
         b.write_text("# B\n\nBeta.\n", encoding="utf-8")
-        await _ingest(db_url, layer, tmp_path)
+        await ingest(db_url, layer, tmp_path)
         await _store_bare_document(db_url, layer, root, "c.md", "Gamma.")
 
         # An emptied file is removed as having no text
         b.write_text("", encoding="utf-8")
-        result = await _ingest(db_url, layer, tmp_path)
+        result = await ingest(db_url, layer, tmp_path)
         assert ("b.md", "removed", "no_text") in [
             (f.relative_path, f.outcome, f.reason) for f in result.files
         ]
@@ -462,9 +464,219 @@ class TestVersions:
         from stratakb.knowledge.ingestion import clear_layer
 
         (tmp_path / "a.md").write_text("# A\n\nAlpha.\n", encoding="utf-8")
-        await _ingest(db_url, layer, tmp_path)
+        await ingest(db_url, layer, tmp_path)
         await clear_layer(db_url, layer)
         assert await _documents(db_url, layer) == []
+
+    async def test_ingest_reuses_no_version_a_prune_deleted(self, db_url, layer, tmp_path):
+        from stratakb.core.database import get_pool
+        from stratakb.knowledge.documents import prune_documents
+        from stratakb.rag.receipts import new_receipt_id
+
+        src = tmp_path / "src"
+        src.mkdir()
+        a = src / "a.md"
+        a.write_text("# A\n\nAlpha about failover.\n", encoding="utf-8")
+        (src / "b.md").write_text("# B\n\nBeta.\n", encoding="utf-8")
+        await ingest(db_url, layer, src)
+        pruned = {d["relative_path"]: d["id"] for d in await _documents(db_url, layer)}["a.md"]
+
+        pool = await get_pool(db_url)
+        layer_id = await _layer_id(db_url, layer)
+        receipt_id = new_receipt_id()
+        await pool.execute(
+            """
+            INSERT INTO strata_core.receipts (id, issued_by, kind, mode, layers, body)
+            VALUES ($1, 'alice', 'verify', 'grounded', '[]', '{}')
+            """,
+            receipt_id,
+        )
+        await pool.execute(
+            "INSERT INTO strata_core.receipt_documents (receipt_id, document_id) VALUES ($1, $2)",
+            receipt_id,
+            pruned,
+        )
+        # Removed from the folder: the receipt keeps its version
+        away = tmp_path / "away.md"
+        a.rename(away)
+        await ingest(db_url, layer, src)
+        assert pruned in [d["id"] for d in await _documents(db_url, layer)]
+
+        async with pool.acquire() as held:
+            tx = held.transaction()
+            await tx.start()
+            try:
+                await held.execute("DELETE FROM strata_core.receipts WHERE id = $1", receipt_id)
+                assert await prune_documents(held, [layer_id]) == 1
+                # Back with the same text while the prune is not committed yet
+                away.rename(a)
+                ingest_task = asyncio.create_task(ingest(db_url, layer, src))
+                await wait_until_blocked_by(pool, held.get_server_pid(), ingest_task)
+                await tx.commit()
+            except BaseException:
+                with contextlib.suppress(Exception):
+                    await tx.rollback()
+                raise
+        result = await ingest_task
+
+        assert ("a.md", "added", None) in [
+            (f.relative_path, f.outcome, f.reason) for f in result.files
+        ]
+        assert result.errors == []
+        docs = await _assert_offsets_match(db_url, layer)
+        a_docs = [d for d in await _documents(db_url, layer) if d["relative_path"] == "a.md"]
+        assert len(a_docs) == 1
+        assert docs["a.md"]["id"] != pruned
+
+    async def test_clear_layer_locks_file_rows_before_chunks(self, db_url, layer, tmp_path):
+        import asyncpg
+
+        from stratakb.core.database import get_pool
+        from stratakb.knowledge.ingestion import clear_layer
+
+        (tmp_path / "a.md").write_text("# A\n\nAlpha.\n", encoding="utf-8")
+        await ingest(db_url, layer, tmp_path)
+        file_id = (await _file_rows(db_url, layer))["a.md"]
+
+        pool = await get_pool(db_url)
+        async with pool.acquire() as held, pool.acquire() as probe:
+            tx = held.transaction()
+            await tx.start()
+            try:
+                await held.execute(
+                    "SELECT id FROM strata_core.ingested_files WHERE id = $1 FOR KEY SHARE",
+                    file_id,
+                )
+                clearing = asyncio.create_task(clear_layer(db_url, layer))
+                await wait_until_blocked_by(pool, held.get_server_pid(), clearing)
+                # The clear waits on the file row without holding its chunks
+                probe_tx = probe.transaction()
+                await probe_tx.start()
+                try:
+                    await probe.execute(
+                        "SELECT id FROM strata_vectors.chunks WHERE file_id = $1"
+                        " FOR UPDATE NOWAIT",
+                        file_id,
+                    )
+                except asyncpg.LockNotAvailableError:
+                    pytest.fail("clear_layer locked the chunks before the file row")
+                finally:
+                    await probe_tx.rollback()
+            finally:
+                await tx.rollback()
+        await clearing
+
+        assert await _chunks(db_url, layer) == []
+        assert await _documents(db_url, layer) == []
+        assert await _file_rows(db_url, layer) == {}
+
+    @pytest.mark.parametrize("how", ["remove", "clear"])
+    async def test_removal_waits_for_ingest_of_same_file(self, db_url, layer, tmp_path, how):
+        from stratakb.core.database import get_pool
+        from stratakb.knowledge import ingestion
+
+        a = tmp_path / "a.md"
+        a.write_text("# A\n\nFirst text about failover.\n", encoding="utf-8")
+        await ingest(db_url, layer, tmp_path)
+        layer_id = await _layer_id(db_url, layer)
+        a.write_text("# A\n\nSecond text about restores.\n", encoding="utf-8")
+
+        real = ingestion.store_document_version
+        picked, release = asyncio.Event(), asyncio.Event()
+        pids = []
+
+        async def paused(conn, **kwargs):
+            stored = await real(conn, **kwargs)
+            pids.append(conn.get_server_pid())
+            picked.set()
+            await release.wait()
+            return stored
+
+        pool = await get_pool(db_url)
+        with patch("stratakb.knowledge.ingestion.store_document_version", paused):
+            ingest_task = asyncio.create_task(ingest(db_url, layer, tmp_path))
+            try:
+                async with asyncio.timeout(30):
+                    await picked.wait()
+                    if how == "remove":
+                        removal = asyncio.create_task(ingestion._remove_files(
+                            pool, layer_id=str(layer_id),
+                            source_root=tmp_path.resolve().as_posix(),
+                            relative_paths=["a.md"],
+                        ))
+                    else:
+                        removal = asyncio.create_task(ingestion.clear_layer(db_url, layer))
+                    await wait_until_blocked_by(pool, pids[0], removal)
+            finally:
+                release.set()
+            result = await ingest_task
+        await removal
+
+        assert ("a.md", "updated", None) in [
+            (f.relative_path, f.outcome, f.reason) for f in result.files
+        ]
+        assert result.errors == []
+        assert await _file_rows(db_url, layer) == {}
+        assert await _chunks(db_url, layer) == []
+        assert await _documents(db_url, layer) == []
+
+    async def test_overlapping_removers_do_not_deadlock(self, db_url, layer, tmp_path):
+        from stratakb.core.database import get_pool
+        from stratakb.knowledge.ingestion import _remove_files, clear_layer
+
+        for name in ("a", "b", "c"):
+            (tmp_path / f"{name}.md").write_text(f"# {name}\n\nText {name}.\n", encoding="utf-8")
+        await ingest(db_url, layer, tmp_path)
+        layer_id = str(await _layer_id(db_url, layer))
+        root = tmp_path.resolve().as_posix()
+        pool = await get_pool(db_url)
+
+        def remove(*names):
+            return _remove_files(
+                pool, layer_id=layer_id, source_root=root,
+                relative_paths=[f"{n}.md" for n in names],
+            )
+
+        async with asyncio.timeout(30):
+            await asyncio.gather(
+                remove("a", "b"), remove("c", "b", "a"), clear_layer(db_url, layer)
+            )
+
+        assert await _file_rows(db_url, layer) == {}
+        assert await _chunks(db_url, layer) == []
+        assert await _documents(db_url, layer) == []
+
+    async def test_remove_files_keeps_the_same_path_under_another_root(
+        self, db_url, layer, tmp_path
+    ):
+        from stratakb.core.database import get_pool
+        from stratakb.knowledge.ingestion import _remove_files
+
+        x = tmp_path / "x"
+        y = tmp_path / "y"
+        for folder, text in ((x, "Folder X content."), (y, "Folder Y content.")):
+            folder.mkdir()
+            (folder / "readme.md").write_text(f"# Title\n\n{text}\n", encoding="utf-8")
+        await ingest(db_url, layer, x)
+        await ingest(db_url, layer, y)
+        root_x, root_y = x.resolve().as_posix(), y.resolve().as_posix()
+        layer_id = await _layer_id(db_url, layer)
+        pool = await get_pool(db_url)
+
+        await _remove_files(
+            pool, layer_id=str(layer_id), source_root=root_x, relative_paths=["readme.md"]
+        )
+
+        file_roots = await pool.fetch(
+            "SELECT source_root FROM strata_core.ingested_files WHERE layer_id = $1", layer_id
+        )
+        assert [r["source_root"] for r in file_roots] == [root_y]
+        doc_rows = await pool.fetch(
+            "SELECT id, source_root FROM strata_vectors.documents WHERE layer_id = $1", layer_id
+        )
+        assert [r["source_root"] for r in doc_rows] == [root_y]
+        chunks = await _chunks(db_url, layer)
+        assert chunks and {c["document_id"] for c in chunks} == {doc_rows[0]["id"]}
 
     async def test_delete_layer_removes_documents(self, db_url, tmp_path):
         from stratakb.core.database import get_pool
@@ -473,7 +685,7 @@ class TestVersions:
         name = f"test_docs_{uuid4().hex[:10]}"
         await create_layer(db_url, name=name, display_name="Doomed")
         (tmp_path / "a.md").write_text("# A\n\nAlpha.\n", encoding="utf-8")
-        await _ingest(db_url, name, tmp_path)
+        await ingest(db_url, name, tmp_path)
         pool = await get_pool(db_url)
         layer_id = await pool.fetchval(
             "SELECT id FROM strata_core.knowledge_layers WHERE name = $1", name
@@ -483,6 +695,13 @@ class TestVersions:
         assert await pool.fetchval(
             "SELECT count(*) FROM strata_vectors.documents WHERE layer_id = $1", layer_id
         ) == 0
+
+
+async def test_file_scope_needs_one_layer():
+    from stratakb.knowledge.documents import FileScope, prune_documents
+
+    with pytest.raises(ValueError, match="exactly one layer"):
+        await prune_documents(None, ["a", "b"], files=FileScope("r", ["x.md"]))
 
 
 class TestLegacyChunks:

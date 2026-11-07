@@ -7,6 +7,7 @@ Tests cover:
 - strata_admin_health lists the switch and the outbound providers
 - Embedding, model loading and query rewriting refuse or skip at call time
 - A rewrite endpoint (QUERY_REWRITE_BASE_URL) is outbound unless loopback
+- core owns the rewrite egress table, and one rewrite runs its skip rule once
 
 No database and no model are needed: the pool, the server run and the
 model classes are patched.
@@ -14,24 +15,28 @@ model classes are patched.
 
 from __future__ import annotations
 
+import ast
 import os
 import sys
+import typing
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from stratakb.config import Settings
-from stratakb.core.egress import outbound_providers
-from tests.conftest import call_tool
+import stratakb.core
+from stratakb.config import DEFAULT_QUERY_REWRITE_MODEL, Settings
+from stratakb.core.egress import (
+    REWRITE_EGRESS,
+    RewriteProviderName,
+    RewriteRequest,
+    outbound_providers,
+    rewrite_skip_reason,
+)
+from tests.helpers import call_health, capture_tools
 
-
-@pytest.fixture(autouse=True)
-def _no_base_url_env(monkeypatch):
-    """Keep SDK base-URL overrides from the shell out of the tests."""
-    monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
-    monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
-    monkeypatch.delenv("QUERY_REWRITE_MODEL", raising=False)
+pytestmark = pytest.mark.usefixtures("no_sdk_env")
 
 
 def _settings(**overrides) -> Settings:
@@ -165,7 +170,7 @@ def test_anthropic_key_unused_with_openai_compatible():
 
 
 @pytest.fixture
-def server(monkeypatch):
+def main_server(monkeypatch):
     """The server module, local-only settings for main(), FastMCP.run patched.
 
     main() builds its server inside the call, so run is patched on the class.
@@ -190,8 +195,8 @@ def server(monkeypatch):
     return mcp_server, settings, run
 
 
-def test_main_refuses_with_named_settings(server, monkeypatch):
-    mcp_server, settings, run = server
+def test_main_refuses_with_named_settings(main_server, monkeypatch):
+    mcp_server, settings, run = main_server
     monkeypatch.setattr(settings, "anthropic_api_key", "sk-ant-test-123")
     with pytest.raises(SystemExit) as exc:
         mcp_server.main(settings)
@@ -208,16 +213,16 @@ def test_main_refuses_with_named_settings(server, monkeypatch):
     run.assert_not_called()
 
 
-def test_main_refusal_hides_key_value(server, monkeypatch):
-    mcp_server, settings, _ = server
+def test_main_refusal_hides_key_value(main_server, monkeypatch):
+    mcp_server, settings, _ = main_server
     monkeypatch.setattr(settings, "anthropic_api_key", "sk-ant-test-123")
     with pytest.raises(SystemExit) as exc:
         mcp_server.main(settings)
     assert "sk-ant-test-123" not in str(exc.value)
 
 
-def test_main_refuses_remote_rewrite_endpoint(server, monkeypatch):
-    mcp_server, settings, run = server
+def test_main_refuses_remote_rewrite_endpoint(main_server, monkeypatch):
+    mcp_server, settings, run = main_server
     monkeypatch.setattr(settings, "query_rewrite_provider", "openai_compatible")
     monkeypatch.setattr(
         settings, "query_rewrite_base_url", "http://user:pw@gpu-box:11434/v1"
@@ -232,16 +237,16 @@ def test_main_refuses_remote_rewrite_endpoint(server, monkeypatch):
     run.assert_not_called()
 
 
-def test_main_starts_with_remote_rewrite_endpoint_without_model(server, monkeypatch):
-    mcp_server, settings, run = server
+def test_main_starts_with_remote_rewrite_endpoint_without_model(main_server, monkeypatch):
+    mcp_server, settings, run = main_server
     monkeypatch.setattr(settings, "query_rewrite_provider", "openai_compatible")
     monkeypatch.setattr(settings, "query_rewrite_base_url", "http://gpu-box:11434/v1")
     mcp_server.main(settings)
     run.assert_called_once()
 
 
-def test_main_starts_with_loopback_rewrite_endpoint(server, monkeypatch):
-    mcp_server, settings, run = server
+def test_main_starts_with_loopback_rewrite_endpoint(main_server, monkeypatch):
+    mcp_server, settings, run = main_server
     monkeypatch.setattr(settings, "query_rewrite_provider", "openai_compatible")
     monkeypatch.setattr(settings, "query_rewrite_base_url", "http://127.0.0.1:11434/v1")
     monkeypatch.setattr(settings, "anthropic_api_key", "sk-ant-test-123")
@@ -249,8 +254,8 @@ def test_main_starts_with_loopback_rewrite_endpoint(server, monkeypatch):
     run.assert_called_once()
 
 
-def test_main_forces_hf_offline(server, monkeypatch):
-    mcp_server, settings, run = server
+def test_main_forces_hf_offline(main_server, monkeypatch):
+    mcp_server, settings, run = main_server
     monkeypatch.setenv("HF_HUB_OFFLINE", "0")
     mcp_server.main(settings)
     run.assert_called_once()
@@ -258,8 +263,8 @@ def test_main_forces_hf_offline(server, monkeypatch):
     assert os.environ["TRANSFORMERS_OFFLINE"] == "1"
 
 
-def test_main_leaves_env_when_off(server, monkeypatch):
-    mcp_server, settings, run = server
+def test_main_leaves_env_when_off(main_server, monkeypatch):
+    mcp_server, settings, run = main_server
     monkeypatch.setattr(settings, "strata_local_only", False)
     monkeypatch.setattr(settings, "anthropic_api_key", "sk-ant-test-123")
     mcp_server.main(settings)
@@ -273,25 +278,10 @@ def test_main_leaves_env_when_off(server, monkeypatch):
 # ==========================================
 
 
-async def _health(mcp_server, settings: Settings) -> dict:
-    """Call strata_admin_health on a server built from `settings`."""
-    return await call_tool(mcp_server.build_server(settings), "strata_admin_health")
-
-
 @pytest.mark.asyncio
 async def test_health_lists_outbound():
-    from stratakb import mcp_server
-
     settings = _settings(anthropic_api_key="sk-ant-test")
-    with (
-        patch("stratakb.config.get_settings", return_value=settings),
-        patch("stratakb.mcp_server.get_settings", return_value=settings),
-        patch(
-            "stratakb.mcp_server.check_connection",
-            AsyncMock(return_value={"status": "ok"}),
-        ),
-    ):
-        result = await _health(mcp_server, settings)
+    result = await call_health(settings)
 
     for key in ("database", "anthropic_api", "openai_api", "overall", "user"):
         assert key in result
@@ -310,20 +300,10 @@ async def test_health_lists_outbound():
 
 @pytest.mark.asyncio
 async def test_health_lists_rewrite_endpoint():
-    from stratakb import mcp_server
-
     settings = _rewrite_endpoint(
         "http://user:pw@gpu-box:11434/v1", query_rewrite_api_key="endpoint-key"
     )
-    with (
-        patch("stratakb.config.get_settings", return_value=settings),
-        patch("stratakb.mcp_server.get_settings", return_value=settings),
-        patch(
-            "stratakb.mcp_server.check_connection",
-            AsyncMock(return_value={"status": "ok"}),
-        ),
-    ):
-        result = await _health(mcp_server, settings)
+    result = await call_health(settings)
 
     assert result["outbound"] == [
         {
@@ -345,27 +325,11 @@ async def test_health_lists_rewrite_endpoint():
 # ==========================================
 
 
-def _capture_tools(register, *args) -> dict:
-    captured = {}
-    mock_mcp = MagicMock()
-
-    def capture_tool(**kwargs):
-        def decorator(fn):
-            name = getattr(fn, "__wrapped__", fn).__name__
-            captured[name] = fn
-            return fn
-        return decorator
-
-    mock_mcp.tool = capture_tool
-    register(mock_mcp, *args)
-    return captured
-
-
 @pytest.mark.asyncio
 async def test_search_refused_under_local_only():
     from stratakb.rag.tools import register_rag_tools
 
-    fn = _capture_tools(register_rag_tools, "postgresql://test", "sk-test")["strata_search"]
+    fn = capture_tools(register_rag_tools, "postgresql://test", "sk-test")["strata_search"]
     search = AsyncMock(return_value=[])
     settings = _settings(
         strata_local_only=True, embedding_backend="openai", learning_enabled=False
@@ -518,3 +482,81 @@ async def test_explicit_model_rewrite_refused_under_local_only():
         result = await rewrite_query("q")
     assert result == ["a", "b"]
     client_cls.assert_called_once()
+
+
+# ==========================================
+# The rewrite egress table and its skip rule
+# ==========================================
+
+
+def test_core_owns_the_egress_table():
+    """The egress table has the same names, and core imports nothing from rag."""
+    assert set(typing.get_args(RewriteProviderName)) == set(REWRITE_EGRESS)
+    for name, e in REWRITE_EGRESS.items():
+        assert name == e.name
+
+    for path in Path(stratakb.core.__path__[0]).rglob("*.py"):
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+            modules = []
+            if isinstance(node, ast.Import):
+                modules = [alias.name for alias in node.names]
+            elif isinstance(node, ast.ImportFrom):
+                modules = [node.module or ""]
+            assert not [m for m in modules if m.startswith("stratakb.rag")], path
+
+
+@pytest.mark.asyncio
+async def test_one_rewrite_runs_the_skip_rule_once(monkeypatch):
+    """Even with the local-only check, one rewrite asks the rule once and calls the entry."""
+    from stratakb.rag.query_rewriter import (
+        REWRITE_PROVIDERS,
+        RewriteProvider,
+        rewrite_query,
+    )
+
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "http://127.0.0.1:9/")
+    skip = MagicMock(return_value=None)
+    call = AsyncMock(return_value='["one", "two"]')
+    egress = REWRITE_EGRESS["anthropic"]._replace(skip_reason=skip)
+    settings = _settings(strata_local_only=True)
+
+    with (
+        patch.dict(REWRITE_PROVIDERS, {"anthropic": RewriteProvider(egress, call)}),
+        patch("stratakb.config.get_settings", return_value=settings),
+    ):
+        result = await rewrite_query("question", anthropic_api_key="fake-key")
+
+    assert result == ["one", "two"]
+    skip.assert_called_once()
+    request = skip.call_args.args[0]
+    assert (request.settings, request.anthropic_api_key) == (settings, "fake-key")
+    call.assert_awaited_once()
+    assert call.await_args.args[0] == request
+
+
+@pytest.mark.parametrize(
+    ("overrides", "reason"),
+    [
+        ({"query_rewrite_provider": "ollama"}, "unknown_provider"),
+        ({}, "no_api_key"),
+        ({"anthropic_api_key": "k"}, None),
+        (
+            {"query_rewrite_provider": "openai_compatible", "query_rewrite_base_url": ""},
+            "no_base_url",
+        ),
+        (
+            {
+                "query_rewrite_provider": "openai_compatible",
+                "query_rewrite_base_url": "http://127.0.0.1:11434/v1",
+            },
+            "model_not_set",
+        ),
+    ],
+)
+def test_skip_reasons_from_the_one_rule(overrides, reason):
+    """The base URL is checked before the model; an unknown name has its own reason."""
+    values = {"anthropic_api_key": "", "query_rewrite_model": DEFAULT_QUERY_REWRITE_MODEL}
+    settings = _settings(**(values | overrides))
+    request = RewriteRequest(settings, settings.anthropic_api_key, settings.query_rewrite_model)
+    entry = REWRITE_EGRESS.get(settings.query_rewrite_provider)
+    assert rewrite_skip_reason(entry, request) == reason

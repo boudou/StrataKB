@@ -9,10 +9,36 @@ cross-encoder's relevance probability ("rerank").
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Literal
+from typing import Any, Literal
 
 # What strata_ask reports about its passages
 AnswerStatus = Literal["found", "partly_found", "not_found"]
+
+
+@dataclass(frozen=True)
+class Confidence:
+    """How far a result can be trusted: level, the scores behind it, and the scale they are on.
+
+    warning is set only for a low level.
+    """
+
+    level: str
+    top_score: float
+    relevant_sources: int
+    basis: str
+    warning: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        """The confidence as a tool response carries it; no warning key when there is none."""
+        result: dict[str, Any] = {
+            "level": self.level,
+            "top_score": self.top_score,
+            "relevant_sources": self.relevant_sources,
+            "basis": self.basis,
+        }
+        if self.warning is not None:
+            result["warning"] = self.warning
+        return result
 
 
 @dataclass(frozen=True)
@@ -31,6 +57,11 @@ class ConfidenceThresholds:
 SIMILARITY_THRESHOLDS = ConfidenceThresholds(high_score=0.6, medium_score=0.45)
 # Cross-encoder relevance probability (sigmoid over the logits; 0.5 is logit 0).
 RERANK_THRESHOLDS = ConfidenceThresholds(high_score=0.8, medium_score=0.5)
+# The score a sentence needs before an extractive answer quotes it, on the same
+# relevance probability. Provisional like the rest, not measured: it is the
+# medium threshold, so a quote never scores below what answer_status calls
+# partly found. The evaluation suite's abstention tier sets the final value.
+EXTRACTIVE_SENTENCE_THRESHOLD = RERANK_THRESHOLDS.medium_score
 
 _BASIS_THRESHOLDS = {
     "similarity": SIMILARITY_THRESHOLDS,
@@ -49,7 +80,7 @@ def similarity_or_zero(similarity: float | None) -> float:
     return 0.0 if similarity is None else similarity
 
 
-def score_confidence(scores: list[float], *, basis: str) -> dict:
+def score_confidence(scores: list[float], *, basis: str) -> Confidence:
     """Compute confidence level from search result scores.
 
     Args:
@@ -59,8 +90,8 @@ def score_confidence(scores: list[float], *, basis: str) -> dict:
             thresholds, and the result reports it.
 
     Returns:
-        Dict with level (high/medium/low), top_score, relevant_sources count,
-        basis, and warning text if low.
+        Confidence with level (high/medium/low), top_score, relevant_sources
+        count, basis, and warning text if low.
 
     Raises:
         ValueError: If basis is not "similarity" or "rerank".
@@ -82,15 +113,10 @@ def score_confidence(scores: list[float], *, basis: str) -> dict:
         else:
             level = "low"
 
-    result = {
-        "level": level,
-        "top_score": round(top_score, 4),
-        "relevant_sources": relevant,
-        "basis": basis,
-    }
+    warning = None
     if level == "low":
-        result["warning"] = _LOW_CONFIDENCE_WARNING if scores else _NO_RESULTS_WARNING
-    return result
+        warning = _LOW_CONFIDENCE_WARNING if scores else _NO_RESULTS_WARNING
+    return Confidence(level, round(top_score, 4), relevant, basis, warning)
 
 
 def answer_status(top_score: float, basis: str) -> AnswerStatus:

@@ -20,6 +20,9 @@ Reports about these areas are especially welcome:
   controls. Restrict what the database user can do with PostgreSQL grants.
 - Give the server a database user with only the privileges it needs, and keep
   `DATABASE_URL` and API keys out of version control.
+- `scripts/backup_restore.py restore` and `import-layer` feed the file to `psql` with the
+  database owner's rights, so a crafted file can do anything in the database. Import only
+  files you made or trust.
 - The SQL tools run each statement in a read-only transaction that is rolled back.
   A read-only transaction still allows reading functions such as `pg_read_file()` when
   the connection is a superuser, so the SQL tools are only registered when

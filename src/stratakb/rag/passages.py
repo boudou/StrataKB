@@ -8,6 +8,10 @@ the file's relative path, the page, the line range and the clause path.
 The budget counts each passage's id, ref and citation with its text, and an
 answer holds at most MAX_PASSAGES passages, all of which the learning loop
 stores, so feedback by passage id resolves for every one.
+
+The typed results of strata_ask and strata_search live here too: AskResult,
+SearchResponse and the ToolFailure either can return. All three say whether
+they succeeded (ok), so nobody has to check which type they hold.
 """
 
 from __future__ import annotations
@@ -16,15 +20,16 @@ import json
 import math
 import re
 from dataclasses import dataclass, field
-from typing import Any, Literal
+from typing import Any, ClassVar, Literal
 
 from stratakb.knowledge.documents import locate
-from stratakb.rag.confidence import AnswerStatus
+from stratakb.rag.confidence import AnswerStatus, Confidence, similarity_or_zero
 
 ResponseFormat = Literal["concise", "detailed"]
 
-# Extractive answers (the document's own sentences) come later
-MODE = "grounded"
+# Who writes an answer: the client, from the passages (grounded), or the
+# server, from the document's own sentences (extractive)
+AnswerMode = Literal["grounded", "extractive"]
 
 # The most passages an answer returns, and results the learning loop stores
 MAX_PASSAGES = 50
@@ -34,16 +39,39 @@ MAX_PASSAGES = 50
 # with six-digit spans and three-digit pages: about 81 characters)
 RESPONSE_SLACK_TOKENS = 21
 
-_NEXT_STEPS = {
-    "not_found": (
-        "Nothing in the knowledge base answers this. If no layer covers the topic, "
-        "add a folder with `stratakb add`; for an exact identifier or term, try strata_search."
-    ),
-    "partly_found": (
-        "The passages answer this only in part. Say what they leave open, or ask "
-        "again with the knowledge base's own terms or a named layer."
-    ),
+_PASSAGE_ID = re.compile(r"[Ss]([1-9][0-9]*)")
+
+_NOT_FOUND_STEP = (
+    "Nothing in the knowledge base answers this. If no layer covers the topic, "
+    "add a folder with `stratakb add`; for an exact identifier or term, try strata_search."
+)
+_NEXT_STEPS: dict[AnswerMode, dict[str, str]] = {
+    "grounded": {
+        "not_found": _NOT_FOUND_STEP,
+        "partly_found": (
+            "The passages answer this only in part. Say what they leave open, or ask "
+            "again with the knowledge base's own terms or a named layer."
+        ),
+    },
+    "extractive": {
+        "not_found": _NOT_FOUND_STEP,
+        "partly_found": (
+            "The quotes answer this only in part. Say what they leave open, or ask "
+            "again with the knowledge base's own terms or a named layer."
+        ),
+    },
 }
+
+
+def passage_id(n: int) -> str:
+    """The id of the n-th passage: S1, S2, ... It does not check n."""
+    return f"S{n}"
+
+
+def passage_number(text: str) -> int | None:
+    """The n of a passage id, in either case; None for any other text, S0 and S01 too."""
+    match = _PASSAGE_ID.fullmatch(text)
+    return int(match.group(1)) if match else None
 
 
 def ask_chunk(
@@ -195,7 +223,7 @@ def build_passages(
     """One passage per chunk, in order: id, ref, the chunk's text and its citation."""
     return [
         {
-            "id": f"S{n}",
+            "id": passage_id(n),
             "ref": passage_ref(chunk),
             "text": chunk["content"],
             "citation": cite(chunk, documents.get(chunk.get("document_id"))),
@@ -204,9 +232,108 @@ def build_passages(
     ]
 
 
-def next_step(status: str) -> str | None:
+def basis_score(chunk: dict[str, Any], basis: str) -> float:
+    """The score confidence judges a strata_ask chunk on, for this basis.
+
+    An exact clause match is the passage asked for: it scores 1.0.
+    """
+    if chunk.get("match") == "exact":
+        return 1.0
+    if basis == "rerank":
+        return chunk["rerank_score"]
+    return similarity_or_zero(chunk["similarity"])
+
+
+def sources_from(chunks: list[dict[str, Any]], basis: str) -> list[dict[str, Any]]:
+    """One source per (layer, file, section), in order, scored on its first chunk."""
+    sources: dict[tuple[Any, Any, Any], dict[str, Any]] = {}
+    for c in chunks:
+        sources.setdefault((c["layer"], c["source_file"], c["section"]), {
+            "layer": c["layer"],
+            "file": c["source_file"],
+            "section": c["section"],
+            "doc_type": c["doc_type"],
+            "relevance_score": basis_score(c, basis),
+        })
+    return list(sources.values())
+
+
+def next_step(status: str, mode: AnswerMode) -> str | None:
     """What to do when the answer was not, or only partly, found."""
-    return _NEXT_STEPS.get(status)
+    return _NEXT_STEPS[mode].get(status)
+
+
+@dataclass(frozen=True)
+class ToolFailure:
+    """A strata_ask or strata_search call that failed; clients see its to_dict."""
+
+    ok: ClassVar[Literal[False]] = False
+
+    error: str
+
+    def to_dict(self, response_format: ResponseFormat = "concise") -> dict[str, Any]:
+        """The same for every response format."""
+        return {"status": "error", "error": self.error}
+
+
+@dataclass
+class SearchResponse:
+    """One strata_search result. The learning tracker sets interaction_id."""
+
+    ok: ClassVar[Literal[True]] = True
+
+    query: str
+    confidence: Confidence
+    results: list[dict[str, Any]]
+    auto_detected_layers: list[str] = field(default_factory=list)
+    routing_fallback: str | None = None
+    interaction_id: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        response: dict[str, Any] = {
+            "status": "ok",
+            "query": self.query,
+            "confidence": self.confidence.to_dict(),
+            "results": self.results,
+            "total": len(self.results),
+        }
+        if self.auto_detected_layers:
+            response["auto_detected_layers"] = self.auto_detected_layers
+        if self.routing_fallback:
+            response["routing_fallback"] = {
+                "reason": self.routing_fallback, "searched_layers": "all",
+            }
+        if self.interaction_id is not None:
+            response["interaction_id"] = self.interaction_id
+        return response
+
+
+@dataclass(frozen=True)
+class ExtractiveAnswer:
+    """The answer the server wrote: the document's own sentences, or not_found.
+
+    sentences come from extractive.answer_item, receipt_id is None when there
+    are none, status is judged on them, and note says why the answer is not the
+    one asked for.
+    """
+
+    sentences: list[dict[str, Any]]
+    receipt_id: str | None
+    status: AnswerStatus
+    note: str | None
+
+    def fields(self, *, with_scores: bool) -> dict[str, Any]:
+        """The response fields only an extractive answer has."""
+        fields: dict[str, Any] = {
+            "answer": self.sentences if with_scores else [
+                {k: v for k, v in s.items() if k != "score"} for s in self.sentences
+            ],
+        }
+        if self.receipt_id is not None:
+            fields["receipt_id"] = self.receipt_id
+        if self.note is not None:
+            fields["note"] = self.note
+        return fields
 
 
 @dataclass
@@ -214,13 +341,18 @@ class AskResult:
     """One strata_ask answer, from which both response formats are built.
 
     confidence is judged on the retrieved chunks before the budget; status
-    on the passages returned. sources is None when they were not asked for.
-    The learning tracker sets interaction_id.
+    on the passages returned, or for an extraction on its sentences. sources is
+    None when they were not asked for. The learning tracker sets interaction_id.
+
+    extraction is the server's answer when the mode is extractive; without it
+    the client composes the answer from the passages.
     """
+
+    ok: ClassVar[Literal[True]] = True
 
     question: str
     queries_used: list[str]
-    confidence: dict[str, Any]
+    confidence: Confidence
     chunks: list[dict[str, Any]]
     passages: list[dict[str, Any]]
     status: AnswerStatus
@@ -228,16 +360,25 @@ class AskResult:
     auto_detected_layers: list[str] = field(default_factory=list)
     routing_fallback: str | None = None
     interaction_id: str | None = None
+    extraction: ExtractiveAnswer | None = None
+
+    @property
+    def mode(self) -> AnswerMode:
+        return "grounded" if self.extraction is None else "extractive"
+
+    def to_dict(self, response_format: ResponseFormat = "concise") -> dict[str, Any]:
+        return self.detailed() if response_format == "detailed" else self.concise()
 
     def concise(self) -> dict[str, Any]:
-        """The answer status, the mode, the passages, the next step when there
-        is one, and the interaction_id for strata_feedback."""
-        response: dict[str, Any] = {
-            "status": self.status,
-            "mode": MODE,
-            "passages": self.passages,
-        }
-        if step := next_step(self.status):
+        """The answer status, the mode, the passages (grounded) or the answer and
+        its receipt (extractive), the next step when there is one, and the
+        interaction_id for strata_feedback."""
+        response: dict[str, Any] = {"status": self.status, "mode": self.mode}
+        if self.extraction is not None:
+            response |= self.extraction.fields(with_scores=False)
+        else:
+            response["passages"] = self.passages
+        if step := next_step(self.status, self.mode):
             response["next_step"] = step
         if self.interaction_id is not None:
             response["interaction_id"] = self.interaction_id
@@ -249,14 +390,15 @@ class AskResult:
             "status": "ok",
             "question": self.question,
             "queries_used": self.queries_used,
-            "confidence": self.confidence,
+            "confidence": self.confidence.to_dict(),
             "retrieved_chunks": self.chunks,
             "total_chunks": len(self.chunks),
             "answer_status": self.status,
-            "mode": MODE,
+            "mode": self.mode,
+            **(self.extraction.fields(with_scores=True) if self.extraction is not None else {}),
             "passages": self.passages,
         }
-        if step := next_step(self.status):
+        if step := next_step(self.status, self.mode):
             response["next_step"] = step
         if self.sources is not None:
             response["sources"] = self.sources

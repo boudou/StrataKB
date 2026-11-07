@@ -3,7 +3,6 @@ of the command built from it. No database is needed."""
 
 from __future__ import annotations
 
-import dataclasses
 import json
 from unittest.mock import patch
 
@@ -12,19 +11,43 @@ from stratakb.knowledge import add_folder
 from stratakb.knowledge.add_folder import Options, Plan
 
 
-def test_every_need_has_a_flag_that_sets_its_options_field():
-    fields = {field.name for field in dataclasses.fields(Options)}
+def test_every_need_has_a_flag_that_confirms_only_it():
     for need in cli._NEEDS:
-        assert need.option in fields
-        assert getattr(Options(), need.option) is False
         args = cli._parser().parse_args(["add", "docs", need.flag])
-        assert getattr(args, need.option) is True
-        others = [other.option for other in cli._NEEDS if other is not need]
-        assert not any(getattr(args, option) for option in others)
+        assert args.confirmed == [need.name]
+    assert cli._parser().parse_args(["add", "docs"]).confirmed is None
+    assert Options().confirmed == frozenset()
 
 
-def test_needs_are_asked_in_table_order():
-    assert [need.name for need in cli._NEEDS] == ["broad_path", "large_run"]
+def _both_needs() -> Plan:
+    return Plan(root="r", needs={"large_run", "broad_path"}, broad_why="a drive root")
+
+
+def test_confirmations_ask_broad_path_then_large_run():
+    with (
+        patch.object(cli, "_stdin_is_tty", return_value=True),
+        patch.object(cli, "_confirm", return_value=True) as confirm,
+    ):
+        confirmed, refusal = cli._confirmations(_both_needs(), Options())
+    assert [call.args[0] for call in confirm.call_args_list] == [
+        "r is a broad path (a drive root). Add it anyway?",
+        "This run adds or updates 0 files (0.0 MB) and removes 0. Continue?",
+    ]
+    assert confirmed == {"broad_path", "large_run"}
+    assert refusal is None
+
+
+def test_confirmations_refuse_at_the_first_unconfirmed_need():
+    with patch.object(cli, "_stdin_is_tty", return_value=False):
+        confirmed, refusal = cli._confirmations(_both_needs(), Options())
+        assert confirmed == set()
+        assert refusal is not None and refusal[0] == "broad_path"
+
+        confirmed, refusal = cli._confirmations(
+            _both_needs(), Options(confirmed=frozenset({"broad_path"}))
+        )
+        assert confirmed == {"broad_path"}
+        assert refusal is not None and refusal[0] == "large_run"
 
 
 def test_plan_counts_files_added_or_updated():
