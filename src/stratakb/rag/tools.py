@@ -96,6 +96,27 @@ async def _exact_clauses(
     return await lookup_clauses(database_url, question, layers, budget, patterns)
 
 
+async def _answer_mode(
+    database_url: str,
+    requested: AnswerMode | None,
+    chunks: list[dict[str, Any]],
+    searched_layers: list[str] | None,
+) -> tuple[str, str | None]:
+    """The mode an answer runs in, judged on the passages it hands back, and any note.
+
+    With no passages there is nothing to loosen: the mode asked for, else the
+    strictest of the layers searched. Modes are read from the table on each call.
+    """
+    from stratakb.knowledge.layers import get_answer_modes
+
+    if chunks:
+        layers = sorted({c["layer"] for c in chunks})
+        return effective_mode(requested, await get_answer_modes(database_url, layers))
+    if requested:
+        return requested, None
+    return effective_mode(None, await get_answer_modes(database_url, searched_layers))
+
+
 def _routing_fallback_reason(
     result_count: int, top_k: int, confidence: Confidence
 ) -> str | None:
@@ -474,7 +495,6 @@ def register_rag_tools(
         mode: AnswerMode | None = None,
     ) -> AskResult | ToolFailure:
         """Run strata_ask; the tool below documents the arguments."""
-        from stratakb.knowledge.layers import get_answer_modes
         from stratakb.rag.query_rewriter import (
             build_domain_context,
             rewrite_configured,
@@ -587,10 +607,8 @@ def register_rag_tools(
             )
             sources = sources_from(chunks, basis) if include_sources else None
 
-            # The strictest of the request and the layers finally searched
-            used_mode, refused_note = effective_mode(
-                mode, await get_answer_modes(database_url, layers)
-            )
+            # Judged on the passages handed back, not on the layers searched
+            used_mode, refused_note = await _answer_mode(database_url, mode, chunks, layers)
             extraction = None
             if used_mode == "extractive":
                 extraction = await _extract_answer(
@@ -657,10 +675,10 @@ def register_rag_tools(
         budget (ANSWER_TOKEN_BUDGET, about 1,500 tokens, each passage's id,
         ref and citation counted with its text; at most 50 passages). In
         grounded mode the client composes the answer from the passages and
-        cites them by id. On an extractive layer the server answers with the
-        document's own sentences. A clause or section the question
-        names ("clause 7.2", "Annex II") is looked up exactly and comes
-        first, verbatim, once per document that has it.
+        cites them by id. When a passage comes from an extractive layer the
+        server answers with the document's own sentences. A clause or section
+        the question names ("clause 7.2", "Annex II") is looked up exactly and
+        comes first, verbatim, once per document that has it.
 
         The response: status is found, partly_found or not_found, with a
         next_step for the last two; mode is the mode used; passages lists S1,
@@ -689,8 +707,8 @@ def register_rag_tools(
             response_format: "concise" (default) or "detailed", which adds scores,
                     confidence, query variants, chunk ids and metadata.
             mode: "extractive" asks for the document's own sentences on any layer.
-                  "grounded" cannot loosen an extractive layer: the answer stays
-                  extractive and a note says so. Across layers the strictest wins.
+                  "grounded" cannot loosen a result holding a passage from an
+                  extractive layer: the answer stays extractive and a note says so.
         """
         if _tracker:
             result = await _tracker.track_ask(

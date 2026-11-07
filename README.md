@@ -269,7 +269,7 @@ flowchart TD
 
 The layer's **description** also tells the query rewriter which terminology the layer uses, so a clear description improves `strata_ask`.
 
-The layer's **answer_mode** says how its questions are to be answered: `grounded` (the default) means your client writes the answer from the cited passages; `extractive` is for layers where paraphrase is not acceptable, answered with the document's own sentences. Any other value is refused. `strata_create_knowledge_layer` takes the same `answer_mode`. `strata_list_knowledge_layers` shows each layer's mode, applying a preset again sets the mode of an existing layer when the preset gives one (a preset without `answer_mode` leaves the layer's mode alone), and layers created before this setting read as `grounded`. See [extractive answers](#extractive-answers) for what the mode does.
+The layer's **answer_mode** says how an answer holding its passages is given: `grounded` (the default) means your client writes the answer from the cited passages; `extractive` is for layers where paraphrase is not acceptable, answered with the document's own sentences. Any other value is refused. `strata_create_knowledge_layer` takes the same `answer_mode`. `strata_list_knowledge_layers` shows each layer's mode, applying a preset again sets the mode of an existing layer when the preset gives one (a preset without `answer_mode` leaves the layer's mode alone), and layers created before this setting read as `grounded`. See [extractive answers](#extractive-answers) for what the mode does.
 
 ### Try an example preset
 
@@ -288,7 +288,7 @@ Then ask from your client, for example *"How long should a line of Python be?"*.
 
 | Tool | Role | What it does |
 | --- | --- | --- |
-| `strata_ask` | viewer | Rewrites a question, searches in parallel, reranks, and returns found, partly found or not found with the best passages, each with its file, page, lines and headings ([what it returns](#what-strata_ask-returns)). On an extractive layer, or with `mode: "extractive"`, it answers with [the document's own sentences](#extractive-answers) and a receipt |
+| `strata_ask` | viewer | Rewrites a question, searches in parallel, reranks, and returns found, partly found or not found with the best passages, each with its file, page, lines and headings ([what it returns](#what-strata_ask-returns)). When a passage returned comes from an extractive layer, or with `mode: "extractive"`, it answers with [the document's own sentences](#extractive-answers) and a receipt |
 | `strata_verify` | viewer | Checks a drafted answer against the passages it cites: every quote, number, date, amount, code and clause reference must be in them. A verified draft gets a receipt ([checking a drafted answer](#checking-a-drafted-answer)) |
 | `strata_search` | viewer | Hybrid search for exact terms and identifiers, with optional layer and metadata filters, and a confidence level; a clause or section the query names (`clause 7.2`) comes first, verbatim |
 | `strata_list_knowledge_layers` | viewer | Lists layers with document and chunk counts |
@@ -397,7 +397,15 @@ flowchart LR
 }
 ```
 
-- **When it applies:** the strictest wins. The answer is extractive when any layer searched is extractive or the call passes `mode: "extractive"`. `mode: "grounded"` cannot loosen an extractive layer: the answer stays extractive and a `note` says so. The layers searched are the ones finally used, so a question with no layer named that is not routed, or that falls back to all layers, is extractive as soon as one layer in the knowledge base is.
+```mermaid
+flowchart TD
+    P{"Passages to<br/>hand back?"} -->|yes| E{"Any from an extractive layer,<br/>or mode: extractive asked?"}
+    E -->|yes| X[extractive]
+    E -->|no| G[grounded]
+    P -->|no| N["not_found, in the mode asked for,<br/>else the strictest of the layers searched"]
+```
+
+- **When it applies:** the mode follows the passages the answer hands back, after reranking and the token budget. The answer is extractive when any returned passage comes from an extractive layer, exact clause matches included, or when the call passes `mode: "extractive"`. A result with passages from grounded layers only stays grounded, whichever layers were searched, so adding an extractive layer does not change the answers that do not use it. `mode: "grounded"` cannot loosen a result holding a passage from an extractive layer: the answer stays extractive and a `note` says so. With no passages, `not_found` reports the mode asked for, or else extractive if one of the layers searched is.
 - **Each `text`** is exactly the span `ref` names in the stored document, whole sentences only, even when a passage starts or stops inside one. A wrapped line stays in its sentence; headings are left out; abbreviations and clause numbers (`e.g.`, `No.`, `7.2`) do not end one. A sentence from scanned text has `text_origin` `ocr` and a `warning` to check the original page.
 - **Long blocks are not quoted.** Lines without end marks (a price list, a schedule, a log, YAML) run together as one sentence until a blank line, heading or list item. A span over 2,000 characters is never cut and never returned, so a question that only such a block could answer is `not_found`. The best sentences that fit `ANSWER_TOKEN_BUDGET` are returned; the rest are left out.
 - **`receipt_id`** opens the quotes with `strata_get_receipt`. No sentence, no receipt.
@@ -676,7 +684,7 @@ The target: ask your own documents (contracts, rulebooks, specs, runbooks) and g
 flowchart LR
     Q[Question] --> A[strata_ask]
     A --> P["Passages with<br/>exact locations"]
-    P --> G{Layer mode}
+    P --> G{"Mode of the<br/>passages' layers"}
     G -->|grounded| W[Client writes answer] --> V[strata_verify] --> R[Receipt]
     G -->|extractive| X["Server returns the<br/>document's own sentences"] --> R
 ```

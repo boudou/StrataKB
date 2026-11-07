@@ -39,8 +39,8 @@ MAX_SENTENCE_CHARS = 2000
 
 # The note when a mode asked for could not loosen a layer's
 GROUNDED_REFUSED_NOTE = (
-    "A layer searched is extractive, so this answer is extractive; "
-    "grounded cannot be asked for on it."
+    "A passage returned comes from an extractive layer, so this answer is extractive; "
+    "grounded cannot be asked for on that layer."
 )
 # The note when only chunks stored before documents were kept matched
 LEGACY_ONLY_NOTE = "Re-ingest this layer to enable extractive answers."
@@ -139,8 +139,9 @@ def split_sentences(text: str, start: int = 0) -> list[tuple[int, int]]:
 def effective_mode(requested: str | None, layer_modes: Sequence[str]) -> tuple[str, str | None]:
     """The mode an answer runs in and a note when the request could not loosen it.
 
-    The strictest wins: any extractive layer, or a request for extractive, makes
-    the answer extractive.
+    The strictest wins: an extractive mode among layer_modes, or a request for
+    extractive, makes the answer extractive. strata_ask gives the modes of the
+    layers its passages come from.
     """
     if requested == "extractive" or "extractive" in layer_modes:
         return "extractive", GROUNDED_REFUSED_NOTE if requested == "grounded" else None

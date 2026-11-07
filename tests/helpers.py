@@ -362,6 +362,29 @@ async def wait_until_blocked_by(
         raise
 
 
+# Extractive answers: a contract, two of its sentences, and a block too long to quote
+
+DOC_TEXT = (
+    "# Master agreement\n"
+    "\n"
+    "Intro line.\n"
+    "\n"
+    "## 7 Termination\n"
+    "\n"
+    "7.2 Either party may end this agreement\n"
+    "with ninety days' written notice. Notice goes by registered letter, e.g. by courier.\n"
+    "\n"
+    "## 8 Payment\n"
+    "\n"
+    "Invoices are due within 30 days. Late payment carries interest.\n"
+)
+NINETY = "7.2 Either party may end this agreement\nwith ninety days' written notice."
+LETTER = "Notice goes by registered letter, e.g. by courier."
+# Lines without end marks: one sentence of 100 KB, the part a chunk hits at its end
+BLOCK_HIT = "the fee for the annex is ninety euros "
+LONG_BLOCK = "item without an end mark\n" * 4200 + BLOCK_HIT * 21
+
+
 # Receipts: a policy document, a quote from it, and a receipt citing that quote
 
 V1_TEXT = (
