@@ -252,10 +252,13 @@ _DATES = [
     ("literal", re.compile(r"(?<![\w./])\d{1,2}[/.]\d{1,2}[/.]\d{2,4}(?![\w./])")),
 ]
 
-_IDENTIFIERS = [
-    # IBAN-shaped, printed in groups of four or compact
+# IBAN-shaped, printed in groups of four or compact: account data, not names
+ACCOUNT_PATTERNS = [
     re.compile(r"(?<![\w])[A-Z]{2}\d{2}(?: [A-Z0-9]{4}){3,7}(?: [A-Z0-9]{1,3})?(?![\w])"),
     re.compile(r"(?<![\w])[A-Z]{2}\d{2}[A-Z0-9]{10,30}(?![\w])"),
+]
+
+IDENTIFIER_PATTERNS = [
     # Message ids such as pacs.008 or pacs.008.001.08
     re.compile(r"(?<![\w.])[a-z]{4}\.\d{3}(?:\.\d{3}\.\d{2})?(?![\w.])"),
     # Codes with a dash, such as AT-02
@@ -269,7 +272,7 @@ _CLAUSE_WORD = (
     r"|Schedule|Rule|§)"
 )
 _CLAUSE_NUM = r"\d+[A-Za-z]?(?:\.\d+)*(?:\(\w{1,4}\))*"
-_CLAUSES = [
+CLAUSE_PATTERNS = [
     re.compile(rf"(?<![\w]){_CLAUSE_WORD}\s*(?P<num>{_CLAUSE_NUM})(?![\w]|\.\d)", re.IGNORECASE),
     # 7(2)(b) or 7.2.1 without a keyword
     re.compile(r"(?<![\w.])(?P<num>\d+(?:\.\d+)*(?:\(\w{1,4}\))+)(?![\w])"),
@@ -414,7 +417,7 @@ def _located_facts(text: str) -> list[tuple[int, Fact]]:
     """
     work = list(text)
     found: list[tuple[int, Fact]] = []
-    for pattern in _IDENTIFIERS:
+    for pattern in (*ACCOUNT_PATTERNS, *IDENTIFIER_PATTERNS):
         for m in _take(work, pattern):
             key = ("id", m.group(0).replace(" ", ""))
             found.append((m.start(), Fact("identifier", m.group(0), key)))
@@ -422,7 +425,7 @@ def _located_facts(text: str) -> list[tuple[int, Fact]]:
         for m in _take(work, pattern):
             if fact := _date_fact(kind, m):
                 found.append((m.start(), fact))
-    for pattern in _CLAUSES:
+    for pattern in CLAUSE_PATTERNS:
         for m in _take(work, pattern):
             key = ("clause", m.group("num").lower())
             found.append((m.start(), Fact("clause", m.group(0), key)))

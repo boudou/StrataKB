@@ -34,6 +34,7 @@ from stratakb.rag.extractive import (
     fit_to_answer_budget,
     select_sentences,
 )
+from stratakb.rag.names import Name, check_names, find_names, missing_names_note
 from stratakb.rag.passages import (
     AnswerMode,
     AskResult,
@@ -203,6 +204,15 @@ def _ask_chunk(r: SearchResult, score: float) -> dict[str, Any]:
     )
 
 
+def _name_texts(chunks: list[dict[str, Any]]) -> list[str]:
+    """The text a name the question asks about is looked for in: each chunk and its file."""
+    return [t for c in chunks for t in (c.get("content"), c.get("source_file")) if t]
+
+
+def _join_notes(*notes: str | None) -> str | None:
+    return " ".join(n for n in notes if n) or None
+
+
 def _cited_ends(chunks: list[dict[str, Any]], reach: int = 0) -> dict[int, int]:
     """Each cited document's id and how far to read it: its furthest span's end, plus reach."""
     ends: dict[int, int] = {}
@@ -245,6 +255,9 @@ async def _extract_answer(
     budget: int,
     refused_note: str | None,
     omitted_note: str | None,
+    *,
+    names: list[Name],
+    named_clause: bool,
 ) -> ExtractiveAnswer:
     """Choose the sentences that answer question from the chunks, and issue their receipt.
 
@@ -257,6 +270,10 @@ async def _extract_answer(
     omitted_note says named clauses never reached chunks: it makes a found answer
     partly_found too, and a not_found answer keeps it, so "not in the documents"
     does not hide what was not read.
+    names are the names the question asks about (names.find_names). When none
+    is in the chunks or the chosen sentences, and no named clause was returned,
+    the answer is not_found, before any receipt; when some are missing, a found
+    answer becomes partly_found. The note names the missing ones.
     """
     from stratakb.core.database import get_pool
     from stratakb.knowledge.documents import fetch_cited_documents
@@ -281,8 +298,16 @@ async def _extract_answer(
     logger.info("extractive_answer", candidates=len(candidates), sentences=len(sentences))
     if not sentences:
         legacy_note = LEGACY_ONLY_NOTE if chunks and not ends else None
-        note = " ".join(n for n in (refused_note, legacy_note, omitted_note) if n) or None
+        names_note = missing_names_note(check_names(names, _name_texts(chunks)), related=False)
+        note = _join_notes(refused_note, names_note, legacy_note, omitted_note)
         return ExtractiveAnswer([], None, "not_found", note)
+    # A sentence can reach past its chunk, so its own text counts too
+    check = check_names(names, [*_name_texts(chunks), *(s.text for s in sentences)])
+    names_note = missing_names_note(check, related=False)
+    if check.none_present and not named_clause:
+        return ExtractiveAnswer(
+            [], None, "not_found", _join_notes(refused_note, names_note, omitted_note)
+        )
 
     sentences = fit_to_answer_budget(sentences, chunks, documents, budget)
     answer = [answer_item(s, chunks, documents) for s in sentences]
@@ -304,9 +329,9 @@ async def _extract_answer(
     )
     status = answer_status(max(s.score for s in sentences), "rerank")
     gap_note = await asyncio.to_thread(clause_gap_note, chunks, documents, ends, sentences)
-    if (gap_note or omitted_note) and status == "found":
+    if (names_note or gap_note or omitted_note) and status == "found":
         status = "partly_found"
-    note = " ".join(n for n in (refused_note, gap_note, omitted_note) if n) or None
+    note = _join_notes(refused_note, names_note, gap_note, omitted_note)
     return ExtractiveAnswer(answer, receipt_id, status, note)
 
 
@@ -632,6 +657,10 @@ def register_rag_tools(
                 max((basis_score(c, basis) for c in chunks), default=0.0), basis
             )
             sources = sources_from(chunks, basis) if include_sources else None
+            # The names the question asks about must be in what goes back; a
+            # named clause returned means it named something that is there
+            names = find_names(question)
+            named_clause = len(exact) > len(left_out)
 
             # Judged on the passages handed back, not on the layers searched
             used_mode, refused_note = await _answer_mode(database_url, mode, chunks, layers)
@@ -646,14 +675,23 @@ def register_rag_tools(
                     _settings.answer_token_budget,
                     refused_note,
                     omitted,
+                    names=names,
+                    named_clause=named_clause,
                 )
                 status = extraction.status
             else:
-                note = " ".join(
-                    n for n in (cut_clause_note(chunks, passages), omitted) if n
-                ) or None
-                if note and status == "found":
+                clause_note = _join_notes(cut_clause_note(chunks, passages), omitted)
+                if clause_note and status == "found":
                     status = "partly_found"
+                check = check_names(names, _name_texts(chunks))
+                if check.none_present and not named_clause:
+                    status = "not_found"
+                elif check.missing and status == "found":
+                    status = "partly_found"
+                names_note = missing_names_note(
+                    check, related=bool(passages) and status == "not_found"
+                )
+                note = _join_notes(names_note, clause_note)
 
             # Audit
             await write_audit_log(
@@ -718,6 +756,10 @@ def register_rag_tools(
         partly_found, with a note naming the clause and the file. A named clause
         that does not fit, or a match past the first 10, is left out: a found
         answer becomes partly_found, with a note giving the count and the files.
+        A name the question asks about (asyncio.TaskPool, PyConfig_Merge,
+        AC04, PEP 8) must be in a passage returned: when none is, the status
+        is not_found and the passages are only related text; when some are
+        missing, a found answer becomes partly_found. The note names them.
 
         The response: status is found, partly_found or not_found, with a
         next_step for the last two; mode is the mode used; passages lists S1,
