@@ -216,7 +216,8 @@ class TestVerifyTool:
 
     async def test_wide_ref_flagged(self, server, db_url, layer, tmp_path, user):
         doc = await _document(db_url, layer, tmp_path)
-        whole = f"d{doc['id']}:0-{len(doc['text'])}"
+        # No section starts at 1, so the span keeps the chunk_size bound
+        whole = f"d{doc['id']}:1-{len(doc['text'])}"
         beyond = f"d{doc['id']}:0-{len(doc['text']) + 5}"
         with _as(user):
             result = await _verify(
@@ -227,6 +228,29 @@ class TestVerifyTool:
         assert flags == [("passage", whole), ("passage", beyond)]
         assert "more than a passage can (200)" in result["flags"][0]["message"]
         assert "lies outside its document" in result["flags"][1]["message"]
+
+    async def test_section_ref_verifies(self, server, db_url, layer, tmp_path, user):
+        # policy.md is one section (# Retention), wider than the 200 limit
+        doc = await _document(db_url, layer, tmp_path)
+        assert len(doc["text"]) > 200
+        section = f"d{doc['id']}:0-{len(doc['text'])}"
+        with _as(user):
+            result = await _verify(server, f'"{QUOTE}" [S1]', [section])
+        assert result["result"] == "verified", result
+        assert result["receipt_id"]
+
+    async def test_section_ref_over_the_budget_flagged(self, db_url, layer, tmp_path, user):
+        from stratakb.rag.verify_tools import verify_draft
+
+        doc = await _document(db_url, layer, tmp_path)
+        section = f"d{doc['id']}:0-{len(doc['text'])}"
+        with _as(user):
+            result = await verify_draft(
+                db_url, "No facts here [S1].", [section], user, "viewer", answer_token_budget=100
+            )
+        assert result["result"] == "flagged"
+        assert [f["kind"] for f in result["flags"]] == ["passage"]
+        assert "more than a passage can (400)" in result["flags"][0]["message"]
 
     async def test_unreadable_layer_refused(self, server, db_url, layer, tmp_path, user):
         doc = await _document(db_url, layer, tmp_path)
@@ -345,7 +369,7 @@ class TestVerifyTool:
 
     async def test_passage_flag_beats_nothing_checked(self, server, db_url, layer, tmp_path, user):
         doc = await _document(db_url, layer, tmp_path)
-        whole = f"d{doc['id']}:0-{len(doc['text'])}"
+        whole = f"d{doc['id']}:1-{len(doc['text'])}"
         with _as(user):
             result = await _verify(server, "No facts here [S1].", [whole])
         assert result["result"] == "flagged"

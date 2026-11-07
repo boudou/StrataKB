@@ -163,7 +163,8 @@ _ANSWER_CONTRACT = (
     "Follow the mode in the response. In grounded mode write the answer, then call strata_verify "
     "before showing it, with the draft and every returned passage's ref in order (the first is "
     "S1). When the result is flagged, fix or drop the flagged claims and verify again. A flag of "
-    "kind passage cannot be fixed by rewriting: say the answer is unverified. When the result is "
+    "kind passage is about a ref, not the draft: pass the refs exactly as strata_ask returned them "
+    "and verify again, and if it stays, say the answer is unverified. When the result is "
     "nothing_checked, the draft has no quote or fact to check and no receipt: quote the passage "
     "that supports it and verify again, or say the answer is unverified.",
     "In extractive mode show answer verbatim, each sentence with its citation, and any note or "
@@ -215,7 +216,7 @@ def build_server(settings: Settings) -> FastMCP:
         mcp, settings.database_url, settings.openai_api_key, settings=settings
     )
     register_receipt_tools(mcp, settings.database_url)
-    register_verify_tools(mcp, settings.database_url)
+    register_verify_tools(mcp, settings.database_url, settings=settings)
     register_database_tools(mcp, settings.database_url, settings.readonly_database_url)
     register_learning_tools(mcp, settings.database_url)
     _register_admin_tools(mcp, settings)

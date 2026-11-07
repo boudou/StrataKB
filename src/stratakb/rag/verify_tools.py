@@ -3,7 +3,9 @@
 The passages are named by the refs strata_ask returned, in S-id order, and
 their text is always read from the store, never taken from the caller. A
 ref is bounded: its span must lie inside its document and be at most twice
-the layer's chunk_size long, so a citation cannot be widened to a whole
+the layer's chunk_size long, or, for a span that starts where a stored
+section starts and ends inside it, at most as long as the widest exact
+clause strata_ask can return, so a citation cannot be widened to a whole
 document. A verified draft gets a receipt, and a draft with nothing to check
 gets none; every call is audited with counts only, never the draft.
 """
@@ -13,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import re
 from dataclasses import asdict, dataclass
+from typing import TYPE_CHECKING
 
 import structlog
 from mcp.server.fastmcp import FastMCP
@@ -23,9 +26,13 @@ from stratakb.core.database import get_pool
 from stratakb.core.logging import log_tool_call
 from stratakb.core.migrations import ensure_schema
 from stratakb.knowledge.layers import DEFAULT_CHUNK_SIZE
+from stratakb.rag.clause_lookup import max_exact_chars
 from stratakb.rag.passages import ChunkRef, DocumentRef, parse_ref, passage_id
 from stratakb.rag.receipts import ReceiptError, issue_receipt, readable_layers
 from stratakb.rag.verify import MAX_FLAGS, Flag, check
+
+if TYPE_CHECKING:
+    from stratakb.config import Settings
 
 logger = structlog.get_logger()
 
@@ -33,7 +40,8 @@ logger = structlog.get_logger()
 MAX_PASSAGES = 50
 MAX_DRAFT_CHARS = 50_000
 
-# A passage may be at most this many times its layer's chunk_size long
+# A passage that is not a stored section's start may be at most this many
+# times its layer's chunk_size long
 MAX_REF_WIDTH_FACTOR = 2
 
 # Chunks stored before the context prefix left content still start with it
@@ -70,8 +78,12 @@ class _Passage:
     span: DocumentRef | None
 
 
-async def _resolve(database_url: str, refs: list[str]) -> list[_Passage]:
+async def _resolve(database_url: str, refs: list[str], exact_chars: int) -> list[_Passage]:
     """Each ref's layer and stored text, with its span checked, in order.
+
+    A span that starts where a stored section of its document starts and
+    ends inside that section, the shape of every exact clause, may be up to
+    exact_chars long, so a clause strata_ask returned always verifies.
 
     Raises:
         _RefusedError: For a malformed ref or one that names nothing stored.
@@ -92,9 +104,15 @@ async def _resolve(database_url: str, refs: list[str]) -> list[_Passage]:
         """
         SELECT x.n, kl.name AS layer, char_length(d.text) AS length,
                coalesce((kl.chunk_config->>'chunk_size')::int, $4) AS chunk_size,
+               EXISTS (
+                   SELECT 1 FROM strata_vectors.document_sections s
+                   WHERE s.document_id = d.id AND s.char_start = x.s AND x.e <= s.char_end
+               ) AS in_section,
                substr(d.text, x.s + 1,
                       greatest(least(x.e - x.s,
-                                     $5 * coalesce((kl.chunk_config->>'chunk_size')::int, $4)),
+                                     greatest($5 * coalesce((kl.chunk_config->>'chunk_size')::int,
+                                                            $4),
+                                              $6)),
                                0)) AS text
         FROM unnest($1::bigint[], $2::int[], $3::int[]) WITH ORDINALITY AS x(id, s, e, n)
         JOIN strata_vectors.documents d ON d.id = x.id
@@ -105,6 +123,7 @@ async def _resolve(database_url: str, refs: list[str]) -> list[_Passage]:
         [d.char_end for d in documents],
         DEFAULT_CHUNK_SIZE,
         MAX_REF_WIDTH_FACTOR,
+        exact_chars,
     ) if documents else []
     by_position = {row["n"]: row for row in doc_rows}
     chunk_rows = {
@@ -138,6 +157,8 @@ async def _resolve(database_url: str, refs: list[str]) -> list[_Passage]:
             raise _RefusedError(_NOT_READABLE.format(pid=pid, ref=ref))
         start, end = target.char_start, target.char_end
         limit = MAX_REF_WIDTH_FACTOR * row["chunk_size"]
+        if row["in_section"]:
+            limit = max(limit, exact_chars)
         text, problem = row["text"], None
         if not start <= end <= row["length"]:
             text, problem = None, "lies outside its document"
@@ -156,8 +177,13 @@ async def verify_draft(
     role: str,
     *,
     tool_name: str = "verify_draft",
+    answer_token_budget: int | None = None,
 ) -> dict:
-    """Check the draft against the passages named by refs; issue a receipt when verified."""
+    """Check the draft against the passages named by refs; issue a receipt when verified.
+
+    answer_token_budget bounds an exact clause's span as strata_ask cuts it;
+    None reads the environment's settings.
+    """
 
     async def audit(outcome: str, **counts) -> None:
         await write_audit_log(
@@ -180,9 +206,13 @@ async def verify_draft(
             ),
         }
 
+    if answer_token_budget is None:
+        from stratakb.config import get_settings
+
+        answer_token_budget = get_settings().answer_token_budget
     await ensure_schema(database_url)
     try:
-        passages = await _resolve(database_url, refs)
+        passages = await _resolve(database_url, refs, max_exact_chars(answer_token_budget))
         readable = await readable_layers(database_url, user_id, role)
         for p in passages:
             if p.layer not in readable:
@@ -247,8 +277,14 @@ async def verify_draft(
     return response
 
 
-def register_verify_tools(mcp: FastMCP, database_url: str) -> None:
-    """Register strata_verify on the MCP server."""
+def register_verify_tools(
+    mcp: FastMCP, database_url: str, settings: Settings | None = None
+) -> None:
+    """Register strata_verify on the MCP server.
+
+    With settings, answer_token_budget is read from them on each call;
+    without, from the environment's settings.
+    """
 
     @mcp.tool()
     @require_role("viewer")
@@ -276,5 +312,6 @@ def register_verify_tools(mcp: FastMCP, database_url: str) -> None:
         """
         user_id, role = get_current_user()
         return await verify_draft(
-            database_url, draft, passages, user_id, role, tool_name="strata_verify"
+            database_url, draft, passages, user_id, role, tool_name="strata_verify",
+            answer_token_budget=settings.answer_token_budget if settings else None,
         )

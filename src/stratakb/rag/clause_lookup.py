@@ -354,6 +354,14 @@ def fit_to_budget(chunk: dict[str, Any], budget: int) -> dict[str, Any]:
     }
 
 
+def max_exact_chars(budget: int) -> int:
+    """The widest exact passage, in characters, that fit_to_budget returns for budget tokens.
+
+    estimate_tokens counts about four characters per token.
+    """
+    return max(4 * budget, _MIN_TRIMMED_CHARS)
+
+
 def fit_clauses(chunks: list[dict[str, Any]], budget: int) -> list[dict[str, Any]]:
     """Each chunk fit to the budget left, divided by the chunks still to fit, in order.
 

@@ -24,6 +24,7 @@ from stratakb.rag.clause_lookup import (
     find_references,
     fit_clauses,
     fit_to_budget,
+    max_exact_chars,
     question_pattern,
     unanchored,
     without_exact_spans,
@@ -171,6 +172,11 @@ def test_fit_to_budget_keeps_offsets():
     assert not trimmed["content"].endswith((" ", "wor"))
     assert trimmed["cut"] is True
     assert fit_to_budget(_exact("short"), budget)["content"] == "short"
+
+
+def test_max_exact_chars():
+    assert max_exact_chars(1500) == 6000
+    assert max_exact_chars(10) == 200
 
 
 def test_fit_clauses_shares_what_a_floor_leaves():
@@ -471,6 +477,40 @@ class TestAskClause:
 
         assert response["status"] == "found"
         assert "note" not in response
+
+    async def test_long_clause_ref_verifies(self, server, settings, layers):
+        # Clause 2.2 is wider than twice the layer's chunk_size (400)
+        layer, _ = layers
+
+        response, _ = await _call(
+            server, "strata_ask", [], question="clause 2.2", layers=[layer],
+        )
+
+        ref = response["passages"][0]["ref"]
+        start, end = (int(n) for n in ref.split(":")[1].split("-"))
+        assert end - start > 400
+        draft = '"Either party may terminate this agreement with immediate effect" [S1].'
+        result = _payload(
+            await server.call_tool("strata_verify", {"draft": draft, "passages": [ref]})
+        )
+        assert result["result"] == "verified", result
+        assert result["receipt_id"]
+
+    async def test_cut_clause_ref_verifies(self, server, settings, layers):
+        layer, _ = layers
+        settings.answer_token_budget = 120
+
+        response, _ = await _call(
+            server, "strata_ask", [], question="clause 2", layers=[layer],
+        )
+
+        ref = response["passages"][0]["ref"]
+        draft = '"Either party may terminate this agreement by written notice" [S1].'
+        result = _payload(
+            await server.call_tool("strata_verify", {"draft": draft, "passages": [ref]})
+        )
+        assert result["result"] == "verified", result
+        assert result["receipt_id"]
 
     async def test_each_cut_clause_names_its_file(self, server, settings, layers):
         _, layer = layers
