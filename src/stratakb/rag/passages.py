@@ -5,8 +5,8 @@ numbered S1, S2, ... in it, so S<n> is the n-th retrieved chunk the
 learning loop records. Each passage carries a ref that names the exact span
 of the stored document text it holds, and a citation a developer can open:
 the file's relative path, the page, the line range, the clause path and
-the document's date, and the file that says it replaces this one when there
-is one.
+the document's date, the file that says it replaces this one when there is
+one, and a label when the file's layer marks it as archived.
 The budget counts each passage's id, ref and citation with its text, and an
 answer holds at most MAX_PASSAGES passages, all of which the learning loop
 stores, so feedback by passage id resolves for every one.
@@ -37,12 +37,12 @@ AnswerMode = Literal["grounded", "extractive"]
 MAX_PASSAGES = 50
 # The tokens a passage costs in the response beyond its own indent-2 JSON: the
 # deeper indentation inside the response's passages list and the page, lines,
-# page_end and the date and date_source values a stored document adds (measured
-# on FastMCP's indent-2 JSON with six-digit spans and three-digit pages: about
-# 107 characters). A replaced_by label is not counted: packing runs before
-# documents are read, a path can be 500 characters, and raising this for every
-# passage would cost all answers room for a rare key
-RESPONSE_SLACK_TOKENS = 27
+# page_end, the date and date_source values and the archived key a stored
+# document adds (measured on FastMCP's indent-2 JSON with six-digit spans and
+# three-digit pages: about 133 characters). A replaced_by label is not counted:
+# packing runs before documents are read, a path can be 500 characters, and
+# raising this for every passage would cost all answers room for a rare key
+RESPONSE_SLACK_TOKENS = 34
 
 _PASSAGE_ID = re.compile(r"[Ss]([1-9][0-9]*)")
 
@@ -197,7 +197,8 @@ def cite(chunk: dict[str, Any], document: dict[str, Any] | None) -> dict[str, An
     With its stored document the file is the relative path, the page and line
     range come from the chunk's span, and the date and date_source are the
     document's, None when it has none. replaced_by is there only when another
-    file says it replaces this one. A chunk ingested before documents were
+    file says it replaces this one, and archived, always True, only when the
+    layer's patterns match the file. A chunk ingested before documents were
     stored is cited by its file name and, for a PDF, its page; its lines and
     date are unknown.
     """
@@ -216,6 +217,8 @@ def cite(chunk: dict[str, Any], document: dict[str, Any] | None) -> dict[str, An
         citation["date_source"] = document.get("doc_date_source")
         if document.get("replaced_by"):
             citation["replaced_by"] = document["replaced_by"]
+        if document.get("archived"):
+            citation["archived"] = True
         where = locate(
             document["text"], document["page_map"], chunk["char_start"], chunk["char_end"]
         )

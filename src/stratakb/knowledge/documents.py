@@ -18,6 +18,7 @@ from uuid import UUID
 
 import asyncpg
 import structlog
+from pathspec import GitIgnoreSpec
 
 from stratakb.knowledge.parsers.document import ParsedDocument
 from stratakb.knowledge.structure import Heading, Section
@@ -312,6 +313,27 @@ async def prune_documents(
     return int(result.split()[-1])
 
 
+def _archived_spec(raw: object, layer_id: UUID) -> GitIgnoreSpec | None:
+    """A layer's archived files patterns, compiled; None when it has none or they are unusable.
+
+    A stored list may never have passed the validator (a restored backup), and
+    a pattern that cannot compile or that stalls would cost the whole citation.
+    The whole list is dropped, not the bad pattern: with last match wins,
+    dropping one changes what the others mean.
+    """
+    # Imported here: layers.py imports this module
+    from stratakb.knowledge.layers import LayerValidationError, _validate_archived_patterns
+
+    patterns = json.loads(raw) if isinstance(raw, str) else raw
+    if not patterns:
+        return None
+    try:
+        return GitIgnoreSpec.from_lines(_validate_archived_patterns(patterns))
+    except LayerValidationError:
+        logger.warning("archived_patterns_unusable", layer_id=str(layer_id))
+        return None
+
+
 async def fetch_cited_documents(
     conn: asyncpg.Connection, ends: dict[int, int]
 ) -> dict[int, dict]:
@@ -322,12 +344,16 @@ async def fetch_cited_documents(
     path of the first file, by path, in the same layer and source root whose
     latest version declares that it supersedes this one, or None. Older
     versions keep their value and their file_id, so only the latest counts.
+    archived says the path matches its layer's archived files patterns. They
+    are read from the table on every call, not the routing cache, so a change
+    shows on the next ask, and they are not returned.
     """
     if not ends:
         return {}
     rows = await conn.fetch(
         """
-        SELECT d.id, d.relative_path, d.page_map, d.text_origin, d.doc_date, d.doc_date_source,
+        SELECT d.id, d.layer_id, d.relative_path, d.page_map, d.text_origin,
+               d.doc_date, d.doc_date_source, kl.archived_patterns,
                left(d.text, x.max_end) AS text,
                (
                    SELECT r.relative_path
@@ -347,11 +373,25 @@ async def fetch_cited_documents(
                ) AS replaced_by
         FROM strata_vectors.documents d
         JOIN unnest($1::bigint[], $2::int[]) AS x(id, max_end) ON x.id = d.id
+        JOIN strata_core.knowledge_layers kl ON kl.id = d.layer_id
         """,
         list(ends),
         list(ends.values()),
     )
-    return {row["id"]: dict(row) for row in rows}
+    documents: dict[int, dict] = {}
+    specs: dict[UUID, GitIgnoreSpec | None] = {}
+    for row in rows:
+        document = dict(row)
+        layer_id = document.pop("layer_id")
+        patterns = document.pop("archived_patterns")
+        if layer_id not in specs:
+            specs[layer_id] = _archived_spec(patterns, layer_id)
+        spec = specs[layer_id]
+        document["archived"] = (
+            spec is not None and spec.check_file(document["relative_path"]).include is True
+        )
+        documents[row["id"]] = document
+    return documents
 
 
 def locate(

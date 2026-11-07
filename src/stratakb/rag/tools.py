@@ -692,9 +692,10 @@ def register_rag_tools(
         next_step for the last two; mode is the mode used; passages lists S1,
         S2, ... in order of relevance, each with its exact text, a ref to the
         span of the stored document, and a citation (file path, page, lines,
-        clause path, layer, date and date_source and, when another file says
-        it replaces this one, replaced_by). interaction_id goes to
-        strata_feedback, where passages can be rated by id ({"S1": "useful"}).
+        clause path, layer, date and date_source; when another file says it
+        replaces this one, replaced_by; when the layer's patterns mark the file
+        as archived, archived). interaction_id goes to strata_feedback, where
+        passages can be rated by id ({"S1": "useful"}).
 
         In extractive mode answer replaces passages: sentences word for word,
         each with its ref, citation and text_origin, plus a receipt_id (open it

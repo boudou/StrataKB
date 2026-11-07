@@ -250,8 +250,9 @@ def register_knowledge_tools(
         Patterns are in .gitignore style, matched against each file's path
         relative to its folder: "archive/", "*-2024.md", "!keep.md". The last
         match wins, so the order counts. Each may hold at most three wildcards.
-        An empty list clears them. Archived files are not the layer's
-        "archived" status, which covers the whole layer.
+        An empty list clears them. Citations of a matching file are labelled
+        as archived from the next ask on, with no new ingest. Archived files
+        are not the layer's "archived" status, which covers the whole layer.
 
         Args:
             layer_name: The layer to set them on (e.g., "runbooks").
@@ -343,8 +344,8 @@ def register_knowledge_tools(
         """Create or update a knowledge layer from a preset file and ingest all its sources.
 
         A preset is a YAML file describing one layer (name, description,
-        chunking, routing patterns) and the folders to ingest into it. This
-        tool:
+        chunking, routing patterns, archived file patterns) and the folders to
+        ingest into it. This tool:
         1. Creates the layer, or updates an existing layer made by this preset
            to the preset's settings; a layer with the same name made another
            way is refused and left unchanged
@@ -432,6 +433,16 @@ def register_knowledge_tools(
         if error is not None:
             # Nothing was changed, so there is nothing to audit
             return {"status": "error", "error": error}
+        # Written before the ingest: the patterns are stored, and it can raise
+        if "archived_patterns" in layer_result["changes"] or (
+            layer_result["status"] == "created" and preset.archived_patterns
+        ):
+            await write_audit_log(
+                database_url,
+                action="set_archived_patterns",
+                tool_name="strata_apply_preset",
+                parameters={"layer": preset.name, "patterns": preset.archived_patterns},
+            )
         ingest_result = await ingest_preset(database_url, openai_api_key, preset, root)
 
         layer_text = f"Layer '{preset.name}': {layer_result['status']}"
