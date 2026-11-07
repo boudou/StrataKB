@@ -100,9 +100,12 @@ async def store_document_version(
     (layer, source root, relative path) makes a concurrent call for the same
     file wait until the first caller's transaction ends, and then read the
     version it committed. The function opens its own transaction (a savepoint
-    inside the caller's), so the lock holds until the outermost one ends.
-    A version that a concurrent prune deletes while this call waits on it is
-    not reused: the call reads the latest version again.
+    inside the caller's), so the locks hold until the outermost one ends.
+
+    All the file's versions are locked up front in id order, the order a
+    whole-layer prune locks them: a file new to the layer has no row for a
+    clear to wait on, so the two meet here. A version that a concurrent prune
+    deletes while this call waits on it is not read, so it is not reused.
     """
     sha256 = hashlib.sha256(text.encode("utf-8")).hexdigest()
     async with conn.transaction():
@@ -111,26 +114,26 @@ async def store_document_version(
             _VERSION_LOCK_NAMESPACE,
             _version_lock_key(layer_id, source_root, relative_path),
         )
-        while True:
-            latest = await conn.fetchrow(
-                """
-                SELECT id, version, sha256 FROM strata_vectors.documents
-                WHERE layer_id = $1 AND source_root = $2 AND relative_path = $3
-                ORDER BY version DESC LIMIT 1
-                """,
-                layer_id,
-                source_root,
-                relative_path,
-            )
-            if latest is None or latest["sha256"] != sha256:
-                break
-            # No row back: a prune deleted this version while we waited on it
-            if await conn.fetchval(
-                "UPDATE strata_vectors.documents SET file_id = $2 WHERE id = $1 RETURNING id",
+        # NO KEY: a receipt citing a version (FOR KEY SHARE) need not wait
+        versions = await conn.fetch(
+            """
+            SELECT id, version, sha256 FROM strata_vectors.documents
+            WHERE layer_id = $1 AND source_root = $2 AND relative_path = $3
+            ORDER BY id
+            FOR NO KEY UPDATE
+            """,
+            layer_id,
+            source_root,
+            relative_path,
+        )
+        latest = max(versions, key=lambda row: row["version"], default=None)
+        if latest is not None and latest["sha256"] == sha256:
+            await conn.execute(
+                "UPDATE strata_vectors.documents SET file_id = $2 WHERE id = $1",
                 latest["id"],
                 file_id,
-            ) is not None:
-                return latest["id"], latest["version"]
+            )
+            return latest["id"], latest["version"]
 
         version = 1 if latest is None else latest["version"] + 1
         document_id = await conn.fetchval(
@@ -197,6 +200,36 @@ class FileScope:
     relative_paths: Sequence[str]
 
 
+async def lock_file_rows(
+    conn: asyncpg.Connection,
+    layer_id: str | UUID | None,
+    *,
+    files: FileScope | None = None,
+) -> list[UUID]:
+    """Lock a layer's tracked file rows (or only those of files); return their ids.
+
+    Whoever removes files calls this before touching chunks: an ingest of a
+    file locks its row first and its chunks second, so that order is the same
+    everywhere, and the id order keeps removers apart from each other. A row
+    committed after this call is not locked, so delete by the ids returned.
+    No layer_id matches no row.
+    """
+    scope = ""
+    args: list = [layer_id]
+    if files is not None:
+        scope = "AND source_root = $2 AND relative_path = ANY($3::text[])"
+        args += [files.source_root, list(files.relative_paths)]
+    rows = await conn.fetch(
+        f"""
+        SELECT id FROM strata_core.ingested_files
+        WHERE layer_id = $1 {scope}
+        ORDER BY id FOR UPDATE
+        """,
+        *args,
+    )
+    return [row["id"] for row in rows]
+
+
 async def prune_documents(
     conn: asyncpg.Connection,
     layer_ids: Sequence[str | UUID],
@@ -209,8 +242,8 @@ async def prune_documents(
     only those files' versions, and layer_ids must then hold exactly one layer
     (a file belongs to one). Several layers are swept in one statement, so
     their versions are locked in one id order across layers, the order a
-    receipt locks the versions it cites (sweeping them one by one could
-    deadlock).
+    receipt locks the versions it cites and an ingest the versions of its file
+    (sweeping them one by one could deadlock).
 
     Two statements, because a lone DELETE that waits on an uncommitted
     reference still deletes once it commits: its checks keep the snapshot taken

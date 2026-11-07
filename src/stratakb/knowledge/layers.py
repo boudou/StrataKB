@@ -20,6 +20,7 @@ from cachetools import TTLCache
 from stratakb.core.database import get_pool
 from stratakb.core.migrations import ensure_schema
 from stratakb.core.stamp_watcher import StampWatcher
+from stratakb.knowledge.documents import lock_file_rows
 
 logger = structlog.get_logger()
 
@@ -682,6 +683,14 @@ async def update_layer(
 async def delete_layer(database_url: str, *, name: str) -> dict:
     """Delete a knowledge layer and all its chunks.
 
+    The layer's file rows are locked before the chunks are deleted (see
+    lock_file_rows), so a running ingest of one of its files finishes first.
+    A file first ingested meanwhile holds the layer row until it commits, and
+    the delete of that row then cascades to it; chunks_deleted leaves its
+    chunks out. One order stays open: such a file stored again between the
+    lock and the delete of the layer row deadlocks, and Postgres aborts one
+    side with nothing half done.
+
     Returns summary of what was deleted.
     Raises LayerNotFoundError if layer doesn't exist.
     """
@@ -697,15 +706,21 @@ async def delete_layer(database_url: str, *, name: str) -> dict:
             if layer is None:
                 raise LayerNotFoundError(f"Knowledge layer '{name}' not found.")
 
-            # Delete chunks from vector store
+            file_ids = await lock_file_rows(conn, layer["id"])
+
+            # Delete chunks from vector store: the locked files' and legacy ones
             result = await conn.execute(
-                "DELETE FROM strata_vectors.chunks WHERE layer_name = $1",
+                """
+                DELETE FROM strata_vectors.chunks
+                WHERE layer_name = $1 AND (file_id IS NULL OR file_id = ANY($2::uuid[]))
+                """,
                 name,
+                file_ids,
             )
             # asyncpg returns "DELETE N" where N is number of rows deleted
             chunks_deleted = int(result.split()[-1])
 
-            # Delete layer (cascades to ingestion_runs)
+            # Delete layer (cascades to its files, documents and ingestion_runs)
             await conn.execute(
                 "DELETE FROM strata_core.knowledge_layers WHERE name = $1",
                 name,
