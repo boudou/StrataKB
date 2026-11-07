@@ -153,17 +153,23 @@ def question_pattern(pattern: str) -> str:
 def _question_regex(pattern: str) -> re.Pattern[str] | None:
     """question_pattern(pattern) compiled, or None when the stored pattern
     must not run (it does not compile or it repeats a repeated part)."""
-    # Check the stored pattern, not the question form: an unsafe part outside
-    # the label group would not show in the label group alone
+    # Check the stored pattern and the question form: an unsafe part outside
+    # the label group would not show in the label group alone, and text that
+    # only looks like the label group ('[(?P<label>(a+)+)]' is a character
+    # class) is safe as stored but not once cut out
     problem = pattern_problem(pattern, line_starts=True)
+    if problem is None:
+        try:
+            regex = question_pattern(pattern)
+            re.compile(regex)
+        except re.error:
+            # The label group alone does not compile (it refers to another group)
+            regex = unanchored(pattern)
+        problem = pattern_problem(regex)
     if problem is not None:
         logger.warning("unsafe_structure_pattern", pattern=pattern, reason=problem)
         return None
-    try:
-        return re.compile(question_pattern(pattern))
-    except re.error:
-        # The label group alone does not compile (it refers to another group)
-        return re.compile(unanchored(pattern))
+    return re.compile(regex)
 
 
 def find_references(

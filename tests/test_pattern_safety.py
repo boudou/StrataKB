@@ -95,6 +95,16 @@ def test_unsafe_stored_pattern_finds_no_reference():
     assert find_references("show AT-44", [r"^(?P<label>(AT-\d+)+)"]) == []
 
 
+@pytest.mark.parametrize("pattern", [r"[(?P<label>(a+)+)]", r"[(?P<label>(a*)*)]"])
+def test_label_group_text_in_a_class_is_checked_as_cut_out(pattern):
+    # Safe as stored (a character class), unsafe as the question form
+    started = time.monotonic()
+    with capture_logs() as logs:
+        assert find_references("clause " + "a" * 28 + "b", [pattern]) == []
+    assert time.monotonic() - started < 1
+    assert any(e["event"] == "unsafe_structure_pattern" for e in logs)
+
+
 def test_invalid_stored_pattern_is_skipped():
     refs = find_references("show AT-44", ["(unclosed", r"^(?P<label>AT-\d+)"])
     assert [r.labels for r in refs] == [("at-44",)]
