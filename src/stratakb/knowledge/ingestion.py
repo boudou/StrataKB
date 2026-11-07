@@ -24,6 +24,7 @@ import structlog
 
 from stratakb.core.database import get_pool
 from stratakb.core.migrations import ensure_schema
+from stratakb.knowledge.document_dates import backfill_dates, document_date
 from stratakb.knowledge.documents import (
     FileScope,
     build_document_text,
@@ -208,12 +209,14 @@ async def _store_file(
     page_map: list[list[int]] | None = None,
     text_origin: str = "text",
     sections: Sequence[Section] = (),
+    doc_date: str | None = None,
+    doc_date_source: str | None = None,
 ) -> None:
     """Replace one file's row, document version and chunks in a single transaction.
 
     The text is stored as the file's current document version (reused when
-    unchanged), with its structure map (sections); this file's versions no
-    chunk references any more are pruned afterwards.
+    unchanged), with its date and structure map (sections); this file's
+    versions no chunk references any more are pruned afterwards.
     """
     pool = await get_pool(database_url)
     async with pool.acquire() as conn:
@@ -247,6 +250,8 @@ async def _store_file(
                 text=document_text,
                 page_map=page_map,
                 text_origin=text_origin,
+                doc_date=doc_date,
+                doc_date_source=doc_date_source,
             )
             await store_sections(conn, document_id, sections)
             for chunk in chunks:
@@ -388,12 +393,17 @@ async def ingest_documents(
     A database connection lost while a file is stored raises instead of
     being recorded as a failed file.
 
+    Each stored document version records a date: the front matter's updated or
+    date, otherwise the file's modification time. An unchanged file whose
+    latest version has none yet gets one, with nothing embedded.
+
     Steps:
     1. Validate layer exists (and apply the schema migration if needed)
     2. Discover files at source_path, or take the given file list
     3. Clear the layer (replace_all) or its pre-tracking chunks (legacy)
     4. For each file: check its name; for a changed or new file, check for
-       text, then parse, chunk, embed, store
+       text, then parse, chunk, embed, store; then date unchanged files
+       stored without a date
     5. Remove files that are gone from the root (for a file list: every
        tracked file not in it)
     6. Record ingestion run
@@ -536,6 +546,7 @@ async def ingest_documents(
 
         # Step 4: Parse, chunk, embed and store each new or changed file
         seen: set[str] = set()
+        unchanged: dict[str, Path] = {}
         for relative_path, file_path, carried_hash in work:
             seen.add(relative_path)
             previous = tracked.get(relative_path)
@@ -545,9 +556,11 @@ async def ingest_documents(
                 await drop(relative_path, previous, "secret")
                 continue
 
-            # A carried hash equal to the tracked one: unchanged, never opened
+            # A carried hash equal to the tracked one: unchanged, not opened
+            # here, and later only while its stored version has no date
             if _matches_tracked(carried_hash, previous):
                 result.files.append(FileOutcome(relative_path, "unchanged"))
+                unchanged[relative_path] = file_path
                 continue
 
             try:
@@ -563,6 +576,7 @@ async def ingest_documents(
 
             if _matches_tracked(content_hash, previous):
                 result.files.append(FileOutcome(relative_path, "unchanged"))
+                unchanged[relative_path] = file_path
                 continue
 
             # A listed file may have an unknown extension: _parse_file rejects it
@@ -613,6 +627,7 @@ async def ingest_documents(
                 fail(relative_path, file_path, str(e), "embed_error")
                 continue
 
+            doc_date, doc_date_source = await asyncio.to_thread(document_date, file_path, data)
             try:
                 await _store_file(
                     database_url,
@@ -625,6 +640,8 @@ async def ingest_documents(
                     document_text=mapped.text,
                     page_map=mapped.page_map,
                     sections=mapped.sections,
+                    doc_date=doc_date,
+                    doc_date_source=doc_date_source,
                 )
             except (asyncpg.PostgresConnectionError, asyncpg.InterfaceError, OSError):
                 # A lost database is an error for the whole run, not one failed file
@@ -649,6 +666,14 @@ async def ingest_documents(
             done += 1
             if progress is not None:
                 progress(done, total)
+
+        await backfill_dates(
+            pool,
+            layer_id=layer_id,
+            layer_name=layer_name,
+            source_root=source_root,
+            unchanged=unchanged,
+        )
 
         # Step 5: Remove files ingested from this root that no longer exist
         # or, for a file list, every tracked file that is not in it

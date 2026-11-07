@@ -310,6 +310,18 @@ MIGRATIONS: list[Migration] = [
         )
         """,
     ),
+    Migration(
+        14,
+        "14_document_dates.sql",
+        """
+        SELECT EXISTS (
+            SELECT 1 FROM information_schema.columns
+            WHERE table_schema = 'strata_vectors'
+              AND table_name = 'documents'
+              AND column_name = 'doc_date_source'
+        )
+        """,
+    ),
 ]
 
 # Same definition as in 05_add_folder.sql (tests compare the two)

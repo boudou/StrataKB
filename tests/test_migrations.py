@@ -477,6 +477,42 @@ async def test_applies_missing_13_drops_query_embedding_and_keeps_rows(db_url, r
         )
 
 
+async def test_applies_missing_14_existing_documents_have_no_date(db_url, restore_schema):
+    await owner_execute(
+        db_url,
+        """
+        DELETE FROM strata_core.knowledge_layers WHERE name = 'test_mig_doc_dates';
+        ALTER TABLE strata_vectors.documents DROP COLUMN doc_date;
+        ALTER TABLE strata_vectors.documents DROP COLUMN doc_date_source;
+        DELETE FROM strata_core.schema_migrations WHERE version = 14;
+        INSERT INTO strata_core.knowledge_layers (name, display_name)
+        VALUES ('test_mig_doc_dates', 'Older layer');
+        INSERT INTO strata_vectors.documents
+            (layer_id, source_root, relative_path, version, text, sha256)
+        SELECT id, '/older', 'older.md', 1, 'Older text', repeat('a', 64)
+        FROM strata_core.knowledge_layers WHERE name = 'test_mig_doc_dates';
+        """,
+    )
+    try:
+        await migrations.ensure_schema(db_url)
+
+        conn = await asyncpg.connect(db_url)
+        try:
+            row = await conn.fetchrow(
+                "SELECT doc_date, doc_date_source FROM strata_vectors.documents "
+                "WHERE source_root = '/older' AND relative_path = 'older.md'"
+            )
+        finally:
+            await conn.close()
+        assert tuple(row) == (None, None)
+        assert await recorded_versions(db_url) == ALL_VERSIONS
+    finally:
+        await owner_execute(
+            db_url,
+            "DELETE FROM strata_core.knowledge_layers WHERE name = 'test_mig_doc_dates'",
+        )
+
+
 async def test_applies_missing_07_older_chunks_keep_null_offsets(db_url, restore_schema):
     await owner_execute(
         db_url,

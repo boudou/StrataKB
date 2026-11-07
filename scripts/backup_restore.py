@@ -181,7 +181,7 @@ def cmd_stats(args):
 
 # ── export-layer ──────────────────────────────────────────────────────
 
-EXPORT_FORMAT = 2
+EXPORT_FORMAT = 3
 
 
 class ExportTable(NamedTuple):
@@ -212,7 +212,7 @@ FILES = ExportTable(
 DOCUMENTS = ExportTable(
     "strata_vectors.documents",
     ("id", "layer_id", "file_id", "source_root", "relative_path", "version", "text",
-     "sha256", "page_map", "text_origin", "ingested_at"),
+     "sha256", "page_map", "text_origin", "ingested_at", "doc_date", "doc_date_source"),
     "layer_id = {layer_id}")
 SECTIONS = ExportTable(
     "strata_vectors.document_sections",

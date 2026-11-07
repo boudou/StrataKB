@@ -86,6 +86,8 @@ async def store_document_version(
     text: str,
     page_map: list[list[int]] | None,
     text_origin: str = "text",
+    doc_date: str | None = None,
+    doc_date_source: str | None = None,
 ) -> tuple[int, int]:
     """Store the text as the file's current version; return (document_id, version).
 
@@ -95,6 +97,9 @@ async def store_document_version(
     not by file row, so a layer that was cleared and ingested again continues
     its numbering while older versions are still stored, and same-named files
     from different roots keep separate versions.
+
+    A reused version takes the given date (the front matter can change while
+    the text stays the same) and keeps its stored one when doc_date is None.
 
     Numbering is serialized per file: a transaction-scoped advisory lock on
     (layer, source root, relative path) makes a concurrent call for the same
@@ -129,9 +134,18 @@ async def store_document_version(
         latest = max(versions, key=lambda row: row["version"], default=None)
         if latest is not None and latest["sha256"] == sha256:
             await conn.execute(
-                "UPDATE strata_vectors.documents SET file_id = $2 WHERE id = $1",
+                """
+                UPDATE strata_vectors.documents
+                SET file_id = $2,
+                    doc_date = COALESCE($3::text, doc_date),
+                    doc_date_source = CASE WHEN $3::text IS NULL THEN doc_date_source
+                                           ELSE $4::text END
+                WHERE id = $1
+                """,
                 latest["id"],
                 file_id,
+                doc_date,
+                doc_date_source,
             )
             return latest["id"], latest["version"]
 
@@ -140,8 +154,8 @@ async def store_document_version(
             """
             INSERT INTO strata_vectors.documents
                 (layer_id, file_id, source_root, relative_path, version, text, sha256,
-                 page_map, text_origin)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                 page_map, text_origin, doc_date, doc_date_source)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
             RETURNING id
             """,
             layer_id,
@@ -153,6 +167,8 @@ async def store_document_version(
             sha256,
             json.dumps(page_map) if page_map is not None else None,
             text_origin,
+            doc_date,
+            doc_date_source,
         )
     logger.info("document_version_stored", relative_path=relative_path, version=version)
     return document_id, version
