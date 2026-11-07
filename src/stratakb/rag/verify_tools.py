@@ -250,9 +250,10 @@ def register_verify_tools(mcp: FastMCP, database_url: str) -> None:
         giving it. It checks, without a model and against the stored text:
         every quoted span ("..." [S2]) appears in the passage it cites; every
         number, date, amount, percentage, code (AC01, pacs.008, IBANs) and
-        clause reference appears in at least one passage ("30 days" matches
-        "thirty (30) days", "1,000.00" matches "1000", "2026-11-04" matches
-        "4 November 2026"); every [Sn] names a passage given. A verified draft
+        clause reference appears in a passage cited in the same sentence, or in
+        any passage when the sentence cites none ("30 days" matches "thirty
+        (30) days", "1,000.00" matches "1000", "2026-11-04" matches "4 November
+        2026"); every [Sn] names a passage given. A verified draft
         gets a receipt (open it with strata_get_receipt). A paraphrase that
         changes the meaning without changing a fact is not caught.
 

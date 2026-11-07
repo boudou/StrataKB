@@ -307,7 +307,7 @@ flowchart TD
 **The answer contract** is what the server tells the client's model to do, in the instructions it sends when a client connects:
 
 - Answer only from the passages `strata_ask` returns, never from its own knowledge.
-- Cite every claim by passage id, and copy numbers, dates, amounts, codes and clause numbers verbatim.
+- Cite every claim by passage id in the sentence that makes it, since a sentence's facts are checked against only the passages it cites, and copy numbers, dates, amounts, codes and clause numbers verbatim.
 - In grounded mode, call `strata_verify` before showing the answer, and fix or drop what it flags. A flag of kind `passage` (a span too wide to check, for example) cannot be fixed by rewriting, so the client says the answer is unverified.
 - In extractive mode, show `answer` verbatim, with each sentence's citation and any note or warning.
 - Show the receipt id when there is one. A `not_found`, a flagged draft and a grounded answer not yet verified have none.
@@ -324,7 +324,7 @@ Clients that show MCP prompts also offer the same steps as the prompt `answer_fr
 | Tool | Role | What it does |
 | --- | --- | --- |
 | `strata_ask` | viewer | Rewrites a question, searches in parallel, reranks, and returns found, partly found or not found with the best passages, each with its file, page, lines and headings ([what it returns](#what-strata_ask-returns)). When a passage returned comes from an extractive layer, or with `mode: "extractive"`, it answers with [the document's own sentences](#extractive-answers) and a receipt |
-| `strata_verify` | viewer | Checks a drafted answer against the passages it cites: every quote, number, date, amount, code and clause reference must be in them. A verified draft gets a receipt ([checking a drafted answer](#checking-a-drafted-answer)) |
+| `strata_verify` | viewer | Checks a drafted answer against the passages it cites: every quote, and every number, date, amount, code and clause reference in a sentence, must be in the passages cited there. A fact in a sentence with no citation is checked against all the passages given. A verified draft gets a receipt ([checking a drafted answer](#checking-a-drafted-answer)) |
 | `strata_search` | viewer | Hybrid search for exact terms and identifiers, with optional layer and metadata filters, and a confidence level; a clause or section the query names (`clause 7.2`) comes first, verbatim |
 | `strata_list_knowledge_layers` | viewer | Lists layers with document and chunk counts |
 | `strata_get_layer_status` | viewer | One layer's configuration and ingestion history |
@@ -464,16 +464,23 @@ After your client writes an answer from the passages, it can pass the draft and 
 ```mermaid
 flowchart LR
     D["Draft + refs"] --> T["Read each span<br/>from the store"]
-    T --> C{Quotes and facts<br/>in the passages?}
+    T --> C{Quotes and facts in the<br/>passages they cite?}
     C -->|yes| V["verified + receipt"]
     C -->|no| F["flags: the text,<br/>and the passages searched"]
 ```
 
+```mermaid
+flowchart LR
+    F["A fact in the draft"] --> S{Its sentence<br/>cites a passage?}
+    S -->|yes| C["Checked against the<br/>passages cited there"]
+    S -->|no| A["Checked against all<br/>the passages given"]
+```
+
 - The passages' text is read from the stored documents, never taken from the request. A `ref` must lie inside its document and span at most twice the layer's `chunk_size`, so a citation cannot be widened to a whole document. A `ref` that names nothing stored, or a layer you may not read, is refused with one message for both.
 - **Quotes:** every quoted span (`"…" [S2]`) must appear in the passage it cites (in any passage when it cites none), after whitespace, quote marks and dashes are normalised; `...` inside a quote marks an omission.
-- **Facts:** every number, date, amount, percentage, code (such as `AC01`, `pacs.008` or an IBAN) and clause reference outside the quotes must appear in at least one passage. Both sides are normalised: `30 days` matches `thirty (30) days`, `1,000.00` matches `1000`, `EUR 1.000,00` matches `1000 EUR`, and `2026-11-04` matches `4 November 2026`. An amount matches only an amount or a plain number, never a day count, clause number or year. A date such as `04/11/2026`, which could be either day or month first, only matches as written. The `1.` and `2)` of a numbered list are not facts.
+- **Facts:** every number, date, amount, percentage, code (such as `AC01`, `pacs.008` or an IBAN) and clause reference outside the quotes must appear in a passage cited in the same sentence. When a sentence cites several passages, any one of them will do. A fact in a sentence with no citation is checked against all the passages given. A sentence ends at a line break, or at `.`, `!` or `?` unless a lower-case letter follows, or a digit follows anything but a citation (so `Art. 12` stays whole). A citation right after the end (`90 days. [S1]`) belongs to the sentence before it, unless a lower-case word follows it (`[S2] says ...`). Both sides are normalised: `30 days` matches `thirty (30) days`, `1,000.00` matches `1000`, `EUR 1.000,00` matches `1000 EUR`, and `2026-11-04` matches `4 November 2026`. An amount matches only an amount or a plain number, never a day count, clause number or year. A date such as `04/11/2026`, which could be either day or month first, only matches as written. The `1.` and `2)` of a numbered list are not facts.
 - **Citations:** an `[S5]` when four passages were given is flagged.
-- The result is `verified` with a `receipt_id` (open it with `strata_get_receipt`), or `flagged` with a list of flags, each naming the text, why, and the passages searched, for example `"13 days" not found in S1–S4`. At most 50 flags are listed; `more_flags` counts the rest. The receipt keeps the passages and the draft, with IBANs, BICs and account numbers in the draft replaced by placeholders.
+- The result is `verified` with a `receipt_id` (open it with `strata_get_receipt`), or `flagged` with a list of flags, each naming the text, why, and the passages searched, for example `"13 days" not found in S1`. At most 50 flags are listed; `more_flags` counts the rest. The receipt keeps the passages and the draft, with IBANs, BICs and account numbers in the draft replaced by placeholders.
 - Both checks run in Python, without a model: nothing leaves the machine. They catch a changed quote, number, date, amount, code or clause, not a paraphrase that changes the meaning without changing a fact. For layers where that is not acceptable, use [`answer_mode: extractive`](#extractive-answers).
 - Each call with passages and within the limits (50 passages, a draft of 50,000 characters) writes one audit entry (`verify`) with counts and, when verified, the receipt id; never the draft.
 

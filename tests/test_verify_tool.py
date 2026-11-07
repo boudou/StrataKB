@@ -139,6 +139,26 @@ class TestVerifyTool:
             ("quantity", "13 days", '"13 days" not found in S1')
         ]
 
+    async def test_fact_checked_against_cited_passage(
+        self, server, db_url, layer, tmp_path, user
+    ):
+        # S1 says 30 days; S2, which the sentence cites, does not
+        doc = await _document(db_url, layer, tmp_path)
+        passages = [_ref(doc, QUOTE), _ref(doc, REFUND)]
+        with _as(user):
+            result = await _verify(
+                server, "Refunds reach the account within 30 days [S2].", passages
+            )
+        assert result["result"] == "flagged"
+        assert "receipt_id" not in result
+        assert [f["message"] for f in result["flags"]] == ['"30 days" not found in S2']
+        assert [f["passages"] for f in result["flags"]] == [["S2"]]
+
+        with _as(user):
+            result = await _verify(server, "Records are kept for 30 days [S1].", passages)
+        assert result["result"] == "verified"
+        assert result["receipt_id"].startswith("rcpt_")
+
     async def test_flag_list_is_bounded(self, server, db_url, layer, tmp_path, user):
         from stratakb.rag.verify import MAX_FLAGS
 

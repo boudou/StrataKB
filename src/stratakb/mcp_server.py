@@ -155,7 +155,10 @@ def _preload_embedding_model_sync(model_name: str) -> None:
 # The answer contract: the instructions and the prompt both list these rules
 _ANSWER_CONTRACT = (
     "Answer only from the passages strata_ask returns, never from your own knowledge.",
-    'Cite every claim by passage id, as [S1]; write a quote as "..." [S1].',
+    'Cite every claim by passage id, as [S1], in the sentence that makes it; write a quote as '
+    '"..." [S1]. '
+    "A sentence's numbers, dates, amounts, codes and clause numbers are checked against only the "
+    "passages it cites.",
     "Copy numbers, dates, amounts, codes and clause numbers verbatim.",
     "Follow the mode in the response. In grounded mode write the answer, then call strata_verify "
     "before showing it, with the draft and every returned passage's ref in order (the first is "
