@@ -85,7 +85,7 @@ class TestErrorsWithoutAbsolutePaths:
         assert await _last_error_log(db_url, layer) == expected
 
     async def test_parse_error_names_the_relative_path(self, db_url, layer, tmp_path):
-        from stratakb.knowledge.parsers.pdf_parser import ParsedDocument
+        from stratakb.knowledge.parsers.document import ParsedDocument
 
         write_file(tmp_path / "bad.md", "# Bad\n\nBad content.\n")
         root = tmp_path.resolve()

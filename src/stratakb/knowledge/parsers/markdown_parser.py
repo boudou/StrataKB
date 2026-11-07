@@ -12,7 +12,7 @@ from pathlib import Path
 
 import structlog
 
-from stratakb.knowledge.parsers.pdf_parser import ParsedDocument, ParsedPage
+from stratakb.knowledge.parsers.document import ParsedDocument, ParsedPage
 from stratakb.knowledge.structure import frontmatter_end
 
 logger = structlog.get_logger()

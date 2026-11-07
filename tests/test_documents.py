@@ -248,7 +248,7 @@ class TestLocate:
 class TestBuildText:
     def test_pages_joined_and_page_map_uses_page_numbers(self):
         from stratakb.knowledge.documents import build_document_text, page_starts
-        from stratakb.knowledge.parsers.pdf_parser import ParsedDocument, ParsedPage
+        from stratakb.knowledge.parsers.document import ParsedDocument, ParsedPage
 
         # Page 2 was empty and dropped by the parser
         doc = ParsedDocument(
@@ -263,7 +263,7 @@ class TestBuildText:
 
     def test_no_page_map_for_other_formats(self):
         from stratakb.knowledge.documents import build_document_text
-        from stratakb.knowledge.parsers.pdf_parser import ParsedDocument, ParsedPage
+        from stratakb.knowledge.parsers.document import ParsedDocument, ParsedPage
 
         doc = ParsedDocument(source_file="a.md", pages=[ParsedPage("# A", 1, "a.md")])
         assert build_document_text(doc) == ("# A", None)

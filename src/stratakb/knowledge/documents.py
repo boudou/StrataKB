@@ -19,7 +19,7 @@ from uuid import UUID
 import asyncpg
 import structlog
 
-from stratakb.knowledge.parsers.pdf_parser import ParsedDocument
+from stratakb.knowledge.parsers.document import ParsedDocument
 from stratakb.knowledge.structure import Heading, Section
 
 logger = structlog.get_logger()

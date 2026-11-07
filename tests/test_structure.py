@@ -610,7 +610,7 @@ def test_fallback_without_structure(tmp_path):
 
 
 def test_pages_are_cuts_and_keep_their_numbers():
-    from stratakb.knowledge.parsers.pdf_parser import ParsedDocument, ParsedPage
+    from stratakb.knowledge.parsers.document import ParsedDocument, ParsedPage
 
     doc = ParsedDocument(
         source_file="c.pdf",

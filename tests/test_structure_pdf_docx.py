@@ -12,7 +12,8 @@ from types import SimpleNamespace
 from stratakb.knowledge.documents import build_document_text, document_headings, locate
 from stratakb.knowledge.ingestion import _chunk_document, _map_document, _parse_file
 from stratakb.knowledge.parsers import pdf_parser
-from stratakb.knowledge.parsers.pdf_parser import ParsedPage, ParserFlag, _attach_outline
+from stratakb.knowledge.parsers.document import ParsedPage, ParserFlag
+from stratakb.knowledge.parsers.pdf_parser import _attach_outline
 from stratakb.knowledge.structure import Heading, detect_sections
 
 FIXTURES = Path(__file__).parent / "fixtures"

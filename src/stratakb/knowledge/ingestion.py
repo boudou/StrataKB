@@ -40,7 +40,7 @@ from stratakb.knowledge.layers import (
     LayerNotFoundError,
     get_layer_status,
 )
-from stratakb.knowledge.parsers.pdf_parser import FlagReason, ParsedDocument
+from stratakb.knowledge.parsers.document import FlagReason, ParsedDocument
 from stratakb.knowledge.parsers.registry import FORMATS, Format
 from stratakb.knowledge.policy import is_secret_name
 from stratakb.knowledge.structure import (
@@ -63,21 +63,20 @@ EMBED_BATCH_SIZE = 100
 _ERROR_MAX_CHARS = 300
 
 Outcome = Literal["added", "updated", "unchanged", "removed", "skipped", "flagged", "failed"]
-Reason = Literal[
-    "deleted", "not_selected", "secret", "no_text",
-    "probably_scanned", "truncated",
-    "read_error", "parse_error", "embed_error",
-]
+SkippedReason = Literal["secret", "no_text"]
+RemovedReason = Literal["deleted", "not_selected", SkippedReason]
+FailedReason = Literal["read_error", "parse_error", "embed_error"]
+Reason = Literal[RemovedReason, FlagReason, FailedReason]
 
 # The reasons each outcome may carry; None: no reason
 REASONS: dict[Outcome, frozenset[Reason | None]] = {
     "added": frozenset({None}),
     "updated": frozenset({None}),
     "unchanged": frozenset({None}),
-    "removed": frozenset({"deleted", "not_selected", "secret", "no_text"}),
-    "skipped": frozenset({"secret", "no_text"}),
+    "removed": frozenset(get_args(RemovedReason)),
+    "skipped": frozenset(get_args(SkippedReason)),
     "flagged": frozenset(get_args(FlagReason)),
-    "failed": frozenset({"read_error", "parse_error", "embed_error"}),
+    "failed": frozenset(get_args(FailedReason)),
 }
 
 
@@ -656,10 +655,11 @@ async def ingest_documents(
                 fail(relative_path, file_path, str(e), "embed_error")
                 continue
 
-            flag = parsed.flag
             stored = "added" if previous is None else "updated"
-            if flag is not None:
-                outcome = FileOutcome(relative_path, "flagged", flag.reason, flag.count, stored)
+            if parsed.flag is not None:
+                outcome = FileOutcome(
+                    relative_path, "flagged", parsed.flag.reason, parsed.flag.count, stored
+                )
             else:
                 outcome = FileOutcome(relative_path, stored)
             result.files.append(outcome)

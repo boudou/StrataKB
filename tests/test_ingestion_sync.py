@@ -425,7 +425,8 @@ class TestPolicyAndEmpty:
 
 def _pdf_doc(page_lengths: list[int], total_pages: int):
     """A parsed PDF with one text page per length; the parser drops pages without text."""
-    from stratakb.knowledge.parsers.pdf_parser import ParsedDocument, ParsedPage, scanned_flag
+    from stratakb.knowledge.parsers.document import ParsedDocument, ParsedPage
+    from stratakb.knowledge.parsers.pdf_parser import scanned_flag
 
     doc = ParsedDocument(
         source_file="scan.pdf",
@@ -592,7 +593,7 @@ class TestTruncatedCsv:
 async def test_parser_flag_reaches_the_outcome(db_url, layer, tmp_path):
     """The ingest loop copies any parser's flag into the outcome, whatever the format."""
     from stratakb.knowledge.ingestion import FileOutcome
-    from stratakb.knowledge.parsers.pdf_parser import ParsedDocument, ParsedPage, ParserFlag
+    from stratakb.knowledge.parsers.document import ParsedDocument, ParsedPage, ParserFlag
 
     write_file(tmp_path / "a.md", "# Alpha\n\nAlpha content.\n")
     doc = ParsedDocument(
@@ -741,15 +742,6 @@ def test_counters_cannot_be_set():
     result = IngestionResult(layer_name="x", status="completed")
     with pytest.raises(AttributeError):
         result.files_added = 1
-
-
-def test_flagged_outcome_reasons_match_the_parser_literal():
-    from typing import get_args
-
-    from stratakb.knowledge.ingestion import REASONS
-    from stratakb.knowledge.parsers.pdf_parser import FlagReason
-
-    assert REASONS["flagged"] == set(get_args(FlagReason))
 
 
 def test_reasons_cover_the_literals():

@@ -188,7 +188,7 @@ class TestOpenAPISchemaCut:
     def test_schema_over_limit_flagged_with_count(self, tmp_path):
         from structlog.testing import capture_logs
 
-        from stratakb.knowledge.parsers.pdf_parser import ParserFlag
+        from stratakb.knowledge.parsers.document import ParserFlag
         from stratakb.knowledge.parsers.yaml_parser import parse_yaml
 
         path = _write_openapi(tmp_path / "big.yaml", {"type": "object", "properties": _props(20)})
@@ -201,7 +201,7 @@ class TestOpenAPISchemaCut:
         assert parsed[0]["properties_left_out"] == 5
 
     def test_cuts_summed_over_file(self, tmp_path):
-        from stratakb.knowledge.parsers.pdf_parser import ParserFlag
+        from stratakb.knowledge.parsers.document import ParserFlag
         from stratakb.knowledge.parsers.yaml_parser import parse_yaml
 
         nested = {"properties": _props(17, "n")}  # no type: its summary is listed
@@ -343,7 +343,7 @@ class TestCSVParser:
         from structlog.testing import capture_logs
 
         from stratakb.knowledge.parsers.csv_parser import MAX_ROWS, parse_csv
-        from stratakb.knowledge.parsers.pdf_parser import ParserFlag
+        from stratakb.knowledge.parsers.document import ParserFlag
 
         path = _write_rows(tmp_path / "big.csv", MAX_ROWS + 5)
         with capture_logs() as logs:
@@ -461,7 +461,7 @@ class TestCSVParser:
         from unittest.mock import patch
 
         from stratakb.knowledge.parsers.csv_parser import parse_csv
-        from stratakb.knowledge.parsers.pdf_parser import ParserFlag
+        from stratakb.knowledge.parsers.document import ParserFlag
 
         path = tmp_path / "blank.csv"
         path.write_text("a,b\n1,2\n\n3,4\n", encoding="utf-8")

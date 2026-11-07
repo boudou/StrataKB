@@ -6,12 +6,11 @@ Extracts text from PDF files with page-level source tracking.
 from __future__ import annotations
 
 from bisect import bisect_left
-from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Literal
 
 import structlog
 
+from stratakb.knowledge.parsers.document import ParsedDocument, ParsedPage, ParserFlag
 from stratakb.knowledge.structure import Heading, leading_label, strip_clause_number
 
 logger = structlog.get_logger()
@@ -29,43 +28,6 @@ _MAX_PREFIX_CANDIDATES = 50
 
 # How many lines a wrapped outline title may span on its page
 _MAX_TITLE_LINES = 3
-
-FlagReason = Literal["probably_scanned", "truncated"]
-
-
-@dataclass(frozen=True)
-class ParserFlag:
-    """Why a parsed file is stored but flagged, and how many items a limit left
-    out (None when nothing was counted)."""
-
-    reason: FlagReason
-    count: int | None = None
-
-
-@dataclass
-class ParsedPage:
-    """A single page extracted from a PDF."""
-
-    text: str
-    page_number: int
-    source_file: str
-    # Heading chain of a section, outermost first (Markdown and HTML); empty for other formats
-    section_path: list[str] = field(default_factory=list)
-    # Headings the file marks outside its text (a PDF outline, Word heading
-    # styles), in offset order; empty for other formats
-    headings: list[Heading] = field(default_factory=list)
-
-
-@dataclass
-class ParsedDocument:
-    """Result of parsing a PDF document."""
-
-    source_file: str
-    pages: list[ParsedPage] = field(default_factory=list)
-    total_pages: int = 0
-    error: str | None = None
-    # Set by a parser that stored only part of a file or found it probably scanned; None otherwise
-    flag: ParserFlag | None = None
 
 
 def scanned_flag(doc: ParsedDocument) -> ParserFlag | None:
