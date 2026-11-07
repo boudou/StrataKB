@@ -5,15 +5,12 @@ Registers feedback, stats, and reset tools.
 
 from __future__ import annotations
 
-import re
-
 from mcp.server.fastmcp import FastMCP
 
 from stratakb.core.audit import write_audit_log
 from stratakb.core.auth import require_role
 from stratakb.core.logging import log_tool_call
-
-_PASSAGE_ID = re.compile(r"[Ss]([1-9][0-9]*)")
+from stratakb.rag.passages import passage_number
 
 # The chunk ratings strata_feedback accepts, with their signal values
 _CHUNK_RATINGS = {"useful": 0.7, "wrong": -1.0, "outdated": -0.5}
@@ -27,7 +24,7 @@ async def _resolve_passage_ids(
     Other keys are chunk ids and map to themselves. Returns the mapping and an
     error message, or None.
     """
-    if not any(_PASSAGE_ID.fullmatch(str(key)) for key in chunk_feedback):
+    if not any(passage_number(str(key)) is not None for key in chunk_feedback):
         return {key: key for key in chunk_feedback}, None
     results = await store.get_interaction_results(interaction_id)
     if results is None:
@@ -38,11 +35,10 @@ async def _resolve_passage_ids(
     resolved: dict = {}
     unknown: list[str] = []
     for key in chunk_feedback:
-        match = _PASSAGE_ID.fullmatch(str(key))
-        if match is None:
+        n = passage_number(str(key))
+        if n is None:
             resolved[key] = key
             continue
-        n = int(match.group(1))
         chunk_id = results[n - 1].get("chunk_id") if n <= len(results) else None
         if chunk_id is None:
             unknown.append(str(key))

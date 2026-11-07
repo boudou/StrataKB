@@ -83,6 +83,11 @@ class TestCheck:
         assert flags[0].text == "S5"
         assert "S1–S4" in flags[0].message
 
+    def test_citation_of_passage_zero_keeps_its_range(self):
+        flags = check('"a quote that is absent" [S0, S1, S2]', PASSAGES).flags
+        quote = next(f for f in flags if f.kind == "quote")
+        assert "S0–S2" in quote.message
+
     def test_citation_range_and_list(self):
         assert _flag_texts("Fees apply [S1-S4] and [S2, S3].") == []
         assert _flag_texts("Fees apply [S3, S6].") == ["S6"]

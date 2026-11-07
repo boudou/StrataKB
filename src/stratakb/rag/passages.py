@@ -34,6 +34,8 @@ MAX_PASSAGES = 50
 # with six-digit spans and three-digit pages: about 81 characters)
 RESPONSE_SLACK_TOKENS = 21
 
+_PASSAGE_ID = re.compile(r"[Ss]([1-9][0-9]*)")
+
 _NEXT_STEPS = {
     "not_found": (
         "Nothing in the knowledge base answers this. If no layer covers the topic, "
@@ -44,6 +46,17 @@ _NEXT_STEPS = {
         "again with the knowledge base's own terms or a named layer."
     ),
 }
+
+
+def passage_id(n: int) -> str:
+    """The id of the n-th passage: S1, S2, ... It does not check n."""
+    return f"S{n}"
+
+
+def passage_number(text: str) -> int | None:
+    """The n of a passage id, in either case; None for any other text, S0 and S01 too."""
+    match = _PASSAGE_ID.fullmatch(text)
+    return int(match.group(1)) if match else None
 
 
 def ask_chunk(
@@ -195,7 +208,7 @@ def build_passages(
     """One passage per chunk, in order: id, ref, the chunk's text and its citation."""
     return [
         {
-            "id": f"S{n}",
+            "id": passage_id(n),
             "ref": passage_ref(chunk),
             "text": chunk["content"],
             "citation": cite(chunk, documents.get(chunk.get("document_id"))),

@@ -23,6 +23,11 @@ _rewrite_cache: TTLCache = TTLCache(maxsize=200, ttl=3600)
 _synonym_cache: TTLCache = TTLCache(maxsize=500, ttl=3600)
 
 
+def _decode_results(value):
+    """An interaction's results column: asyncpg returns JSONB as text."""
+    return json.loads(value) if isinstance(value, str) else value
+
+
 @dataclass
 class LearnedRewrite:
     """A learned query rewrite pattern."""
@@ -192,10 +197,8 @@ class LearningStore:
             session_id,
             limit,
         )
-        # asyncpg returns JSONB as text
         for row in rows:
-            if isinstance(row.get("results"), str):
-                row["results"] = json.loads(row["results"])
+            row["results"] = _decode_results(row.get("results"))
         return rows
 
     async def get_interaction_results(self, interaction_id: str) -> list[dict] | None:
@@ -206,11 +209,7 @@ class LearningStore:
         )
         if not rows:
             return None
-        results = rows[0]["results"]
-        # asyncpg returns JSONB as text
-        if isinstance(results, str):
-            results = json.loads(results)
-        return results or []
+        return _decode_results(rows[0]["results"]) or []
 
     # ── Feedback ──────────────────────────────────────────────
 

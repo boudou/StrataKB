@@ -22,6 +22,8 @@ from dataclasses import asdict, dataclass, field
 from datetime import date
 from decimal import Decimal, InvalidOperation
 
+from stratakb.rag.passages import passage_id
+
 # At most this many flags are listed; the rest are only counted
 MAX_FLAGS = 50
 
@@ -78,7 +80,7 @@ def _cited_ids(marker: str) -> list[str]:
         last = int(m.group(2)) if m.group(2) else first
         # A reversed or huge range is read as its two ends only
         span = range(first, last + 1) if 0 <= last - first <= 50 else (first, last)
-        ids.extend(f"S{n}" for n in span)
+        ids.extend(passage_id(n) for n in span)
     return ids
 
 
@@ -455,6 +457,7 @@ def _id_range(ids: Sequence[str]) -> str:
     """S1-S4 for a consecutive run, S1, S3 otherwise; "no passage" when empty."""
     if not ids:
         return "no passage"
+    # Not passage_number: a draft may cite S0, which is no passage id but still has a number
     numbers = [int(i[1:]) for i in ids]
     if len(ids) > 2 and numbers == list(range(numbers[0], numbers[0] + len(numbers))):
         return f"{ids[0]}–{ids[-1]}"

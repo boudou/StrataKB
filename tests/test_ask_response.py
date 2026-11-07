@@ -27,6 +27,8 @@ from stratakb.rag.passages import (
     pack_passages,
     parse_ref,
     passage_cost,
+    passage_id,
+    passage_number,
     passage_ref,
 )
 from stratakb.rag.retriever import SearchResult
@@ -196,6 +198,19 @@ class TestPacking:
 
 
 class TestRefAndCitation:
+    def test_passage_id_round_trip(self):
+        for n in (1, 25, MAX_PASSAGES):
+            assert passage_number(passage_id(n)) == n
+        chunks = [{"chunk_id": f"c{i}", "content": "text", "layer": "l", "metadata": {}}
+                  for i in range(3)]
+        assert [p["id"] for p in build_passages(chunks, {})] \
+            == [passage_id(1), passage_id(2), passage_id(3)]
+
+    def test_passage_number_refuses_other_text(self):
+        assert passage_number("s3") == 3
+        for other in ("S0", "S01", "S", "S1 ", "chunk-1", ""):
+            assert passage_number(other) is None
+
     def test_ref_forms(self):
         assert passage_ref({"chunk_id": "x", "document_id": 7, "char_start": 30, "char_end": 41}) \
             == "d7:30-41"
@@ -473,6 +488,32 @@ class TestAskResponse:
             }))
             assert unknown["status"] == "error"
             assert "S9" in unknown["error"]
+        finally:
+            await _delete_interaction(settings.database_url, interaction_id)
+
+    async def test_feedback_by_lowercase_passage_id(self, server, settings):
+        from stratakb.core.database import get_pool
+
+        results = [_result(f"chunk-{i}", "docs") for i in range(3)]
+        response = await _ask(server, results, layers=["docs"])
+        interaction_id = response["interaction_id"]
+
+        try:
+            feedback = _payload(await server.call_tool("strata_feedback", {
+                "interaction_id": interaction_id,
+                "helpful": True,
+                "chunk_feedback": {"s2": "useful"},
+            }))
+            assert feedback["status"] == "ok"
+
+            pool = await get_pool(settings.database_url)
+            rows = await pool.fetch(
+                "SELECT signal_name, metadata FROM strata_learning.feedback_signals "
+                "WHERE interaction_id = $1 AND signal_name LIKE 'chunk_%'",
+                interaction_id,
+            )
+            rated = {json.loads(r["metadata"])["chunk_id"]: r["signal_name"] for r in rows}
+            assert rated == {"chunk-1": "chunk_useful"}
         finally:
             await _delete_interaction(settings.database_url, interaction_id)
 
