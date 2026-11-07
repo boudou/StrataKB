@@ -318,8 +318,8 @@ class TestRAGToolRegistration:
         register_knowledge_tools(mock_mcp, "postgresql://test", "sk-test")
         register_rag_tools(mock_mcp, "postgresql://test", "sk-test")
 
-        # 6 knowledge tools + 2 RAG tools (strata_search + strata_ask) = 8
-        assert mock_mcp.tool.call_count == 8
+        # 7 knowledge tools + 2 RAG tools (strata_search + strata_ask) = 9
+        assert mock_mcp.tool.call_count == 9
 
 
 class TestSearchTool:

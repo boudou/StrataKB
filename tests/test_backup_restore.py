@@ -124,7 +124,7 @@ def _recording_psql(monkeypatch, stdout=b"", code=0):
     return calls
 
 
-@pytest.mark.parametrize("header", [b"-- Format: 5", b"-- Format: three"])
+@pytest.mark.parametrize("header", [b"-- Format: 6", b"-- Format: three"])
 def test_import_refuses_a_format_it_cannot_read(tmp_path, monkeypatch, capsys, header):
     calls = _recording_psql(monkeypatch)
     data = b"-- StrataKB Layer Export\n" + header + b"\n-- Layer: x\nBEGIN;\nCOMMIT;\n"
@@ -135,7 +135,7 @@ def test_import_refuses_a_format_it_cannot_read(tmp_path, monkeypatch, capsys, h
     out = capsys.readouterr()
     assert "older version" not in out.out
     assert "Import failed: nothing was changed." in out.err
-    assert ("export format 5" in out.err) if header.endswith(b"5") else ("format" in out.err)
+    assert ("export format 6" in out.err) if header.endswith(b"6") else ("format" in out.err)
 
 
 def test_import_still_reads_format_2(tmp_path):
@@ -150,8 +150,14 @@ def test_import_still_reads_format_3(tmp_path):
     assert br._readable_format(tmp_path / "layer.sql.gz", data) == 3
 
 
+def test_import_still_reads_format_4(tmp_path):
+    # A format 4 file names its own columns, so its layer imports with no archived files patterns
+    data = b"-- StrataKB Layer Export\n-- Format: 4\n-- Layer: x\nBEGIN;\nCOMMIT;\n"
+    assert br._readable_format(tmp_path / "layer.sql.gz", data) == 4
+
+
 def test_export_states_the_current_format():
-    assert br.export_format(_export_file()) == br.EXPORT_FORMAT == 4
+    assert br.export_format(_export_file()) == br.EXPORT_FORMAT == 5
 
 
 def test_import_names_the_layer_holding_the_root(tmp_path, monkeypatch, capsys):
@@ -310,7 +316,8 @@ async def test_round_trip_keeps_tracking_and_text(folder_db_url, tmp_path, clean
     try:
         await conn.execute(
             "UPDATE strata_core.knowledge_layers SET answer_mode = 'extractive', "
-            "structure_patterns = '[\"^(?P<label>AT-\\\\d{2})\"]' WHERE name = $1",
+            "structure_patterns = '[\"^(?P<label>AT-\\\\d{2})\"]', "
+            "archived_patterns = '[\"archive/\", \"\\\\#old.md\"]' WHERE name = $1",
             name)
         await conn.execute(
             "UPDATE strata_vectors.documents SET supersedes = 'old.md' WHERE layer_id = "
@@ -332,6 +339,7 @@ async def test_round_trip_keeps_tracking_and_text(folder_db_url, tmp_path, clean
     assert after == before
     assert after["layer"]["answer_mode"] == "extractive"
     assert json.loads(after["layer"]["structure_patterns"]) == ["^(?P<label>AT-\\d{2})"]
+    assert json.loads(after["layer"]["archived_patterns"]) == ["archive/", "\\#old.md"]
 
     p = await add_folder.plan(folder_db_url, root, Options(name=name))
     assert p.action == "sync"

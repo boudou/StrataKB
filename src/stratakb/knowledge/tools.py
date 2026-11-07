@@ -23,6 +23,7 @@ from stratakb.knowledge.layers import (
     delete_layer,
     get_layer_status,
     list_layers,
+    update_layer,
 )
 from stratakb.knowledge.parsers import csv_parser
 
@@ -90,8 +91,9 @@ def _serialize(obj: object) -> object:
     return obj
 
 
-# Who made a layer and the server folder it holds are shown to admins only
-_ADMIN_ONLY_LAYER_FIELDS = ("owner", "root_path")
+# Who made a layer, the server folder it holds and its archived files patterns
+# are shown to admins only
+_ADMIN_ONLY_LAYER_FIELDS = ("owner", "root_path", "archived_patterns")
 
 
 # strata_apply_preset's dry run reports layer_check "unknown" after this many seconds
@@ -238,6 +240,34 @@ def register_knowledge_tools(
             return {"status": "deleted", **result}
         except LayerNotFoundError as e:
             return {"status": "error", "error": str(e)}
+
+    @mcp.tool()
+    @require_role("admin")
+    @log_tool_call
+    async def strata_set_archived_patterns(layer_name: str, patterns: list[str]) -> dict:
+        """Set which of a layer's files are archived, replacing the list it holds.
+
+        Patterns are in .gitignore style, matched against each file's path
+        relative to its folder: "archive/", "*-2024.md", "!keep.md". The last
+        match wins, so the order counts. Each may hold at most three wildcards.
+        An empty list clears them. Archived files are not the layer's
+        "archived" status, which covers the whole layer.
+
+        Args:
+            layer_name: The layer to set them on (e.g., "runbooks").
+            patterns: The whole new list of patterns.
+        """
+        try:
+            layer = await update_layer(database_url, layer_name, archived_patterns=patterns)
+        except (LayerNotFoundError, LayerValidationError) as e:
+            return {"status": "error", "error": str(e)}
+        await write_audit_log(
+            database_url,
+            action="set_archived_patterns",
+            tool_name="strata_set_archived_patterns",
+            parameters={"layer": layer_name, "patterns": patterns},
+        )
+        return {"status": "updated", "layer": _serialize(layer)}
 
     @mcp.tool(description=_ingest_description())
     @require_role("admin")

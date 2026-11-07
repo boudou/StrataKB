@@ -334,6 +334,18 @@ MIGRATIONS: list[Migration] = [
         )
         """,
     ),
+    Migration(
+        16,
+        "16_archived_patterns.sql",
+        """
+        SELECT EXISTS (
+            SELECT 1 FROM information_schema.columns
+            WHERE table_schema = 'strata_core'
+              AND table_name = 'knowledge_layers'
+              AND column_name = 'archived_patterns'
+        )
+        """,
+    ),
 ]
 
 # Same definition as in 05_add_folder.sql (tests compare the two)

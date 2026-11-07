@@ -179,6 +179,8 @@ StrataKB cannot control what your MCP client's language model does with the retr
 
 Make a layer per folder or domain. A preset is a YAML file that names a layer and lists its folders; apply it with `scripts/apply_preset.py` or the `strata_apply_preset` tool. Ready-made presets are in [examples/](examples/README.md), and every key is described in the [wiki](https://github.com/boudou/StrataKB/wiki/Layers-and-Presets#presets).
 
+**Archived files.** A layer can hold a list of path patterns saying which of its files are archived. `strata_set_archived_patterns` (admin) sets them, in `.gitignore` style, matched against each file's path relative to its folder (`archive/`, `*-2024.md`, `!keep.md`), at most three wildcards each; an empty list clears them. This is not the layer's `archived` status, which covers the whole layer. For now the patterns are only stored: admins see them in `strata_get_layer_status`, and citations do not show them yet.
+
 ### Try an example preset
 
 The repository also ships three example presets. The quickest to try is Python PEPs: git fetches a handful of PEPs in a few seconds, with no account:

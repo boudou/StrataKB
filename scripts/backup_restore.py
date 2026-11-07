@@ -181,7 +181,7 @@ def cmd_stats(args):
 
 # ── export-layer ──────────────────────────────────────────────────────
 
-EXPORT_FORMAT = 4
+EXPORT_FORMAT = 5
 
 
 class ExportTable(NamedTuple):
