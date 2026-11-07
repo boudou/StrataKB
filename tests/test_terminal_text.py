@@ -7,6 +7,7 @@ import json
 import pytest
 
 from stratakb.core.terminal_text import (
+    one_line,
     printable_only,
     terminal_safe_json,
     unprintable,
@@ -32,6 +33,12 @@ def test_visible_escapes_and_keeps_layout():
     expected = "a\\x1b[2J\tb\nc\\x9b\\u202e\\U000e0001"
     assert visible("a\x1b[2J\tb\nc\x9b‮\U000e0001") == expected
     assert visible(42) == "42"
+
+
+def test_one_line_also_escapes_layout():
+    assert one_line("a\x1b[2J\tb\nc\r‮") == "a\\x1b[2J\\tb\\nc\\x0d\\u202e"
+    assert one_line("back\\slash ταυ") == "back\\slash ταυ"
+    assert one_line(42) == "42"
 
 
 def test_printable_only_drops():

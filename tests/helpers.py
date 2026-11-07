@@ -18,6 +18,7 @@ if TYPE_CHECKING:
     from mcp.server.fastmcp import FastMCP
 
     from stratakb.config import Settings
+    from stratakb.knowledge.add_folder import Report
 
 FAKE_EMBEDDING = [0.01] * 768
 
@@ -162,6 +163,38 @@ def folder_settings(user: str | None = None, *, key: str = "fake-key") -> Simple
     return SimpleNamespace(
         strata_user=user or "developer", model_fields_set=fields, openai_api_key=key
     )
+
+
+# The folder in the stratakb add tests, which need no real one
+ROOT = "C:/work/docs"
+
+
+def add_report(**overrides) -> Report:
+    """The report of a stratakb add that added three files."""
+    from stratakb.knowledge.add_folder import OUTCOME_KEYS, Report
+
+    counts = dict.fromkeys(OUTCOME_KEYS, 0)
+    counts["added"] = 3
+    values = {
+        "run_id": "r" * 32,
+        "layer": "docs",
+        "created": True,
+        "root": ROOT,
+        "mode": "git",
+        "counts": counts,
+        "skipped_by_reason": {},
+        "excluded_by_reason": {},
+        "files": [
+            {"path": f"f{i}.md", "outcome": "added", "reason": None} for i in range(3)
+        ],
+        "excluded": [],
+        "notes": [],
+        "reason": None,
+        "exit_code": 0,
+        "db_target": "db.example:5433",
+    }
+    values.update(overrides)
+    return Report(**values)
 
 
 def fake_embed(texts, **_) -> list[list[float]]:

@@ -27,7 +27,7 @@ from typing import TYPE_CHECKING, Any, NamedTuple
 
 import structlog
 
-from stratakb.core.terminal_text import terminal_safe_json, visible
+from stratakb.core.terminal_text import one_line, terminal_safe_json, visible
 
 if TYPE_CHECKING:
     from stratakb.core.local_db import DownOutcome, UpState
@@ -447,7 +447,7 @@ def _finish(report: Report, args: argparse.Namespace) -> int:
     """Print the report and return its exit code."""
     if args.json:
         if report.reason is not None and report.hint:
-            _err(report.hint)
+            _err(one_line(report.hint))
         _out(render_json(report))
     elif report.reason is not None:
         _err(render_text(report))
@@ -695,12 +695,17 @@ def _flagged_line(row: dict) -> str:
 
 
 def render_text(report: Report) -> str:
-    """The report for a person to read."""
+    """The report for a person to read.
+
+    Each entry of lines is one report line, escaped once at the end
+    (stratakb.core.terminal_text), so no field reaches the terminal with its
+    control characters and a newline in a file name starts no new line.
+    """
     if report.reason is not None:
         text = f"Not added ({report.reason})"
         if report.layer:
             text += f", layer {report.layer}"
-        return f"{text}: {report.hint}" if report.hint else text
+        return one_line(f"{text}: {report.hint}" if report.hint else text)
 
     verb = "Created" if report.created else "Synced"
     lines = [f"{verb} layer {report.layer} in the database at {report.db_target}"]
@@ -730,7 +735,7 @@ def render_text(report: Report) -> str:
     lines.append(
         f"Next: ask in your MCP client: what do the docs in {report.layer} say about …?"
     )
-    return "\n".join(lines)
+    return "\n".join(one_line(line) for line in lines)
 
 
 def _verification_line(verification: dict[str, Any]) -> str:

@@ -35,6 +35,11 @@ def visible(value: Any) -> str:
     return "".join(out)
 
 
+def one_line(value: Any) -> str:
+    """visible() for a single line: a newline or tab in the value is no layout here."""
+    return visible(value).replace("\n", "\\n").replace("\t", "\\t")
+
+
 def printable_only(text: str) -> str:
     """The text with every unprintable character dropped (newlines and tabs too)."""
     return "".join(c for c in text if c.isprintable())
