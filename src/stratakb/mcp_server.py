@@ -163,7 +163,9 @@ _ANSWER_CONTRACT = (
     "Follow the mode in the response. In grounded mode write the answer, then call strata_verify "
     "before showing it, with the draft and every returned passage's ref in order (the first is "
     "S1). When the result is flagged, fix or drop the flagged claims and verify again. A flag of "
-    "kind passage cannot be fixed by rewriting: say the answer is unverified.",
+    "kind passage cannot be fixed by rewriting: say the answer is unverified. When the result is "
+    "nothing_checked, the draft has no quote or fact to check and no receipt: quote the passage "
+    "that supports it and verify again, or say the answer is unverified.",
     "In extractive mode show answer verbatim, each sentence with its citation, and any note or "
     "warning.",
     "Always show the receipt id when there is one: receipt_id from strata_verify, or from "

@@ -11,8 +11,11 @@ Two deterministic checks, in Python only (no model call):
   are normalised, so "thirty (30) days" matches "30 days", "1,000.00" matches
   "1000" and "4 November 2026" matches "2026-11-04".
 
-A citation to a passage id that was not given is flagged too. A paraphrase
-that changes the meaning without changing a fact is not caught.
+A citation to a passage id that was not given is flagged too, and so is a
+draft with no citations at all, even when its quotes and facts match. A draft
+with no quote and no fact to check is not verified: there was nothing to
+compare. A paraphrase that changes the meaning without changing a fact is not
+caught.
 """
 
 from __future__ import annotations
@@ -306,8 +309,12 @@ class CheckResult:
     flags_unlisted: int = 0
 
     @property
+    def nothing_checked(self) -> bool:
+        return not self.quotes_checked and not self.facts_checked
+
+    @property
     def verified(self) -> bool:
-        return not self.flags and not self.flags_unlisted
+        return not self.flags and not self.flags_unlisted and not self.nothing_checked
 
 
 def _words_value(text: str) -> int:
@@ -572,6 +579,16 @@ def check(
             flags.append(Flag(kind, text, f"{message}{scope.label}", list(scope.ids)))
         else:
             unlisted += 1
+
+    # First, so the cap on flags cannot drop it. A [S1] inside a quote is the
+    # document's text; the citations right after a quote stay
+    if not _CITATION.search(_QUOTE.sub(r" \2", flat_draft)):
+        flag(
+            "citation",
+            "no citation",
+            "The draft has no citations; cite each claim as [S1]. The passages given are ",
+            scope_of(()),
+        )
 
     for marker in _CITATION.finditer(flat_draft):
         for pid in _cited_ids(marker.group(0)):

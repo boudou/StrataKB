@@ -111,6 +111,7 @@ flowchart TD
     M -->|grounded| W["Client writes the answer<br/>from the passages, cites [S1]"] --> V[strata_verify]
     V -->|flagged| W
     V -->|verified| R[Receipt]
+    V -->|nothing_checked| U["Quote a passage and verify again,<br/>or say: unverified"]
     M -->|extractive| X["Server returns the document's<br/>own sentences, shown as they are"] --> R
 ```
 
@@ -118,14 +119,14 @@ flowchart TD
 
 - Answer only from the passages `strata_ask` returns, never from its own knowledge.
 - Cite every claim by passage id in the sentence that makes it, since a sentence's facts are checked against only the passages it cites, and copy numbers, dates, amounts, codes and clause numbers verbatim.
-- In grounded mode, call `strata_verify` before showing the answer, and fix or drop what it flags. A flag of kind `passage` (a span too wide to check, for example) cannot be fixed by rewriting, so the client says the answer is unverified.
+- In grounded mode, call `strata_verify` before showing the answer, and fix or drop what it flags. A flag of kind `passage` (a span too wide to check, for example) cannot be fixed by rewriting, so the client says the answer is unverified. When the result is `nothing_checked`, the draft has no quote or fact to check and no receipt: the client quotes the passage that supports it and verifies again, or says the answer is unverified.
 - In extractive mode, show `answer` verbatim, with each sentence's citation and any note or warning.
-- Show the receipt id when there is one. A `not_found`, a flagged draft and a grounded answer not yet verified have none.
+- Show the receipt id when there is one. A `not_found`, a flagged draft, a `nothing_checked` draft and a grounded answer not yet verified have none.
 - When the status is `not_found`, say "not in the documents" and give `next_step`, even if passages came back. When it is `partly_found`, answer what the passages support and say what they leave open. When it is `error`, report the error.
 
 Clients that show MCP prompts also offer the same steps as the prompt `answer_from_documents`, with a `question` and optional comma-separated `layers`. The prompt reads no data and needs no database; the tools it names make their usual role checks.
 
-**The limits.** The instructions are a request to the client, not something the server can enforce: a client can ignore them, skip the check or retype a quote. What you can rely on is the receipt, which holds what the server itself read from the documents and, for a checked answer, the draft it checked. `strata_verify` checks quotes, numbers, dates, amounts, codes and clause references. It does not catch a paraphrase that changes the meaning without changing a fact; for layers where that is not acceptable, use `answer_mode: extractive`.
+**The limits.** The instructions are a request to the client, not something the server can enforce: a client can ignore them, skip the check or retype a quote. What you can rely on is the receipt, which holds what the server itself read from the documents and, for a checked answer, the draft it checked. `strata_verify` checks quotes, numbers, dates, amounts, codes and clause references. A draft with citations but no quotes or facts returns `nothing_checked`, because the check had nothing to compare. The check does not catch a paraphrase that changes the meaning without changing a fact; for layers where that is not acceptable, use `answer_mode: extractive`.
 
 **Opening a receipt.** Use `strata_get_receipt`, the resource `strata://receipts/{receipt_id}` or the command line, `uv run stratakb receipt <id>` ([what it prints](https://github.com/boudou/StrataKB/wiki/Asking-and-Searching#checking-a-drafted-answer)). Each quote appears in its surrounding text, marked current, changed or gone. Receipts are kept for `RECEIPT_RETENTION_DAYS` (90 by default).
 

@@ -99,7 +99,52 @@ class TestCheck:
         assert [(f.kind, f.passages) for f in flags] == [("quote", ["S2"])]
 
     def test_uncited_quote_searches_every_passage(self):
-        assert _flag_texts('"the late rate is 5%"') == []
+        # The draft cites elsewhere, so the quote with no citation of its own may be anywhere
+        assert _flag_texts('"the late rate is 5%". Either party may end it [S1].') == []
+
+    def test_no_citations_flagged_even_when_everything_matches(self):
+        result = check('"the late rate is 5%" and the fee is EUR 1,000.00.', PASSAGES)
+        assert [(f.kind, f.text) for f in result.flags] == [("citation", "no citation")]
+        assert result.flags[0].passages == list(PASSAGES)
+        assert result.quotes_checked == 1
+        assert result.facts_checked == 1
+        assert not result.verified
+
+    def test_no_citation_flag_listed_first_past_the_cap(self):
+        draft = " ".join(f"Q{i}Z" for i in range(1, MAX_FLAGS + 20))
+        result = check(draft, PASSAGES)
+        assert result.flags[0].text == "no citation"
+        assert len(result.flags) == MAX_FLAGS
+        assert result.flags_unlisted == 20
+
+    def test_citation_inside_a_quote_does_not_count(self):
+        # The [S1] is the document's own text, not a citation by the draft
+        passages = {"S1": "See [S1] for the form."}
+        assert [f.text for f in check('"See [S1] for the form"', passages).flags] == ["no citation"]
+        result = check('"See [S1] for the form" [S1]', passages)
+        assert result.flags == []
+        assert result.verified
+
+    @pytest.mark.parametrize(
+        "draft",
+        [
+            "Termination also requires approval from the board of directors [S1].",
+            '"..." [S1]',
+            "[S1]",
+        ],
+    )
+    def test_cited_draft_with_nothing_to_check(self, draft):
+        result = check(draft, PASSAGES)
+        assert result.flags == []
+        assert result.nothing_checked
+        assert not result.verified
+
+    @pytest.mark.parametrize("draft", ["The moon is made of cheese.", "", "   "])
+    def test_draft_with_no_citations_and_nothing_to_check_flagged(self, draft):
+        result = check(draft, PASSAGES)
+        assert [(f.kind, f.text) for f in result.flags] == [("citation", "no citation")]
+        assert result.nothing_checked
+        assert not result.verified
 
     def test_quote_with_omission(self):
         assert _flag_texts('"A fee of EUR 1,000.00 ... is reported in pacs.002" [S2]') == []
@@ -171,7 +216,7 @@ class TestCheck:
         assert check("See section 12 [S1].", passages).flags == []
 
     def test_large_hostile_draft_bounded(self):
-        draft = " ".join(f"Q{i}Z" for i in range(1, 10_000))[:MAX_DRAFT_CHARS]
+        draft = " ".join(f"Q{i}Z" for i in range(1, 10_000))[:MAX_DRAFT_CHARS - 5] + " [S1]"
         passages = {f"S{i}": "A fee of EUR 25 applies within 30 days. " * 50 for i in range(1, 51)}
         result = check(draft, passages)
         assert len(result.flags) == MAX_FLAGS

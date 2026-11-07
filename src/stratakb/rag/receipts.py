@@ -42,6 +42,12 @@ CONTEXT_CHARS = 300
 # The note on a quote whose file or layer is no longer in the knowledge base
 SOURCE_GONE = "source no longer in the knowledge base"
 
+# Shown on a stored verify receipt whose draft had nothing to check
+NOTHING_CHECKED_NOTE = (
+    "Nothing was checked: this draft had no quotes and no facts, so this receipt does not show "
+    "the answer is right."
+)
+
 # The same message for an unknown receipt and a refused one: an id alone
 # tells the caller nothing
 _NOT_READABLE = "Receipt not found, or you may not open it."
@@ -348,6 +354,10 @@ async def open_receipt(
     for key in ("draft", "verification"):
         if key in body:
             result[key] = body[key]
+    # Issued before a draft with nothing to check stopped getting a receipt
+    verification = body.get("verification") or {}
+    if verification.get("quotes") == 0 and verification.get("facts") == 0:
+        result["verification_note"] = NOTHING_CHECKED_NOTE
     return result
 
 

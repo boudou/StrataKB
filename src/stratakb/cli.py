@@ -764,6 +764,8 @@ def render_receipt(receipt: dict) -> str:
         lines.append(f"Draft: {receipt['draft']}")
     if receipt.get("verification"):
         lines.append(_verification_line(receipt["verification"]))
+    if receipt.get("verification_note"):
+        lines.append(receipt["verification_note"])
     for position, quote in enumerate(receipt["quotes"], start=1):
         where = [f"layer {quote['layer']}", f"v{quote['version']}"]
         if quote.get("clause_path"):

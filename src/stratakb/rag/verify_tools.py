@@ -4,8 +4,8 @@ The passages are named by the refs strata_ask returned, in S-id order, and
 their text is always read from the store, never taken from the caller. A
 ref is bounded: its span must lie inside its document and be at most twice
 the layer's chunk_size long, so a citation cannot be widened to a whole
-document. A verified draft gets a receipt; every call is audited with counts
-only, never the draft.
+document. A verified draft gets a receipt, and a draft with nothing to check
+gets none; every call is audited with counts only, never the draft.
 """
 
 from __future__ import annotations
@@ -41,6 +41,13 @@ _LEGACY_PREFIX = re.compile(r"\A\[[^\]\n]*\]\n")
 
 # The same message for an unknown passage and an unreadable one
 _NOT_READABLE = "Passage {pid} ({ref}) was not found, or you may not read it."
+
+# Why a draft with citations but no quote or fact to check has no receipt
+_NOTHING_CHECKED = (
+    "The draft has no quote and no fact to check, so it is not verified and has no receipt. "
+    'Quote the passage that supports it as "..." [S1] and verify again, or say the answer is '
+    "unverified."
+)
 
 
 class _RefusedError(Exception):
@@ -212,6 +219,9 @@ async def verify_draft(
             response["more_flags"] = total - MAX_FLAGS
         await audit("flagged", **counts)
         return response
+    if result.nothing_checked:
+        await audit("nothing_checked", **counts)
+        return {**response, "result": "nothing_checked", "note": _NOTHING_CHECKED}
 
     try:
         receipt_id = await issue_receipt(
@@ -253,7 +263,9 @@ def register_verify_tools(mcp: FastMCP, database_url: str) -> None:
         clause reference appears in a passage cited in the same sentence, or in
         any passage when the sentence cites none ("30 days" matches "thirty
         (30) days", "1,000.00" matches "1000", "2026-11-04" matches "4 November
-        2026"); every [Sn] names a passage given. A verified draft
+        2026"); every [Sn] names a passage given. A draft with no citations at
+        all is flagged. A draft with citations but no quote or fact to check
+        returns nothing_checked, with no receipt. A verified draft
         gets a receipt (open it with strata_get_receipt). A paraphrase that
         changes the meaning without changing a fact is not caught.
 
