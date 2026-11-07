@@ -322,6 +322,18 @@ MIGRATIONS: list[Migration] = [
         )
         """,
     ),
+    Migration(
+        15,
+        "15_supersedes.sql",
+        """
+        SELECT EXISTS (
+            SELECT 1 FROM information_schema.columns
+            WHERE table_schema = 'strata_vectors'
+              AND table_name = 'documents'
+              AND column_name = 'supersedes'
+        )
+        """,
+    ),
 ]
 
 # Same definition as in 05_add_folder.sql (tests compare the two)

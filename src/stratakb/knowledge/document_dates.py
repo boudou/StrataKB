@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING
 import structlog
 
 from stratakb.knowledge.parsers.registry import FORMATS
-from stratakb.knowledge.structure import frontmatter_end
+from stratakb.knowledge.structure import frontmatter_end, frontmatter_source
 
 if TYPE_CHECKING:
     from uuid import UUID
@@ -60,9 +60,7 @@ def document_date(file_path: Path, data: bytes) -> tuple[str | None, str | None]
     """
     fmt = FORMATS.get(file_path.suffix.lower())
     if fmt is not None and not fmt.binary:
-        # The byte-order mark would hide the block, and its pattern needs \n
-        text = data.decode("utf-8-sig", errors="replace")
-        found = frontmatter_date(text.replace("\r\n", "\n").replace("\r", "\n"))
+        found = frontmatter_date(frontmatter_source(data))
         if found is not None:
             return found, "front_matter"
     try:

@@ -50,6 +50,7 @@ from stratakb.knowledge.structure import (
     chunk_spans,
     detect_sections,
 )
+from stratakb.knowledge.supersedes import declared_supersedes
 from stratakb.knowledge.vector_store import ChunkRecord, chunk_embed_text, insert_chunks
 
 if TYPE_CHECKING:
@@ -211,11 +212,13 @@ async def _store_file(
     sections: Sequence[Section] = (),
     doc_date: str | None = None,
     doc_date_source: str | None = None,
+    supersedes: str | None = None,
 ) -> None:
     """Replace one file's row, document version and chunks in a single transaction.
 
     The text is stored as the file's current document version (reused when
-    unchanged), with its date and structure map (sections); this file's
+    unchanged), with its date, what it replaces and its structure map
+    (sections); this file's
     versions no chunk references any more are pruned afterwards.
     """
     pool = await get_pool(database_url)
@@ -252,6 +255,7 @@ async def _store_file(
                 text_origin=text_origin,
                 doc_date=doc_date,
                 doc_date_source=doc_date_source,
+                supersedes=supersedes,
             )
             await store_sections(conn, document_id, sections)
             for chunk in chunks:
@@ -628,6 +632,7 @@ async def ingest_documents(
                 continue
 
             doc_date, doc_date_source = await asyncio.to_thread(document_date, file_path, data)
+            supersedes = await asyncio.to_thread(declared_supersedes, fmt, data, relative_path)
             try:
                 await _store_file(
                     database_url,
@@ -642,6 +647,7 @@ async def ingest_documents(
                     sections=mapped.sections,
                     doc_date=doc_date,
                     doc_date_source=doc_date_source,
+                    supersedes=supersedes,
                 )
             except (asyncpg.PostgresConnectionError, asyncpg.InterfaceError, OSError):
                 # A lost database is an error for the whole run, not one failed file

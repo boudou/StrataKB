@@ -233,6 +233,13 @@ def strip_clause_number(text: str) -> str:
     return text
 
 
+def frontmatter_source(data: bytes) -> str:
+    """A file's bytes as text to look for front matter in: frontmatter_end's
+    pattern needs \\n line ends, and a byte-order mark would hide the block."""
+    text = data.decode("utf-8-sig", errors="replace")
+    return text.replace("\r\n", "\n").replace("\r", "\n")
+
+
 def frontmatter_end(text: str) -> int:
     """Return the offset just past the leading YAML front matter, or 0 when there is none.
 

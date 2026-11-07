@@ -513,6 +513,46 @@ async def test_applies_missing_14_existing_documents_have_no_date(db_url, restor
         )
 
 
+async def test_applies_missing_15_existing_documents_declare_nothing(db_url, restore_schema):
+    await owner_execute(
+        db_url,
+        """
+        DELETE FROM strata_core.knowledge_layers WHERE name = 'test_mig_supersedes';
+        ALTER TABLE strata_vectors.documents DROP COLUMN supersedes;
+        DELETE FROM strata_core.schema_migrations WHERE version = 15;
+        INSERT INTO strata_core.knowledge_layers (name, display_name)
+        VALUES ('test_mig_supersedes', 'Older layer');
+        INSERT INTO strata_vectors.documents
+            (layer_id, source_root, relative_path, version, text, sha256)
+        SELECT id, '/older', 'older.md', 1, 'Older text', repeat('a', 64)
+        FROM strata_core.knowledge_layers WHERE name = 'test_mig_supersedes';
+        """,
+    )
+    try:
+        await migrations.ensure_schema(db_url)
+
+        conn = await asyncpg.connect(db_url)
+        try:
+            row = await conn.fetchrow(
+                "SELECT supersedes FROM strata_vectors.documents "
+                "WHERE source_root = '/older' AND relative_path = 'older.md'"
+            )
+            index = await conn.fetchval(
+                "SELECT indexdef FROM pg_indexes WHERE schemaname = 'strata_vectors' "
+                "AND indexname = 'idx_documents_supersedes'"
+            )
+        finally:
+            await conn.close()
+        assert row["supersedes"] is None
+        assert "supersedes IS NOT NULL" in index
+        assert await recorded_versions(db_url) == ALL_VERSIONS
+    finally:
+        await owner_execute(
+            db_url,
+            "DELETE FROM strata_core.knowledge_layers WHERE name = 'test_mig_supersedes'",
+        )
+
+
 async def test_applies_missing_07_older_chunks_keep_null_offsets(db_url, restore_schema):
     await owner_execute(
         db_url,

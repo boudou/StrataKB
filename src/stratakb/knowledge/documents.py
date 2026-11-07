@@ -88,6 +88,7 @@ async def store_document_version(
     text_origin: str = "text",
     doc_date: str | None = None,
     doc_date_source: str | None = None,
+    supersedes: str | None = None,
 ) -> tuple[int, int]:
     """Store the text as the file's current version; return (document_id, version).
 
@@ -100,6 +101,7 @@ async def store_document_version(
 
     A reused version takes the given date (the front matter can change while
     the text stays the same) and keeps its stored one when doc_date is None.
+    It always takes the given supersedes: None means the key was removed.
 
     Numbering is serialized per file: a transaction-scoped advisory lock on
     (layer, source root, relative path) makes a concurrent call for the same
@@ -139,13 +141,15 @@ async def store_document_version(
                 SET file_id = $2,
                     doc_date = COALESCE($3::text, doc_date),
                     doc_date_source = CASE WHEN $3::text IS NULL THEN doc_date_source
-                                           ELSE $4::text END
+                                           ELSE $4::text END,
+                    supersedes = $5
                 WHERE id = $1
                 """,
                 latest["id"],
                 file_id,
                 doc_date,
                 doc_date_source,
+                supersedes,
             )
             return latest["id"], latest["version"]
 
@@ -154,8 +158,8 @@ async def store_document_version(
             """
             INSERT INTO strata_vectors.documents
                 (layer_id, file_id, source_root, relative_path, version, text, sha256,
-                 page_map, text_origin, doc_date, doc_date_source)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+                 page_map, text_origin, doc_date, doc_date_source, supersedes)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
             RETURNING id
             """,
             layer_id,
@@ -169,6 +173,7 @@ async def store_document_version(
             text_origin,
             doc_date,
             doc_date_source,
+            supersedes,
         )
     logger.info("document_version_stored", relative_path=relative_path, version=version)
     return document_id, version
