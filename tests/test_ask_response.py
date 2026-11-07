@@ -243,7 +243,81 @@ class TestRefAndCitation:
         citation = cite(chunk, document)
 
         assert citation == {"file": "specs/a.pdf", "page": 2, "lines": "2-3",
-                            "clause_path": None, "layer": "specs"}
+                            "clause_path": None, "layer": "specs",
+                            "date": None, "date_source": None}
+
+    def test_citation_carries_the_document_date(self):
+        document = {"relative_path": "a.md", "page_map": None, "text": "one",
+                    "doc_date": "2026-03-04", "doc_date_source": "front_matter"}
+        chunk = {"chunk_id": "c", "content": "one", "layer": "l", "metadata": {},
+                 "document_id": 1, "char_start": 0, "char_end": 3}
+
+        citation = cite(chunk, document)
+
+        assert (citation["date"], citation["date_source"]) == ("2026-03-04", "front_matter")
+
+    def test_answer_item_carries_the_date(self):
+        from stratakb.rag.extractive import Sentence, answer_item
+
+        document = {"relative_path": "a.md", "page_map": None, "text": "One sentence.",
+                    "text_origin": "text",
+                    "doc_date": "2024-05-06", "doc_date_source": "file"}
+        chunk = {"chunk_id": "c", "content": "One sentence.", "layer": "l", "metadata": {},
+                 "document_id": 1, "char_start": 0, "char_end": 13}
+        sentence = Sentence(1, 0, 13, "One sentence.", 0, False, 0.9)
+
+        item = answer_item(sentence, [chunk], {1: document})
+
+        assert (item["citation"]["date"], item["citation"]["date_source"]) == (
+            "2024-05-06", "file"
+        )
+
+    def test_chunk_without_offsets_has_no_date(self):
+        document = {"relative_path": "a.md", "page_map": None, "text": "one",
+                    "doc_date": "2026-03-04", "doc_date_source": "front_matter"}
+        chunk = {"chunk_id": "c", "content": "one", "layer": "l", "metadata": {},
+                 "document_id": 1, "char_start": None, "char_end": None}
+
+        citation = cite(chunk, document)
+
+        assert (citation["date"], citation["date_source"]) == (None, None)
+
+    @pytest.mark.parametrize("length", range(4))
+    def test_filled_date_fits_passage_cost(self, length):
+        import pydantic_core
+
+        def tokens(response: dict) -> int:
+            return estimate_tokens(pydantic_core.to_json(response, indent=2).decode())
+
+        # Six-digit spans, across two three-digit pages
+        boundary = 150_000
+        document = {"relative_path": "a.pdf", "page_map": [[0, 100], [boundary, 101]],
+                    "text": "x\n" * 100_000, "doc_date": "2026-03-04",
+                    "doc_date_source": "front_matter"}
+        chunk = {"chunk_id": "c", "content": "x" * length, "layer": "l", "doc_type": "pdf",
+                 "metadata": {}, "source_file": "a.pdf", "document_id": 123_456,
+                 "char_start": boundary - 10, "char_end": boundary + 10}
+        passage = build_passages([chunk], {123_456: document})[0]
+        assert passage["citation"]["page_end"] == 101
+        assert passage["citation"]["date"] == "2026-03-04"
+
+        response = {"status": "found", "mode": "grounded"}
+        filled = tokens({**response, "passages": [passage]}) - tokens({**response, "passages": []})
+
+        assert filled <= passage_cost(chunk)
+
+    async def test_cited_documents_brings_the_schema_up_first(self):
+        from stratakb.core.migrations import MigrationError
+        from stratakb.rag.tools import _cited_documents
+
+        chunk = {"chunk_id": "c", "document_id": 1, "char_start": 0, "char_end": 3}
+
+        with patch(
+            "stratakb.core.migrations.ensure_schema",
+            AsyncMock(side_effect=MigrationError("out of date")),
+        ) as ensure:
+            assert await _cited_documents("postgresql://unused", [chunk]) == {}
+        ensure.assert_awaited_once_with("postgresql://unused")
 
     def test_citation_across_pages_names_the_last_page(self):
         text = "one\n\ntwo"
@@ -267,7 +341,7 @@ class TestRefAndCitation:
             "ref": "cold",
             "text": "[l > a > Page 3] text",
             "citation": {"file": "a.pdf", "page": 3, "lines": None, "clause_path": None,
-                         "layer": "l"},
+                         "layer": "l", "date": None, "date_source": None},
         }
 
 
@@ -453,6 +527,8 @@ class TestAskResponse:
             "lines": "7-8",
             "clause_path": "Master agreement > 7 Termination",
             "layer": layer,
+            "date": None,
+            "date_source": None,
         }
         assert second["id"] == "S2"
         assert second["ref"] == "cother"

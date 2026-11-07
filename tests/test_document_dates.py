@@ -8,10 +8,11 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
+import json
 import os
 from datetime import UTC, datetime
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 from uuid import uuid4
 
 import pytest
@@ -25,6 +26,37 @@ from tests.helpers import (
     locked_read_bytes,
     write_file,
 )
+
+
+@pytest.fixture
+def settings():
+    from stratakb.config import Settings, get_settings
+
+    return Settings(
+        _env_file=None,
+        database_url=get_settings().database_url,
+        learning_enabled=True,
+        reranking_enabled=False,
+        strata_user="test-user",
+        strata_role="viewer",
+    )
+
+
+@pytest.fixture
+def server(settings):
+    """A StrataKB server on the test database, its settings patched in everywhere."""
+    from stratakb.mcp_server import build_server
+
+    with (
+        patch("stratakb.config.get_settings", return_value=settings),
+        patch("stratakb.rag.tools.write_audit_log", AsyncMock()),
+        patch("stratakb.learning.tools.write_audit_log", AsyncMock()),
+        patch(
+            "stratakb.rag.query_rewriter.rewrite_query",
+            AsyncMock(side_effect=lambda question, **_: [question]),
+        ),
+    ):
+        yield build_server(settings)
 
 
 @pytest.fixture
@@ -117,6 +149,88 @@ async def test_two_runbooks_store_both_kinds_of_date(db_url, layer, tmp_path):
     assert await _dates(db_url, layer, "failover-2026.md") == {
         1: ("2026-03-04", "front_matter")
     }
+
+
+async def _ask_about_layer(server, db_url: str, layer: str) -> dict:
+    """strata_ask with the search patched to return every chunk of the layer."""
+    from stratakb.core.database import get_pool
+    from stratakb.rag.retriever import SearchResult
+
+    pool = await get_pool(db_url)
+    rows = await pool.fetch(
+        """
+        SELECT id, document_id, char_start, char_end, content, source_file
+        FROM strata_vectors.chunks WHERE layer_name = $1 ORDER BY id
+        """,
+        layer,
+    )
+    results = [
+        SearchResult(
+            chunk_id=str(row["id"]),
+            content=row["content"],
+            score=1.0,
+            layer_name=layer,
+            source_file=row["source_file"],
+            source_section="section",
+            doc_type="markdown",
+            metadata={},
+            similarity=0.9,
+            document_id=row["document_id"],
+            char_start=row["char_start"],
+            char_end=row["char_end"],
+        )
+        for row in rows
+    ]
+    with patch("stratakb.rag.retriever.search_chunks", AsyncMock(return_value=results)):
+        result = await server.call_tool("strata_ask", {"question": "q", "layers": [layer]})
+    if isinstance(result, tuple):
+        result = result[0]
+    response = result if isinstance(result, dict) else json.loads(result[0].text)
+    if "interaction_id" in response:
+        await pool.execute(
+            "DELETE FROM strata_learning.interaction_events WHERE id = $1",
+            response["interaction_id"],
+        )
+    return response
+
+
+async def test_two_runbooks_cite_their_dates(server, db_url, layer, tmp_path):
+    old = write_file(tmp_path / "failover-2024.md", "# Failover\n\nSwitch by hand.\n")
+    _set_modified(old, 2024, 5, 6)
+    new = write_file(
+        tmp_path / "failover-2026.md",
+        "---\ndate: 2026-03-04\n---\n# Failover\n\nSwitch with the script.\n",
+    )
+    _set_modified(new, 2025, 1, 1)
+    await ingest(db_url, layer, tmp_path)
+
+    response = await _ask_about_layer(server, db_url, layer)
+
+    assert response["status"] == "found"
+    dates = {
+        passage["citation"]["file"]: (
+            passage["citation"]["date"], passage["citation"]["date_source"]
+        )
+        for passage in response["passages"]
+    }
+    assert dates == {
+        "failover-2024.md": ("2024-05-06", "file"),
+        "failover-2026.md": ("2026-03-04", "front_matter"),
+    }
+
+
+async def test_document_without_a_date_cites_null(server, db_url, layer, tmp_path):
+    write_file(tmp_path / "a.md", "---\ndate: 2026-03-04\n---\n# A\n\nThe text.\n")
+    await ingest(db_url, layer, tmp_path)
+    await _clear_dates(db_url, layer)
+
+    response = await _ask_about_layer(server, db_url, layer)
+
+    assert response["status"] != "error"
+    citation = response["passages"][0]["citation"]
+    assert citation["file"] == "a.md"
+    assert citation["lines"] is not None
+    assert (citation["date"], citation["date_source"]) == (None, None)
 
 
 @pytest.mark.parametrize(

@@ -4,7 +4,8 @@ A passage is one retrieved chunk. Passages keep the retrieval order and are
 numbered S1, S2, ... in it, so S<n> is the n-th retrieved chunk the
 learning loop records. Each passage carries a ref that names the exact span
 of the stored document text it holds, and a citation a developer can open:
-the file's relative path, the page, the line range and the clause path.
+the file's relative path, the page, the line range, the clause path and
+the document's date.
 The budget counts each passage's id, ref and citation with its text, and an
 answer holds at most MAX_PASSAGES passages, all of which the learning loop
 stores, so feedback by passage id resolves for every one.
@@ -34,10 +35,11 @@ AnswerMode = Literal["grounded", "extractive"]
 # The most passages an answer returns, and results the learning loop stores
 MAX_PASSAGES = 50
 # The tokens a passage costs in the response beyond its own indent-2 JSON: the
-# deeper indentation inside the response's passages list and the page, lines
-# and page_end a stored document adds (measured on FastMCP's indent-2 JSON
-# with six-digit spans and three-digit pages: about 81 characters)
-RESPONSE_SLACK_TOKENS = 21
+# deeper indentation inside the response's passages list and the page, lines,
+# page_end and the date and date_source values a stored document adds (measured
+# on FastMCP's indent-2 JSON with six-digit spans and three-digit pages: about
+# 107 characters)
+RESPONSE_SLACK_TOKENS = 27
 
 _PASSAGE_ID = re.compile(r"[Ss]([1-9][0-9]*)")
 
@@ -187,12 +189,13 @@ def _clause_path(chunk: dict[str, Any], metadata: dict[str, Any]) -> str | None:
 
 
 def cite(chunk: dict[str, Any], document: dict[str, Any] | None) -> dict[str, Any]:
-    """Where a passage comes from: file, page, lines, clause path and layer.
+    """Where a passage comes from: file, page, lines, clause path, layer and date.
 
-    With its stored document the file is the relative path and the page and
-    line range come from the chunk's span. A chunk ingested before documents
-    were stored is cited by its file name and, for a PDF, its page; its
-    lines are unknown.
+    With its stored document the file is the relative path, the page and line
+    range come from the chunk's span, and the date and date_source are the
+    document's, None when it has none. A chunk ingested before documents were
+    stored is cited by its file name and, for a PDF, its page; its lines and
+    date are unknown.
     """
     metadata = chunk.get("metadata") or {}
     citation: dict[str, Any] = {
@@ -201,8 +204,12 @@ def cite(chunk: dict[str, Any], document: dict[str, Any] | None) -> dict[str, An
         "lines": None,
         "clause_path": _clause_path(chunk, metadata),
         "layer": chunk.get("layer"),
+        "date": None,
+        "date_source": None,
     }
     if document is not None and chunk.get("char_start") is not None:
+        citation["date"] = document.get("doc_date")
+        citation["date_source"] = document.get("doc_date_source")
         where = locate(
             document["text"], document["page_map"], chunk["char_start"], chunk["char_end"]
         )

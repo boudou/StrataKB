@@ -170,6 +170,10 @@ _ANSWER_CONTRACT = (
     "warning.",
     "Always show the receipt id when there is one: receipt_id from strata_verify, or from "
     "strata_ask in extractive mode. strata_get_receipt opens it.",
+    "Each citation's date shows which document is newer: date_source says if it came from the "
+    "document's front matter or the file's modification time, which can be a checkout or a copy. "
+    "A date does not show that documents conflict. Give it beside the answer, not in the draft "
+    "you verify: strata_verify checks only passage text.",
     'When status is not_found, say "not in the documents" and give next_step, even if passages '
     "came back. When it is partly_found, answer what the passages support and say what they "
     "leave open. When it is error, report the error.",

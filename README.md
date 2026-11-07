@@ -83,7 +83,7 @@ How it works, every tool and every setting are in the [wiki](https://github.com/
 ## What works today
 
 - **Add a folder**: one command reads PDF, DOCX, Markdown, HTML, plain text, reStructuredText, AsciiDoc, CSV (up to 10,000 rows per file), JSON, XML/XSD and OpenAPI/AsyncAPI YAML, and later runs read only what changed.
-- **Cited passages**: every passage comes with its file, page, lines and headings.
+- **Cited passages**: every passage comes with its file, page, lines, headings and date.
 - **Answers you can check**: `strata_verify` checks the quotes and facts in a drafted answer, extractive answers use the document's own sentences, and both give a receipt you can open outside the chat. See [Answers you can prove](#answers-you-can-prove).
 - **Layers, routing and presets**: a layer per folder or domain, questions routed to the right layers by each layer's patterns, and one YAML file to build or rebuild a layer. See [Layers and presets](#layers-and-presets).
 - **Local embeddings and a local-only switch**: `all-mpnet-base-v2` runs on CPU with no API key, and `STRATA_LOCAL_ONLY=true` refuses to start while any setting would send content off this machine. See [Where your data goes](#where-your-data-goes).
@@ -122,11 +122,14 @@ flowchart TD
 - In grounded mode, call `strata_verify` before showing the answer, and fix or drop what it flags. A flag of kind `passage` (a span too wide to check, for example) cannot be fixed by rewriting, so the client says the answer is unverified. When the result is `nothing_checked`, the draft has no quote or fact to check and no receipt: the client quotes the passage that supports it and verifies again, or says the answer is unverified.
 - In extractive mode, show `answer` verbatim, with each sentence's citation and any note or warning.
 - Show the receipt id when there is one. A `not_found`, a flagged draft, a `nothing_checked` draft and a grounded answer not yet verified have none.
+- Use each citation's date to tell which document is newer, and `date_source` to tell whether it came from the document's front matter or the file's modification time, which can be a checkout or a copy. A date does not show that documents conflict. The client gives it beside the answer, not in the draft it verifies, because `strata_verify` checks only passage text.
 - When the status is `not_found`, say "not in the documents" and give `next_step`, even if passages came back. When it is `partly_found`, answer what the passages support and say what they leave open. When it is `error`, report the error.
 
 Clients that show MCP prompts also offer the same steps as the prompt `answer_from_documents`, with a `question` and optional comma-separated `layers`. The prompt reads no data and needs no database; the tools it names make their usual role checks.
 
 **The limits.** The instructions are a request to the client, not something the server can enforce: a client can ignore them, skip the check or retype a quote. What you can rely on is the receipt, which holds what the server itself read from the documents and, for a checked answer, the draft it checked. `strata_verify` checks quotes, numbers, dates, amounts, codes and clause references. A draft with citations but no quotes or facts returns `nothing_checked`, because the check had nothing to compare. The check does not catch a paraphrase that changes the meaning without changing a fact; for layers where that is not acceptable, use `answer_mode: extractive`.
+
+**What a date means.** Each citation has a `date`, as `YYYY-MM-DD`, and a `date_source` that says where it came from. With `front_matter` it is the document's own `updated` key or, without one, its `date` key. With `file` it is the file's modification time as a UTC date, which can show a checkout or a copy rather than an edit. A date shows which document is newer, not that two documents conflict. A document stored before dates were recorded shows `null` until its folder is ingested again, and one stored before document text was kept shows `null` until the file changes or the layer is rebuilt.
 
 **Opening a receipt.** Use `strata_get_receipt`, the resource `strata://receipts/{receipt_id}` or the command line, `uv run stratakb receipt <id>` ([what it prints](https://github.com/boudou/StrataKB/wiki/Asking-and-Searching#checking-a-drafted-answer)). Each quote appears in its surrounding text, marked current, changed or gone. Receipts are kept for `RECEIPT_RETENTION_DAYS` (90 by default).
 

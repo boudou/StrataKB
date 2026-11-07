@@ -223,8 +223,10 @@ async def _cited_documents(
         return {}
     try:
         from stratakb.core.database import get_pool
+        from stratakb.core.migrations import ensure_schema
         from stratakb.knowledge.documents import fetch_cited_documents
 
+        await ensure_schema(database_url)
         pool = await get_pool(database_url)
         async with pool.acquire() as conn:
             return await fetch_cited_documents(conn, ends)
@@ -690,8 +692,8 @@ def register_rag_tools(
         next_step for the last two; mode is the mode used; passages lists S1,
         S2, ... in order of relevance, each with its exact text, a ref to the
         span of the stored document, and a citation (file path, page, lines,
-        clause path, layer). interaction_id goes to strata_feedback, where
-        passages can be rated by id ({"S1": "useful"}).
+        clause path, layer, date and date_source). interaction_id goes to
+        strata_feedback, where passages can be rated by id ({"S1": "useful"}).
 
         In extractive mode answer replaces passages: sentences word for word,
         each with its ref, citation and text_origin, plus a receipt_id (open it
