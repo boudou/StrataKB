@@ -8,6 +8,10 @@ the file's relative path, the page, the line range and the clause path.
 The budget counts each passage's id, ref and citation with its text, and an
 answer holds at most MAX_PASSAGES passages, all of which the learning loop
 stores, so feedback by passage id resolves for every one.
+
+The typed results of strata_ask and strata_search live here too: AskResult,
+SearchResponse and the ToolFailure either can return. All three say whether
+they succeeded (ok), so nobody has to check which type they hold.
 """
 
 from __future__ import annotations
@@ -16,10 +20,10 @@ import json
 import math
 import re
 from dataclasses import dataclass, field
-from typing import Any, Literal
+from typing import Any, ClassVar, Literal
 
 from stratakb.knowledge.documents import locate
-from stratakb.rag.confidence import AnswerStatus
+from stratakb.rag.confidence import AnswerStatus, Confidence, similarity_or_zero
 
 ResponseFormat = Literal["concise", "detailed"]
 
@@ -217,9 +221,80 @@ def build_passages(
     ]
 
 
+def basis_score(chunk: dict[str, Any], basis: str) -> float:
+    """The score confidence judges a strata_ask chunk on, for this basis.
+
+    An exact clause match is the passage asked for: it scores 1.0.
+    """
+    if chunk.get("match") == "exact":
+        return 1.0
+    if basis == "rerank":
+        return chunk["rerank_score"]
+    return similarity_or_zero(chunk["similarity"])
+
+
+def sources_from(chunks: list[dict[str, Any]], basis: str) -> list[dict[str, Any]]:
+    """One source per (layer, file, section), in order, scored on its first chunk."""
+    sources: dict[tuple[Any, Any, Any], dict[str, Any]] = {}
+    for c in chunks:
+        sources.setdefault((c["layer"], c["source_file"], c["section"]), {
+            "layer": c["layer"],
+            "file": c["source_file"],
+            "section": c["section"],
+            "doc_type": c["doc_type"],
+            "relevance_score": basis_score(c, basis),
+        })
+    return list(sources.values())
+
+
 def next_step(status: str) -> str | None:
     """What to do when the answer was not, or only partly, found."""
     return _NEXT_STEPS.get(status)
+
+
+@dataclass(frozen=True)
+class ToolFailure:
+    """A strata_ask or strata_search call that failed; clients see its to_dict."""
+
+    ok: ClassVar[Literal[False]] = False
+
+    error: str
+
+    def to_dict(self, response_format: ResponseFormat = "concise") -> dict[str, Any]:
+        """The same for every response format."""
+        return {"status": "error", "error": self.error}
+
+
+@dataclass
+class SearchResponse:
+    """One strata_search result. The learning tracker sets interaction_id."""
+
+    ok: ClassVar[Literal[True]] = True
+
+    query: str
+    confidence: Confidence
+    results: list[dict[str, Any]]
+    auto_detected_layers: list[str] = field(default_factory=list)
+    routing_fallback: str | None = None
+    interaction_id: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        response: dict[str, Any] = {
+            "status": "ok",
+            "query": self.query,
+            "confidence": self.confidence.to_dict(),
+            "results": self.results,
+            "total": len(self.results),
+        }
+        if self.auto_detected_layers:
+            response["auto_detected_layers"] = self.auto_detected_layers
+        if self.routing_fallback:
+            response["routing_fallback"] = {
+                "reason": self.routing_fallback, "searched_layers": "all",
+            }
+        if self.interaction_id is not None:
+            response["interaction_id"] = self.interaction_id
+        return response
 
 
 @dataclass
@@ -231,9 +306,11 @@ class AskResult:
     The learning tracker sets interaction_id.
     """
 
+    ok: ClassVar[Literal[True]] = True
+
     question: str
     queries_used: list[str]
-    confidence: dict[str, Any]
+    confidence: Confidence
     chunks: list[dict[str, Any]]
     passages: list[dict[str, Any]]
     status: AnswerStatus
@@ -241,6 +318,9 @@ class AskResult:
     auto_detected_layers: list[str] = field(default_factory=list)
     routing_fallback: str | None = None
     interaction_id: str | None = None
+
+    def to_dict(self, response_format: ResponseFormat = "concise") -> dict[str, Any]:
+        return self.detailed() if response_format == "detailed" else self.concise()
 
     def concise(self) -> dict[str, Any]:
         """The answer status, the mode, the passages, the next step when there
@@ -262,7 +342,7 @@ class AskResult:
             "status": "ok",
             "question": self.question,
             "queries_used": self.queries_used,
-            "confidence": self.confidence,
+            "confidence": self.confidence.to_dict(),
             "retrieved_chunks": self.chunks,
             "total_chunks": len(self.chunks),
             "answer_status": self.status,

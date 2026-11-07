@@ -15,12 +15,15 @@ from uuid import uuid4
 import pytest
 from mcp.server.fastmcp.exceptions import ToolError
 
+from stratakb.rag.confidence import Confidence
 from stratakb.rag.passages import (
     MAX_PASSAGES,
     RESPONSE_SLACK_TOKENS,
     AskResult,
     ChunkRef,
     DocumentRef,
+    SearchResponse,
+    ToolFailure,
     build_passages,
     cite,
     estimate_tokens,
@@ -30,6 +33,7 @@ from stratakb.rag.passages import (
     passage_id,
     passage_number,
     passage_ref,
+    sources_from,
 )
 from stratakb.rag.retriever import SearchResult
 
@@ -271,7 +275,7 @@ def _answer(**fields) -> AskResult:
     defaults = {
         "question": "q",
         "queries_used": ["q"],
-        "confidence": {"level": "high", "top_score": 0.9, "basis": "similarity"},
+        "confidence": Confidence("high", 0.9, 3, "similarity"),
         "chunks": [{"chunk_id": "c1"}],
         "passages": [{"id": "S1"}],
         "status": "found",
@@ -339,6 +343,89 @@ class TestAskResultShapes:
 
         assert answer.concise()["interaction_id"] == "int-7"
         assert answer.detailed()["interaction_id"] == "int-7"
+
+    def test_detailed_confidence_is_the_plain_dict(self):
+        assert _answer().detailed()["confidence"] == {
+            "level": "high", "top_score": 0.9, "relevant_sources": 3, "basis": "similarity",
+        }
+
+
+class TestSearchResponseShape:
+    def test_key_order(self):
+        response = SearchResponse(
+            query="q",
+            confidence=Confidence("low", 0.2, 0, "similarity", "careful"),
+            results=[{"chunk_id": "c1"}],
+            auto_detected_layers=["sepa"],
+            routing_fallback="low_confidence",
+            interaction_id="int-1",
+        ).to_dict()
+
+        assert list(response) == [
+            "status", "query", "confidence", "results", "total",
+            "auto_detected_layers", "routing_fallback", "interaction_id",
+        ]
+        assert response["status"] == "ok"
+        assert response["total"] == 1
+        assert list(response["confidence"]) == [
+            "level", "top_score", "relevant_sources", "basis", "warning",
+        ]
+        assert response["routing_fallback"] == {
+            "reason": "low_confidence", "searched_layers": "all",
+        }
+
+    def test_leaves_out_what_is_unset(self):
+        response = SearchResponse(
+            query="q", confidence=Confidence("high", 0.9, 3, "similarity"), results=[]
+        ).to_dict()
+
+        assert list(response) == ["status", "query", "confidence", "results", "total"]
+        assert "warning" not in response["confidence"]
+
+
+def test_tool_failure_dict_and_flags():
+    assert ToolFailure("boom").to_dict() == {"status": "error", "error": "boom"}
+    assert ToolFailure("boom").ok is False
+    assert _answer().ok is True
+
+
+def _source_chunk(section, *, layer="l", file="a.md", similarity=0.5, **extra):
+    return {
+        "layer": layer, "source_file": file, "section": section, "doc_type": "markdown",
+        "similarity": similarity, "rerank_score": 0.8, **extra,
+    }
+
+
+class TestSourcesFrom:
+    def test_one_source_per_layer_file_section_scored_on_its_first_chunk(self):
+        chunks = [
+            _source_chunk("s1", similarity=0.7),
+            _source_chunk("s1", similarity=0.9),
+            _source_chunk("s2", similarity=0.4),
+            _source_chunk("s1", file="b.md", similarity=0.3),
+            _source_chunk("s1", layer="m", similarity=0.2),
+        ]
+
+        assert sources_from(chunks, "similarity") == [
+            {"layer": "l", "file": "a.md", "section": "s1", "doc_type": "markdown",
+             "relevance_score": 0.7},
+            {"layer": "l", "file": "a.md", "section": "s2", "doc_type": "markdown",
+             "relevance_score": 0.4},
+            {"layer": "l", "file": "b.md", "section": "s1", "doc_type": "markdown",
+             "relevance_score": 0.3},
+            {"layer": "m", "file": "a.md", "section": "s1", "doc_type": "markdown",
+             "relevance_score": 0.2},
+        ]
+
+    def test_scores_on_the_basis_and_exact_matches_as_one(self):
+        assert sources_from([_source_chunk("s")], "rerank")[0]["relevance_score"] == 0.8
+        missing = _source_chunk("s", similarity=None)
+        assert sources_from([missing], "similarity")[0]["relevance_score"] == 0.0
+        exact = _source_chunk("s", similarity=None, match="exact")
+        assert sources_from([exact], "rerank")[0]["relevance_score"] == 1.0
+
+    def test_no_chunks_no_sources(self):
+        assert sources_from([], "similarity") == []
 
 
 class TestAskResponse:

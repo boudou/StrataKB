@@ -1,9 +1,14 @@
 """Tests for the interaction tracker."""
 
-from datetime import UTC
+from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+
+from stratakb.learning.store import LearningStore
+from stratakb.learning.tracker import Tracker
+from stratakb.rag.confidence import Confidence
+from stratakb.rag.passages import AskResult, SearchResponse, ToolFailure
 
 
 @pytest.mark.asyncio
@@ -14,9 +19,6 @@ async def test_tracker_calls_pii_scrub():
         learning_store_raw_queries=False,
         learning_session_timeout_minutes=30,
     )
-
-    from stratakb.learning.store import LearningStore
-    from stratakb.learning.tracker import Tracker
 
     store = MagicMock(spec=LearningStore)
     store.get_or_create_session = AsyncMock(
@@ -51,30 +53,24 @@ async def test_tracker_skips_when_disabled():
     """Tracker should pass-through when learning is disabled."""
     settings = MagicMock(learning_enabled=False)
 
-    from stratakb.learning.tracker import Tracker
-
     store = MagicMock()
     tracker = Tracker(store, settings)
 
-    original_fn = AsyncMock(return_value={"status": "ok", "results": []})
+    response = _search_response()
+    original_fn = AsyncMock(return_value=response)
     result = await tracker.track_search(original_fn, "test query")
     original_fn.assert_called_once()
-    assert result["status"] == "ok"
+    assert result is response
 
 
 @pytest.mark.asyncio
 async def test_tracker_detects_signals_on_reformulation():
     """Tracker should detect reformulation signals between sequential queries."""
-    from datetime import datetime, timedelta
-
     settings = MagicMock(
         learning_enabled=True,
         learning_store_raw_queries=True,
         learning_session_timeout_minutes=30,
     )
-
-    from stratakb.learning.store import LearningStore
-    from stratakb.learning.tracker import Tracker
 
     now = datetime.now(UTC)
     store = MagicMock(spec=LearningStore)
@@ -132,7 +128,6 @@ async def test_promoter_fires_after_n_queries():
     mock_store.store_interaction.return_value = {"id": "i1", "created_at": None}
     mock_store.get_recent_interactions.return_value = []
 
-    from stratakb.learning.tracker import Tracker
     tracker = Tracker(mock_store, mock_settings)
     tracker._interaction_count = 2  # Next call = 3rd
 
@@ -150,8 +145,6 @@ async def test_promoter_fires_after_n_queries():
 
 
 def _mock_store(recent=None):
-    from stratakb.learning.store import LearningStore
-
     store = MagicMock(spec=LearningStore)
     store.get_or_create_session = AsyncMock(return_value={"id": "sess-1"})
     store.store_interaction = AsyncMock(return_value={"id": "int-9", "created_at": None})
@@ -161,18 +154,25 @@ def _mock_store(recent=None):
     return store
 
 
-def _ask_result(**fields):
-    from stratakb.rag.passages import AskResult
+def _confidence(level="medium", top_score=0.5):
+    return Confidence(level, top_score, 1, "similarity")
 
+
+def _ask_result(**fields):
     defaults = {
         "question": "question",
         "queries_used": ["question"],
-        "confidence": {"level": "medium", "top_score": 0.5, "basis": "similarity"},
+        "confidence": _confidence(),
         "chunks": [{"chunk_id": "c1"}],
         "passages": [],
         "status": "found",
     }
     return AskResult(**{**defaults, **fields})
+
+
+def _search_response(**fields):
+    defaults = {"query": "query", "confidence": _confidence(), "results": []}
+    return SearchResponse(**{**defaults, **fields})
 
 
 def _enabled_settings():
@@ -186,20 +186,19 @@ def _enabled_settings():
 
 @pytest.mark.asyncio
 async def test_track_search_returns_interaction_id_and_timing():
-    from stratakb.learning.tracker import Tracker
-
     store = _mock_store()
     tracker = Tracker(store, _enabled_settings())
 
-    search = AsyncMock(return_value={
-        "status": "ok", "results": [{"chunk_id": "c1", "score": 0.7}],
-        "auto_detected_layers": ["sepa"],
-    })
+    search = AsyncMock(return_value=_search_response(
+        results=[{"chunk_id": "c1", "score": 0.7}],
+        auto_detected_layers=["sepa"],
+    ))
 
     with patch("stratakb.learning.tracker.time.monotonic", side_effect=[10.0, 10.25]):
         result = await tracker.track_search(search, "SEPA reject codes", None, 5, None)
 
-    assert result["interaction_id"] == "int-9"
+    assert result.interaction_id == "int-9"
+    assert result.to_dict()["interaction_id"] == "int-9"
     kwargs = store.store_interaction.call_args.kwargs
     assert kwargs["response_time_ms"] == 250
     assert kwargs["layers_searched"] == ["sepa"]
@@ -208,13 +207,11 @@ async def test_track_search_returns_interaction_id_and_timing():
 
 @pytest.mark.asyncio
 async def test_track_ask_survives_recording_failure():
-    from stratakb.learning.tracker import Tracker
-
     store = _mock_store()
     store.store_interaction = AsyncMock(side_effect=RuntimeError("db down"))
     tracker = Tracker(store, _enabled_settings())
 
-    ask = AsyncMock(return_value=_ask_result(chunks=[], confidence={}))
+    ask = AsyncMock(return_value=_ask_result(chunks=[]))
     result = await tracker.track_ask(ask, "question", ["sepa"], True, 10)
 
     assert result.status == "found"
@@ -224,8 +221,6 @@ async def test_track_ask_survives_recording_failure():
 
 @pytest.mark.asyncio
 async def test_layer_switch_compares_with_previous_auto_detection():
-    from datetime import UTC, datetime, timedelta
-
     now = datetime.now(UTC)
     recent = [
         {"id": "int-9", "query_text": "cut-off times", "created_at": now,
@@ -236,8 +231,6 @@ async def test_layer_switch_compares_with_previous_auto_detection():
          "layers_detected": ["iso20022"], "layers_searched": ["iso20022"],
          "results": [{"chunk_id": "c1", "score": 0.4, "layer": "iso20022"}]},
     ]
-    from stratakb.learning.tracker import Tracker
-
     store = _mock_store(recent)
     store.store_interaction = AsyncMock(return_value={"id": "int-9", "created_at": now})
     tracker = Tracker(store, _enabled_settings())
@@ -257,23 +250,16 @@ async def test_layer_switch_compares_with_previous_auto_detection():
 
 @pytest.mark.asyncio
 async def test_track_search_stores_the_confidence_the_tool_returned():
-    from stratakb.learning.tracker import Tracker
-
     store = _mock_store()
     tracker = Tracker(store, _enabled_settings())
 
     # The similarities alone would score high: the tracker must not rescore.
-    search = AsyncMock(return_value={
-        "status": "ok",
-        "confidence": {
-            "level": "medium", "top_score": 0.5,
-            "relevant_sources": 1, "basis": "similarity",
-        },
-        "results": [
+    search = AsyncMock(return_value=_search_response(
+        results=[
             {"chunk_id": f"c{i}", "score": 1.0 - i * 0.1, "similarity": 0.9}
             for i in range(3)
         ],
-    })
+    ))
     await tracker.track_search(search, "SEPA reject codes", ["sepa"], 5, None)
 
     kwargs = store.store_interaction.call_args.kwargs
@@ -283,15 +269,13 @@ async def test_track_search_stores_the_confidence_the_tool_returned():
 
 @pytest.mark.asyncio
 async def test_track_search_stores_result_similarity():
-    from stratakb.learning.tracker import Tracker
-
     store = _mock_store()
     tracker = Tracker(store, _enabled_settings())
 
-    search = AsyncMock(return_value={"status": "ok", "results": [
+    search = AsyncMock(return_value=_search_response(results=[
         {"chunk_id": "c1", "content": "text", "score": 1.0, "similarity": 0.3,
          "layer": "sepa", "source_file": "rules.md"},
-    ]})
+    ]))
     await tracker.track_search(search, "SEPA reject codes", ["sepa"], 5, None)
 
     kwargs = store.store_interaction.call_args.kwargs
@@ -303,15 +287,13 @@ async def test_track_search_stores_result_similarity():
 
 @pytest.mark.asyncio
 async def test_track_ask_records_rewritten_queries_and_chunks():
-    from stratakb.learning.tracker import Tracker
-
     store = _mock_store()
     tracker = Tracker(store, _enabled_settings())
 
     ask = AsyncMock(return_value=_ask_result(
         queries_used=["a", "b"],
         chunks=[{"chunk_id": "c1"}, {"chunk_id": "c2"}],
-        confidence={"level": "high", "top_score": 0.8, "basis": "similarity"},
+        confidence=_confidence("high", 0.8),
     ))
     result = await tracker.track_ask(ask, "question", ["sepa"], True, 10)
 
@@ -331,8 +313,6 @@ async def test_track_ask_records_rewritten_queries_and_chunks():
 
 @pytest.mark.asyncio
 async def test_track_ask_records_detected_layers():
-    from stratakb.learning.tracker import Tracker
-
     store = _mock_store()
     tracker = Tracker(store, _enabled_settings())
 
@@ -346,16 +326,10 @@ async def test_track_ask_records_detected_layers():
 
 @pytest.mark.asyncio
 async def test_track_search_records_no_rewritten_queries():
-    from stratakb.learning.tracker import Tracker
-
     store = _mock_store()
     tracker = Tracker(store, _enabled_settings())
 
-    search = AsyncMock(return_value={
-        "status": "ok", "queries_used": ["ignored"],
-        "results": [{"chunk_id": "c1"}],
-        "retrieved_chunks": [{"chunk_id": "x"}, {"chunk_id": "y"}],
-    })
+    search = AsyncMock(return_value=_search_response(results=[{"chunk_id": "c1"}]))
     await tracker.track_search(search, "query", ["sepa"], 5, {"doc_type": "pdf"})
 
     search.assert_awaited_once_with("query", ["sepa"], 5, {"doc_type": "pdf"})
@@ -364,19 +338,17 @@ async def test_track_search_records_no_rewritten_queries():
     assert kwargs["rewritten_queries"] is None
     assert kwargs["result_count"] == 1
     assert kwargs["results"][0]["chunk_id"] == "c1"
-    assert kwargs["confidence_level"] is None
-    assert kwargs["confidence_score"] is None
+    assert kwargs["confidence_level"] == "medium"
+    assert kwargs["confidence_score"] == 0.5
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("tool", ["track_ask", "track_search"])
 async def test_track_returns_error_result_without_recording(tool):
-    from stratakb.learning.tracker import Tracker
-
     store = _mock_store()
     tracker = Tracker(store, _enabled_settings())
 
-    error = {"status": "error", "error": "boom"}
+    error = ToolFailure("boom")
     result = await getattr(tracker, tool)(AsyncMock(return_value=error), "query")
 
     assert result is error

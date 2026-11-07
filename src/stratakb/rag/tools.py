@@ -17,13 +17,22 @@ from stratakb.core.logging import log_tool_call
 from stratakb.learning.pii import scrub_query
 from stratakb.rag.clause_lookup import in_exact_span, without_exact_spans
 from stratakb.rag.clause_lookup import lookup as lookup_clauses
-from stratakb.rag.confidence import answer_status, score_confidence, similarity_or_zero
+from stratakb.rag.confidence import (
+    Confidence,
+    answer_status,
+    score_confidence,
+    similarity_or_zero,
+)
 from stratakb.rag.passages import (
     AskResult,
     ResponseFormat,
+    SearchResponse,
+    ToolFailure,
     ask_chunk,
+    basis_score,
     build_passages,
     pack_passages,
+    sources_from,
 )
 
 if TYPE_CHECKING:
@@ -75,12 +84,12 @@ async def _exact_clauses(
 
 
 def _routing_fallback_reason(
-    result_count: int, top_k: int, confidence: dict[str, Any]
+    result_count: int, top_k: int, confidence: Confidence
 ) -> str | None:
     """Decide whether an automatically routed search needs to broaden its scope."""
     if result_count < max(1, min(top_k, 50)):
         return "insufficient_results"
-    if confidence["level"] == "low":
+    if confidence.level == "low":
         return "low_confidence"
     return None
 
@@ -130,13 +139,12 @@ def _fuse_query_results(
 class _Collected(NamedTuple):
     """One strata_ask retrieval: candidates found, chunks kept, their confidence.
 
-    basis names the scale the chunks were judged on: similarity or rerank.
+    confidence.basis names the scale the chunks were judged on: similarity or rerank.
     """
 
     candidate_count: int
     chunks: list[dict[str, Any]]
-    confidence: dict[str, Any]
-    basis: str
+    confidence: Confidence
 
 
 def _ask_chunk(r: SearchResult, score: float) -> dict[str, Any]:
@@ -205,19 +213,7 @@ def _search_item(chunk: dict[str, Any]) -> dict[str, Any]:
     return item
 
 
-def _basis_score(chunk: dict[str, Any], basis: str) -> float:
-    """The score confidence judges a strata_ask chunk on, for this basis.
-
-    An exact clause match is the passage asked for: it scores 1.0.
-    """
-    if chunk.get("match") == "exact":
-        return 1.0
-    if basis == "rerank":
-        return chunk["rerank_score"]
-    return similarity_or_zero(chunk["similarity"])
-
-
-def _search_confidence(results: list[SearchResult]) -> dict[str, Any]:
+def _search_confidence(results: list[SearchResult]) -> Confidence:
     """Judge strata_search results on cosine similarity, never the fused score.
 
     The fused score is divided by the top score, so the best result is
@@ -260,7 +256,7 @@ def register_rag_tools(
         layers: list[str] | None,
         top_k: int,
         metadata_filter: dict[str, str] | None,
-    ) -> dict:
+    ) -> SearchResponse | ToolFailure:
         """Run strata_search; the tool below documents the arguments."""
         from stratakb.config import get_settings
         from stratakb.knowledge.embeddings import embedding_key_error
@@ -268,13 +264,10 @@ def register_rag_tools(
 
         _settings = get_settings()
         if err := embedding_key_error(_settings, openai_api_key):
-            return {"status": "error", "error": err}
+            return ToolFailure(err)
 
         if not query or not query.strip():
-            return {
-                "status": "error",
-                "error": "Query cannot be empty.",
-            }
+            return ToolFailure("Query cannot be empty.")
 
         try:
             # NLP layer detection — auto-detect layers if not explicitly specified
@@ -334,23 +327,15 @@ def register_rag_tools(
                 result_summary=f"Found {len(items)} results",
             )
 
-            response = {
-                "status": "ok",
-                "query": query,
-                "confidence": confidence,
-                "results": items,
-                "total": len(items),
-            }
-            if detected_layers:
-                response["auto_detected_layers"] = detected_layers
-            if fallback_reason:
-                response["routing_fallback"] = {
-                    "reason": fallback_reason, "searched_layers": "all",
-                }
-
-            return response
+            return SearchResponse(
+                query=query,
+                confidence=confidence,
+                results=items,
+                auto_detected_layers=detected_layers,
+                routing_fallback=fallback_reason,
+            )
         except Exception as e:
-            return {"status": "error", "error": str(e)}
+            return ToolFailure(str(e))
 
     @mcp.tool()
     @require_role("viewer")
@@ -384,19 +369,18 @@ def register_rag_tools(
                            Examples: {"doc_type": "pdf"}, {"doc_type": "xsd"}
         """
         if _tracker:
-            return await _tracker.track_search(_search, query, layers, top_k, metadata_filter)
-        return await _search(query, layers, top_k, metadata_filter)
+            result = await _tracker.track_search(_search, query, layers, top_k, metadata_filter)
+        else:
+            result = await _search(query, layers, top_k, metadata_filter)
+        return result.to_dict()
 
     async def _ask(
         question: str,
         layers: list[str] | None,
         include_sources: bool,
         top_k: int,
-    ) -> AskResult | dict:
-        """Run strata_ask; the tool below documents the arguments.
-
-        An error comes back as {"status": "error", "error": ...}.
-        """
+    ) -> AskResult | ToolFailure:
+        """Run strata_ask; the tool below documents the arguments."""
         from stratakb.config import get_settings
         from stratakb.rag.query_rewriter import (
             build_domain_context,
@@ -408,7 +392,7 @@ def register_rag_tools(
         _settings = get_settings()
 
         if not question or not question.strip():
-            return {"status": "error", "error": "Question cannot be empty."}
+            return ToolFailure("Question cannot be empty.")
 
         try:
             # Auto-detect layers if not specified
@@ -477,9 +461,9 @@ def register_rag_tools(
                     chunks = candidates
                     basis = "similarity"
                 confidence = score_confidence(
-                    [_basis_score(c, basis) for c in chunks], basis=basis
+                    [basis_score(c, basis) for c in chunks], basis=basis
                 )
-                return _Collected(len(candidates), chunks, confidence, basis)
+                return _Collected(len(candidates), chunks, confidence)
 
             collected = await _collect(layers)
             fallback_reason = None
@@ -502,27 +486,12 @@ def register_rag_tools(
                 _settings.answer_token_budget,
             )
             confidence = collected.confidence
-            basis = collected.basis
+            basis = confidence.basis
             passages = build_passages(chunks, await _cited_documents(database_url, chunks))
             status = answer_status(
-                max((_basis_score(c, basis) for c in chunks), default=0.0), basis
+                max((basis_score(c, basis) for c in chunks), default=0.0), basis
             )
-
-            sources = None
-            if include_sources:
-                sources = []
-                seen_sources = set()
-                for c in chunks:
-                    source_key = f"{c['layer']}:{c['source_file']}:{c['section']}"
-                    if source_key not in seen_sources:
-                        seen_sources.add(source_key)
-                        sources.append({
-                            "layer": c["layer"],
-                            "file": c["source_file"],
-                            "section": c["section"],
-                            "doc_type": c["doc_type"],
-                            "relevance_score": _basis_score(c, basis),
-                        })
+            sources = sources_from(chunks, basis) if include_sources else None
 
             # Audit
             await write_audit_log(
@@ -538,7 +507,7 @@ def register_rag_tools(
                 },
                 result_summary=(
                     f"{collected.candidate_count} chunks, {len(passages)} passages, "
-                    f"confidence={confidence['level']}"
+                    f"confidence={confidence.level}"
                 ),
             )
 
@@ -555,7 +524,7 @@ def register_rag_tools(
             )
 
         except Exception as e:
-            return {"status": "error", "error": str(e)}
+            return ToolFailure(str(e))
 
     @mcp.tool()
     @require_role("viewer")
@@ -604,7 +573,4 @@ def register_rag_tools(
             result = await _tracker.track_ask(_ask, question, layers, include_sources, top_k)
         else:
             result = await _ask(question, layers, include_sources, top_k)
-        if not isinstance(result, AskResult):
-            # The error dict, returned as it is
-            return result
-        return result.detailed() if response_format == "detailed" else result.concise()
+        return result.to_dict(response_format)

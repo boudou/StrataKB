@@ -193,31 +193,31 @@ class TestConfidenceScoring:
         from stratakb.rag.confidence import score_confidence
 
         result = score_confidence([0.92, 0.85, 0.81, 0.75], basis="similarity")
-        assert result["level"] == "high"
-        assert result["top_score"] == 0.92
-        assert result["relevant_sources"] >= 3
+        assert result.level == "high"
+        assert result.top_score == 0.92
+        assert result.relevant_sources >= 3
 
     def test_medium_confidence(self):
         from stratakb.rag.confidence import score_confidence
 
         result = score_confidence([0.72, 0.65], basis="similarity")
-        assert result["level"] == "medium"
+        assert result.level == "medium"
 
     def test_low_confidence(self):
         from stratakb.rag.confidence import score_confidence
 
         result = score_confidence([0.40, 0.30], basis="similarity")
-        assert result["level"] == "low"
-        assert result["basis"] == "similarity"
-        assert "warning" in result
+        assert result.level == "low"
+        assert result.basis == "similarity"
+        assert result.warning
 
     def test_rerank_basis_uses_rerank_thresholds(self):
         from stratakb.rag.confidence import score_confidence
 
         scores = [0.7, 0.65, 0.6]
-        assert score_confidence(scores, basis="rerank")["level"] == "medium"
-        assert score_confidence(scores, basis="rerank")["basis"] == "rerank"
-        assert score_confidence(scores, basis="similarity")["level"] == "high"
+        assert score_confidence(scores, basis="rerank").level == "medium"
+        assert score_confidence(scores, basis="rerank").basis == "rerank"
+        assert score_confidence(scores, basis="similarity").level == "high"
 
     def test_unknown_basis_raises(self):
         from stratakb.rag.confidence import score_confidence
@@ -228,16 +228,16 @@ class TestConfidenceScoring:
     def test_empty_scores_report_basis(self):
         from stratakb.rag.confidence import score_confidence
 
-        assert score_confidence([], basis="rerank")["basis"] == "rerank"
-        assert score_confidence([], basis="similarity")["basis"] == "similarity"
+        assert score_confidence([], basis="rerank").basis == "rerank"
+        assert score_confidence([], basis="similarity").basis == "similarity"
 
     def test_no_results(self):
         from stratakb.rag.confidence import score_confidence
 
         result = score_confidence([], basis="similarity")
-        assert result["level"] == "low"
-        assert "warning" in result
-        assert result["relevant_sources"] == 0
+        assert result.level == "low"
+        assert result.warning
+        assert result.relevant_sources == 0
 
     def test_basis_is_required(self):
         from stratakb.rag.confidence import ConfidenceThresholds, score_confidence
@@ -258,19 +258,19 @@ class TestConfidenceScoring:
 
         # Only 1 relevant source — not enough for "high" (needs 3+)
         result = score_confidence([0.95], basis="similarity")
-        assert result["level"] == "medium"
+        assert result.level == "medium"
 
     def test_warning_only_for_low(self):
         from stratakb.rag.confidence import score_confidence
 
-        assert "warning" not in score_confidence([0.92, 0.85, 0.81], basis="similarity")
+        assert score_confidence([0.92, 0.85, 0.81], basis="similarity").warning is None
         medium = score_confidence([0.72, 0.65], basis="similarity")
-        assert medium["level"] == "medium"
-        assert "warning" not in medium
-        assert score_confidence([0.4], basis="similarity")["warning"].startswith(
+        assert medium.level == "medium"
+        assert medium.warning is None
+        assert score_confidence([0.4], basis="similarity").warning.startswith(
             "Low confidence results"
         )
-        assert score_confidence([], basis="similarity")["warning"].startswith(
+        assert score_confidence([], basis="similarity").warning.startswith(
             "No results found"
         )
 

@@ -324,3 +324,55 @@ async def test_search_confidence_counts_missing_similarity_as_zero(tools, monkey
     response = await registered["strata_search"]("accounting guide", top_k=1)
 
     assert response["confidence"]["warning"].startswith("No results found")
+
+
+@pytest.mark.asyncio
+async def test_search_response_keys_in_order(tools, monkeypatch):
+    registered, _, detect = tools
+    detect.return_value = ["routed"]
+    monkeypatch.setattr(
+        "stratakb.rag.retriever.search_chunks",
+        AsyncMock(return_value=[_result("weak", "routed", similarity=0.1)]),
+    )
+
+    response = await registered["strata_search"]("accounting guide", top_k=1)
+
+    assert list(response) == [
+        "status", "query", "confidence", "results", "total",
+        "auto_detected_layers", "routing_fallback",
+    ]
+    assert list(response["confidence"]) == [
+        "level", "top_score", "relevant_sources", "basis", "warning",
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("tool", "text", "error"),
+    [
+        ("strata_ask", " ", "Question cannot be empty."),
+        ("strata_search", " ", "Query cannot be empty."),
+    ],
+)
+async def test_empty_input_returns_the_error_dict(tools, tool, text, error):
+    registered, _, _ = tools
+
+    assert await registered[tool](text) == {"status": "error", "error": error}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("tool", "kwargs"),
+    [
+        ("strata_ask", {}),
+        ("strata_ask", {"response_format": "detailed"}),
+        ("strata_search", {}),
+    ],
+)
+async def test_failed_search_returns_the_error_dict(tools, monkeypatch, tool, kwargs):
+    registered, _, _ = tools
+    monkeypatch.setattr(
+        "stratakb.rag.retriever.search_chunks", AsyncMock(side_effect=RuntimeError("boom"))
+    )
+
+    assert await registered[tool]("question", **kwargs) == {"status": "error", "error": "boom"}
