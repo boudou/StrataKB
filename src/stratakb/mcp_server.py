@@ -203,12 +203,10 @@ def _register_admin_tools(mcp: FastMCP, settings: Settings) -> None:
         startup: whether the server in EMBEDDING_BASE_URL lists the embedding
         model, and whether the vector column's size matches EMBEDDING_DIMENSIONS.
         A missing model or a size mismatch turns overall to degraded; restart
-        the server after fixing either.
+        the server after fixing either. The report shows the settings the
+        server started with.
         """
-        from stratakb.config import get_settings
-
         result: dict[str, object] = {}
-        current = get_settings()
 
         # Check database
         db_status = await check_connection(settings.database_url)
@@ -230,8 +228,8 @@ def _register_admin_tools(mcp: FastMCP, settings: Settings) -> None:
         result["overall"] = "ok" if all_ok else "degraded"
 
         # Where data goes (host names and setting names only, never values)
-        result["local_only"] = current.strata_local_only
-        result["outbound"] = [p.report() for p in outbound_providers(current)]
+        result["local_only"] = settings.strata_local_only
+        result["outbound"] = [p.report() for p in outbound_providers(settings)]
 
         # SQL tools: on only with a safe READONLY_DATABASE_URL role
         result["sql_tools"] = sql_tools_status()

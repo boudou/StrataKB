@@ -204,6 +204,7 @@ async def rewrite_query(
     model: str = "",
     learning_store=None,
     domain_context: str = "",
+    settings: Settings | None = None,
 ) -> list[str]:
     """Rewrite a user query into 2-4 domain-specific search queries.
 
@@ -218,18 +219,21 @@ async def rewrite_query(
         model: Model to use. Defaults to config's query_rewrite_model.
         learning_store: Optional LearningStore for consulting learned patterns.
         domain_context: What the knowledge base covers (see build_domain_context).
+        settings: The settings to use. Defaults to the environment's, read here.
 
     Returns:
         List of 2-4 rewritten queries. Falls back to [query] on any error.
     """
+    if settings is None:
+        from stratakb.config import get_settings
+
+        settings = get_settings()
+
     enriched_query = query
 
     # Consult learned patterns if available
     if learning_store:
         try:
-            from stratakb.config import get_settings
-            _ls = get_settings()
-
             # Check synonyms
             synonyms = await learning_store.find_synonyms(query)
             if synonyms:
@@ -238,12 +242,12 @@ async def rewrite_query(
 
             # Check learned rewrites
             learned = await learning_store.find_rewrites(
-                query, min_success_rate=_ls.learning_min_success_rate
+                query, min_success_rate=settings.learning_min_success_rate
             )
             if (
                 learned
-                and learned.success_rate >= _ls.learning_rewrite_bypass_threshold
-                and learned.total_count >= _ls.learning_rewrite_bypass_min_samples
+                and learned.success_rate >= settings.learning_rewrite_bypass_threshold
+                and learned.total_count >= settings.learning_rewrite_bypass_min_samples
             ):
                 logger.info(
                     "learning_rewrite_bypass",
@@ -255,9 +259,6 @@ async def rewrite_query(
         except Exception as e:
             logger.debug("learning_consult_failed", error=str(e))
 
-    from stratakb.config import get_settings
-
-    settings = get_settings()
     provider = settings.query_rewrite_provider
     model = model or settings.query_rewrite_model
 

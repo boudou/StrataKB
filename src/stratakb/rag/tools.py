@@ -317,22 +317,30 @@ def register_rag_tools(
 ) -> None:
     """Register RAG search tools on the MCP server.
 
-    `settings` are the server's; without them the tracker uses the
-    environment's settings, read once here.
+    `settings` are the server's: search, ask, rewriting, the query embedding,
+    raw-query audit and the tracker all use them. Without them the tracker
+    uses the environment's settings, read once here, and the tools read them
+    on each call.
     """
+
+    def _current_settings() -> Settings:
+        """The server's settings; without any, the environment's, read per call."""
+        if settings is not None:
+            return settings
+        from stratakb.config import get_settings
+
+        return get_settings()
 
     # Initialize learning tracker
     _tracker = None
     try:
-        if settings is None:
-            from stratakb.config import get_settings
-            settings = get_settings()
-        if settings.learning_enabled:
+        tracker_settings = _current_settings()
+        if tracker_settings.learning_enabled:
             from stratakb.learning.store import LearningStore
             from stratakb.learning.tracker import Tracker
-            _tracker = Tracker(LearningStore(database_url), settings)
-    except Exception:
-        pass
+            _tracker = Tracker(LearningStore(database_url), tracker_settings)
+    except Exception as e:
+        logger.warning("learning_tracker_unavailable", error_type=type(e).__name__)
 
     async def _search(
         query: str,
@@ -341,11 +349,10 @@ def register_rag_tools(
         metadata_filter: dict[str, str] | None,
     ) -> SearchResponse | ToolFailure:
         """Run strata_search; the tool below documents the arguments."""
-        from stratakb.config import get_settings
         from stratakb.knowledge.embeddings import embedding_key_error
         from stratakb.rag.retriever import search_chunks
 
-        _settings = get_settings()
+        _settings = _current_settings()
         if err := embedding_key_error(_settings, openai_api_key):
             return ToolFailure(err)
 
@@ -370,6 +377,7 @@ def register_rag_tools(
                 layers=layers,
                 top_k=top_k,
                 metadata_filter=metadata_filter,
+                settings=_settings,
             )
 
             confidence = _search_confidence(results)
@@ -380,6 +388,7 @@ def register_rag_tools(
                     results = await search_chunks(
                         database_url, openai_api_key, query,
                         layers=None, top_k=top_k, metadata_filter=metadata_filter,
+                        settings=_settings,
                     )
                     layers = None
                     confidence = _search_confidence(results)
@@ -465,7 +474,6 @@ def register_rag_tools(
         mode: AnswerMode | None = None,
     ) -> AskResult | ToolFailure:
         """Run strata_ask; the tool below documents the arguments."""
-        from stratakb.config import get_settings
         from stratakb.knowledge.layers import get_answer_modes
         from stratakb.rag.query_rewriter import (
             build_domain_context,
@@ -474,7 +482,7 @@ def register_rag_tools(
         )
         from stratakb.rag.retriever import search_chunks
 
-        _settings = get_settings()
+        _settings = _current_settings()
 
         if not question or not question.strip():
             return ToolFailure("Question cannot be empty.")
@@ -512,6 +520,7 @@ def register_rag_tools(
                 anthropic_api_key=_settings.anthropic_api_key,
                 learning_store=learning_store,
                 domain_context=domain_context,
+                settings=_settings,
             )
 
             async def _collect(
@@ -520,7 +529,7 @@ def register_rag_tools(
                 async def _run_search(q: str) -> list[SearchResult]:
                     return await search_chunks(
                         database_url, openai_api_key, q,
-                        layers=search_layers, top_k=top_k,
+                        layers=search_layers, top_k=top_k, settings=_settings,
                     )
 
                 batch_results = await asyncio.gather(*(_run_search(q) for q in queries))

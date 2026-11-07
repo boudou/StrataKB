@@ -228,6 +228,8 @@ async def embed_texts(
     model: str = "",
     dimensions: int = 0,
     backend: str = "",
+    *,
+    settings: Settings | None = None,
 ) -> list[list[float]]:
     """Generate embeddings for a list of texts.
 
@@ -237,6 +239,7 @@ async def embed_texts(
         model: Model name override. Defaults to config value.
         dimensions: Output vector dimensions override. Defaults to config value.
         backend: "local" or "openai". Defaults to config value.
+        settings: The settings to use. Defaults to the environment's, read here.
 
     Returns:
         List of embedding vectors (same order as input texts).
@@ -245,9 +248,10 @@ async def embed_texts(
         return []
 
     # Resolve config defaults
-    from stratakb.config import get_settings
+    if settings is None:
+        from stratakb.config import get_settings
 
-    settings = get_settings()
+        settings = get_settings()
     backend = backend or settings.embedding_backend
     model = model or resolve_embedding_model(backend, settings.embedding_model)
     dimensions = dimensions or settings.embedding_dimensions

@@ -171,7 +171,7 @@ async def test_ask_falls_back_after_deduplicating_rewritten_queries(tools, monke
         "stratakb.rag.query_rewriter.rewrite_query", AsyncMock(return_value=["one", "two"])
     )
 
-    async def search(_db, _key, _query, *, layers, top_k):
+    async def search(_db, _key, _query, *, layers, top_k, settings):
         if layers:
             return [_result("first", "routed")]
         return [_result("first", "routed"), _result("second", "other", score=0.9)]

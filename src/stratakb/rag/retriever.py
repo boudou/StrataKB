@@ -11,6 +11,7 @@ import re
 import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 import structlog
 
@@ -18,6 +19,9 @@ from stratakb.core.database import get_pool
 from stratakb.core.stamp_watcher import StampWatcher
 from stratakb.knowledge.embeddings import embed_texts
 from stratakb.rag.cache import QueryCache
+
+if TYPE_CHECKING:
+    from stratakb.config import Settings
 
 logger = structlog.get_logger()
 
@@ -89,6 +93,7 @@ async def search_chunks(
     layers: list[str] | None = None,
     top_k: int = 5,
     metadata_filter: dict[str, str] | None = None,
+    settings: Settings | None = None,
 ) -> list[SearchResult]:
     """Search the knowledge base for chunks relevant to a query.
 
@@ -99,6 +104,7 @@ async def search_chunks(
         layers: Optional list of layer names to restrict search to.
         top_k: Number of results to return (default 5, max 50).
         metadata_filter: Optional key-value pairs to filter on metadata JSONB.
+        settings: The settings to use. Defaults to the environment's, read here.
 
     Returns:
         List of SearchResult ordered by relevance (highest score first).
@@ -116,14 +122,15 @@ async def search_chunks(
             return cached
 
     # Embed the query using the same model as ingestion
-    embeddings = await embed_texts([query], api_key=openai_api_key)
+    embeddings = await embed_texts([query], api_key=openai_api_key, settings=settings)
     query_embedding = embeddings[0]
 
     # Build the SQL query with optional filters
     query_vector = _embedding_to_pgvector(query_embedding)
 
-    from stratakb.config import get_settings
-    settings = get_settings()
+    if settings is None:
+        from stratakb.config import get_settings
+        settings = get_settings()
 
     if settings.hybrid_search_enabled:
         pool = await get_pool(database_url)

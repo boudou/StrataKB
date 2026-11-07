@@ -10,14 +10,16 @@ Tests cover:
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from structlog.testing import capture_logs
 
 from tests.helpers import (
     ISO_PRESET,
     SEPA_PRESET,
     LogitModel,
+    call_tool,
     capture_tools,
     compatible_rewrite_settings,
     example_routing_patterns,
@@ -496,7 +498,7 @@ async def _ask_with(by_query, *, reranking=False, logits=None):
     settings = rewrite_settings(learning_enabled=False, reranking_enabled=reranking)
     ask = _ask_tool(settings)
 
-    async def search(_db, _key, query, *, layers, top_k):
+    async def search(_db, _key, query, *, layers, top_k, settings):
         return by_query[query]
 
     with (
@@ -650,6 +652,229 @@ class TestAskOrdering:
         result = await _ask_with(by_query)
 
         assert [c["chunk_id"] for c in result["retrieved_chunks"]] == ["none", "neg"]
+
+
+# ==========================================
+# The server's settings, not the environment's
+# ==========================================
+
+SEARCH_TOOLS = [("strata_ask", "question"), ("strata_search", "query")]
+
+
+def _built_settings(**overrides):
+    """Settings for a built server; every value these tests depend on is given."""
+    values = {
+        "database_url": "postgresql://test",
+        "learning_enabled": False,
+        "reranking_enabled": False,
+        "embedding_backend": "local",
+        "embedding_base_url": "",
+        "openai_api_key": "",
+        "anthropic_api_key": "",
+        "query_rewrite_provider": "anthropic",
+        "strata_local_only": False,
+        "audit_store_raw_queries": True,
+    }
+    values.update(overrides)
+    return rewrite_settings(**values)
+
+
+def _environment(settings, **changes):
+    """Make get_settings() return these settings with these changes."""
+    return patch("stratakb.config.get_settings", return_value=settings.model_copy(update=changes))
+
+
+def _built_server(settings):
+    from stratakb.mcp_server import build_server
+
+    return build_server(settings)
+
+
+def _no_database():
+    """Stand in for the tables strata_ask and strata_search read around the search."""
+    return (
+        _grounded_layers(),
+        patch("stratakb.knowledge.layers.get_structure_patterns", AsyncMock(return_value=[])),
+    )
+
+
+def _one_vector(settings):
+    """Stand in for the local embedding model."""
+    return patch(
+        "stratakb.knowledge.embeddings._embed_local",
+        return_value=[[0.0] * settings.embedding_dimensions],
+    )
+
+
+def _stopped_search():
+    """Let a search get past its embedding and stop before the database."""
+    return patch("stratakb.rag.retriever.get_pool", AsyncMock(side_effect=RuntimeError("stop")))
+
+
+def _no_cache():
+    return patch("stratakb.rag.retriever._get_cache", return_value=None)
+
+
+class TestBuiltServerSettings:
+    @pytest.mark.asyncio
+    async def test_health_reports_built_settings(self, no_sdk_env):
+        up = patch(
+            "stratakb.mcp_server.check_connection", AsyncMock(return_value={"status": "ok"})
+        )
+
+        built = _built_settings(strata_local_only=True)
+        with _environment(built, strata_local_only=False), up:
+            result = await call_tool(_built_server(built), "strata_admin_health")
+        assert result["local_only"] is True
+        assert result["outbound"] == []
+
+        built = _built_settings(anthropic_api_key="sk-ant-test")
+        with _environment(built, strata_local_only=True, anthropic_api_key=""), up:
+            result = await call_tool(_built_server(built), "strata_admin_health")
+        assert result["local_only"] is False
+        assert [p["provider"] for p in result["outbound"]] == ["anthropic"]
+
+    @pytest.mark.asyncio
+    async def test_built_local_only_skips_rewrite(self, no_sdk_env):
+        built = _built_settings(strata_local_only=True, anthropic_api_key="sk-ant-test")
+        layer_modes, patterns = _no_database()
+        with (
+            _environment(built, strata_local_only=False),
+            patch("anthropic.AsyncAnthropic") as anthropic_cls,
+            patch("stratakb.rag.retriever.search_chunks", AsyncMock(return_value=[])),
+            patch(
+                "stratakb.knowledge.layers.get_layer_routing",
+                AsyncMock(return_value={"descriptions": {}, "patterns": {}}),
+            ),
+            patch("stratakb.rag.tools.write_audit_log", AsyncMock()),
+            layer_modes,
+            patterns,
+        ):
+            result = await call_tool(
+                _built_server(built),
+                "strata_ask",
+                question="Why was it rejected?",
+                layers=["docs"],
+                response_format="detailed",
+            )
+
+        anthropic_cls.assert_not_called()
+        assert result["queries_used"] == ["Why was it rejected?"]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(("tool", "argument"), SEARCH_TOOLS)
+    async def test_built_local_only_refuses_embedding(self, no_sdk_env, tool, argument):
+        built = _built_settings(
+            strata_local_only=True, embedding_backend="openai", openai_api_key="sk-test"
+        )
+        layer_modes, patterns = _no_database()
+        with (
+            _environment(built, strata_local_only=False),
+            _no_cache(),
+            patch("openai.AsyncOpenAI") as openai_cls,
+            patch("stratakb.rag.tools.write_audit_log", AsyncMock()),
+            layer_modes,
+            patterns,
+        ):
+            result = await call_tool(
+                _built_server(built), tool, **{argument: "a question"}, layers=["docs"]
+            )
+
+        openai_cls.assert_not_called()
+        assert result["status"] == "error"
+        assert "STRATA_LOCAL_ONLY" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_built_local_backend_ignores_environment(self, no_sdk_env):
+        built = _built_settings()
+        layer_modes, patterns = _no_database()
+        with (
+            _environment(built, embedding_backend="openai", openai_api_key="sk-test"),
+            _no_cache(),
+            _one_vector(built) as embed_local,
+            _stopped_search(),
+            patch("openai.AsyncOpenAI") as openai_cls,
+            patch("stratakb.rag.tools.write_audit_log", AsyncMock()),
+            layer_modes,
+            patterns,
+        ):
+            await call_tool(
+                _built_server(built), "strata_ask", question="a question", layers=["docs"]
+            )
+
+        embed_local.assert_called_once()
+        openai_cls.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(("tool", "argument"), SEARCH_TOOLS)
+    async def test_built_audit_setting_scrubs_question(self, no_sdk_env, tool, argument):
+        built = _built_settings(audit_store_raw_queries=False)
+        layer_modes, patterns = _no_database()
+        with (
+            _environment(built, audit_store_raw_queries=True),
+            patch("stratakb.rag.retriever.search_chunks", AsyncMock(return_value=[])),
+            patch("stratakb.rag.tools.write_audit_log", AsyncMock()) as audit,
+            layer_modes,
+            patterns,
+        ):
+            await call_tool(
+                _built_server(built),
+                tool,
+                **{argument: "why was GR1601101250000000012300695 rejected?"},
+                layers=["docs"],
+            )
+
+        audit.assert_awaited_once()
+        audited = audit.await_args.kwargs["parameters"][argument]
+        assert audited == "why was [IBAN_REDACTED] rejected?"
+
+    @pytest.mark.asyncio
+    async def test_search_chunks_reads_no_settings_when_given(self, no_sdk_env):
+        from stratakb.rag.retriever import search_chunks
+
+        built = _built_settings()
+        with (
+            patch("stratakb.config.get_settings", side_effect=AssertionError),
+            _no_cache(),
+            _one_vector(built),
+            _stopped_search(),
+            pytest.raises(RuntimeError, match="stop"),
+        ):
+            await search_chunks("postgresql://test", "", "q", settings=built)
+
+    @pytest.mark.asyncio
+    async def test_rewrite_query_reads_no_settings_when_given(self, no_sdk_env):
+        from stratakb.rag.query_rewriter import rewrite_query
+
+        built = _built_settings(learning_min_success_rate=0.77)
+        store = MagicMock(
+            find_synonyms=AsyncMock(return_value=[]),
+            find_rewrites=AsyncMock(return_value=None),
+        )
+        with patch("stratakb.config.get_settings", side_effect=AssertionError):
+            queries = await rewrite_query("q", learning_store=store, settings=built)
+
+        assert queries == ["q"]
+        # A read left inside the try would be swallowed and skip this lookup
+        assert store.find_rewrites.await_args.kwargs["min_success_rate"] == 0.77
+
+    def test_tracker_failure_logs_warning(self, no_sdk_env):
+        from stratakb.rag.tools import register_rag_tools
+
+        built = _built_settings(learning_enabled=True)
+        mock_mcp = MagicMock()
+        with (
+            patch("stratakb.learning.store.LearningStore", side_effect=RuntimeError("secret")),
+            capture_logs() as logs,
+        ):
+            register_rag_tools(mock_mcp, "postgresql://test", settings=built)
+
+        warnings = [e for e in logs if e["event"] == "learning_tracker_unavailable"]
+        assert len(warnings) == 1
+        assert warnings[0]["log_level"] == "warning"
+        assert warnings[0]["error_type"] == "RuntimeError"
+        assert "secret" not in str(logs)
+        assert mock_mcp.tool.call_count == 2
 
 
 # ==========================================
