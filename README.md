@@ -16,7 +16,7 @@ Point it at your documentation, organise it in layers, and query it from any MCP
 
 StrataKB turns folders of your documents into a knowledge base that your AI tools can ask through the Model Context Protocol (MCP). Each folder becomes a **layer**: a searchable collection named after the folder. One PostgreSQL database holds every layer, so a whole team can share one server, with roles and an audit log.
 
-StrataKB finds the passages that answer a question and names the files they come from; your MCP client writes the answer from them.
+StrataKB finds the passages that answer a question and names the files they come from; your MCP client writes the answer from them, or, on a layer set to extractive, the server answers with the document's own sentences.
 
 ## Quick start
 
@@ -186,7 +186,7 @@ flowchart LR
     o -->|"high"| f["found"]
     o -->|"medium"| pf["partly_found<br/>+ next step"]
     o -->|"low or none"| nf["not_found<br/>+ next step"]
-    f & pf & nf --> a["Your MCP client<br/>writes the answer"]
+    f & pf & nf --> a["Your MCP client writes the answer (grounded),<br/>or the server returns the document's<br/>own sentences (extractive)"]
 ```
 
 **Learn**
@@ -311,7 +311,7 @@ flowchart TD
 - In grounded mode, call `strata_verify` before showing the answer, and fix or drop what it flags. A flag of kind `passage` (a span too wide to check, for example) cannot be fixed by rewriting, so the client says the answer is unverified.
 - In extractive mode, show `answer` verbatim, with each sentence's citation and any note or warning.
 - Show the receipt id when there is one. A `not_found`, a flagged draft and a grounded answer not yet verified have none.
-- When the status is `not_found`, say "not in the documents" and give `next_step`, even if passages came back. When it is `partly_found`, answer what the passages support and say what they leave open.
+- When the status is `not_found`, say "not in the documents" and give `next_step`, even if passages came back. When it is `partly_found`, answer what the passages support and say what they leave open. When it is `error`, report the error.
 
 Clients that show MCP prompts also offer the same steps as the prompt `answer_from_documents`, with a `question` and optional comma-separated `layers`. The prompt reads no data and needs no database; the tools it names make their usual role checks.
 
@@ -392,7 +392,7 @@ By default the answer is short: a status, the mode and the passages, each with i
 - A question that names a clause or section (`clause 7.2`, `Article 12`, `§ 4`, `Annex II`, or a bare `4.3.2` or `7(2)(b)`) is looked up exactly in the [structure map](#how-it-works) of the layers searched (only the first 2,000 characters of a question are read for references): that section's text comes back first, verbatim, with its citation and `status` `found`, cut at a word when it would pass the budget. When the same number exists in several documents, each one comes back, cited by its file. The search's own passages follow, without the parts already inside the section. A reference that matches no section (a bare `7.2` that is a version or an amount) changes nothing. `strata_search` puts the same sections first among its results, marked `"match": "exact"`. Exact passages have no chunk id, so `strata_feedback` cannot rate them by passage id yet.
 - The passages come best first and fill a budget of about 1,500 tokens (`ANSWER_TOKEN_BUDGET`), each passage's id, ref and citation counted with its text; the first passage always comes back, at most 50 come back, and `top_k` (default 10) only bounds the search before that.
 - Each passage's `text` is the stored document's own text. `ref` names its span in the stored document (`d<document id>:<start>-<end>`), or the chunk (`c<chunk id>`) for a chunk ingested before documents were stored. The citation has the file's path relative to the ingested folder, the page (PDFs; `page_end` too when the passage spans pages), the line range (from the page's start for PDFs) and the clause path from the structure map (for a chunk without one, such as one stored before the map existed or text before the first heading, the parser's heading path when it has one). A chunk ingested before documents were stored is cited by its file name, without lines.
-- `interaction_id` goes to `strata_feedback`, which takes passage ids for every passage returned: `{"S1": "useful", "S2": "wrong"}`.
+- `interaction_id` goes to `strata_feedback`, which takes passage ids for every passage returned except an exact clause match: `{"S1": "useful", "S2": "wrong"}`. Naming an exact passage refuses the call with an unknown passage id error.
 - `response_format: "detailed"` returns everything as well: `confidence`, the query variants (`queries_used`), `retrieved_chunks` with their ids, scores and metadata, `sources`, with `status` `ok` and the found, partly found or not found in `answer_status`.
 
 ### Extractive answers
@@ -475,7 +475,7 @@ flowchart LR
 - **Citations:** an `[S5]` when four passages were given is flagged.
 - The result is `verified` with a `receipt_id` (open it with `strata_get_receipt`), or `flagged` with a list of flags, each naming the text, why, and the passages searched, for example `"13 days" not found in S1–S4`. At most 50 flags are listed; `more_flags` counts the rest. The receipt keeps the passages and the draft, with IBANs, BICs and account numbers in the draft replaced by placeholders.
 - Both checks run in Python, without a model: nothing leaves the machine. They catch a changed quote, number, date, amount, code or clause, not a paraphrase that changes the meaning without changing a fact. For layers where that is not acceptable, use [`answer_mode: extractive`](#extractive-answers).
-- Each call writes one audit entry (`verify`) with counts and, when verified, the receipt id; never the draft.
+- Each call with passages and within the limits (50 passages, a draft of 50,000 characters) writes one audit entry (`verify`) with counts and, when verified, the receipt id; never the draft.
 
 To check an answer outside the chat, open its receipt from the command line:
 
@@ -610,7 +610,7 @@ The URL ends in `/v1`, and `QUERY_REWRITE_MODEL` must name a model the endpoint 
 
 ## Where your data goes
 
-By default nothing leaves this machine except what you choose to send: your documents stay in PostgreSQL, and the embedding and reranking models run in-process. Each other path is off until a setting turns it on.
+By default nothing leaves this machine except what you choose to send: your documents stay in PostgreSQL, and the embedding and reranking models run in-process. Each other path is off until a setting turns it on, except the model download from Hugging Face on first use, which sends nothing about your documents.
 
 ```mermaid
 flowchart LR
@@ -625,7 +625,7 @@ flowchart LR
     hf["Hugging Face"] -.->|"model files on first use,<br/>nothing about your documents"| models
 ```
 
-Dotted paths are off by default and blocked by `STRATA_LOCAL_ONLY=true`.
+Dotted paths are blocked by `STRATA_LOCAL_ONLY=true`. The rewrite and embedding paths are off by default; the Hugging Face download runs by default when a model is not in the cache.
 
 | Path | What leaves | Turned on by | Blocked by `STRATA_LOCAL_ONLY` |
 | --- | --- | --- | --- |
@@ -635,11 +635,11 @@ Dotted paths are off by default and blocked by `STRATA_LOCAL_ONLY=true`.
 | Rewrite endpoint on another host | Questions and layer descriptions | `QUERY_REWRITE_PROVIDER=openai_compatible` with `QUERY_REWRITE_BASE_URL` pointing off this machine and `QUERY_REWRITE_MODEL` set | Yes |
 | Rewrite endpoint on this machine | Questions and layer descriptions, to `127.0.0.1`, `::1` or `localhost` | `QUERY_REWRITE_PROVIDER=openai_compatible` with `QUERY_REWRITE_BASE_URL` and `QUERY_REWRITE_MODEL` set | No |
 | OpenAI embeddings | Documents and questions | `EMBEDDING_BACKEND=openai` without `EMBEDDING_BASE_URL` | Yes |
-| Embedding server on another host | Documents and questions | `EMBEDDING_BASE_URL` pointing off this machine | Yes |
-| Embedding server on this machine | Documents and questions, to `127.0.0.1`, `::1` or `localhost` | `EMBEDDING_BASE_URL` | No |
+| Embedding server on another host | Documents and questions | `EMBEDDING_BACKEND=openai` with `EMBEDDING_BASE_URL` pointing off this machine | Yes |
+| Embedding server on this machine | Documents and questions, to `127.0.0.1`, `::1` or `localhost` | `EMBEDDING_BACKEND=openai` with `EMBEDDING_BASE_URL` on this machine | No |
 | Hugging Face downloads | Nothing about your documents; model files come in | The first start, the first `stratakb add` and the first `strata_ask` | Yes |
 
-With `STRATA_LOCAL_ONLY=true` the server refuses to start while any blocked path is configured, and the error names each setting that caused it. `strata_search`, `strata_ask` and query rewriting use the settings the server started with: a config file edited while the server runs changes nothing for them until you restart it. `strata_ingest_documents` and `strata_apply_preset` still read the config files on each call and check the switch there, so a key added later is refused. The Hugging Face libraries run offline and load the embedding and reranking models from local files only; a model that is not installed fails with a message that says how to install it (`uv run hf download <model>` on a machine that may download, or `EMBEDDING_MODEL` / `RERANKING_MODEL` set to a folder that holds it). The switch does not cover the database: `DATABASE_URL` may point at a team server on purpose. `stratakb add` checks the embedding path before it starts: with a blocked one configured it refuses with exit `2` (`reason` `local_only` in `--json`), names the setting and writes nothing. It does not check query rewriting, which it never uses. The OpenAI and Anthropic SDKs also read `OPENAI_BASE_URL` and `ANTHROPIC_BASE_URL`; StrataKB treats them as the destination of those paths, and `STRATA_LOCAL_ONLY` checks them too. Requests to `EMBEDDING_BASE_URL` and `QUERY_REWRITE_BASE_URL` never carry `OPENAI_API_KEY`, `OPENAI_ADMIN_KEY`, `OPENAI_ORG_ID` or `OPENAI_PROJECT_ID`.
+With `STRATA_LOCAL_ONLY=true` the server refuses to start while any blocked path is configured, and the error names each setting that caused it. `strata_search`, `strata_ask` and query rewriting use the embedding, search, rewrite and answer settings the server started with: editing those in a config file while the server runs changes nothing for them until you restart it. Three things are read from the config files later: `STRATA_USER` and `STRATA_ROLE` on every tool call, the cache settings when the cache is first built, and the switch itself when a model has to be loaded and is not in the cache. `strata_ingest_documents` and `strata_apply_preset` still read the config files on each call and check the switch there, so a key added later is refused. The Hugging Face libraries run offline and load the embedding and reranking models from local files only; a model that is not installed fails with a message that says how to install it (`uv run hf download <model>` on a machine that may download, or `EMBEDDING_MODEL` / `RERANKING_MODEL` set to a folder that holds it). The switch does not cover the database: `DATABASE_URL` may point at a team server on purpose. `stratakb add` checks the embedding path before it starts: with a blocked one configured it refuses with exit `2` (`reason` `local_only` in `--json`), names the setting and writes nothing. It does not check query rewriting, which it never uses. The OpenAI and Anthropic SDKs also read `OPENAI_BASE_URL` and `ANTHROPIC_BASE_URL`; StrataKB treats them as the destination of those paths, and `STRATA_LOCAL_ONLY` checks them too. Requests to `EMBEDDING_BASE_URL` and `QUERY_REWRITE_BASE_URL` never carry `OPENAI_API_KEY`, `OPENAI_ADMIN_KEY`, `OPENAI_ORG_ID` or `OPENAI_PROJECT_ID`.
 
 `strata_admin_health` always lists the switch (`local_only`) and the active outbound providers (`outbound`: provider, purpose, what it sends, destination host and the setting that turns it on), whether the switch is on or not. It never shows keys, credentials, paths or ports. The report shows the settings the server started with.
 
@@ -671,12 +671,12 @@ StrataKB cannot control what your MCP client's language model does with the retr
 ```
 db/                   03_readonly_role.sql (SQL tools role, applied with psql)
 examples/             Example layer presets (Python PEPs, SEPA, ISO 20022)
-scripts/              apply_preset.py, backup_restore.py
+scripts/              apply_preset.py, backup_restore.py, and the pull request checks check_repo_rules.py and ruff_changed_lines.py
 src/stratakb/
-  cli.py              The stratakb command: add a folder, start a local database, or start the server
+  cli.py              The stratakb command: add a folder, start a local database, open a receipt, or start the server
   mcp_server.py       MCP server: admin and user tools
   core/               Database pool, roles, audit log, logging, schema migrations, local database in Docker
-    sql/              Schema, applied in version order by the server: 01_init, 02_learning, then the 04–12 upgrades
+    sql/              Schema, applied in version order by the server: 01_init, 02_learning, then the 04–13 upgrades
   knowledge/          Layers, presets, ingestion pipeline, structure map, parsers, embeddings, vector store
     add_folder.py     Turns one folder into one layer and keeps it in sync
   rag/                Retriever (hybrid + RRF), reranker, cache, routing, query rewriter, cited passages, receipts, verify, tools
@@ -709,7 +709,7 @@ Without a running database, the integration tests fail with a connection error a
 The target: ask your own documents (contracts, rulebooks, specs, runbooks) and get answers you can **prove**, without learning how retrieval works and without sending private data anywhere you did not choose. Work is grouped into [milestones](https://github.com/boudou/StrataKB/milestones):
 
 1. **Five-minute start**: add a folder in one step, a one-command local mode, any OpenAI-compatible model provider, and a clear statement of where data goes.
-2. **[Answers you can prove](#answers-you-can-prove)** (available): every claim can be checked against its source. Still to come: an evaluation suite that measures the provisional not-found thresholds.
+2. **[Answers you can prove](#answers-you-can-prove)** (available): every claim can be checked against its source. Still to come: an evaluation suite that measures the provisional not-found thresholds, and structured tool output with failures reported as real tool errors.
 3. **Team server**: Streamable HTTP, real identities, per-layer access.
 4. **Daily use and sync**: a command line for daily use, connectors (git first), scanned PDFs.
 5. **Depth**: exact-lookup catalogs, cross-document references, source code.

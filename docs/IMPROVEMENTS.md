@@ -6,7 +6,7 @@ Known issues and planned work live in [GitHub issues](https://github.com/boudou/
 
 ## Product goal
 
-StrataKB lets a developer, or a team of developers, turn their own documents into a knowledge base their tools can ask, without learning how retrieval works and without sending private data anywhere they did not choose. Every issue must serve at least one of these goals, and names them on its last line:
+StrataKB lets a developer, or a team of developers, turn their own documents into a knowledge base their tools can ask, without learning how retrieval works and without sending private data anywhere they did not choose. Every issue must serve at least one of these goals, and names them on a `Goals:` line:
 
 | Goal | What the developer sees |
 | --- | --- |
@@ -22,11 +22,11 @@ StrataKB lets a developer, or a team of developers, turn their own documents int
 ```mermaid
 flowchart LR
     G1["G1 Start in minutes"] --- i1["#1 · #3 · #4 · #24 · #26 · #79"]
-    G2["G2 No retrieval knowledge"] --- i2["#1 · #2 · #7 · #10 · #11 · #15 · #21 · #23 · #32 · #64 · #68 · #69"]
-    G3["G3 Daily work"] --- i3["#23 · #24 · #25 · #27 · #29 · #30 · #31 · #33 · #35 · #36 · #63 · #65 · #69"]
-    G4["G4 Private by default"] --- i4["#1 · #4 · #6 · #14 · #19 · #20 · #22 · #66"]
-    G5["G5 Shared by a team"] --- i5["#12 · #16 · #17 · #18 · #19 · #25 · #37 · #38 · #66"]
-    G6["G6 Answers you can prove"] --- i6["#8 · #9 · #10 · #11 · #20 · #23 · #28 · #37 · #63–#69 · #72–#78"]
+    G2["G2 No retrieval knowledge"] --- i2["#1 · #2 · #7 · #10 · #11 · #15 · #21 · #23 · #32 · #64 · #68 · #69 · #74 · #75 · #78"]
+    G3["G3 Daily work"] --- i3["#23 · #24 · #25 · #27 · #29 · #30 · #31 · #33 · #35 · #36 · #63 · #65 · #69 · #73"]
+    G4["G4 Private by default"] --- i4["#1 · #4 · #6 · #14 · #19 · #20 · #22 · #66 · #76 · #77"]
+    G5["G5 Shared by a team"] --- i5["#12 · #16 · #17 · #18 · #19 · #25 · #37 · #38 · #66 · #73 · #76"]
+    G6["G6 Answers you can prove"] --- i6["#8 · #9 · #10 · #11 · #20 · #28 · #37 · #63–#69 · #72 · #74–#78"]
 ```
 
 #13 (server version) and #34 (developer experience) support the others and serve no goal directly.
@@ -45,7 +45,7 @@ Each milestone on GitHub holds its issues.
 
 ```mermaid
 flowchart LR
-    m1["1. Five-minute start<br/>#1–#4 · #6 · #7 · #37 · #38 · #40 · #48–#62 · #70 · #79"] --> m2["2. Answers you can prove<br/>#8–#11 · #15 · #23 · #63–#69 · #72–#78"]
+    m1["1. Five-minute start<br/>#1–#4 · #6 · #7 · #37 · #38 · #40 · #48–#62 · #70 · #79–#105 · #117 · #119 · #121 · #139 · #148"] --> m2["2. Answers you can prove<br/>#8–#11 · #15 · #23 · #63–#69 · #72–#78 · #109–#111 · #113 · #114 · #118 · #142 · #143 · #146 · #147"]
     m2 --> m3["3. Team server<br/>#12–#14 · #16–#22"]
     m3 --> m4["4. Daily use and sync<br/>#24–#28"]
     m4 --> m5["5. Depth<br/>#29–#36"]
@@ -68,7 +68,8 @@ flowchart LR
     rc --> cli["#77 stratakb receipt"]
     r --> v["#67 strata_verify"]
     rc --> v
-    e["#8 Evals → #10 calibration"] --> x["#68 Extractive answers"]
+    cal["#10 Provisional<br/>thresholds"] --> x["#68 Extractive answers"]
+    e["#8 Evals"] -.-> cal
     r --> x
     rc --> x
     c --> x
@@ -77,8 +78,8 @@ flowchart LR
     x --> k
 ```
 
-- Milestone 1 comes first because nobody reaches the other features without it. Shipped so far: #3, #4, #6, #7, #37, #38, #40, #48–#62, #70 and `stratakb db up` (#79); left: the umbrella #1 and #2. #9 and #11 shipped alongside it.
-- Milestone 2 ships `strata_verify` first (#72 → #63 → #23 → #66 → #67): it needs no calibration. #72, #63, #73, #78, #10, #23, #64, #66, #67, #65, #76 and `stratakb receipt` (#77) have shipped; #10 put confidence on a meaningful scale with provisional thresholds. Next are PDF and Word structure (#74), clause patterns in presets (#75) and the answer contract (#69). #8 runs alongside, and extractive answers (#68) follow once #8 calibrates the "not found" threshold. #73–#78 are small slices next to their parents; all but #74 and #75 have shipped.
+- Milestone 1 comes first because nobody reaches the other features without it. Shipped so far: #3, #4, #6, #7, #37, #38, #40, #48–#62, #70, `stratakb db up` (#79) and the follow-ups #80–#105, #117, #119, #121, #139 and #148; left: the umbrella #1 and #2. #9 and #11 shipped alongside it.
+- Milestone 2 shipped `strata_verify` first (#72 → #63 → #23 → #66 → #67): it needs no calibration. #72, #63, #73, #78, #10, #23, #64, #66, #67, #65, #76, `stratakb receipt` (#77), PDF and Word structure (#74), clause patterns in presets (#75), extractive answers (#68) and the answer contract (#69) have shipped. #10 put confidence on a meaningful scale with provisional thresholds, and extractive answers use the same provisional values to decide "not found". Left: structured output and real errors (#15), and the evaluation suite (#8), which measures those thresholds. #73–#78 were small slices next to their parents.
 - #8 also needs an abstention set and verify-rate and faithfulness metrics for milestone 2.
 - #16 comes before #17, because the SDK 2.x line brings the auth support.
 
