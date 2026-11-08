@@ -142,7 +142,7 @@ Clients that show MCP prompts also offer the same steps as the prompt `answer_fr
 
 **When a question names more clauses than fit.** The budget is shared in order: each named clause gets what is left, divided by the clauses still to fit, and keeps at least its first 200 characters. A clause that no longer fits is left out whole, and so is any clause after it. A `found` answer then becomes `partly_found`, and the `note` gives the count and each clause and file, in both modes. At most 10 matches are read, in the order of the references and then by file path. Past that the note gives the count of matching sections not read, with "at least" when the count stopped at the limit of 50 sections, and no files. The note is not counted against `ANSWER_TOKEN_BUDGET`. `strata_search` returns up to 10 exact results and does not mention further matches. Only the first 10 references in a question are looked up, and the others are not mentioned.
 
-**Missing names.** When passages lack an exact name the question uses (`PEP 8`, `AC04`), `found` becomes `partly_found`, or `not_found` if all are missing.
+**Missing names.** In `strata_ask`, passages lacking a name the question uses (`PEP 8`, `AC04`) turn `found` into `partly_found`; all missing, with no named clause returned, gives `not_found`.
 
 **Opening a receipt.** Use `strata_get_receipt`, the resource `strata://receipts/{receipt_id}` or the command line, `uv run stratakb receipt <id>` ([what it prints](https://github.com/boudou/StrataKB/wiki/Asking-and-Searching#checking-a-drafted-answer)). Each quote appears in its surrounding text, marked current, changed or gone. Receipts are kept for `RECEIPT_RETENTION_DAYS` (90 by default).
 
@@ -208,7 +208,7 @@ Then ask from your client, for example *"How long should a line of Python be?"*.
 
 ## Roles and audit
 
-StrataKB has viewer, operator and admin roles. `STRATA_USER` and `STRATA_ROLE` are self-declared, so whoever starts the server picks the role: the Quick start sets `admin` because that one person runs everything. The server reads both once, when it starts, so changing either takes a restart. `stratakb add` and `stratakb receipt` read them each time they run. Roles separate duties and do not enforce security; see [SECURITY.md](SECURITY.md).
+StrataKB has viewer, operator and admin roles. `STRATA_USER` and `STRATA_ROLE` are self-declared, so whoever starts the server picks the role: the Quick start sets `admin` because that one person runs everything. The server reads both once, when it starts, so changing either takes a restart. `stratakb receipt` reads both per run; `stratakb add`, only `STRATA_USER`. Roles separate duties and do not enforce security; see [SECURITY.md](SECURITY.md).
 
 The audit log records searches and changes under that declared name. The `strata_readonly` role can read five tables only: `strata_core.knowledge_layers`, `strata_core.ingestion_runs`, `strata_core.ingested_files`, `strata_vectors.chunks` and `strata_vectors.documents`. It cannot read the audit log, the users table or anything in `strata_learning`.
 
