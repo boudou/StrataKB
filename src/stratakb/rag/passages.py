@@ -4,7 +4,9 @@ A passage is one retrieved chunk. Passages keep the retrieval order and are
 numbered S1, S2, ... in it, so S<n> is the n-th retrieved chunk the
 learning loop records. Each passage carries a ref that names the exact span
 of the stored document text it holds, and a citation a developer can open:
-the file's relative path, the page, the line range and the clause path.
+the file's relative path, the page, the line range, the clause path and
+the document's date, the file that says it replaces this one when there is
+one, and a label when the file's layer marks it as archived.
 The budget counts each passage's id, ref and citation with its text, and an
 answer holds at most MAX_PASSAGES passages, all of which the learning loop
 stores, so feedback by passage id resolves for every one.
@@ -34,10 +36,13 @@ AnswerMode = Literal["grounded", "extractive"]
 # The most passages an answer returns, and results the learning loop stores
 MAX_PASSAGES = 50
 # The tokens a passage costs in the response beyond its own indent-2 JSON: the
-# deeper indentation inside the response's passages list and the page, lines
-# and page_end a stored document adds (measured on FastMCP's indent-2 JSON
-# with six-digit spans and three-digit pages: about 81 characters)
-RESPONSE_SLACK_TOKENS = 21
+# deeper indentation inside the response's passages list and the page, lines,
+# page_end, the date and date_source values and the archived key a stored
+# document adds (measured on FastMCP's indent-2 JSON with six-digit spans and
+# three-digit pages: about 133 characters). A replaced_by label is not counted:
+# packing runs before documents are read, a path can be 500 characters, and
+# raising this for every passage would cost all answers room for a rare key
+RESPONSE_SLACK_TOKENS = 34
 
 _PASSAGE_ID = re.compile(r"[Ss]([1-9][0-9]*)")
 
@@ -187,12 +192,15 @@ def _clause_path(chunk: dict[str, Any], metadata: dict[str, Any]) -> str | None:
 
 
 def cite(chunk: dict[str, Any], document: dict[str, Any] | None) -> dict[str, Any]:
-    """Where a passage comes from: file, page, lines, clause path and layer.
+    """Where a passage comes from: file, page, lines, clause path, layer and date.
 
-    With its stored document the file is the relative path and the page and
-    line range come from the chunk's span. A chunk ingested before documents
-    were stored is cited by its file name and, for a PDF, its page; its
-    lines are unknown.
+    With its stored document the file is the relative path, the page and line
+    range come from the chunk's span, and the date and date_source are the
+    document's, None when it has none. replaced_by is there only when another
+    file says it replaces this one, and archived, always True, only when the
+    layer's patterns match the file. A chunk ingested before documents were
+    stored is cited by its file name and, for a PDF, its page; its lines and
+    date are unknown.
     """
     metadata = chunk.get("metadata") or {}
     citation: dict[str, Any] = {
@@ -201,8 +209,16 @@ def cite(chunk: dict[str, Any], document: dict[str, Any] | None) -> dict[str, An
         "lines": None,
         "clause_path": _clause_path(chunk, metadata),
         "layer": chunk.get("layer"),
+        "date": None,
+        "date_source": None,
     }
     if document is not None and chunk.get("char_start") is not None:
+        citation["date"] = document.get("doc_date")
+        citation["date_source"] = document.get("doc_date_source")
+        if document.get("replaced_by"):
+            citation["replaced_by"] = document["replaced_by"]
+        if document.get("archived"):
+            citation["archived"] = True
         where = locate(
             document["text"], document["page_map"], chunk["char_start"], chunk["char_end"]
         )
@@ -230,6 +246,55 @@ def build_passages(
         }
         for n, chunk in enumerate(chunks, start=1)
     ]
+
+
+def cut_clause_note(
+    chunks: list[dict[str, Any]], passages: list[dict[str, Any]]
+) -> str | None:
+    """A note naming each clause that was cut to fit the budget, and its file, or None."""
+    notes = []
+    for chunk, passage in zip(chunks, passages, strict=True):
+        if chunk.get("cut"):
+            citation = passage["citation"]
+            name = citation["clause_path"] or "The clause the question names"
+            notes.append(
+                f"{name} is only partly returned: the rest does not fit in the answer. "
+                f"Read the whole clause in {citation['file']}."
+            )
+    return " ".join(notes) or None
+
+
+def left_out_note(
+    left_out: list[dict[str, Any]],
+    documents: dict[int, dict[str, Any]],
+    unread: int = 0,
+    unread_is_minimum: bool = False,
+) -> str | None:
+    """A note on the named clauses an answer does not hold, or None.
+
+    left_out are the clauses packing dropped, each named with its file as a
+    citation gives it; unread counts the matching sections past the match cap,
+    which were never read.
+    """
+    sentences = []
+    if left_out:
+        items = []
+        for chunk in left_out:
+            citation = cite(chunk, documents.get(chunk.get("document_id")))
+            path = citation["clause_path"]
+            items.append(f"{path} in {citation['file']}" if path else f"{citation['file']}")
+        n = len(left_out)
+        sentences.append(
+            f"{n} named {'clause' if n == 1 else 'clauses'} left out, over the token budget: "
+            f"{'; '.join(items)}. Read the files, or ask for fewer at a time."
+        )
+    if unread:
+        sentences.append(
+            f"More documents match than were read: {'at least ' if unread_is_minimum else ''}"
+            f"{unread} more matching {'section' if unread == 1 else 'sections'} not read. "
+            "Name a layer to narrow the question."
+        )
+    return " ".join(sentences) or None
 
 
 def basis_score(chunk: dict[str, Any], basis: str) -> float:
@@ -345,7 +410,8 @@ class AskResult:
     None when they were not asked for. The learning tracker sets interaction_id.
 
     extraction is the server's answer when the mode is extractive; without it
-    the client composes the answer from the passages.
+    the client composes the answer from the passages. note is a grounded answer's
+    note; an extractive answer keeps its own in ExtractiveAnswer.note.
     """
 
     ok: ClassVar[Literal[True]] = True
@@ -361,6 +427,7 @@ class AskResult:
     routing_fallback: str | None = None
     interaction_id: str | None = None
     extraction: ExtractiveAnswer | None = None
+    note: str | None = None
 
     @property
     def mode(self) -> AnswerMode:
@@ -370,14 +437,16 @@ class AskResult:
         return self.detailed() if response_format == "detailed" else self.concise()
 
     def concise(self) -> dict[str, Any]:
-        """The answer status, the mode, the passages (grounded) or the answer and
-        its receipt (extractive), the next step when there is one, and the
-        interaction_id for strata_feedback."""
+        """The answer status, the mode, the passages and any note (grounded) or the
+        answer and its receipt (extractive), the next step when there is one, and
+        the interaction_id for strata_feedback."""
         response: dict[str, Any] = {"status": self.status, "mode": self.mode}
         if self.extraction is not None:
             response |= self.extraction.fields(with_scores=False)
         else:
             response["passages"] = self.passages
+            if self.note is not None:
+                response["note"] = self.note
         if step := next_step(self.status, self.mode):
             response["next_step"] = step
         if self.interaction_id is not None:
@@ -398,6 +467,8 @@ class AskResult:
             **(self.extraction.fields(with_scores=True) if self.extraction is not None else {}),
             "passages": self.passages,
         }
+        if self.extraction is None and self.note is not None:
+            response["note"] = self.note
         if step := next_step(self.status, self.mode):
             response["next_step"] = step
         if self.sources is not None:

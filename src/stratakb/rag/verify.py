@@ -6,21 +6,27 @@ Two deterministic checks, in Python only (no model call):
   passage, or in any passage when it cites none, after whitespace, quote
   mark and dash normalisation;
 - the fact check: every number, date, amount, percentage, identifier and
-  clause reference outside the quotes must appear in at least one passage.
-  Both sides are normalised, so "thirty (30) days" matches "30 days",
-  "1,000.00" matches "1000" and "4 November 2026" matches "2026-11-04".
+  clause reference outside the quotes must appear in a passage cited in the
+  same sentence, or in any passage when the sentence cites none. Both sides
+  are normalised, so "thirty (30) days" matches "30 days", "1,000.00" matches
+  "1000" and "4 November 2026" matches "2026-11-04".
 
-A citation to a passage id that was not given is flagged too. A paraphrase
-that changes the meaning without changing a fact is not caught.
+A citation to a passage id that was not given is flagged too, and so is a
+draft with no citations at all, even when its quotes and facts match. A draft
+with no quote and no fact to check is not verified: there was nothing to
+compare. A paraphrase that changes the meaning without changing a fact is not
+caught.
 """
 
 from __future__ import annotations
 
 import re
+from bisect import bisect_right
 from collections.abc import Iterator, Sequence
 from dataclasses import asdict, dataclass, field
 from datetime import date
 from decimal import Decimal, InvalidOperation
+from functools import cached_property
 
 from stratakb.rag.passages import passage_id
 
@@ -82,6 +88,54 @@ def _cited_ids(marker: str) -> list[str]:
         span = range(first, last + 1) if 0 <= last - first <= 50 else (first, last)
         ids.extend(passage_id(n) for n in span)
     return ids
+
+
+# A line break, or end punctuation (with any closing marks) before whitespace
+_SENTENCE_BREAK = re.compile(r"\n|[.!?][)\]'\"]*(?=\s|\Z)")
+_CITATION_RUN = rf"{_CITATION.pattern}(?:[ ,;]*{_CITATION.pattern})*"
+# Citations right after a sentence's end, and a period that goes with them
+_TRAILING_CITATIONS = re.compile(rf" *{_CITATION_RUN}\.?(?=\s|\Z)")
+# Lines that hold nothing but citations
+_CITATION_LINES = re.compile(rf"(?:{_CITATION_RUN}\.?(?:\n|\Z))*")
+_NEXT_CHAR = re.compile(r" *(\S?)")
+
+
+def _sentence_scopes(text: str) -> tuple[list[int], list[tuple[str, ...]]]:
+    """Where each sentence of text starts, and the passage ids each one cites.
+
+    text keeps its line breaks. A line break ends a sentence, and so does end
+    punctuation, unless a lower-case letter follows, or a digit follows
+    anything but a citation ("Art. 12" stays whole). Citations right after the
+    end belong to the sentence just ended, unless a lower-case word follows
+    them ("[S2] says ..."); after a line break, only when alone on their line.
+    """
+    starts = [0]
+    for m in _SENTENCE_BREAK.finditer(text):
+        if m.end() <= starts[-1]:
+            continue
+        if m.group(0) == "\n":
+            starts.append(_CITATION_LINES.match(text, m.end()).end())
+            continue
+        following = _NEXT_CHAR.match(text, m.end()).group(1)
+        if not following:
+            continue  # The line break, or the end of the text, closes it
+        if following.islower():
+            continue
+        if following.isdigit() and text[m.start() - 1 : m.start()] != "]":
+            continue
+        trailing = _TRAILING_CITATIONS.match(text, m.end())
+        if trailing is None:
+            starts.append(m.end())
+            continue
+        after = _NEXT_CHAR.match(text, trailing.end()).group(1)
+        if after.islower():
+            starts.append(m.end())
+        elif after:
+            starts.append(trailing.end())
+    cited: list[list[str]] = [[] for _ in starts]
+    for marker in _CITATION.finditer(text):
+        cited[bisect_right(starts, marker.start()) - 1].extend(_cited_ids(marker.group(0)))
+    return starts, [tuple(dict.fromkeys(ids)) for ids in cited]
 
 
 # Each part of a quote with an omission must hold at least this many words, so
@@ -198,10 +252,13 @@ _DATES = [
     ("literal", re.compile(r"(?<![\w./])\d{1,2}[/.]\d{1,2}[/.]\d{2,4}(?![\w./])")),
 ]
 
-_IDENTIFIERS = [
-    # IBAN-shaped, printed in groups of four or compact
+# IBAN-shaped, printed in groups of four or compact: account data, not names
+ACCOUNT_PATTERNS = [
     re.compile(r"(?<![\w])[A-Z]{2}\d{2}(?: [A-Z0-9]{4}){3,7}(?: [A-Z0-9]{1,3})?(?![\w])"),
     re.compile(r"(?<![\w])[A-Z]{2}\d{2}[A-Z0-9]{10,30}(?![\w])"),
+]
+
+IDENTIFIER_PATTERNS = [
     # Message ids such as pacs.008 or pacs.008.001.08
     re.compile(r"(?<![\w.])[a-z]{4}\.\d{3}(?:\.\d{3}\.\d{2})?(?![\w.])"),
     # Codes with a dash, such as AT-02
@@ -215,7 +272,7 @@ _CLAUSE_WORD = (
     r"|Schedule|Rule|§)"
 )
 _CLAUSE_NUM = r"\d+[A-Za-z]?(?:\.\d+)*(?:\(\w{1,4}\))*"
-_CLAUSES = [
+CLAUSE_PATTERNS = [
     re.compile(rf"(?<![\w]){_CLAUSE_WORD}\s*(?P<num>{_CLAUSE_NUM})(?![\w]|\.\d)", re.IGNORECASE),
     # 7(2)(b) or 7.2.1 without a keyword
     re.compile(r"(?<![\w.])(?P<num>\d+(?:\.\d+)*(?:\(\w{1,4}\))+)(?![\w])"),
@@ -255,8 +312,12 @@ class CheckResult:
     flags_unlisted: int = 0
 
     @property
+    def nothing_checked(self) -> bool:
+        return not self.quotes_checked and not self.facts_checked
+
+    @property
     def verified(self) -> bool:
-        return not self.flags and not self.flags_unlisted
+        return not self.flags and not self.flags_unlisted and not self.nothing_checked
 
 
 def _words_value(text: str) -> int:
@@ -345,8 +406,8 @@ def _take(text: list[str], pattern: re.Pattern) -> Iterator[re.Match]:
         text[m.start():m.end()] = " " * (m.end() - m.start())
 
 
-def extract_facts(text: str) -> list[Fact]:
-    """The numbers, dates, amounts, percentages, identifiers and clause references in text.
+def _located_facts(text: str) -> list[tuple[int, Fact]]:
+    """The facts in text with where each one starts, in the order they are written.
 
     Identifiers are taken first, then dates, clause references, amounts,
     quantities and bare numbers; each match is blanked before the next kind
@@ -356,7 +417,7 @@ def extract_facts(text: str) -> list[Fact]:
     """
     work = list(text)
     found: list[tuple[int, Fact]] = []
-    for pattern in _IDENTIFIERS:
+    for pattern in (*ACCOUNT_PATTERNS, *IDENTIFIER_PATTERNS):
         for m in _take(work, pattern):
             key = ("id", m.group(0).replace(" ", ""))
             found.append((m.start(), Fact("identifier", m.group(0), key)))
@@ -364,7 +425,7 @@ def extract_facts(text: str) -> list[Fact]:
         for m in _take(work, pattern):
             if fact := _date_fact(kind, m):
                 found.append((m.start(), fact))
-    for pattern in _CLAUSES:
+    for pattern in CLAUSE_PATTERNS:
         for m in _take(work, pattern):
             key = ("clause", m.group("num").lower())
             found.append((m.start(), Fact("clause", m.group(0), key)))
@@ -384,8 +445,12 @@ def extract_facts(text: str) -> list[Fact]:
         value = _number_value(m.group(0))
         if value is not None:
             found.append((m.start(), Fact("number", m.group(0), ("number", value))))
-    # In the order they are written
-    return [fact for _, fact in sorted(found, key=lambda pair: pair[0])]
+    return sorted(found, key=lambda pair: pair[0])
+
+
+def extract_facts(text: str) -> list[Fact]:
+    """The numbers, dates, amounts, percentages, identifiers and clause references in text."""
+    return [fact for _, fact in _located_facts(text)]
 
 
 class _PassageIndex:
@@ -464,6 +529,23 @@ def _id_range(ids: Sequence[str]) -> str:
     return ", ".join(ids)
 
 
+class _Scope:
+    """One set of passage ids to search, shared by everything checked against it.
+
+    A sentence can cite tens of thousands of ids, so checking or flagging a fact
+    must not cost time in proportion to them: the work is done once here, and a
+    scope is hashed by identity.
+    """
+
+    def __init__(self, ids: tuple[str, ...], indexes: dict[str, _PassageIndex]) -> None:
+        self.ids = ids
+        self.targets = [indexes[pid] for pid in ids if pid in indexes]
+
+    @cached_property
+    def label(self) -> str:
+        return _id_range(self.ids)
+
+
 def check(
     draft: str, passages: dict[str, str], given: Sequence[str] | None = None
 ) -> CheckResult:
@@ -479,63 +561,77 @@ def check(
     flat_draft = normalise_text(lines)
     indexes = {pid: _PassageIndex(text) for pid, text in passages.items()}
     flags: list[Flag] = []
-    seen: set[tuple[str, str]] = set()
+    seen: set[tuple[str, str, _Scope]] = set()
     unlisted = 0
+    scopes: dict[tuple[str, ...], _Scope] = {}
 
-    def flag(kind: str, text: str, message: str, searched: Sequence[str]) -> None:
+    def scope_of(cited: Sequence[str]) -> _Scope:
+        """The scope of these citations; with none, all the passages given."""
+        ids = tuple(cited or given_ids)
+        if ids not in scopes:
+            scopes[ids] = _Scope(ids, indexes)
+        return scopes[ids]
+
+    def flag(kind: str, text: str, message: str, scope: _Scope) -> None:
+        """Flag once per kind, text and scope; message goes before the scope's label."""
         nonlocal unlisted
-        if (kind, text) in seen:
+        if (kind, text, scope) in seen:
             return
-        seen.add((kind, text))
+        seen.add((kind, text, scope))
         if len(flags) < MAX_FLAGS:
-            flags.append(Flag(kind, text, message, list(searched)))
+            flags.append(Flag(kind, text, f"{message}{scope.label}", list(scope.ids)))
         else:
             unlisted += 1
+
+    # First, so the cap on flags cannot drop it. A [S1] inside a quote is the
+    # document's text; the citations right after a quote stay
+    if not _CITATION.search(_QUOTE.sub(r" \2", flat_draft)):
+        flag(
+            "citation",
+            "no citation",
+            "The draft has no citations; cite each claim as [S1]. The passages given are ",
+            scope_of(()),
+        )
 
     for marker in _CITATION.finditer(flat_draft):
         for pid in _cited_ids(marker.group(0)):
             if pid not in given_ids:
-                flag(
-                    "citation",
-                    pid,
-                    f"{pid} is cited, but the passages given are {_id_range(given_ids)}",
-                    given_ids,
-                )
+                flag("citation", pid, f"{pid} is cited, but the passages given are ", scope_of(()))
 
     # Quotes are checked whole; their text is then left out of the fact check
     masked = list(flat_draft)
+    # flat_draft and lines have the same length: each line break is one space.
+    # For the sentence scopes a quote's text goes, but not its end punctuation
+    scoped = list(lines)
     quotes = 0
     for m in _QUOTE.finditer(flat_draft):
         quote = m.group(1).strip()
         masked[m.start():m.end()] = " " * (m.end() - m.start())
+        inner = len(m.group(1).rstrip(" .!?"))
+        scoped[m.start(1):m.start(1) + inner] = " " * inner
         if not re.search(r"\w", quote):
             continue
         quotes += 1
         cited = [pid for c in _CITATION.finditer(m.group(2)) for pid in _cited_ids(c.group(0))]
-        targets = [pid for pid in (cited or list(indexes)) if pid in indexes]
-        if not any(_quote_found(quote, indexes[pid].flat) for pid in targets):
-            searched = cited or given_ids
-            flag(
-                "quote",
-                quote,
-                f'Quote "{quote}" not found in {_id_range(searched)}',
-                searched,
-            )
+        scope = scope_of(cited)
+        if not any(_quote_found(quote, index.flat) for index in scope.targets):
+            flag("quote", quote, f'Quote "{quote}" not found in ', scope)
     for marker in _CITATION.finditer(flat_draft):
         masked[marker.start():marker.end()] = " " * (marker.end() - marker.start())
 
-    # Each distinct fact is checked once, however often it is written
+    # Each fact is checked once per set of citations, however often it is written
+    starts, cited_ids = _sentence_scopes("".join(scoped))
+    sentence_scopes = [scope_of(cited) for cited in cited_ids]
     facts: dict[tuple, Fact] = {}
-    for fact in extract_facts("".join(masked)):
+    checked: set[tuple] = set()
+    for pos, fact in _located_facts("".join(masked)):
         facts.setdefault(fact.key, fact)
-    for fact in facts.values():
-        if not any(index.has(fact) for index in indexes.values()):
-            flag(
-                fact.kind,
-                fact.text,
-                f'"{fact.text}" not found in {_id_range(given_ids)}',
-                given_ids,
-            )
+        scope = sentence_scopes[bisect_right(starts, pos) - 1]
+        if (fact.key, scope) in checked:
+            continue
+        checked.add((fact.key, scope))
+        if not any(index.has(fact) for index in scope.targets):
+            flag(fact.kind, fact.text, f'"{fact.text}" not found in ', scope)
     return CheckResult(
         flags=flags, quotes_checked=quotes, facts_checked=len(facts), flags_unlisted=unlisted
     )

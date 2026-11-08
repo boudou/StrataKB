@@ -16,6 +16,9 @@ Example (see examples/ for complete presets):
     routing_patterns: ['\\bsepa\\b', '\\bsct\\s*inst\\b']
     structure_patterns: ['(?P<label>AT-\\d{2,3})\\b']   # extra section starts
     answer_mode: grounded    # or extractive; grounded for a new layer when left out
+    # Quoted, or YAML reads a leading * or ! as its own syntax; a layer keeps
+    # its list when left out, and [] clears it
+    archived_patterns: ['archive/', '*-2024.md', '!keep.md']
     sources:
       - name: rulebooks
         path: rulebooks
@@ -39,6 +42,7 @@ from stratakb.knowledge.layers import (
     LayerOriginError,
     LayerValidationError,
     _validate_answer_mode,
+    _validate_archived_patterns,
     _validate_chunk_config,
     _validate_display_name,
     _validate_metadata_schema,
@@ -79,6 +83,8 @@ class LayerPreset:
     structure_patterns: list[str] = field(default_factory=list)
     # None: a new layer gets DEFAULT_ANSWER_MODE, an existing layer keeps its mode
     answer_mode: str | None = None
+    # None: a new layer has none, an existing layer keeps its list; [] clears it
+    archived_patterns: list[str] | None = None
     sources: list[SourceGroup] = field(default_factory=list)
     # Directory the source paths are relative to, unless the caller overrides it
     root: Path | None = None
@@ -92,7 +98,12 @@ def load_preset(preset_path: str | Path) -> LayerPreset:
         LayerValidationError: If the preset is malformed.
     """
     path = Path(preset_path)
-    data = yaml.safe_load(path.read_text(encoding="utf-8"))
+    try:
+        data = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except yaml.YAMLError as e:
+        raise LayerValidationError(
+            f"Preset {path} is not valid YAML; quote a pattern that starts with * or !: {e}"
+        ) from e
     if not isinstance(data, dict):
         raise LayerValidationError(f"Preset {path} must be a YAML mapping.")
 
@@ -108,6 +119,10 @@ def load_preset(preset_path: str | Path) -> LayerPreset:
     answer_mode = data.get("answer_mode")
     if answer_mode is not None:
         answer_mode = _validate_answer_mode(answer_mode)
+    # Not "or []": an absent key must stay None, and a bare string must be refused
+    archived_patterns = data.get("archived_patterns")
+    if archived_patterns is not None:
+        archived_patterns = _validate_archived_patterns(archived_patterns)
     metadata_schema = _validate_metadata_schema(data.get("metadata_schema") or {})
 
     sources = []
@@ -134,6 +149,7 @@ def load_preset(preset_path: str | Path) -> LayerPreset:
         routing_patterns=routing_patterns,
         structure_patterns=structure_patterns,
         answer_mode=answer_mode,
+        archived_patterns=archived_patterns,
         sources=sources,
         root=root,
     )
@@ -241,7 +257,8 @@ def _parse_source_group(preset: LayerPreset, root: Path, group: SourceGroup) -> 
 def _preset_settings(preset: LayerPreset) -> dict:
     """The layer settings a preset sets, in reporting order, as they are stored.
 
-    answer_mode is left out when the preset does not set it.
+    answer_mode and archived_patterns are left out when the preset does not set
+    them, so the layer keeps its own.
     """
     settings = {
         "display_name": preset.display_name,
@@ -253,6 +270,8 @@ def _preset_settings(preset: LayerPreset) -> dict:
     }
     if preset.answer_mode is not None:
         settings["answer_mode"] = preset.answer_mode
+    if preset.archived_patterns is not None:
+        settings["archived_patterns"] = preset.archived_patterns
     return settings
 
 
@@ -336,6 +355,7 @@ async def create_preset_layer(database_url: str, preset: LayerPreset) -> dict:
             routing_patterns=preset.routing_patterns,
             answer_mode=preset.answer_mode or DEFAULT_ANSWER_MODE,
             structure_patterns=preset.structure_patterns,
+            archived_patterns=preset.archived_patterns,
             origin=origin,
         )
         return {"status": "created", "layer": layer, "changes": []}

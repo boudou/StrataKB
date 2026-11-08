@@ -18,6 +18,7 @@ from uuid import UUID
 
 import asyncpg
 import structlog
+from pathspec import GitIgnoreSpec
 
 from stratakb.knowledge.parsers.document import ParsedDocument
 from stratakb.knowledge.structure import Heading, Section
@@ -86,6 +87,9 @@ async def store_document_version(
     text: str,
     page_map: list[list[int]] | None,
     text_origin: str = "text",
+    doc_date: str | None = None,
+    doc_date_source: str | None = None,
+    supersedes: str | None = None,
 ) -> tuple[int, int]:
     """Store the text as the file's current version; return (document_id, version).
 
@@ -96,13 +100,20 @@ async def store_document_version(
     its numbering while older versions are still stored, and same-named files
     from different roots keep separate versions.
 
+    A reused version takes the given date (the front matter can change while
+    the text stays the same) and keeps its stored one when doc_date is None.
+    It always takes the given supersedes: None means the key was removed.
+
     Numbering is serialized per file: a transaction-scoped advisory lock on
     (layer, source root, relative path) makes a concurrent call for the same
     file wait until the first caller's transaction ends, and then read the
     version it committed. The function opens its own transaction (a savepoint
-    inside the caller's), so the lock holds until the outermost one ends.
-    A version that a concurrent prune deletes while this call waits on it is
-    not reused: the call reads the latest version again.
+    inside the caller's), so the locks hold until the outermost one ends.
+
+    All the file's versions are locked up front in id order, the order a
+    whole-layer prune locks them: a file new to the layer has no row for a
+    clear to wait on, so the two meet here. A version that a concurrent prune
+    deletes while this call waits on it is not read, so it is not reused.
     """
     sha256 = hashlib.sha256(text.encode("utf-8")).hexdigest()
     async with conn.transaction():
@@ -111,34 +122,45 @@ async def store_document_version(
             _VERSION_LOCK_NAMESPACE,
             _version_lock_key(layer_id, source_root, relative_path),
         )
-        while True:
-            latest = await conn.fetchrow(
+        # NO KEY: a receipt citing a version (FOR KEY SHARE) need not wait
+        versions = await conn.fetch(
+            """
+            SELECT id, version, sha256 FROM strata_vectors.documents
+            WHERE layer_id = $1 AND source_root = $2 AND relative_path = $3
+            ORDER BY id
+            FOR NO KEY UPDATE
+            """,
+            layer_id,
+            source_root,
+            relative_path,
+        )
+        latest = max(versions, key=lambda row: row["version"], default=None)
+        if latest is not None and latest["sha256"] == sha256:
+            await conn.execute(
                 """
-                SELECT id, version, sha256 FROM strata_vectors.documents
-                WHERE layer_id = $1 AND source_root = $2 AND relative_path = $3
-                ORDER BY version DESC LIMIT 1
+                UPDATE strata_vectors.documents
+                SET file_id = $2,
+                    doc_date = COALESCE($3::text, doc_date),
+                    doc_date_source = CASE WHEN $3::text IS NULL THEN doc_date_source
+                                           ELSE $4::text END,
+                    supersedes = $5
+                WHERE id = $1
                 """,
-                layer_id,
-                source_root,
-                relative_path,
-            )
-            if latest is None or latest["sha256"] != sha256:
-                break
-            # No row back: a prune deleted this version while we waited on it
-            if await conn.fetchval(
-                "UPDATE strata_vectors.documents SET file_id = $2 WHERE id = $1 RETURNING id",
                 latest["id"],
                 file_id,
-            ) is not None:
-                return latest["id"], latest["version"]
+                doc_date,
+                doc_date_source,
+                supersedes,
+            )
+            return latest["id"], latest["version"]
 
         version = 1 if latest is None else latest["version"] + 1
         document_id = await conn.fetchval(
             """
             INSERT INTO strata_vectors.documents
                 (layer_id, file_id, source_root, relative_path, version, text, sha256,
-                 page_map, text_origin)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                 page_map, text_origin, doc_date, doc_date_source, supersedes)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
             RETURNING id
             """,
             layer_id,
@@ -150,6 +172,9 @@ async def store_document_version(
             sha256,
             json.dumps(page_map) if page_map is not None else None,
             text_origin,
+            doc_date,
+            doc_date_source,
+            supersedes,
         )
     logger.info("document_version_stored", relative_path=relative_path, version=version)
     return document_id, version
@@ -197,6 +222,36 @@ class FileScope:
     relative_paths: Sequence[str]
 
 
+async def lock_file_rows(
+    conn: asyncpg.Connection,
+    layer_id: str | UUID | None,
+    *,
+    files: FileScope | None = None,
+) -> list[UUID]:
+    """Lock a layer's tracked file rows (or only those of files); return their ids.
+
+    Whoever removes files calls this before touching chunks: an ingest of a
+    file locks its row first and its chunks second, so that order is the same
+    everywhere, and the id order keeps removers apart from each other. A row
+    committed after this call is not locked, so delete by the ids returned.
+    No layer_id matches no row.
+    """
+    scope = ""
+    args: list = [layer_id]
+    if files is not None:
+        scope = "AND source_root = $2 AND relative_path = ANY($3::text[])"
+        args += [files.source_root, list(files.relative_paths)]
+    rows = await conn.fetch(
+        f"""
+        SELECT id FROM strata_core.ingested_files
+        WHERE layer_id = $1 {scope}
+        ORDER BY id FOR UPDATE
+        """,
+        *args,
+    )
+    return [row["id"] for row in rows]
+
+
 async def prune_documents(
     conn: asyncpg.Connection,
     layer_ids: Sequence[str | UUID],
@@ -209,8 +264,8 @@ async def prune_documents(
     only those files' versions, and layer_ids must then hold exactly one layer
     (a file belongs to one). Several layers are swept in one statement, so
     their versions are locked in one id order across layers, the order a
-    receipt locks the versions it cites (sweeping them one by one could
-    deadlock).
+    receipt locks the versions it cites and an ingest the versions of its file
+    (sweeping them one by one could deadlock).
 
     Two statements, because a lone DELETE that waits on an uncommitted
     reference still deletes once it commits: its checks keep the snapshot taken
@@ -258,26 +313,85 @@ async def prune_documents(
     return int(result.split()[-1])
 
 
+def _archived_spec(raw: object, layer_id: UUID) -> GitIgnoreSpec | None:
+    """A layer's archived files patterns, compiled; None when it has none or they are unusable.
+
+    A stored list may never have passed the validator (a restored backup), and
+    a pattern that cannot compile or that stalls would cost the whole citation.
+    The whole list is dropped, not the bad pattern: with last match wins,
+    dropping one changes what the others mean.
+    """
+    # Imported here: layers.py imports this module
+    from stratakb.knowledge.layers import LayerValidationError, _validate_archived_patterns
+
+    patterns = json.loads(raw) if isinstance(raw, str) else raw
+    if not patterns:
+        return None
+    try:
+        return GitIgnoreSpec.from_lines(_validate_archived_patterns(patterns))
+    except LayerValidationError:
+        logger.warning("archived_patterns_unusable", layer_id=str(layer_id))
+        return None
+
+
 async def fetch_cited_documents(
     conn: asyncpg.Connection, ends: dict[int, int]
 ) -> dict[int, dict]:
-    """Path, page map, text origin and text up to the given end of each cited document.
+    """Path, page map, text origin, date and text up to the given end of each cited document.
 
     ends maps a document id to the furthest char_end cited in it; only the
-    text before it is read, which is all locate() needs.
+    text before it is read, which is all locate() needs. replaced_by is the
+    path of the first file, by path, in the same layer and source root whose
+    latest version declares that it supersedes this one, or None. Older
+    versions keep their value and their file_id, so only the latest counts.
+    archived says the path matches its layer's archived files patterns. They
+    are read from the table on every call, not the routing cache, so a change
+    shows on the next ask, and they are not returned.
     """
     if not ends:
         return {}
     rows = await conn.fetch(
         """
-        SELECT d.id, d.relative_path, d.page_map, d.text_origin, left(d.text, x.max_end) AS text
+        SELECT d.id, d.layer_id, d.relative_path, d.page_map, d.text_origin,
+               d.doc_date, d.doc_date_source, kl.archived_patterns,
+               left(d.text, x.max_end) AS text,
+               (
+                   SELECT r.relative_path
+                   FROM strata_vectors.documents r
+                   WHERE r.layer_id = d.layer_id
+                     AND r.source_root = d.source_root
+                     AND r.supersedes = d.relative_path
+                     AND r.file_id IS NOT NULL
+                     AND r.version = (
+                         SELECT max(v.version) FROM strata_vectors.documents v
+                         WHERE v.layer_id = r.layer_id
+                           AND v.source_root = r.source_root
+                           AND v.relative_path = r.relative_path
+                     )
+                   ORDER BY r.relative_path
+                   LIMIT 1
+               ) AS replaced_by
         FROM strata_vectors.documents d
         JOIN unnest($1::bigint[], $2::int[]) AS x(id, max_end) ON x.id = d.id
+        JOIN strata_core.knowledge_layers kl ON kl.id = d.layer_id
         """,
         list(ends),
         list(ends.values()),
     )
-    return {row["id"]: dict(row) for row in rows}
+    documents: dict[int, dict] = {}
+    specs: dict[UUID, GitIgnoreSpec | None] = {}
+    for row in rows:
+        document = dict(row)
+        layer_id = document.pop("layer_id")
+        patterns = document.pop("archived_patterns")
+        if layer_id not in specs:
+            specs[layer_id] = _archived_spec(patterns, layer_id)
+        spec = specs[layer_id]
+        document["archived"] = (
+            spec is not None and spec.check_file(document["relative_path"]).include is True
+        )
+        documents[row["id"]] = document
+    return documents
 
 
 def locate(

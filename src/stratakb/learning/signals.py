@@ -10,7 +10,21 @@ import re
 
 import structlog
 
+from stratakb.learning.synonyms import content_terms
+
 logger = structlog.get_logger()
+
+# Below this share of content terms in common, two questions are a change of topic
+REFORMULATION_MIN_SIMILARITY = 0.3
+
+
+def content_similarity(a: str, b: str) -> float:
+    """Jaccard similarity of two questions' content terms; 0 if either has none."""
+    terms_a = set(content_terms(a))
+    terms_b = set(content_terms(b))
+    if not terms_a or not terms_b:
+        return 0.0
+    return len(terms_a & terms_b) / len(terms_a | terms_b)
 
 
 def detect_reformulation(
@@ -21,23 +35,18 @@ def detect_reformulation(
 ) -> list[dict]:
     """Detect if current query is a reformulation of the previous one.
 
-    Uses Jaccard token similarity (fallback when embeddings unavailable).
+    Uses Jaccard similarity on content terms (fallback when embeddings
+    unavailable), so shared function words alone never make a reformulation.
     """
     if time_delta_seconds > 60:
         return []
 
-    # Jaccard similarity on lowercased tokens
-    current_tokens = set(re.findall(r"\w+", current_query.lower()))
-    previous_tokens = set(re.findall(r"\w+", previous_query.lower()))
+    similarity = content_similarity(current_query, previous_query)
 
-    if not current_tokens or not previous_tokens:
-        return []
-
-    intersection = current_tokens & previous_tokens
-    union = current_tokens | previous_tokens
-    similarity = len(intersection) / len(union) if union else 0
-
-    if similarity >= 0.25 and current_query.lower() != previous_query.lower():
+    if (
+        similarity >= REFORMULATION_MIN_SIMILARITY
+        and current_query.lower() != previous_query.lower()
+    ):
         signals = [
             {
                 "signal_name": "reformulation",

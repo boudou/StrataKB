@@ -18,14 +18,18 @@ from uuid import uuid4
 import pytest
 
 from stratakb.rag.clause_lookup import (
+    ClauseMatches,
     Reference,
+    _exact_chunk,
     find_references,
+    fit_clauses,
     fit_to_budget,
+    max_exact_chars,
     question_pattern,
     unanchored,
     without_exact_spans,
 )
-from stratakb.rag.passages import passage_cost
+from stratakb.rag.passages import pack_passages, passage_cost
 from stratakb.rag.retriever import SearchResult
 from tests.helpers import ingest
 
@@ -168,6 +172,40 @@ def test_fit_to_budget_keeps_offsets():
     assert not trimmed["content"].endswith((" ", "wor"))
     assert trimmed["cut"] is True
     assert fit_to_budget(_exact("short"), budget)["content"] == "short"
+
+
+def test_max_exact_chars():
+    assert max_exact_chars(1500) == 6000
+    assert max_exact_chars(10) == 200
+
+
+def test_fit_clauses_shares_what_a_floor_leaves():
+    text = "word " * 400
+    chunks = [_exact(text) | {"clause_path": "x" * 400}, _exact(text, 3000), _exact(text, 6000)]
+    budget = 600
+
+    even = [fit_to_budget(c, budget // 3) for c in chunks]
+    assert passage_cost(even[0]) > budget // 3
+    assert len(pack_passages(even, budget)) == 2
+
+    assert len(pack_passages(fit_clauses(chunks, budget), budget)) == 3
+
+
+def test_fit_clauses_drops_nothing():
+    text = "word " * 400
+    chunks = [_exact(text, start) for start in (0, 3000, 6000)]
+
+    fitted = fit_clauses(chunks, 10)
+
+    assert [c["char_start"] for c in fitted] == [0, 3000, 6000]
+    assert all(len(c["content"]) <= 200 and c["cut"] for c in fitted)
+
+
+def test_short_clause_over_its_share_is_not_marked_cut():
+    chunk = fit_to_budget(_exact("short"), 1)
+
+    assert chunk["content"] == "short"
+    assert "cut" not in chunk
 
 
 def test_chunks_inside_an_exact_span_are_dropped():
@@ -406,6 +444,156 @@ class TestAskClause:
         assert first["ref"] == f"d{doc['id']}:{start}-{start + len(first['text'])}"
         assert len(first["text"]) < len("2. Termination\n\n2.1 Notice") + 200
 
+    async def test_cut_clause_is_partly_found(self, server, settings, layers):
+        layer, _ = layers
+        settings.answer_token_budget = 120
+
+        response, _ = await _call(
+            server, "strata_ask", [], question="clause 2", layers=[layer],
+        )
+
+        assert response["status"] == "partly_found"
+        assert response["mode"] == "grounded"
+        assert response["note"].startswith("2 Termination is only partly returned")
+        assert "contract.md" in response["note"]
+        assert response["next_step"]
+        assert "cut" not in response["passages"][0]
+
+        detailed, _ = await _call(
+            server, "strata_ask", [], question="clause 2", layers=[layer],
+            response_format="detailed",
+        )
+
+        assert detailed["status"] == "ok"
+        assert detailed["answer_status"] == "partly_found"
+        assert detailed["note"] == response["note"]
+
+    async def test_whole_clause_stays_found(self, server, settings, layers):
+        layer, _ = layers
+
+        response, _ = await _call(
+            server, "strata_ask", [], question="clause 2.2", layers=[layer],
+        )
+
+        assert response["status"] == "found"
+        assert "note" not in response
+
+    async def test_long_clause_ref_verifies(self, server, settings, layers):
+        # Clause 2.2 is wider than twice the layer's chunk_size (400)
+        layer, _ = layers
+
+        response, _ = await _call(
+            server, "strata_ask", [], question="clause 2.2", layers=[layer],
+        )
+
+        ref = response["passages"][0]["ref"]
+        start, end = (int(n) for n in ref.split(":")[1].split("-"))
+        assert end - start > 400
+        draft = '"Either party may terminate this agreement with immediate effect" [S1].'
+        result = _payload(
+            await server.call_tool("strata_verify", {"draft": draft, "passages": [ref]})
+        )
+        assert result["result"] == "verified", result
+        assert result["receipt_id"]
+
+    async def test_cut_clause_ref_verifies(self, server, settings, layers):
+        layer, _ = layers
+        settings.answer_token_budget = 120
+
+        response, _ = await _call(
+            server, "strata_ask", [], question="clause 2", layers=[layer],
+        )
+
+        ref = response["passages"][0]["ref"]
+        draft = '"Either party may terminate this agreement by written notice" [S1].'
+        result = _payload(
+            await server.call_tool("strata_verify", {"draft": draft, "passages": [ref]})
+        )
+        assert result["result"] == "verified", result
+        assert result["receipt_id"]
+
+    async def test_each_cut_clause_names_its_file(self, server, settings, layers):
+        _, layer = layers
+        settings.answer_token_budget = 400
+
+        response, _ = await _call(
+            server, "strata_ask", [], question="clause 2", layers=[layer],
+        )
+
+        assert response["status"] == "partly_found"
+        assert len(response["passages"]) == 2
+        assert "acme.md" in response["note"]
+        assert "globex.md" in response["note"]
+
+    async def test_clause_over_the_budget_is_named(self, server, settings, layers):
+        _, layer = layers
+        settings.answer_token_budget = 150
+
+        response, _ = await _call(
+            server, "strata_ask", [], question="clause 2", layers=[layer],
+        )
+
+        assert response["status"] == "partly_found"
+        assert [p["citation"]["file"] for p in response["passages"]] == ["acme.md"]
+        assert "1 named clause left out" in response["note"]
+        assert "globex.md" in response["note"]
+
+        detailed, _ = await _call(
+            server, "strata_ask", [], question="clause 2", layers=[layer],
+            response_format="detailed",
+        )
+
+        assert detailed["answer_status"] == "partly_found"
+        assert detailed["note"] == response["note"]
+
+    async def test_matches_past_the_cap_are_noted(self, server, settings, layers):
+        layer, _ = layers
+        doc = await _document(settings.database_url, layer, "contract.md")
+        chunk = _exact_chunk(
+            {
+                "layer_name": layer, "source_file": "contract.md", "path": "7 X",
+                "doc_type": "markdown", "document_id": doc["id"], "char_start": 0,
+            },
+            doc["text"][:40],
+        )
+
+        with patch(
+            "stratakb.rag.tools._exact_clauses",
+            AsyncMock(return_value=ClauseMatches([chunk], unread=3)),
+        ):
+            response, _ = await _call(
+                server, "strata_ask", [], question="clause 2", layers=[layer],
+            )
+            detailed, _ = await _call(
+                server, "strata_ask", [], question="clause 2", layers=[layer],
+                response_format="detailed",
+            )
+
+        assert response["status"] == "partly_found"
+        assert "More documents match than were read" in response["note"]
+        assert "3 more matching sections" in response["note"]
+        assert detailed["answer_status"] == "partly_found"
+        assert detailed["note"] == response["note"]
+
+    async def test_search_keeps_a_clause_over_the_budget(self, server, settings, layers):
+        _, layer = layers
+        settings.answer_token_budget = 150
+
+        response, _ = await _call(
+            server, "strata_search", [], query="clause 2", layers=[layer],
+        )
+
+        exact = [r for r in response["results"] if r.get("match") == "exact"]
+        assert [r["source_file"] for r in exact] == ["acme.md", "globex.md"]
+
+
+async def test_cut_clause_rule_in_the_contract(server):
+    assert "cut true" in server.instructions
+    assert "or not at all" in server.instructions
+    assert len(server.instructions) <= 4000
+    prompt = await server.get_prompt("answer_from_documents", {"question": "q"})
+    assert "cut true" in prompt.messages[0].content.text
+
 
 async def test_resolve_caps_a_label_many_documents_share(settings, tmp_path):
     from stratakb.knowledge.layers import LayerNotFoundError, delete_layer
@@ -419,9 +607,12 @@ async def test_resolve_caps_a_label_many_documents_share(settings, tmp_path):
     try:
         await _ingest_ok(db_url, layer, tmp_path)
 
-        chunks = await resolve(db_url, find_references("clause 2.2"), [layer])
+        matches = await resolve(db_url, find_references("clause 2.2"), [layer])
+        chunks = matches.chunks
 
         assert len(chunks) == MAX_EXACT_MATCHES
+        assert matches.unread == 3
+        assert matches.unread_is_minimum is False
         assert [c["source_file"] for c in chunks] == names[:MAX_EXACT_MATCHES]
         assert {c["clause_path"] for c in chunks} == {CLAUSE_PATH}
         assert all(c["match"] == "exact" and c["content"] for c in chunks)
@@ -430,8 +621,29 @@ async def test_resolve_caps_a_label_many_documents_share(settings, tmp_path):
             await delete_layer(db_url, name=layer)
 
 
+async def test_resolve_says_when_the_count_stopped(settings, tmp_path, monkeypatch):
+    from stratakb.knowledge.layers import LayerNotFoundError, delete_layer
+    from stratakb.rag import clause_lookup
+
+    monkeypatch.setattr(clause_lookup, "_MAX_CANDIDATE_SECTIONS", 12)
+    db_url = settings.database_url
+    layer = await _make_layer(db_url)
+    for i in range(13):
+        shutil.copy(FIXTURES / "contract.md", tmp_path / f"doc{i:02d}.md")
+    try:
+        await _ingest_ok(db_url, layer, tmp_path)
+
+        matches = await clause_lookup.resolve(db_url, find_references("clause 2.2"), [layer])
+
+        assert len(matches.chunks) == clause_lookup.MAX_EXACT_MATCHES
+        assert matches.unread == 2
+        assert matches.unread_is_minimum is True
+    finally:
+        with contextlib.suppress(LayerNotFoundError):
+            await delete_layer(db_url, name=layer)
+
+
 def test_exact_chunk_has_the_ask_chunk_shape():
-    from stratakb.rag.clause_lookup import _exact_chunk
     from stratakb.rag.tools import _ask_chunk
 
     row = {
@@ -531,6 +743,27 @@ class TestSearchClause:
         assert "match" not in second
         assert response["total"] == 2
         assert audit.await_args.kwargs["parameters"]["exact_matches"] == 1
+
+    async def test_cut_clause_is_marked(self, server, settings, layers):
+        layer, _ = layers
+        settings.answer_token_budget = 120
+
+        response, _ = await _call(
+            server, "strata_search", [_retrieved(layer)],
+            query="clause 2", layers=[layer],
+        )
+
+        assert response["status"] == "ok"
+        first, second = response["results"]
+        assert first["cut"] is True
+        assert "cut" not in second
+
+        settings.answer_token_budget = 1500
+        response, _ = await _call(
+            server, "strata_search", [], query="clause 2.2", layers=[layer],
+        )
+
+        assert "cut" not in response["results"][0]
 
     async def test_unknown_reference_is_plain_search(self, server, settings, layers):
         layer, _ = layers

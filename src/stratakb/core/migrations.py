@@ -19,7 +19,8 @@ from pathlib import Path
 import asyncpg
 import structlog
 
-from stratakb.core.database import connect_once, url_host_port
+from stratakb.core.database import connect_once
+from stratakb.core.urls import url_host_port
 
 logger = structlog.get_logger()
 
@@ -307,6 +308,42 @@ MIGRATIONS: list[Migration] = [
             WHERE table_schema = 'strata_learning'
               AND table_name = 'interaction_events'
               AND column_name = 'query_embedding'
+        )
+        """,
+    ),
+    Migration(
+        14,
+        "14_document_dates.sql",
+        """
+        SELECT EXISTS (
+            SELECT 1 FROM information_schema.columns
+            WHERE table_schema = 'strata_vectors'
+              AND table_name = 'documents'
+              AND column_name = 'doc_date_source'
+        )
+        """,
+    ),
+    Migration(
+        15,
+        "15_supersedes.sql",
+        """
+        SELECT EXISTS (
+            SELECT 1 FROM information_schema.columns
+            WHERE table_schema = 'strata_vectors'
+              AND table_name = 'documents'
+              AND column_name = 'supersedes'
+        )
+        """,
+    ),
+    Migration(
+        16,
+        "16_archived_patterns.sql",
+        """
+        SELECT EXISTS (
+            SELECT 1 FROM information_schema.columns
+            WHERE table_schema = 'strata_core'
+              AND table_name = 'knowledge_layers'
+              AND column_name = 'archived_patterns'
         )
         """,
     ),

@@ -24,8 +24,9 @@ TIMEOUT = 30
 
 
 class _Server:
-    def __init__(self):
-        env = {
+    def __init__(self, env: dict[str, str | None] | None = None):
+        """Start the server; `env` goes over the defaults, and None removes a variable."""
+        child_env = {
             **os.environ,
             "STRATA_ROLE": "admin",
             # Nothing listens here: the protocol must not need the database
@@ -37,12 +38,13 @@ class _Server:
             "EMBEDDING_MODEL": "smoke-test",
             "HF_HUB_OFFLINE": "1",
             "PYTHONUNBUFFERED": "1",
+            "READONLY_DATABASE_URL": None,
+            **(env or {}),
         }
-        env.pop("READONLY_DATABASE_URL", None)
         self.proc = subprocess.Popen(
             [sys.executable, "-m", "stratakb"],
             cwd=REPO,
-            env=env,
+            env={k: v for k, v in child_env.items() if v is not None},
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
@@ -148,3 +150,48 @@ def test_stdio_session_carries_only_json_rpc():
         except json.JSONDecodeError:
             pytest.fail(f"stdout carries a line that is not JSON-RPC: {line!r}")
         assert message.get("jsonrpc") == "2.0", f"not a JSON-RPC message: {line!r}"
+
+
+@pytest.mark.parametrize(("first", "second"), [("admin", "viewer"), ("viewer", "admin")])
+def test_config_edit_does_not_change_the_identity(tmp_path, first, second):
+    config = tmp_path / "c.env"
+    config.write_text(f"STRATA_USER=u1\nSTRATA_ROLE={first}\n", encoding="utf-8")
+    # Environment beats files: with these set, the edit would do nothing
+    server = _Server(env={"STRATAKB_CONFIG": str(config), "STRATA_ROLE": None, "STRATA_USER": None})
+
+    def dry_run(request_id: int) -> dict:
+        server.send({
+            "id": request_id,
+            "method": "tools/call",
+            "params": {
+                "name": "strata_apply_preset",
+                "arguments": {"preset_path": str(SEPA_PRESET), "dry_run": True},
+            },
+        })
+        return server.reply(request_id)["result"]
+
+    def assert_started_identity(call: dict):
+        if first == "admin":
+            assert not call.get("isError"), call
+        else:
+            assert call.get("isError"), call
+            assert "user 'u1' has role 'viewer'" in call["content"][0]["text"]
+
+    try:
+        server.send({
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-06-18",
+                "capabilities": {},
+                "clientInfo": {"name": "smoke-test", "version": "0"},
+            },
+        })
+        server.reply(1)
+        server.send({"method": "notifications/initialized"})
+
+        assert_started_identity(dry_run(2))
+        config.write_text(f"STRATA_USER=u2\nSTRATA_ROLE={second}\n", encoding="utf-8")
+        assert_started_identity(dry_run(3))
+    finally:
+        server.close()

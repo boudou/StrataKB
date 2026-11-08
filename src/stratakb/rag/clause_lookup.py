@@ -15,12 +15,14 @@ Lookup reads plain indexed columns (the label index), no full-text search.
 
 from __future__ import annotations
 
+import functools
 import re
 from collections.abc import Iterable, Sequence
 from typing import Any, NamedTuple
 
 import structlog
 
+from stratakb.knowledge.pattern_safety import pattern_problem
 from stratakb.knowledge.structure import normalise_label
 from stratakb.rag.layer_detect import pattern_text
 from stratakb.rag.passages import ask_chunk, passage_cost
@@ -63,6 +65,15 @@ class Reference(NamedTuple):
 
     text: str
     labels: tuple[str, ...]
+
+
+class ClauseMatches(NamedTuple):
+    """The chunks a lookup returns, and the matching sections it did not read."""
+
+    chunks: list[dict[str, Any]]
+    unread: int = 0
+    # The candidate limit stopped the count, so more than unread may match
+    unread_is_minimum: bool = False
 
 
 def _keyword_labels(keyword: str, number: str) -> tuple[str, ...]:
@@ -138,12 +149,27 @@ def question_pattern(pattern: str) -> str:
     return rf"{flags}(?<!\w){group}(?!\w)"
 
 
-def _compile_for_questions(pattern: str) -> re.Pattern[str]:
-    try:
-        return re.compile(question_pattern(pattern))
-    except re.error:
-        # The label group alone does not compile (it refers to another group)
-        return re.compile(unanchored(pattern))
+@functools.lru_cache(maxsize=256)
+def _question_regex(pattern: str) -> re.Pattern[str] | None:
+    """question_pattern(pattern) compiled, or None when the stored pattern
+    must not run (it does not compile or it repeats a repeated part)."""
+    # Check the stored pattern and the question form: an unsafe part outside
+    # the label group would not show in the label group alone, and text that
+    # only looks like the label group ('[(?P<label>(a+)+)]' is a character
+    # class) is safe as stored but not once cut out
+    problem = pattern_problem(pattern, line_starts=True)
+    if problem is None:
+        try:
+            regex = question_pattern(pattern)
+            re.compile(regex)
+        except re.error:
+            # The label group alone does not compile (it refers to another group)
+            regex = unanchored(pattern)
+        problem = pattern_problem(regex)
+    if problem is not None:
+        logger.warning("unsafe_structure_pattern", pattern=pattern, reason=problem)
+        return None
+    return re.compile(regex)
 
 
 def find_references(
@@ -153,8 +179,10 @@ def find_references(
 
     extra_patterns are a layer's structure patterns (a named group 'label'
     gives the label, as in structure.detect_sections); each match of
-    question_pattern anywhere in the question is a reference. Only the first
-    MAX_PATTERN_QUESTION_CHARS characters of the question are read.
+    question_pattern anywhere in the question is a reference. A stored
+    pattern that does not compile or repeats a repeated part is skipped (it
+    reached the layer some other way than its validated writes). Only the
+    first MAX_PATTERN_QUESTION_CHARS characters of the question are read.
     """
     question = pattern_text(question)
     found: list[tuple[int, Reference]] = []
@@ -171,7 +199,14 @@ def find_references(
         found.append((m.start(), Reference(m.group(0), (normalise_label(m.group(1)),))))
 
     for pattern in extra_patterns:
-        compiled = _compile_for_questions(pattern) if isinstance(pattern, str) else pattern
+        if isinstance(pattern, str):
+            compiled = _question_regex(pattern)
+        elif hasattr(pattern, "finditer"):
+            compiled = pattern
+        else:
+            compiled = None
+        if compiled is None:
+            continue
         for m in compiled.finditer(question):
             if not m.group(0):
                 continue
@@ -189,7 +224,7 @@ def find_references(
 
 async def resolve(
     database_url: str, references: Sequence[Reference], layers: list[str] | None
-) -> list[dict[str, Any]]:
+) -> ClauseMatches:
     """The stored sections the references name, as exact chunks.
 
     Only current documents count (those that still have chunks; an older
@@ -197,7 +232,7 @@ async def resolve(
     The chunks follow the references' order, then the file path; a section
     inside another one returned is left out, as its text is already there.
     At most _MAX_CANDIDATE_SECTIONS sections are read, and the text of at
-    most MAX_EXACT_MATCHES.
+    most MAX_EXACT_MATCHES; the sections past that are counted as unread.
     """
     # Each label ranks by the first reference that names it
     ranks: dict[str, int] = {}
@@ -205,7 +240,7 @@ async def resolve(
         for label in ref.labels:
             ranks.setdefault(label, rank)
     if not ranks:
-        return []
+        return ClauseMatches([])
     from stratakb.core.database import get_pool
 
     pool = await get_pool(database_url)
@@ -248,9 +283,11 @@ async def resolve(
         )
         if not inside:
             kept.append(row)
+    unread = max(len(kept) - MAX_EXACT_MATCHES, 0)
+    unread_is_minimum = len(rows) == _MAX_CANDIDATE_SECTIONS
     kept = kept[:MAX_EXACT_MATCHES]
     if not kept:
-        return []
+        return ClauseMatches([])
 
     text_rows = await pool.fetch(
         """
@@ -267,7 +304,7 @@ async def resolve(
         text = (texts.get(row["id"]) or "").rstrip()
         if text:
             chunks.append(_exact_chunk(row, text))
-    return chunks
+    return ClauseMatches(chunks, unread, unread_is_minimum)
 
 
 def _exact_chunk(row: Any, text: str) -> dict[str, Any]:
@@ -295,12 +332,15 @@ def fit_to_budget(chunk: dict[str, Any], budget: int) -> dict[str, Any]:
     """chunk, its text cut at a word so its passage fits budget tokens.
 
     The cut text is still the document's text from char_start, and char_end
-    moves with it; "cut" marks the chunk, so an extractive answer can say part of
-    the clause is missing. At least _MIN_TRIMMED_CHARS characters are kept.
+    moves with it; "cut" marks a chunk that lost text, so both answer modes can
+    say part of the clause is missing. At least _MIN_TRIMMED_CHARS characters are
+    kept, so a clause no longer than that comes back whole and unmarked.
     """
     if passage_cost(chunk) <= budget:
         return chunk
     content = chunk["content"]
+    if len(content) <= _MIN_TRIMMED_CHARS:
+        return chunk
     cut = len(content)
     while cut > _MIN_TRIMMED_CHARS:
         cut = max(int(cut * 0.9), _MIN_TRIMMED_CHARS)
@@ -320,30 +360,51 @@ def fit_to_budget(chunk: dict[str, Any], budget: int) -> dict[str, Any]:
     }
 
 
+def max_exact_chars(budget: int) -> int:
+    """The widest exact passage, in characters, that fit_to_budget returns for budget tokens.
+
+    estimate_tokens counts about four characters per token.
+    """
+    return max(4 * budget, _MIN_TRIMMED_CHARS)
+
+
+def fit_clauses(chunks: list[dict[str, Any]], budget: int) -> list[dict[str, Any]]:
+    """Each chunk fit to the budget left, divided by the chunks still to fit, in order.
+
+    A chunk's floor (fit_to_budget) can pass its share, and the later ones then
+    share what is left. None is dropped, even when nothing is left: each of
+    those comes back at its floor, and packing decides what fits.
+    """
+    fitted: list[dict[str, Any]] = []
+    remaining = budget
+    for i, chunk in enumerate(chunks):
+        piece = fit_to_budget(chunk, max(remaining // (len(chunks) - i), 1))
+        fitted.append(piece)
+        remaining -= passage_cost(piece)
+    return fitted
+
+
 async def lookup(
     database_url: str,
     question: str,
     layers: list[str] | None,
     budget: int,
     extra_patterns: Iterable[str | re.Pattern[str]] = (),
-) -> list[dict[str, Any]]:
+) -> ClauseMatches:
     """The exact chunks for the references in question, each fit to its share of budget.
 
-    Returns [] when the question names no section, none resolves, or the
-    lookup fails; retrieval then runs as usual.
+    The chunks are empty when the question names no section, none resolves, or
+    the lookup fails; retrieval then runs as usual.
     """
     references = find_references(question, extra_patterns)
     if not references:
-        return []
+        return ClauseMatches([])
     try:
-        chunks = await resolve(database_url, references, layers)
+        matches = await resolve(database_url, references, layers)
     except Exception as e:
         logger.warning("clause_lookup_failed", error_type=type(e).__name__)
-        return []
-    if not chunks:
-        return []
-    share = max(budget // len(chunks), 1)
-    return [fit_to_budget(c, share) for c in chunks]
+        return ClauseMatches([])
+    return matches._replace(chunks=fit_clauses(matches.chunks, budget))
 
 
 def in_exact_span(

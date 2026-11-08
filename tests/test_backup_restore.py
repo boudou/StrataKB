@@ -124,7 +124,7 @@ def _recording_psql(monkeypatch, stdout=b"", code=0):
     return calls
 
 
-@pytest.mark.parametrize("header", [b"-- Format: 3", b"-- Format: three"])
+@pytest.mark.parametrize("header", [b"-- Format: 6", b"-- Format: three"])
 def test_import_refuses_a_format_it_cannot_read(tmp_path, monkeypatch, capsys, header):
     calls = _recording_psql(monkeypatch)
     data = b"-- StrataKB Layer Export\n" + header + b"\n-- Layer: x\nBEGIN;\nCOMMIT;\n"
@@ -135,7 +135,29 @@ def test_import_refuses_a_format_it_cannot_read(tmp_path, monkeypatch, capsys, h
     out = capsys.readouterr()
     assert "older version" not in out.out
     assert "Import failed: nothing was changed." in out.err
-    assert ("export format 3" in out.err) if header.endswith(b"3") else ("format" in out.err)
+    assert ("export format 6" in out.err) if header.endswith(b"6") else ("format" in out.err)
+
+
+def test_import_still_reads_format_2(tmp_path):
+    # A format 2 file names its own columns, so its documents import with no date
+    data = b"-- StrataKB Layer Export\n-- Format: 2\n-- Layer: x\nBEGIN;\nCOMMIT;\n"
+    assert br._readable_format(tmp_path / "layer.sql.gz", data) == 2
+
+
+def test_import_still_reads_format_3(tmp_path):
+    # A format 3 file names its own columns, so its documents import declaring nothing
+    data = b"-- StrataKB Layer Export\n-- Format: 3\n-- Layer: x\nBEGIN;\nCOMMIT;\n"
+    assert br._readable_format(tmp_path / "layer.sql.gz", data) == 3
+
+
+def test_import_still_reads_format_4(tmp_path):
+    # A format 4 file names its own columns, so its layer imports with no archived files patterns
+    data = b"-- StrataKB Layer Export\n-- Format: 4\n-- Layer: x\nBEGIN;\nCOMMIT;\n"
+    assert br._readable_format(tmp_path / "layer.sql.gz", data) == 4
+
+
+def test_export_states_the_current_format():
+    assert br.export_format(_export_file()) == br.EXPORT_FORMAT == 5
 
 
 def test_import_names_the_layer_holding_the_root(tmp_path, monkeypatch, capsys):
@@ -256,7 +278,8 @@ async def _snapshot(conn, layer: str) -> dict:
         "SELECT * FROM strata_core.knowledge_layers WHERE name = $1", layer)
     lid = layer_row["id"]
     doc_key = ("d.source_root, d.relative_path, d.version, d.sha256, d.text, d.file_id, "
-               "d.page_map, d.text_origin, d.ingested_at")
+               "d.page_map, d.text_origin, d.ingested_at, d.supersedes, d.doc_date, "
+               "d.doc_date_source")
     return {
         "layer": dict(layer_row),
         "runs": [dict(r) for r in await conn.fetch(
@@ -293,12 +316,19 @@ async def test_round_trip_keeps_tracking_and_text(folder_db_url, tmp_path, clean
     try:
         await conn.execute(
             "UPDATE strata_core.knowledge_layers SET answer_mode = 'extractive', "
-            "structure_patterns = '[\"^(?P<label>AT-\\\\d{2})\"]' WHERE name = $1",
+            "structure_patterns = '[\"^(?P<label>AT-\\\\d{2})\"]', "
+            "archived_patterns = '[\"archive/\", \"\\\\#old.md\"]' WHERE name = $1",
+            name)
+        await conn.execute(
+            "UPDATE strata_vectors.documents SET supersedes = 'old.md' WHERE layer_id = "
+            "(SELECT id FROM strata_core.knowledge_layers WHERE name = $1)",
             name)
         before = await _snapshot(conn, name)
+        assert all(d[9] == "old.md" for d in before["documents"])
         assert before["layer"]["origin"] == "folder" and before["layer"]["root_path"]
         assert len(before["files"]) == 3 and before["documents"] and before["sections"]
         assert all(c[10] is not None and c[14] is not None for c in before["chunks"])
+        assert all(d[-2] and d[-1] == "file" for d in before["documents"])
         data = await _export(conn, name)
         await delete_layer(folder_db_url, name=name)
         await _apply(conn, data)
@@ -309,6 +339,7 @@ async def test_round_trip_keeps_tracking_and_text(folder_db_url, tmp_path, clean
     assert after == before
     assert after["layer"]["answer_mode"] == "extractive"
     assert json.loads(after["layer"]["structure_patterns"]) == ["^(?P<label>AT-\\d{2})"]
+    assert json.loads(after["layer"]["archived_patterns"]) == ["archive/", "\\#old.md"]
 
     p = await add_folder.plan(folder_db_url, root, Options(name=name))
     assert p.action == "sync"
@@ -319,6 +350,72 @@ async def test_round_trip_keeps_tracking_and_text(folder_db_url, tmp_path, clean
         )
     embed.assert_not_called()
     assert report.counts["unchanged"] == 3
+
+
+async def test_format_2_import_has_no_dates_until_the_next_add(
+    folder_db_url, tmp_path, cleanup, monkeypatch
+):
+    from stratakb.knowledge.layers import delete_layer
+
+    root = docs_folder(tmp_path)
+    name = unique_layer_name()
+    cleanup.append(name)
+    await _add(folder_db_url, root, name)
+
+    old_documents = br.DOCUMENTS._replace(
+        columns=tuple(
+            c for c in br.DOCUMENTS.columns if not c.startswith("doc_date") and c != "supersedes"
+        )
+    )
+    monkeypatch.setattr(br, "DOCUMENTS", old_documents)
+    monkeypatch.setattr(
+        br, "EXPORT_TABLES", (br.LAYERS, br.RUNS, br.FILES, old_documents, br.SECTIONS, br.CHUNKS)
+    )
+
+    conn = await asyncpg.connect(folder_db_url)
+    try:
+        data = await _export(conn, name)
+        await delete_layer(folder_db_url, name=name)
+        await _apply(conn, data)
+        imported = await _snapshot(conn, name)
+        assert imported["documents"] and all(d[-2:] == (None, None) for d in imported["documents"])
+
+        await _assert_folder_unchanged(folder_db_url, root, name)
+        added_again = await _snapshot(conn, name)
+    finally:
+        await conn.close()
+    assert all(d[-1] == "file" and d[-2] for d in added_again["documents"])
+
+
+async def test_format_3_import_declares_nothing(folder_db_url, tmp_path, cleanup, monkeypatch):
+    from stratakb.knowledge.layers import delete_layer
+
+    root = docs_folder(tmp_path)
+    name = unique_layer_name()
+    cleanup.append(name)
+    await _add(folder_db_url, root, name)
+
+    old_documents = br.DOCUMENTS._replace(
+        columns=tuple(c for c in br.DOCUMENTS.columns if c != "supersedes")
+    )
+    monkeypatch.setattr(br, "DOCUMENTS", old_documents)
+    monkeypatch.setattr(
+        br, "EXPORT_TABLES", (br.LAYERS, br.RUNS, br.FILES, old_documents, br.SECTIONS, br.CHUNKS)
+    )
+
+    conn = await asyncpg.connect(folder_db_url)
+    try:
+        await conn.execute(
+            "UPDATE strata_vectors.documents SET supersedes = 'old.md' WHERE layer_id = "
+            "(SELECT id FROM strata_core.knowledge_layers WHERE name = $1)",
+            name)
+        data = await _export(conn, name)
+        await delete_layer(folder_db_url, name=name)
+        await _apply(conn, data)
+        imported = await _snapshot(conn, name)
+    finally:
+        await conn.close()
+    assert imported["documents"] and all(d[9] is None for d in imported["documents"])
 
 
 async def test_import_remaps_colliding_document_ids(folder_db_url, tmp_path, cleanup):

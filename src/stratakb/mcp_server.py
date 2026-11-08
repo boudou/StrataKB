@@ -23,7 +23,7 @@ from pydantic import Field
 # made while a test patches stratakb.config.get_settings keeps the mock for good
 from stratakb.config import Settings, config_file_missing, dotenv_warning
 from stratakb.core.audit import query_audit_log, write_audit_log
-from stratakb.core.auth import require_role
+from stratakb.core.auth import require_role, set_server_identity
 from stratakb.core.database import check_connection, close_pool, get_pool
 from stratakb.core.egress import enforce_local_only, outbound_providers
 from stratakb.core.local_db import START_HINT
@@ -155,16 +155,36 @@ def _preload_embedding_model_sync(model_name: str) -> None:
 # The answer contract: the instructions and the prompt both list these rules
 _ANSWER_CONTRACT = (
     "Answer only from the passages strata_ask returns, never from your own knowledge.",
-    'Cite every claim by passage id, as [S1]; write a quote as "..." [S1].',
+    'Cite every claim by passage id, as [S1], in the sentence that makes it; write a quote as '
+    '"..." [S1]. '
+    "A sentence's numbers, dates, amounts, codes and clause numbers are checked against only the "
+    "passages it cites.",
     "Copy numbers, dates, amounts, codes and clause numbers verbatim.",
     "Follow the mode in the response. In grounded mode write the answer, then call strata_verify "
     "before showing it, with the draft and every returned passage's ref in order (the first is "
     "S1). When the result is flagged, fix or drop the flagged claims and verify again. A flag of "
-    "kind passage cannot be fixed by rewriting: say the answer is unverified.",
+    "kind passage is about a ref, not the draft: pass the refs exactly as strata_ask returned them "
+    "and verify again, and if it stays, say the answer is unverified. When the result is "
+    "nothing_checked, the draft has no quote or fact to check and no receipt: quote the passage "
+    "that supports it and verify again, or say the answer is unverified.",
     "In extractive mode show answer verbatim, each sentence with its citation, and any note or "
     "warning.",
     "Always show the receipt id when there is one: receipt_id from strata_verify, or from "
     "strata_ask in extractive mode. strata_get_receipt opens it.",
+    "Each citation's date shows which document is newer: date_source says if it came from the "
+    "document's front matter or the file's modification time, which can be a checkout or a copy. "
+    "A date does not show that documents conflict. Give it beside the answer, not in the draft "
+    "you verify: strata_verify checks only passage text.",
+    "A citation's replaced_by names the file that says it replaces this one. Tell the reader, and "
+    "give it beside the answer, not in the draft you verify. It is only what a document declares: "
+    "no label does not mean a passage is current.",
+    "A citation with archived true is a file its layer's patterns mark as archived. Tell the "
+    "reader, and give it beside the answer, not in the draft you verify. It does not say what "
+    "replaces the file, and no label does not mean a passage is current.",
+    "When strata_ask in grounded mode returns a note, or a strata_search result has cut true, a "
+    "clause the question names came back only in part or not at all, or a name it asks about "
+    "is in no passage; what is missing can reverse what is there. Tell the reader what the note "
+    "names, beside the answer, not in the draft you verify.",
     'When status is not_found, say "not in the documents" and give next_step, even if passages '
     "came back. When it is partly_found, answer what the passages support and say what they "
     "leave open. When it is error, report the error.",
@@ -196,7 +216,7 @@ def build_server(settings: Settings) -> FastMCP:
         mcp, settings.database_url, settings.openai_api_key, settings=settings
     )
     register_receipt_tools(mcp, settings.database_url)
-    register_verify_tools(mcp, settings.database_url)
+    register_verify_tools(mcp, settings.database_url, settings=settings)
     register_database_tools(mcp, settings.database_url, settings.readonly_database_url)
     register_learning_tools(mcp, settings.database_url)
     _register_admin_tools(mcp, settings)
@@ -421,6 +441,9 @@ def main(settings: Settings | None = None) -> None:
 
     # Before anything imports huggingface_hub, which reads its offline flags once
     enforce_local_only(settings)
+
+    # One server, one identity: role checks and the audit log keep this pair
+    set_server_identity(settings.strata_user, settings.strata_role)
 
     logger.info(
         "starting_stratakb",

@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import gzip
+import json
 import os
 import re
 import subprocess
@@ -34,6 +35,7 @@ from pathlib import Path
 from typing import NamedTuple, NoReturn
 
 from stratakb.knowledge.layers import LAYER_COLUMN_NAMES
+from stratakb.knowledge.pattern_safety import pattern_problem
 
 ROOT = Path(__file__).parent.parent
 BACKUP_DIR = ROOT / "backups"
@@ -181,7 +183,7 @@ def cmd_stats(args):
 
 # ── export-layer ──────────────────────────────────────────────────────
 
-EXPORT_FORMAT = 2
+EXPORT_FORMAT = 5
 
 
 class ExportTable(NamedTuple):
@@ -212,7 +214,8 @@ FILES = ExportTable(
 DOCUMENTS = ExportTable(
     "strata_vectors.documents",
     ("id", "layer_id", "file_id", "source_root", "relative_path", "version", "text",
-     "sha256", "page_map", "text_origin", "ingested_at"),
+     "sha256", "page_map", "text_origin", "ingested_at", "doc_date", "doc_date_source",
+     "supersedes"),
     "layer_id = {layer_id}")
 SECTIONS = ExportTable(
     "strata_vectors.document_sections",
@@ -518,6 +521,50 @@ def _with_new_root(sql: bytes, root: str) -> bytes:
             + sql[end:-len(tail)] + serialize_steps(statements) + tail)
 
 
+# The layer columns holding regular expressions, and whether each marks line starts
+_PATTERN_COLUMNS = {"routing_patterns": False, "structure_patterns": True}
+
+
+def _with_safe_patterns(sql: bytes) -> bytes:
+    """The export file without the layer patterns the server refuses to run.
+
+    Every other write path refuses a pattern that does not compile or repeats
+    a repeated part; an older export may still hold one. Each dropped pattern
+    is named. The file comes back unchanged when nothing is dropped.
+    """
+    span = _layer_row_span(sql)
+    if span is None:
+        return sql
+    columns, start, end = span
+    fields = sql[start:end].split(b"\t")
+    name = _copy_field(fields[columns.index("name")]) if "name" in columns else None
+    changed = False
+    for column, line_starts in _PATTERN_COLUMNS.items():
+        if column not in columns:
+            continue
+        index = columns.index(column)
+        value = _copy_field(fields[index])
+        if value is None:
+            continue
+        patterns = json.loads(value)
+        if not isinstance(patterns, list):
+            continue
+        kept = []
+        for pattern in patterns:
+            problem = pattern_problem(pattern, line_starts=line_starts)
+            if problem is None:
+                kept.append(pattern)
+            else:
+                kind = column.removesuffix("_patterns")
+                print(f"Dropped the {kind} pattern '{pattern}' of layer '{name}': {problem}")
+        if len(kept) < len(patterns):
+            fields[index] = _copy_text(json.dumps(kept))
+            changed = True
+    if not changed:
+        return sql
+    return sql[:start] + b"\t".join(fields) + sql[end:]
+
+
 def _check_root_free(layer: str, root: str) -> None:
     """Exit when another layer holds the folder this import would give the layer."""
     r = _psql(root_holder_query(root, layer), args=[*PSQL_STRICT, "-t", "-A"])
@@ -563,6 +610,7 @@ def _import_current(src: Path, sql: bytes, root: str | None, yes: bool) -> None:
     """Import a file with file tracking, in one transaction that stops at the first error."""
     if root:
         sql = _with_new_root(sql, root)
+    sql = _with_safe_patterns(sql)
     layer = export_layer_row(sql)
     if layer and layer.root_path:
         _check_root_free(layer.name, layer.root_path)

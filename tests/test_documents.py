@@ -678,6 +678,140 @@ class TestVersions:
         chunks = await _chunks(db_url, layer)
         assert chunks and {c["document_id"] for c in chunks} == {doc_rows[0]["id"]}
 
+    async def test_clear_layer_does_not_deadlock_with_ingest_of_a_new_file(
+        self, db_url, layer, tmp_path
+    ):
+        """The new file's row is not among those the clear locks, so the two meet
+        on its stored versions: the whole-layer prune locks them in id order."""
+        from stratakb.core.database import get_pool
+        from stratakb.knowledge import ingestion
+
+        (tmp_path / "a.md").write_text("# A\n\nAlpha about failover.\n", encoding="utf-8")
+        await ingest(db_url, layer, tmp_path)
+        text = (await _documents(db_url, layer))[0]["text"]
+        await ingestion.clear_layer(db_url, layer)
+        # Versions no chunk references yet: the ingest reuses the newer one and
+        # prunes the older one
+        root = tmp_path.resolve().as_posix()
+        await _store_bare_document(db_url, layer, root, "a.md", "Older text.")
+        await _store_bare_document(db_url, layer, root, "a.md", text)
+        newer = (await _documents(db_url, layer))[-1]
+
+        real = ingestion.store_document_version
+        picked, release = asyncio.Event(), asyncio.Event()
+        pids = []
+
+        async def paused(conn, **kwargs):
+            stored = await real(conn, **kwargs)
+            pids.append(conn.get_server_pid())
+            picked.set()
+            await release.wait()
+            return stored
+
+        pool = await get_pool(db_url)
+        with patch("stratakb.knowledge.ingestion.store_document_version", paused):
+            ingest_task = asyncio.create_task(ingest(db_url, layer, tmp_path))
+            try:
+                async with asyncio.timeout(30):
+                    await picked.wait()
+                    clearing = asyncio.create_task(ingestion.clear_layer(db_url, layer))
+                    await wait_until_blocked_by(pool, pids[0], clearing)
+            finally:
+                release.set()
+            result = await ingest_task
+        await clearing
+
+        assert result.errors == []
+        assert list(await _file_rows(db_url, layer)) == ["a.md"]
+        docs = await _assert_offsets_match(db_url, layer)
+        assert docs["a.md"]["id"] == newer["id"]
+        assert [d["id"] for d in await _documents(db_url, layer)] == [newer["id"]]
+
+    async def test_delete_layer_locks_file_rows_before_chunks(self, db_url, layer, tmp_path):
+        from stratakb.core.database import get_pool
+        from stratakb.knowledge.layers import LayerNotFoundError, delete_layer, get_layer
+
+        (tmp_path / "a.md").write_text("# A\n\nAlpha.\n", encoding="utf-8")
+        await ingest(db_url, layer, tmp_path)
+        file_id = (await _file_rows(db_url, layer))["a.md"]
+
+        pool = await get_pool(db_url)
+        async with pool.acquire() as ingesting:
+            tx = ingesting.transaction()
+            await tx.start()
+            try:
+                # What storing a file does first: lock its row, then delete its chunks
+                await ingesting.execute(
+                    "UPDATE strata_core.ingested_files SET ingested_at = NOW() WHERE id = $1",
+                    file_id,
+                )
+                deleting = asyncio.create_task(delete_layer(db_url, name=layer))
+                await wait_until_blocked_by(pool, ingesting.get_server_pid(), deleting)
+                await ingesting.execute(
+                    "DELETE FROM strata_vectors.chunks WHERE file_id = $1", file_id
+                )
+                await tx.commit()
+            except BaseException:
+                with contextlib.suppress(Exception):
+                    await tx.rollback()
+                raise
+        async with asyncio.timeout(30):
+            await deleting
+
+        with pytest.raises(LayerNotFoundError):
+            await get_layer(db_url, name=layer)
+        assert await _chunks(db_url, layer) == []
+        assert await pool.fetchval(
+            "SELECT count(*) FROM strata_core.ingested_files WHERE id = $1", file_id
+        ) == 0
+
+    async def test_delete_layer_removes_a_file_first_ingested_meanwhile(
+        self, db_url, layer, tmp_path
+    ):
+        import asyncpg
+
+        from stratakb.core.database import get_pool
+        from stratakb.knowledge import ingestion
+        from stratakb.knowledge.layers import delete_layer
+
+        (tmp_path / "a.md").write_text("# A\n\nAlpha.\n", encoding="utf-8")
+        await ingest(db_url, layer, tmp_path)
+        layer_id = await _layer_id(db_url, layer)
+        (tmp_path / "b.md").write_text("# B\n\nBeta.\n", encoding="utf-8")
+
+        real = ingestion.store_document_version
+        picked, release = asyncio.Event(), asyncio.Event()
+        pids = []
+
+        async def paused(conn, **kwargs):
+            stored = await real(conn, **kwargs)
+            pids.append(conn.get_server_pid())
+            picked.set()
+            await release.wait()
+            return stored
+
+        pool = await get_pool(db_url)
+        with patch("stratakb.knowledge.ingestion.store_document_version", paused):
+            ingest_task = asyncio.create_task(ingest(db_url, layer, tmp_path))
+            try:
+                async with asyncio.timeout(30):
+                    await picked.wait()
+                    # The new row is invisible to the delete, which waits on the
+                    # layer row that row's foreign key holds
+                    deleting = asyncio.create_task(delete_layer(db_url, name=layer))
+                    await wait_until_blocked_by(pool, pids[0], deleting)
+            finally:
+                release.set()
+            ran = (await asyncio.gather(ingest_task, return_exceptions=True))[0]
+        await deleting
+
+        assert not isinstance(ran, asyncpg.DeadlockDetectedError)
+        for table in ("strata_core.ingested_files", "strata_vectors.documents"):
+            assert await pool.fetchval(
+                f"SELECT count(*) FROM {table} WHERE layer_id = $1", layer_id
+            ) == 0
+        assert await _chunks(db_url, layer) == []
+
     async def test_delete_layer_removes_documents(self, db_url, tmp_path):
         from stratakb.core.database import get_pool
         from stratakb.knowledge.layers import create_layer, delete_layer

@@ -26,7 +26,9 @@ from stratakb.rag.passages import (
     ToolFailure,
     build_passages,
     cite,
+    cut_clause_note,
     estimate_tokens,
+    left_out_note,
     pack_passages,
     parse_ref,
     passage_cost,
@@ -243,7 +245,81 @@ class TestRefAndCitation:
         citation = cite(chunk, document)
 
         assert citation == {"file": "specs/a.pdf", "page": 2, "lines": "2-3",
-                            "clause_path": None, "layer": "specs"}
+                            "clause_path": None, "layer": "specs",
+                            "date": None, "date_source": None}
+
+    def test_citation_carries_the_document_date(self):
+        document = {"relative_path": "a.md", "page_map": None, "text": "one",
+                    "doc_date": "2026-03-04", "doc_date_source": "front_matter"}
+        chunk = {"chunk_id": "c", "content": "one", "layer": "l", "metadata": {},
+                 "document_id": 1, "char_start": 0, "char_end": 3}
+
+        citation = cite(chunk, document)
+
+        assert (citation["date"], citation["date_source"]) == ("2026-03-04", "front_matter")
+
+    def test_answer_item_carries_the_date(self):
+        from stratakb.rag.extractive import Sentence, answer_item
+
+        document = {"relative_path": "a.md", "page_map": None, "text": "One sentence.",
+                    "text_origin": "text",
+                    "doc_date": "2024-05-06", "doc_date_source": "file"}
+        chunk = {"chunk_id": "c", "content": "One sentence.", "layer": "l", "metadata": {},
+                 "document_id": 1, "char_start": 0, "char_end": 13}
+        sentence = Sentence(1, 0, 13, "One sentence.", 0, False, 0.9)
+
+        item = answer_item(sentence, [chunk], {1: document})
+
+        assert (item["citation"]["date"], item["citation"]["date_source"]) == (
+            "2024-05-06", "file"
+        )
+
+    def test_chunk_without_offsets_has_no_date(self):
+        document = {"relative_path": "a.md", "page_map": None, "text": "one",
+                    "doc_date": "2026-03-04", "doc_date_source": "front_matter"}
+        chunk = {"chunk_id": "c", "content": "one", "layer": "l", "metadata": {},
+                 "document_id": 1, "char_start": None, "char_end": None}
+
+        citation = cite(chunk, document)
+
+        assert (citation["date"], citation["date_source"]) == (None, None)
+
+    @pytest.mark.parametrize("length", range(4))
+    def test_filled_date_fits_passage_cost(self, length):
+        import pydantic_core
+
+        def tokens(response: dict) -> int:
+            return estimate_tokens(pydantic_core.to_json(response, indent=2).decode())
+
+        # Six-digit spans, across two three-digit pages
+        boundary = 150_000
+        document = {"relative_path": "a.pdf", "page_map": [[0, 100], [boundary, 101]],
+                    "text": "x\n" * 100_000, "doc_date": "2026-03-04",
+                    "doc_date_source": "front_matter"}
+        chunk = {"chunk_id": "c", "content": "x" * length, "layer": "l", "doc_type": "pdf",
+                 "metadata": {}, "source_file": "a.pdf", "document_id": 123_456,
+                 "char_start": boundary - 10, "char_end": boundary + 10}
+        passage = build_passages([chunk], {123_456: document})[0]
+        assert passage["citation"]["page_end"] == 101
+        assert passage["citation"]["date"] == "2026-03-04"
+
+        response = {"status": "found", "mode": "grounded"}
+        filled = tokens({**response, "passages": [passage]}) - tokens({**response, "passages": []})
+
+        assert filled <= passage_cost(chunk)
+
+    async def test_cited_documents_brings_the_schema_up_first(self):
+        from stratakb.core.migrations import MigrationError
+        from stratakb.rag.tools import _cited_documents
+
+        chunk = {"chunk_id": "c", "document_id": 1, "char_start": 0, "char_end": 3}
+
+        with patch(
+            "stratakb.core.migrations.ensure_schema",
+            AsyncMock(side_effect=MigrationError("out of date")),
+        ) as ensure:
+            assert await _cited_documents("postgresql://unused", [chunk]) == {}
+        ensure.assert_awaited_once_with("postgresql://unused")
 
     def test_citation_across_pages_names_the_last_page(self):
         text = "one\n\ntwo"
@@ -267,7 +343,7 @@ class TestRefAndCitation:
             "ref": "cold",
             "text": "[l > a > Page 3] text",
             "citation": {"file": "a.pdf", "page": 3, "lines": None, "clause_path": None,
-                         "layer": "l"},
+                         "layer": "l", "date": None, "date_source": None},
         }
 
 
@@ -348,6 +424,76 @@ class TestAskResultShapes:
         assert _answer().detailed()["confidence"] == {
             "level": "high", "top_score": 0.9, "relevant_sources": 3, "basis": "similarity",
         }
+
+    def test_note_follows_the_passages(self):
+        answer = _answer(status="partly_found", note="Read the rest.", interaction_id="int-1")
+
+        assert list(answer.concise()) == [
+            "status", "mode", "passages", "note", "next_step", "interaction_id",
+        ]
+        assert list(answer.detailed()) == [
+            "status", "question", "queries_used", "confidence", "retrieved_chunks",
+            "total_chunks", "answer_status", "mode", "passages", "note", "next_step",
+            "interaction_id",
+        ]
+        assert answer.concise()["note"] == "Read the rest."
+        assert answer.detailed()["note"] == "Read the rest."
+
+
+def test_cut_clause_note_names_only_cut_clauses():
+    def passage(path, file):
+        return {"citation": {"clause_path": path, "file": file}}
+
+    note = cut_clause_note(
+        [{"cut": True}, {}],
+        [passage("7 Fees", "a.md"), passage("8 Term", "b.md")],
+    )
+
+    assert note.startswith("7 Fees is only partly returned")
+    assert "a.md" in note
+    assert "8 Term" not in note
+    assert "b.md" not in note
+
+    unnamed = cut_clause_note([{"cut": True}], [passage(None, "a.md")])
+    assert unnamed.startswith("The clause the question names is only partly returned")
+
+    assert cut_clause_note([{}], [passage("7 Fees", "a.md")]) is None
+    assert cut_clause_note([], []) is None
+
+
+def test_left_out_note():
+    def chunk(path, file):
+        return {"source_file": file, "clause_path": path}
+
+    assert left_out_note([], {}) is None
+
+    assert left_out_note([chunk("7 Fees", "a.md")], {}) == (
+        "1 named clause left out, over the token budget: 7 Fees in a.md. "
+        "Read the files, or ask for fewer at a time."
+    )
+    two = left_out_note([chunk("7 Fees", "a.md"), chunk(None, "b.md")], {})
+    assert two.startswith("2 named clauses left out, over the token budget: 7 Fees in a.md; b.md. ")
+
+    assert left_out_note([], {}, 1) == (
+        "More documents match than were read: 1 more matching section not read. "
+        "Name a layer to narrow the question."
+    )
+    assert "at least 3 more matching sections" in left_out_note([], {}, 3, True)
+
+    both = left_out_note([chunk("7 Fees", "a.md")], {}, 2)
+    assert both.startswith("1 named clause left out")
+    assert "ask for fewer at a time. More documents match" in both
+    assert "2 more matching sections" in both
+
+
+def test_left_out_note_gives_the_path_a_citation_gives():
+    chunk = {
+        "source_file": "a.md", "clause_path": "7 Fees", "document_id": 1,
+        "char_start": 0, "char_end": 4,
+    }
+    documents = {1: {"text": "text", "page_map": None, "relative_path": "docs/a.md"}}
+
+    assert "7 Fees in docs/a.md." in left_out_note([chunk], documents)
 
 
 class TestSearchResponseShape:
@@ -453,6 +599,8 @@ class TestAskResponse:
             "lines": "7-8",
             "clause_path": "Master agreement > 7 Termination",
             "layer": layer,
+            "date": None,
+            "date_source": None,
         }
         assert second["id"] == "S2"
         assert second["ref"] == "cother"

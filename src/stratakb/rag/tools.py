@@ -15,7 +15,7 @@ from stratakb.core.audit import write_audit_log
 from stratakb.core.auth import require_role
 from stratakb.core.logging import log_tool_call
 from stratakb.learning.pii import scrub_query
-from stratakb.rag.clause_lookup import in_exact_span, without_exact_spans
+from stratakb.rag.clause_lookup import ClauseMatches, in_exact_span, without_exact_spans
 from stratakb.rag.clause_lookup import lookup as lookup_clauses
 from stratakb.rag.confidence import (
     EXTRACTIVE_SENTENCE_THRESHOLD,
@@ -34,6 +34,7 @@ from stratakb.rag.extractive import (
     fit_to_answer_budget,
     select_sentences,
 )
+from stratakb.rag.names import Name, check_names, find_names, missing_names_note
 from stratakb.rag.passages import (
     AnswerMode,
     AskResult,
@@ -44,6 +45,8 @@ from stratakb.rag.passages import (
     ask_chunk,
     basis_score,
     build_passages,
+    cut_clause_note,
+    left_out_note,
     pack_passages,
     sources_from,
 )
@@ -85,7 +88,7 @@ async def _detect_layers(database_url: str, query: str, learning_enabled: bool) 
 
 async def _exact_clauses(
     database_url: str, question: str, layers: list[str] | None, budget: int
-) -> list[dict[str, Any]]:
+) -> ClauseMatches:
     """The sections question names, looked up with the searched layers' structure patterns."""
     from stratakb.knowledge.layers import get_structure_patterns
 
@@ -201,6 +204,15 @@ def _ask_chunk(r: SearchResult, score: float) -> dict[str, Any]:
     )
 
 
+def _name_texts(chunks: list[dict[str, Any]]) -> list[str]:
+    """The text a name the question asks about is looked for in: each chunk and its file."""
+    return [t for c in chunks for t in (c.get("content"), c.get("source_file")) if t]
+
+
+def _join_notes(*notes: str | None) -> str | None:
+    return " ".join(n for n in notes if n) or None
+
+
 def _cited_ends(chunks: list[dict[str, Any]], reach: int = 0) -> dict[int, int]:
     """Each cited document's id and how far to read it: its furthest span's end, plus reach."""
     ends: dict[int, int] = {}
@@ -223,8 +235,10 @@ async def _cited_documents(
         return {}
     try:
         from stratakb.core.database import get_pool
+        from stratakb.core.migrations import ensure_schema
         from stratakb.knowledge.documents import fetch_cited_documents
 
+        await ensure_schema(database_url)
         pool = await get_pool(database_url)
         async with pool.acquire() as conn:
             return await fetch_cited_documents(conn, ends)
@@ -240,6 +254,10 @@ async def _extract_answer(
     model_name: str,
     budget: int,
     refused_note: str | None,
+    omitted_note: str | None,
+    *,
+    names: list[Name],
+    named_clause: bool,
 ) -> ExtractiveAnswer:
     """Choose the sentences that answer question from the chunks, and issue their receipt.
 
@@ -249,6 +267,13 @@ async def _extract_answer(
     grounded answer it fails when the documents cannot be read or the model
     cannot load: there is no answer without them.
     refused_note says the caller asked for a mode the layers do not allow.
+    omitted_note says named clauses never reached chunks: it makes a found answer
+    partly_found too, and a not_found answer keeps it, so "not in the documents"
+    does not hide what was not read.
+    names are the names the question asks about (names.find_names). When none
+    is in the chunks or the chosen sentences, and no named clause was returned,
+    the answer is not_found, before any receipt; when some are missing, a found
+    answer becomes partly_found. The note names the missing ones.
     """
     from stratakb.core.database import get_pool
     from stratakb.knowledge.documents import fetch_cited_documents
@@ -273,8 +298,16 @@ async def _extract_answer(
     logger.info("extractive_answer", candidates=len(candidates), sentences=len(sentences))
     if not sentences:
         legacy_note = LEGACY_ONLY_NOTE if chunks and not ends else None
-        note = " ".join(n for n in (refused_note, legacy_note) if n) or None
+        names_note = missing_names_note(check_names(names, _name_texts(chunks)), related=False)
+        note = _join_notes(refused_note, names_note, legacy_note, omitted_note)
         return ExtractiveAnswer([], None, "not_found", note)
+    # A sentence can reach past its chunk, so its own text counts too
+    check = check_names(names, [*_name_texts(chunks), *(s.text for s in sentences)])
+    names_note = missing_names_note(check, related=False)
+    if check.none_present and not named_clause:
+        return ExtractiveAnswer(
+            [], None, "not_found", _join_notes(refused_note, names_note, omitted_note)
+        )
 
     sentences = fit_to_answer_budget(sentences, chunks, documents, budget)
     answer = [answer_item(s, chunks, documents) for s in sentences]
@@ -296,16 +329,17 @@ async def _extract_answer(
     )
     status = answer_status(max(s.score for s in sentences), "rerank")
     gap_note = await asyncio.to_thread(clause_gap_note, chunks, documents, ends, sentences)
-    if gap_note and status == "found":
+    if (names_note or gap_note or omitted_note) and status == "found":
         status = "partly_found"
-    note = " ".join(n for n in (refused_note, gap_note) if n) or None
+    note = _join_notes(refused_note, names_note, gap_note, omitted_note)
     return ExtractiveAnswer(answer, receipt_id, status, note)
 
 
 def _search_item(chunk: dict[str, Any]) -> dict[str, Any]:
     """A chunk in the strata_ask shape as a strata_search result.
 
-    An exact clause chunk keeps its "match": "exact" marker, last.
+    An exact clause chunk keeps its "match": "exact" marker, and one cut to fit
+    the budget its "cut" mark, last.
     """
     item = {
         "chunk_id": chunk["chunk_id"],
@@ -320,6 +354,8 @@ def _search_item(chunk: dict[str, Any]) -> dict[str, Any]:
     }
     if "match" in chunk:
         item["match"] = chunk["match"]
+    if chunk.get("cut"):
+        item["cut"] = True
     return item
 
 
@@ -421,9 +457,10 @@ def register_rag_tools(
                     confidence = _search_confidence(results)
 
             # A clause or section the query names comes first, verbatim
-            exact = await _exact_clauses(
+            matches = await _exact_clauses(
                 database_url, query, layers, _settings.answer_token_budget
             )
+            exact = matches.chunks
             found = [
                 _search_item(_ask_chunk(r, r.score))
                 for r in results
@@ -474,7 +511,8 @@ def register_rag_tools(
         medium or low) judged on the results' similarity, with a warning when
         low, and an interaction_id to pass to strata_feedback. A clause or
         section the query names ("clause 7.2") comes first, verbatim,
-        marked "match": "exact".
+        marked "match": "exact". A result cut to fit the token budget also has
+        "cut": true: it holds only the start of the clause.
 
         Args:
             query: Natural language search query, or exact terms and identifiers.
@@ -596,9 +634,10 @@ def register_rag_tools(
                     layers = None
             # A clause or section the question names comes first, verbatim,
             # looked up in the layers searched; retrieved chunks inside it go
-            exact = await _exact_clauses(
+            matches = await _exact_clauses(
                 database_url, question, layers, _settings.answer_token_budget
             )
+            exact = matches.chunks
             # The best chunks that fit the answer budget; confidence is judged
             # on the reranked chunks, the answer status on what is returned
             chunks = pack_passages(
@@ -607,15 +646,26 @@ def register_rag_tools(
             )
             confidence = collected.confidence
             basis = confidence.basis
-            passages = build_passages(chunks, await _cited_documents(database_url, chunks))
+            # Packing keeps a prefix, so the named clauses past it did not fit
+            left_out = exact[len(chunks):]
+            documents = await _cited_documents(database_url, chunks + left_out)
+            passages = build_passages(chunks, documents)
+            omitted = left_out_note(
+                left_out, documents, matches.unread, matches.unread_is_minimum
+            )
             status = answer_status(
                 max((basis_score(c, basis) for c in chunks), default=0.0), basis
             )
             sources = sources_from(chunks, basis) if include_sources else None
+            # The names the question asks about must be in what goes back; a
+            # named clause returned means it named something that is there
+            names = find_names(question)
+            named_clause = len(exact) > len(left_out)
 
             # Judged on the passages handed back, not on the layers searched
             used_mode, refused_note = await _answer_mode(database_url, mode, chunks, layers)
             extraction = None
+            note = None
             if used_mode == "extractive":
                 extraction = await _extract_answer(
                     database_url,
@@ -624,8 +674,24 @@ def register_rag_tools(
                     _settings.reranking_model,
                     _settings.answer_token_budget,
                     refused_note,
+                    omitted,
+                    names=names,
+                    named_clause=named_clause,
                 )
                 status = extraction.status
+            else:
+                clause_note = _join_notes(cut_clause_note(chunks, passages), omitted)
+                if clause_note and status == "found":
+                    status = "partly_found"
+                check = check_names(names, _name_texts(chunks))
+                if check.none_present and not named_clause:
+                    status = "not_found"
+                elif check.missing and status == "found":
+                    status = "partly_found"
+                names_note = missing_names_note(
+                    check, related=bool(passages) and status == "not_found"
+                )
+                note = _join_notes(names_note, clause_note)
 
             # Audit
             await write_audit_log(
@@ -657,6 +723,7 @@ def register_rag_tools(
                 auto_detected_layers=detected,
                 routing_fallback=fallback_reason,
                 extraction=extraction,
+                note=note,
             )
 
         except Exception as e:
@@ -679,18 +746,28 @@ def register_rag_tools(
         knowledge base's terminology, runs several searches in parallel,
         reranks the results, and returns the best passages that fit a token
         budget (ANSWER_TOKEN_BUDGET, about 1,500 tokens, each passage's id,
-        ref and citation counted with its text; at most 50 passages). In
-        grounded mode the client composes the answer from the passages and
+        ref and citation counted with its text, except a replaced_by label; at
+        most 50 passages). In grounded mode the client composes the answer from the passages and
         cites them by id. When a passage comes from an extractive layer the
         server answers with the document's own sentences. A clause or section
         the question names ("clause 7.2", "Annex II") is looked up exactly and
-        comes first, verbatim, once per document that has it.
+        comes first, verbatim, once per document that has it. A named clause over
+        its share of the budget comes back cut: a found answer becomes
+        partly_found, with a note naming the clause and the file. A named clause
+        that does not fit, or a match past the first 10, is left out: a found
+        answer becomes partly_found, with a note giving the count and the files.
+        A name the question asks about (asyncio.TaskPool, PyConfig_Merge,
+        AC04, PEP 8) must be in a passage returned: when none is, the status
+        is not_found and the passages are only related text; when some are
+        missing, a found answer becomes partly_found. The note names them.
 
         The response: status is found, partly_found or not_found, with a
         next_step for the last two; mode is the mode used; passages lists S1,
         S2, ... in order of relevance, each with its exact text, a ref to the
         span of the stored document, and a citation (file path, page, lines,
-        clause path, layer). interaction_id goes to strata_feedback, where
+        clause path, layer, date and date_source; when another file says it
+        replaces this one, replaced_by; when the layer's patterns mark the file
+        as archived, archived). interaction_id goes to strata_feedback, where
         passages can be rated by id ({"S1": "useful"}).
 
         In extractive mode answer replaces passages: sentences word for word,

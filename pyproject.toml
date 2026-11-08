@@ -1,7 +1,7 @@
 [project]
 name = "stratakb"
 version = "0.1.0"
-description = "Layered, self-learning knowledge base served over the Model Context Protocol"
+description = "Knowledge base over the Model Context Protocol whose answers you can check against exact locations in your documents"
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
@@ -76,6 +76,7 @@ only-include = [
     "db",
     "examples",
     "scripts",
+    "evals",
     "docker-compose.yml",
     ".env.example",
     "README.md",

@@ -61,6 +61,14 @@ Notable changes to StrataKB. The format follows [Keep a Changelog](https://keepa
 - `strata_ingest_documents` returns `flagged`, a list of file, reason and count; `stratakb add` rows carry `count`, and its text output prints a Flagged section.
 - `import-layer --root <folder>` moves the imported layer to a new folder, so the next `stratakb add` finds its files unchanged.
 - The text form of `stratakb receipt` prints one line summing up the verification result that `--json` already carried.
+- `strata_verify` returns `nothing_checked`, with a note and no receipt, for a draft with citations but no quote or fact to check. The `verify` audit entry records it as its outcome.
+- Each citation in `strata_ask` carries the document's `date` and `date_source`: the front-matter `updated` or `date` key (`front_matter`), else the file's modification time (`file`). Migration `14_document_dates.sql` adds the columns, and layer exports carry them as format 3.
+- A document can say in its front matter that it replaces another (`supersedes: failover-2024.md`); citations of the named file then carry `replaced_by`. Migration `15_supersedes.sql` adds the column, and layer exports carry it as format 4.
+- Archived files: a layer's `archived_patterns` (`.gitignore` style, at most three wildcards each) label matching citations `"archived": true` on every ask, with no new ingest. Set them with the admin tool `strata_set_archived_patterns` or the preset key `archived_patterns`; both write a `set_archived_patterns` audit entry. Migration `16_archived_patterns.sql` adds the column, and layer exports carry it as format 5; older formats still import.
+- `strata_ask` says when part of the answer is missing: a named clause cut to fit the token budget, or left out because more clauses were named than fit, makes a `found` answer `partly_found` with a `note` naming the clause and file; `strata_search` marks such a clause `"cut": true`.
+- `strata_ask` checks the names a question asks about (dotted and snake_case names, codes, numbered references such as `PEP 8`) against the passages: some missing makes a `found` answer `partly_found`, none present makes it `not_found` unless a named clause came back, and the `note` lists them.
+- `strata_learning_stats` shows each top synonym's layer and `usage_count`.
+- A frozen gold set of questions over the Python Enhancement Proposals, with scripts to check and score it, under `evals/`.
 
 ### Changed
 
@@ -107,6 +115,13 @@ Notable changes to StrataKB. The format follows [Keep a Changelog](https://keepa
 - An `EMBEDDING_BACKEND` other than `local` or `openai` is refused with a message naming the setting. Before, an unknown name with `OPENAI_API_KEY` set sent the texts to OpenAI. A setup such as `EMBEDDING_BACKEND=ollama` with `EMBEDDING_BASE_URL` set must now use `openai`.
 - The unused `query_embedding` column is dropped from `strata_learning.interaction_events` (migration `13_drop_query_embedding.sql`). It held only NULLs and would have failed on a model of another size.
 - The offline message for the reranking model lists its ways out with one "or", like the local-only message.
+- `strata_verify` checks a fact against the passages cited in its sentence, and only a sentence with no citation against all the passages given. A draft with no citations at all is flagged `no citation`; a `[S1]` inside a quote does not count.
+- A PDF is flagged `probably_scanned` only when more than half its pages hold an image and under 200 characters of text, instead of on any file averaging under 200 characters per page.
+- `strata_verify` accepts an exact clause as long as `strata_ask` returns it for the current `ANSWER_TOKEN_BUDGET`, instead of refusing any span wider than twice the layer's chunk size.
+- The server reads `STRATA_USER` and `STRATA_ROLE` once, at startup, for role checks, logs, audit entries, receipts and learning; changing either takes a restart. Before, each tool call reread the config files, so an edit could change the role mid-session. `stratakb receipt` still reads both each time it runs, and `stratakb add` reads only `STRATA_USER`.
+- The README describes what works today, for one developer or a small trusted group, and no longer implies a team server; the full tool and settings reference moved to the wiki's Tools and Configuration pages.
+- The package description now reads "Knowledge base over the Model Context Protocol whose answers you can check against exact locations in your documents".
+- Receipts stored earlier keep `verified`; one with no quotes and no facts checked now opens with a `verification_note` saying nothing was checked, which `stratakb receipt` prints after the Verification line.
 
 ### Fixed
 
@@ -154,6 +169,9 @@ Notable changes to StrataKB. The format follows [Keep a Changelog](https://keepa
 - Query rewriting closes its HTTP client after each call, which used to stay open.
 - The local database readiness wait, the schema check and the SQL tools role check open their single connection with a deadline; a stalled role check had no connect timeout.
 - An explicit heading that is only a clause number or keyword id (`Article 6`, `7.`) no longer doubles the number in its section name, and tables in a Word file stay in their section instead of moving after all paragraphs.
+- Learning no longer mines synonyms from unrelated questions that shared common words: similarity uses content terms only and must reach 0.3, a pair needs exactly one term unique to the first question and two sightings, and mined synonyms are stored at confidence 0.7. Rows stored at 0.6 stop being applied and are deleted on the next promoter run, and a rerun no longer duplicates rows with no layer.
+- Deleting a layer during an ingest of it could deadlock. `delete_layer`, `clear_layer` and file removal now lock file rows in the same order as an ingest.
+- The gold set scorer turns learning off itself, stops at the first failed question or a missing layer, and writes its output only for a finished run; the checker exits non-zero on problems.
 
 ### Security
 
@@ -168,3 +186,5 @@ Notable changes to StrataKB. The format follows [Keep a Changelog](https://keepa
 - The text output of `stratakb receipt` shows control and other non-printable characters from documents, questions and drafts as `\xNN` or `\uNNNN` escapes, so a document cannot send terminal escape sequences to whoever opens the receipt.
 - Routing patterns that repeat a repeated part are refused when a layer is created or updated and when a preset is loaded, and skipped with a warning at search time for layers already holding one, so a badly backtracking pattern cannot stall a search.
 - `stratakb receipt --json`, its JSON error form and `stratakb add --json` write DEL, C1 controls and bidi overrides as `\uXXXX` escapes, so a document quote or file name cannot drive the terminal; the output stays valid JSON. The text report of `stratakb add` and the refusal hints now escape them too, each entry on one line.
+- The `creating_db_pool` log shows only host and port. Before, a `DATABASE_URL` with the password in its query string (`?user=…&password=…`) put the password in the log.
+- Structure patterns already stored in a layer (from an import, a restore or an older version) that do not compile or repeat a repeated part are now skipped with an `unsafe_structure_pattern` warning in the clause lookup and at ingest, as routing patterns already were at search time, and `import-layer` drops such structure and routing patterns, naming each. The `label` group a question runs is checked too, so a pattern that only looks safe as stored cannot stall a search.

@@ -17,7 +17,7 @@ from typing import TYPE_CHECKING, Literal, NamedTuple
 import structlog
 
 from stratakb.config import DEFAULT_QUERY_REWRITE_MODEL
-from stratakb.core.database import url_host
+from stratakb.core.urls import url_host
 
 if TYPE_CHECKING:
     from stratakb.config import Settings

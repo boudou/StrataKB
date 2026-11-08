@@ -2,7 +2,9 @@
 
 Provides a `require_role` decorator that enforces minimum role level
 before allowing tool execution. User identity comes from environment
-configuration (stdio transport) or JWT (SSE transport, future).
+configuration (stdio transport) or JWT (SSE transport, future). A running
+server keeps the identity it started with; commands and scripts read it on
+each call.
 
 Role hierarchy: viewer < operator < admin
 """
@@ -23,6 +25,9 @@ ROLE_LEVELS = {
     "admin": 2,
 }
 
+# The (user_id, role) a running server started with; None outside a server
+_server_identity: tuple[str, str] | None = None
+
 
 class PermissionDeniedError(Exception):
     """User does not have the required role."""
@@ -38,12 +43,21 @@ class PermissionDeniedError(Exception):
         )
 
 
+def set_server_identity(user_id: str, role: str) -> None:
+    """Keep this identity for the life of the process. Called once, when the server starts."""
+    global _server_identity
+    _server_identity = (user_id, role)
+
+
 def get_current_user() -> tuple[str, str]:
-    """Get current user identity from settings.
+    """Get current user identity: the one the server started with, else from settings.
 
     Returns:
         Tuple of (user_id, role).
     """
+    if _server_identity is not None:
+        return _server_identity
+
     from stratakb.config import get_settings
 
     settings = get_settings()

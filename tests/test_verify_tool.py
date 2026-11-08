@@ -27,6 +27,11 @@ POLICY = (
 )
 QUOTE = "Records are kept for thirty (30) days after closure."
 REFUND = f"Refunds go to account {IBAN} within 5 business days."
+_NOTHING_CHECKED = (
+    "The draft has no quote and no fact to check, so it is not verified and has no receipt. "
+    'Quote the passage that supports it as "..." [S1] and verify again, or say the answer is '
+    "unverified."
+)
 
 
 @pytest.fixture
@@ -99,6 +104,36 @@ async def _audit_rows(db_url: str, user: str) -> list:
     )
 
 
+async def _receipts_of(db_url: str, user: str) -> int:
+    from stratakb.core.database import get_pool
+
+    pool = await get_pool(db_url)
+    return await pool.fetchval(
+        "SELECT count(*) FROM strata_core.receipts WHERE issued_by = $1", user
+    )
+
+
+async def _old_receipt(db_url: str, layer: str, tmp_path: Path, user: str, *, quotes, facts) -> str:
+    """A verify receipt stored as it was before a draft could return nothing_checked."""
+    from stratakb.rag.receipts import issue_receipt
+
+    doc = await _document(db_url, layer, tmp_path)
+    start = doc["text"].index(QUOTE)
+    span = {"document_id": doc["id"], "char_start": start, "char_end": start + len(QUOTE)}
+    with _as(user):
+        return await issue_receipt(
+            db_url,
+            kind="verify",
+            mode="grounded",
+            question=None,
+            quotes=[span],
+            draft="No facts here [S1].",
+            verification={
+                "result": "verified", "passages": [], "quotes": quotes, "facts": facts, "flags": 0,
+            },
+        )
+
+
 class TestVerifyTool:
     async def test_verified_has_receipt(self, server, db_url, layer, tmp_path, user):
         from stratakb.rag.receipts import open_receipt
@@ -139,11 +174,31 @@ class TestVerifyTool:
             ("quantity", "13 days", '"13 days" not found in S1')
         ]
 
+    async def test_fact_checked_against_cited_passage(
+        self, server, db_url, layer, tmp_path, user
+    ):
+        # S1 says 30 days; S2, which the sentence cites, does not
+        doc = await _document(db_url, layer, tmp_path)
+        passages = [_ref(doc, QUOTE), _ref(doc, REFUND)]
+        with _as(user):
+            result = await _verify(
+                server, "Refunds reach the account within 30 days [S2].", passages
+            )
+        assert result["result"] == "flagged"
+        assert "receipt_id" not in result
+        assert [f["message"] for f in result["flags"]] == ['"30 days" not found in S2']
+        assert [f["passages"] for f in result["flags"]] == [["S2"]]
+
+        with _as(user):
+            result = await _verify(server, "Records are kept for 30 days [S1].", passages)
+        assert result["result"] == "verified"
+        assert result["receipt_id"].startswith("rcpt_")
+
     async def test_flag_list_is_bounded(self, server, db_url, layer, tmp_path, user):
         from stratakb.rag.verify import MAX_FLAGS
 
         doc = await _document(db_url, layer, tmp_path)
-        draft = " ".join(f"Q{i}Z" for i in range(1, 2001))
+        draft = " ".join(f"Q{i}Z" for i in range(1, 2001)) + " [S1]"
         with _as(user):
             result = await _verify(server, draft, [_ref(doc, QUOTE)])
         assert result["result"] == "flagged"
@@ -161,7 +216,8 @@ class TestVerifyTool:
 
     async def test_wide_ref_flagged(self, server, db_url, layer, tmp_path, user):
         doc = await _document(db_url, layer, tmp_path)
-        whole = f"d{doc['id']}:0-{len(doc['text'])}"
+        # No section starts at 1, so the span keeps the chunk_size bound
+        whole = f"d{doc['id']}:1-{len(doc['text'])}"
         beyond = f"d{doc['id']}:0-{len(doc['text']) + 5}"
         with _as(user):
             result = await _verify(
@@ -172,6 +228,29 @@ class TestVerifyTool:
         assert flags == [("passage", whole), ("passage", beyond)]
         assert "more than a passage can (200)" in result["flags"][0]["message"]
         assert "lies outside its document" in result["flags"][1]["message"]
+
+    async def test_section_ref_verifies(self, server, db_url, layer, tmp_path, user):
+        # policy.md is one section (# Retention), wider than the 200 limit
+        doc = await _document(db_url, layer, tmp_path)
+        assert len(doc["text"]) > 200
+        section = f"d{doc['id']}:0-{len(doc['text'])}"
+        with _as(user):
+            result = await _verify(server, f'"{QUOTE}" [S1]', [section])
+        assert result["result"] == "verified", result
+        assert result["receipt_id"]
+
+    async def test_section_ref_over_the_budget_flagged(self, db_url, layer, tmp_path, user):
+        from stratakb.rag.verify_tools import verify_draft
+
+        doc = await _document(db_url, layer, tmp_path)
+        section = f"d{doc['id']}:0-{len(doc['text'])}"
+        with _as(user):
+            result = await verify_draft(
+                db_url, "No facts here [S1].", [section], user, "viewer", answer_token_budget=100
+            )
+        assert result["result"] == "flagged"
+        assert [f["kind"] for f in result["flags"]] == ["passage"]
+        assert "more than a passage can (400)" in result["flags"][0]["message"]
 
     async def test_unreadable_layer_refused(self, server, db_url, layer, tmp_path, user):
         doc = await _document(db_url, layer, tmp_path)
@@ -237,6 +316,95 @@ class TestVerifyTool:
         for r in rows:
             assert QUOTE not in r["parameters"]
             assert IBAN not in r["parameters"]
+
+    async def test_uncited_draft_flagged_without_receipt(
+        self, server, db_url, layer, tmp_path, user
+    ):
+        doc = await _document(db_url, layer, tmp_path)
+        with _as(user):
+            result = await _verify(server, "The moon is made of cheese.", [_ref(doc, QUOTE)])
+        assert result["result"] == "flagged"
+        assert "receipt_id" not in result
+        assert [(f["kind"], f["text"]) for f in result["flags"]] == [("citation", "no citation")]
+        # Flagged even when its quote and fact match the passage
+        with _as(user):
+            matching = await _verify(server, f'"{QUOTE}" That is 30 days.', [_ref(doc, QUOTE)])
+        assert matching["result"] == "flagged"
+        assert (matching["quotes_checked"], matching["facts_checked"]) == (1, 1)
+        assert [f["text"] for f in matching["flags"]] == ["no citation"]
+        assert await _receipts_of(db_url, user) == 0
+
+    async def test_uncited_quote_in_a_cited_draft_verified(
+        self, server, db_url, layer, tmp_path, user
+    ):
+        # A quote with no citation of its own, in a draft that cites elsewhere
+        doc = await _document(db_url, layer, tmp_path)
+        draft = f'"{QUOTE}" Either way it ends there [S1].'
+        with _as(user):
+            result = await _verify(server, draft, [_ref(doc, QUOTE)])
+        assert result["result"] == "verified"
+        assert result["receipt_id"].startswith("rcpt_")
+
+    async def test_nothing_to_check_has_no_receipt(self, server, db_url, layer, tmp_path, user):
+        doc = await _document(db_url, layer, tmp_path)
+        draft = "Termination also requires approval from the board of directors [S1]."
+        with _as(user):
+            result = await _verify(server, draft, [_ref(doc, QUOTE)])
+        assert result == {
+            "status": "ok",
+            "result": "nothing_checked",
+            "quotes_checked": 0,
+            "facts_checked": 0,
+            "note": _NOTHING_CHECKED,
+        }
+        assert await _receipts_of(db_url, user) == 0
+        rows = await _audit_rows(db_url, user)
+        assert [(r["tool_name"], r["result_summary"]) for r in rows] == [
+            ("strata_verify", "nothing_checked")
+        ]
+        assert json.loads(rows[0]["parameters"]) == {
+            "passages": 1, "quotes": 0, "facts": 0, "flags": 0,
+        }
+        assert "board" not in rows[0]["parameters"]
+
+    async def test_passage_flag_beats_nothing_checked(self, server, db_url, layer, tmp_path, user):
+        doc = await _document(db_url, layer, tmp_path)
+        whole = f"d{doc['id']}:1-{len(doc['text'])}"
+        with _as(user):
+            result = await _verify(server, "No facts here [S1].", [whole])
+        assert result["result"] == "flagged"
+        assert [f["kind"] for f in result["flags"]] == ["passage"]
+        assert "receipt_id" not in result
+
+    async def test_old_receipt_with_nothing_checked_says_so(
+        self, server, db_url, layer, tmp_path, user
+    ):
+        from stratakb.cli import render_receipt
+        from stratakb.rag.receipts import NOTHING_CHECKED_NOTE
+
+        receipt_id = await _old_receipt(db_url, layer, tmp_path, user, quotes=0, facts=0)
+        with _as(user):
+            opened = await call_tool(server, "strata_get_receipt", receipt_id=receipt_id)
+        receipt = opened["receipt"]
+        # The stored result stays as it was
+        assert receipt["verification"]["result"] == "verified"
+        assert receipt["verification_note"] == NOTHING_CHECKED_NOTE
+        lines = render_receipt(receipt).split("\n")
+        at = next(i for i, line in enumerate(lines) if line.startswith("Verification:"))
+        assert lines[at + 1] == NOTHING_CHECKED_NOTE
+
+    @pytest.mark.parametrize(("quotes", "facts"), [(1, 0), (0, 1)])
+    async def test_receipt_with_checks_has_no_note(
+        self, server, db_url, layer, tmp_path, user, quotes, facts
+    ):
+        from stratakb.cli import render_receipt
+        from stratakb.rag.receipts import NOTHING_CHECKED_NOTE
+
+        receipt_id = await _old_receipt(db_url, layer, tmp_path, user, quotes=quotes, facts=facts)
+        with _as(user):
+            opened = await call_tool(server, "strata_get_receipt", receipt_id=receipt_id)
+        assert "verification_note" not in opened["receipt"]
+        assert NOTHING_CHECKED_NOTE not in render_receipt(opened["receipt"])
 
     async def test_input_limits(self, server, user):
         with _as(user):

@@ -356,6 +356,20 @@ class TestSearchItem:
         assert item["score"] == 1.0
         assert item["match"] == "exact"
 
+    def test_cut_chunk_marked_after_match(self):
+        from stratakb.rag.clause_lookup import _exact_chunk, fit_to_budget
+        from stratakb.rag.tools import _search_item
+
+        row = {
+            "layer_name": "docs", "source_file": "a.md", "path": "7 > 7.2",
+            "doc_type": "markdown", "document_id": 3, "char_start": 10,
+        }
+
+        item = _search_item(fit_to_budget(_exact_chunk(row, "word " * 400), 60))
+
+        assert list(item) == [*self._KEYS, "match", "cut"]
+        assert item["cut"] is True
+
 
 def _grounded_layers():
     """Layer modes come from the table; these tests run without a database."""

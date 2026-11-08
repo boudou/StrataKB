@@ -24,10 +24,12 @@ import structlog
 
 from stratakb.core.database import get_pool
 from stratakb.core.migrations import ensure_schema
+from stratakb.knowledge.document_dates import backfill_dates, document_date
 from stratakb.knowledge.documents import (
     FileScope,
     build_document_text,
     document_headings,
+    lock_file_rows,
     page_starts,
     prune_documents,
     store_document_version,
@@ -42,12 +44,14 @@ from stratakb.knowledge.layers import (
 )
 from stratakb.knowledge.parsers.document import FlagReason, ParsedDocument
 from stratakb.knowledge.parsers.registry import FORMATS, Format
+from stratakb.knowledge.pattern_safety import usable_patterns
 from stratakb.knowledge.policy import is_secret_name
 from stratakb.knowledge.structure import (
     Section,
     chunk_spans,
     detect_sections,
 )
+from stratakb.knowledge.supersedes import declared_supersedes
 from stratakb.knowledge.vector_store import ChunkRecord, chunk_embed_text, insert_chunks
 
 if TYPE_CHECKING:
@@ -207,12 +211,16 @@ async def _store_file(
     page_map: list[list[int]] | None = None,
     text_origin: str = "text",
     sections: Sequence[Section] = (),
+    doc_date: str | None = None,
+    doc_date_source: str | None = None,
+    supersedes: str | None = None,
 ) -> None:
     """Replace one file's row, document version and chunks in a single transaction.
 
     The text is stored as the file's current document version (reused when
-    unchanged), with its structure map (sections); this file's versions no
-    chunk references any more are pruned afterwards.
+    unchanged), with its date, what it replaces and its structure map
+    (sections); this file's
+    versions no chunk references any more are pruned afterwards.
     """
     pool = await get_pool(database_url)
     async with pool.acquire() as conn:
@@ -246,6 +254,9 @@ async def _store_file(
                 text=document_text,
                 page_map=page_map,
                 text_origin=text_origin,
+                doc_date=doc_date,
+                doc_date_source=doc_date_source,
+                supersedes=supersedes,
             )
             await store_sections(conn, document_id, sections)
             for chunk in chunks:
@@ -274,28 +285,17 @@ async def _remove_files(
     """Remove tracked files of a layer and root, in one transaction.
 
     Deleting the rows cascades to their chunks and unlinks their documents,
-    so their versions are pruned afterwards. The rows are locked in id order
-    before anything is deleted, so an ingest of the same file (which locks its
-    row first) and other removers never lock them in the opposite order. The
-    delete targets the locked ids, so a row committed after the lock is left
-    alone.
+    so their versions are pruned afterwards. The rows are locked before
+    anything is deleted (see lock_file_rows). The delete targets the locked
+    ids, so a row committed after the lock is left alone.
     """
+    scope = FileScope(source_root, relative_paths)
     async with pool.acquire() as conn, conn.transaction():
-        rows = await conn.fetch(
-            """
-            SELECT id FROM strata_core.ingested_files
-            WHERE layer_id = $1 AND source_root = $2 AND relative_path = ANY($3::text[])
-            ORDER BY id FOR UPDATE
-            """,
-            layer_id,
-            source_root,
-            list(relative_paths),
-        )
+        file_ids = await lock_file_rows(conn, layer_id, files=scope)
         await conn.execute(
-            "DELETE FROM strata_core.ingested_files WHERE id = ANY($1::uuid[])",
-            [r["id"] for r in rows],
+            "DELETE FROM strata_core.ingested_files WHERE id = ANY($1::uuid[])", file_ids
         )
-        await prune_documents(conn, [layer_id], files=FileScope(source_root, relative_paths))
+        await prune_documents(conn, [layer_id], files=scope)
 
 
 async def tracked_files(
@@ -321,9 +321,10 @@ async def tracked_files(
 async def clear_layer(database_url: str, layer_name: str) -> None:
     """Delete every chunk and ingested_files row of a layer, and its unreferenced documents.
 
-    The layer's file rows are locked in id order before anything is deleted,
-    so an ingest of the same file (which locks its row first) and removers of
-    some of its files never lock them in the opposite order.
+    The layer's file rows are locked before anything is deleted (see
+    lock_file_rows). A file first ingested meanwhile is not among them and is
+    not cleared; the prune meets its ingest on the file's versions only, which
+    both lock in id order.
     """
     await ensure_schema(database_url)
     pool = await get_pool(database_url)
@@ -333,16 +334,7 @@ async def clear_layer(database_url: str, layer_name: str) -> None:
             layer_id = await conn.fetchval(
                 "SELECT id FROM strata_core.knowledge_layers WHERE name = $1", layer_name
             )
-            file_ids = []
-            if layer_id is not None:
-                rows = await conn.fetch(
-                    """
-                    SELECT id FROM strata_core.ingested_files
-                    WHERE layer_id = $1 ORDER BY id FOR UPDATE
-                    """,
-                    layer_id,
-                )
-                file_ids = [r["id"] for r in rows]
+            file_ids = await lock_file_rows(conn, layer_id)
             # Only the locked files' chunks, plus legacy chunks that have no file row:
             # a file first ingested meanwhile is not cleared
             chunks = await conn.execute(
@@ -406,12 +398,17 @@ async def ingest_documents(
     A database connection lost while a file is stored raises instead of
     being recorded as a failed file.
 
+    Each stored document version records a date: the front matter's updated or
+    date, otherwise the file's modification time. An unchanged file whose
+    latest version has none yet gets one, with nothing embedded.
+
     Steps:
     1. Validate layer exists (and apply the schema migration if needed)
     2. Discover files at source_path, or take the given file list
     3. Clear the layer (replace_all) or its pre-tracking chunks (legacy)
     4. For each file: check its name; for a changed or new file, check for
-       text, then parse, chunk, embed, store
+       text, then parse, chunk, embed, store; then date unchanged files
+       stored without a date
     5. Remove files that are gone from the root (for a file list: every
        tracked file not in it)
     6. Record ingestion run
@@ -473,8 +470,14 @@ async def ingest_documents(
     chunk_config = layer["chunk_config"]
     chunk_size = chunk_config.get("chunk_size", DEFAULT_CHUNK_SIZE)
     chunk_overlap = chunk_config.get("chunk_overlap", DEFAULT_CHUNK_OVERLAP)
-    # The layer's own section starts (set by a preset), compiled once per run
-    structure_patterns = [re.compile(p) for p in layer.get("structure_patterns") or []]
+    # The layer's own section starts (set by a preset), compiled once per run;
+    # an unsafe one that reached the row another way is skipped with a warning
+    structure_patterns = usable_patterns(
+        layer.get("structure_patterns") or [],
+        kind="structure",
+        layer=layer_name,
+        line_starts=True,
+    )
 
     # Step 2: Discover files
     source = Path(source_path)
@@ -554,6 +557,7 @@ async def ingest_documents(
 
         # Step 4: Parse, chunk, embed and store each new or changed file
         seen: set[str] = set()
+        unchanged: dict[str, Path] = {}
         for relative_path, file_path, carried_hash in work:
             seen.add(relative_path)
             previous = tracked.get(relative_path)
@@ -563,9 +567,11 @@ async def ingest_documents(
                 await drop(relative_path, previous, "secret")
                 continue
 
-            # A carried hash equal to the tracked one: unchanged, never opened
+            # A carried hash equal to the tracked one: unchanged, not opened
+            # here, and later only while its stored version has no date
             if _matches_tracked(carried_hash, previous):
                 result.files.append(FileOutcome(relative_path, "unchanged"))
+                unchanged[relative_path] = file_path
                 continue
 
             try:
@@ -581,6 +587,7 @@ async def ingest_documents(
 
             if _matches_tracked(content_hash, previous):
                 result.files.append(FileOutcome(relative_path, "unchanged"))
+                unchanged[relative_path] = file_path
                 continue
 
             # A listed file may have an unknown extension: _parse_file rejects it
@@ -631,6 +638,8 @@ async def ingest_documents(
                 fail(relative_path, file_path, str(e), "embed_error")
                 continue
 
+            doc_date, doc_date_source = await asyncio.to_thread(document_date, file_path, data)
+            supersedes = await asyncio.to_thread(declared_supersedes, fmt, data, relative_path)
             try:
                 await _store_file(
                     database_url,
@@ -643,6 +652,9 @@ async def ingest_documents(
                     document_text=mapped.text,
                     page_map=mapped.page_map,
                     sections=mapped.sections,
+                    doc_date=doc_date,
+                    doc_date_source=doc_date_source,
+                    supersedes=supersedes,
                 )
             except (asyncpg.PostgresConnectionError, asyncpg.InterfaceError, OSError):
                 # A lost database is an error for the whole run, not one failed file
@@ -667,6 +679,14 @@ async def ingest_documents(
             done += 1
             if progress is not None:
                 progress(done, total)
+
+        await backfill_dates(
+            pool,
+            layer_id=layer_id,
+            layer_name=layer_name,
+            source_root=source_root,
+            unchanged=unchanged,
+        )
 
         # Step 5: Remove files ingested from this root that no longer exist
         # or, for a file list, every tracked file that is not in it

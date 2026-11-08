@@ -23,6 +23,7 @@ from stratakb.knowledge.layers import (
     delete_layer,
     get_layer_status,
     list_layers,
+    update_layer,
 )
 from stratakb.knowledge.parsers import csv_parser
 
@@ -49,8 +50,8 @@ def _ingest_description() -> str:
     opened; one ingested earlier is removed. Empty files are reported as
     no text, not as failures: skipped, or removed if ingested earlier.
     files_skipped counts the skipped files. A PDF that looks scanned
-    (under half its pages have text, or under 200 characters per page on
-    average) is stored for the text it has and counted in files_flagged;
+    (more than half its pages have an image and under 200 characters of
+    text) is stored for the text it has and counted in files_flagged;
     it also counts as added or updated. A CSV over {limit} rows is stored
     for its first {limit} rows and also counted in files_flagged. flagged
     lists these files with file, reason ("probably_scanned" or "truncated")
@@ -90,8 +91,9 @@ def _serialize(obj: object) -> object:
     return obj
 
 
-# Who made a layer and the server folder it holds are shown to admins only
-_ADMIN_ONLY_LAYER_FIELDS = ("owner", "root_path")
+# Who made a layer, the server folder it holds and its archived files patterns
+# are shown to admins only
+_ADMIN_ONLY_LAYER_FIELDS = ("owner", "root_path", "archived_patterns")
 
 
 # strata_apply_preset's dry run reports layer_check "unknown" after this many seconds
@@ -239,6 +241,35 @@ def register_knowledge_tools(
         except LayerNotFoundError as e:
             return {"status": "error", "error": str(e)}
 
+    @mcp.tool()
+    @require_role("admin")
+    @log_tool_call
+    async def strata_set_archived_patterns(layer_name: str, patterns: list[str]) -> dict:
+        """Set which of a layer's files are archived, replacing the list it holds.
+
+        Patterns are in .gitignore style, matched against each file's path
+        relative to its folder: "archive/", "*-2024.md", "!keep.md". The last
+        match wins, so the order counts. Each may hold at most three wildcards.
+        An empty list clears them. Citations of a matching file are labelled
+        as archived from the next ask on, with no new ingest. Archived files
+        are not the layer's "archived" status, which covers the whole layer.
+
+        Args:
+            layer_name: The layer to set them on (e.g., "runbooks").
+            patterns: The whole new list of patterns.
+        """
+        try:
+            layer = await update_layer(database_url, layer_name, archived_patterns=patterns)
+        except (LayerNotFoundError, LayerValidationError) as e:
+            return {"status": "error", "error": str(e)}
+        await write_audit_log(
+            database_url,
+            action="set_archived_patterns",
+            tool_name="strata_set_archived_patterns",
+            parameters={"layer": layer_name, "patterns": patterns},
+        )
+        return {"status": "updated", "layer": _serialize(layer)}
+
     @mcp.tool(description=_ingest_description())
     @require_role("admin")
     @log_tool_call
@@ -313,8 +344,8 @@ def register_knowledge_tools(
         """Create or update a knowledge layer from a preset file and ingest all its sources.
 
         A preset is a YAML file describing one layer (name, description,
-        chunking, routing patterns) and the folders to ingest into it. This
-        tool:
+        chunking, routing patterns, archived file patterns) and the folders to
+        ingest into it. This tool:
         1. Creates the layer, or updates an existing layer made by this preset
            to the preset's settings; a layer with the same name made another
            way is refused and left unchanged
@@ -402,6 +433,16 @@ def register_knowledge_tools(
         if error is not None:
             # Nothing was changed, so there is nothing to audit
             return {"status": "error", "error": error}
+        # Written before the ingest: the patterns are stored, and it can raise
+        if "archived_patterns" in layer_result["changes"] or (
+            layer_result["status"] == "created" and preset.archived_patterns
+        ):
+            await write_audit_log(
+                database_url,
+                action="set_archived_patterns",
+                tool_name="strata_apply_preset",
+                parameters={"layer": preset.name, "patterns": preset.archived_patterns},
+            )
         ingest_result = await ingest_preset(database_url, openai_api_key, preset, root)
 
         layer_text = f"Layer '{preset.name}': {layer_result['status']}"

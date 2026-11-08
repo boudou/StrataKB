@@ -31,7 +31,7 @@ from uuid import UUID, uuid4
 import asyncpg
 
 from stratakb.core.audit import write_audit_log
-from stratakb.core.database import url_host_port
+from stratakb.core.urls import url_host_port
 from stratakb.knowledge.ingestion import IngestionResult, Outcome, ingest_documents, tracked_files
 from stratakb.knowledge.layers import (
     MAX_OWNER_LENGTH,

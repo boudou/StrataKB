@@ -9,17 +9,18 @@ from __future__ import annotations
 
 import json
 import re
-from re import _constants as _sre
-from re import _parser as _sre_parser
 from typing import Literal, get_args
 
 import asyncpg
 import structlog
 from cachetools import TTLCache
+from pathspec import GitIgnoreSpec
 
 from stratakb.core.database import get_pool
 from stratakb.core.migrations import ensure_schema
 from stratakb.core.stamp_watcher import StampWatcher
+from stratakb.knowledge.documents import lock_file_rows
+from stratakb.knowledge.pattern_safety import pattern_problem
 
 logger = structlog.get_logger()
 
@@ -36,6 +37,8 @@ DEFAULT_ANSWER_MODE = "grounded"
 # Column sizes in core/sql/05_add_folder.sql
 MAX_ORIGIN_LENGTH = 100
 MAX_OWNER_LENGTH = 200
+# Wildcards one archived files pattern may hold: with more, a match can take very long
+MAX_ARCHIVED_WILDCARDS = 3
 
 # Partial unique index on root_path (core/sql/05_add_folder.sql)
 _ROOT_PATH_INDEX = "knowledge_layers_root_path_key"
@@ -45,12 +48,15 @@ LAYER_COLUMN_NAMES = (
     "id", "name", "display_name", "description", "metadata_schema", "chunk_config",
     "routing_patterns", "status", "doc_count", "chunk_count", "last_ingested",
     "created_at", "updated_at", "origin", "owner", "root_path", "answer_mode",
-    "structure_patterns",
+    "structure_patterns", "archived_patterns",
 )
 _LAYER_COLUMNS = ", ".join(LAYER_COLUMN_NAMES)
 
 # asyncpg returns jsonb as text (the pool sets no JSON codec): decoded by _decode_jsonb
-_JSONB_COLUMNS = ("metadata_schema", "chunk_config", "routing_patterns", "structure_patterns")
+_JSONB_COLUMNS = (
+    "metadata_schema", "chunk_config", "routing_patterns", "structure_patterns",
+    "archived_patterns",
+)
 
 # The only columns _write_columns puts into SQL
 _LayerColumn = Literal[
@@ -60,6 +66,7 @@ _LayerColumn = Literal[
     "chunk_config",
     "routing_patterns",
     "structure_patterns",
+    "archived_patterns",
     "answer_mode",
     "origin",
     "root_path",
@@ -126,46 +133,6 @@ def _validate_name(name: str) -> None:
         )
 
 
-_REPEATS = (_sre.MAX_REPEAT, _sre.MIN_REPEAT, _sre.POSSESSIVE_REPEAT)
-
-
-def _subpatterns(value: object):
-    """The parsed subpatterns inside a node's argument, at any depth."""
-    if isinstance(value, _sre_parser.SubPattern):
-        yield value
-    elif isinstance(value, (tuple, list)):
-        for item in value:
-            yield from _subpatterns(item)
-
-
-def _nested_repeat(items, unbounded_outside: bool = False) -> bool:
-    """True when a variable repeat of more than one sits inside an unbounded repeat.
-
-    Such a pattern ('(a+)+', '(\\w+\\s?)*') can backtrack exponentially on a
-    line it almost matches; a fixed count inside ('(\\d{3})+') cannot.
-    """
-    for op, av in items:
-        if op in _REPEATS:
-            lo, hi, body = av
-            if unbounded_outside and hi > 1 and lo != hi:
-                return True
-            if _nested_repeat(body, unbounded_outside or hi == _sre.MAXREPEAT):
-                return True
-            continue
-        for sub in _subpatterns(av):
-            if _nested_repeat(sub, unbounded_outside):
-                return True
-    return False
-
-
-def has_nested_repeat(pattern: str) -> bool:
-    """True when pattern nests a variable repeat inside an unbounded one.
-
-    Call it only on a pattern that compiles (parsing raises re.error otherwise).
-    """
-    return _nested_repeat(_sre_parser.parse(pattern))
-
-
 def _validate_patterns(
     key: str, patterns: list[str], *, line_starts: bool = False
 ) -> list[str]:
@@ -181,19 +148,9 @@ def _validate_patterns(
         raise LayerValidationError(f"{key} must be a list of strings.")
     kind = key.removesuffix("_patterns")
     for pattern in patterns:
-        try:
-            compiled = re.compile(pattern)
-        except re.error as e:
-            raise LayerValidationError(f"Invalid {kind} pattern '{pattern}': {e}") from e
-        if line_starts and compiled.match(""):
-            raise LayerValidationError(
-                f"Invalid {kind} pattern '{pattern}': it matches an empty line."
-            )
-        if has_nested_repeat(pattern):
-            raise LayerValidationError(
-                f"Invalid {kind} pattern '{pattern}': it repeats a repeated part, "
-                "which can take very long on some lines."
-            )
+        problem = pattern_problem(pattern, line_starts=line_starts)
+        if problem is not None:
+            raise LayerValidationError(f"Invalid {kind} pattern '{pattern}': {problem}")
     return patterns
 
 
@@ -210,6 +167,47 @@ def _validate_structure_patterns(patterns: list[str]) -> list[str]:
     section's label, else the whole match does).
     """
     return _validate_patterns("structure_patterns", patterns, line_starts=True)
+
+
+def _count_wildcards(pattern: str) -> int:
+    """Count a pattern's wildcards: a "**" path segment is one, any other star is one each."""
+    segments = pattern.removeprefix("!").split("/")
+    return sum(1 if segment == "**" else segment.count("*") for segment in segments)
+
+
+def _validate_archived_patterns(patterns: object) -> list[str]:
+    """Validate archived files patterns: .gitignore-style, not regular expressions.
+
+    A pattern that cannot compile or that matches nothing (a comment, "/", an
+    open "[") is refused, so an admin never sees it accepted with no file
+    labelled. So is one with more than MAX_ARCHIVED_WILDCARDS wildcards, whose
+    match can stall, and one with a line break or a NUL, which is not one line
+    of a .gitignore and which jsonb cannot hold.
+    """
+    if not isinstance(patterns, list):
+        raise LayerValidationError("archived_patterns must be a list of strings.")
+    for pattern in patterns:
+        if not isinstance(pattern, str) or not pattern.strip():
+            raise LayerValidationError("Each archived files pattern must be a non-blank string.")
+        if any(c in pattern for c in "\n\r\0"):
+            raise LayerValidationError(
+                f"Invalid archived files pattern {pattern!r}: it holds a line break or a NUL."
+            )
+        if _count_wildcards(pattern) > MAX_ARCHIVED_WILDCARDS:
+            raise LayerValidationError(
+                f"Invalid archived files pattern '{pattern}': it has more than "
+                f"{MAX_ARCHIVED_WILDCARDS} wildcards, which can take very long on some paths."
+            )
+        try:
+            compiled = GitIgnoreSpec.from_lines([pattern]).patterns
+        # An inverted range ("[z-a]") gets through to re.compile
+        except (ValueError, re.error) as e:
+            raise LayerValidationError(f"Invalid archived files pattern '{pattern}': {e}") from e
+        if any(p.include is None for p in compiled):
+            raise LayerValidationError(
+                f"Invalid archived files pattern '{pattern}': it matches nothing."
+            )
+    return patterns
 
 
 def _validate_chunk_config(chunk_config: dict) -> dict:
@@ -302,11 +300,13 @@ async def create_layer(
     root_path: str | None = None,
     answer_mode: str = DEFAULT_ANSWER_MODE,
     structure_patterns: list[str] | None = None,
+    archived_patterns: list[str] | None = None,
 ) -> dict:
     """Create a new knowledge layer.
 
     root_path is stored as given: callers pass Path(p).resolve().as_posix().
     structure_patterns mark extra section starts at ingestion (set by presets).
+    archived_patterns say which of the layer's files are archived.
 
     Returns the created layer record.
     Raises LayerExistsError if name already taken.
@@ -320,6 +320,7 @@ async def create_layer(
     routing = _validate_routing_patterns(routing_patterns or [])
     mode = _validate_answer_mode(answer_mode)
     structure = _validate_structure_patterns(structure_patterns or [])
+    archived = _validate_archived_patterns(archived_patterns or [])
     _validate_length("origin", origin, MAX_ORIGIN_LENGTH)
     _validate_length("owner", owner, MAX_OWNER_LENGTH)
 
@@ -331,9 +332,9 @@ async def create_layer(
             INSERT INTO strata_core.knowledge_layers
                 (name, display_name, description, metadata_schema, chunk_config,
                  routing_patterns, origin, owner, root_path, answer_mode,
-                 structure_patterns)
+                 structure_patterns, archived_patterns)
             VALUES ($1, $2, $3, $4::jsonb, $5::jsonb, $6::jsonb, $7, $8, $9, $10,
-                    $11::jsonb)
+                    $11::jsonb, $12::jsonb)
             RETURNING {_LAYER_COLUMNS}
             """,
             name,
@@ -347,6 +348,7 @@ async def create_layer(
             root_path,
             mode,
             json.dumps(structure),
+            _encode_column("archived_patterns", archived),
         )
     except asyncpg.UniqueViolationError as e:
         _raise_if_root_taken(e, root_path)
@@ -390,7 +392,7 @@ async def get_layer_status(database_url: str, *, name: str) -> dict:
                kl.status, kl.doc_count, kl.chunk_count, kl.last_ingested,
                kl.chunk_config, kl.metadata_schema, kl.routing_patterns,
                kl.created_at, kl.updated_at, kl.origin, kl.owner, kl.root_path,
-               kl.answer_mode, kl.structure_patterns,
+               kl.answer_mode, kl.structure_patterns, kl.archived_patterns,
                (SELECT count(*) FROM strata_core.ingestion_runs ir
                 WHERE ir.layer_id = kl.id) AS ingestion_run_count,
                (SELECT max(ir.completed_at) FROM strata_core.ingestion_runs ir
@@ -643,6 +645,7 @@ async def update_layer(
     routing_patterns: list[str] | None = None,
     answer_mode: str | None = None,
     structure_patterns: list[str] | None = None,
+    archived_patterns: list[str] | None = None,
     claim_origin: str | None = None,
 ) -> dict:
     """Set the given settings of a layer in one UPDATE; None leaves a setting as it is.
@@ -671,6 +674,8 @@ async def update_layer(
         values["answer_mode"] = _validate_answer_mode(answer_mode)
     if structure_patterns is not None:
         values["structure_patterns"] = _validate_structure_patterns(structure_patterns)
+    if archived_patterns is not None:
+        values["archived_patterns"] = _validate_archived_patterns(archived_patterns)
     if claim_origin is not None:
         _validate_length("origin", claim_origin, MAX_ORIGIN_LENGTH)
 
@@ -681,6 +686,14 @@ async def update_layer(
 
 async def delete_layer(database_url: str, *, name: str) -> dict:
     """Delete a knowledge layer and all its chunks.
+
+    The layer's file rows are locked before the chunks are deleted (see
+    lock_file_rows), so a running ingest of one of its files finishes first.
+    A file first ingested meanwhile holds the layer row until it commits, and
+    the delete of that row then cascades to it; chunks_deleted leaves its
+    chunks out. One order stays open: such a file stored again between the
+    lock and the delete of the layer row deadlocks, and Postgres aborts one
+    side with nothing half done.
 
     Returns summary of what was deleted.
     Raises LayerNotFoundError if layer doesn't exist.
@@ -697,15 +710,21 @@ async def delete_layer(database_url: str, *, name: str) -> dict:
             if layer is None:
                 raise LayerNotFoundError(f"Knowledge layer '{name}' not found.")
 
-            # Delete chunks from vector store
+            file_ids = await lock_file_rows(conn, layer["id"])
+
+            # Delete chunks from vector store: the locked files' and legacy ones
             result = await conn.execute(
-                "DELETE FROM strata_vectors.chunks WHERE layer_name = $1",
+                """
+                DELETE FROM strata_vectors.chunks
+                WHERE layer_name = $1 AND (file_id IS NULL OR file_id = ANY($2::uuid[]))
+                """,
                 name,
+                file_ids,
             )
             # asyncpg returns "DELETE N" where N is number of rows deleted
             chunks_deleted = int(result.split()[-1])
 
-            # Delete layer (cascades to ingestion_runs)
+            # Delete layer (cascades to its files, documents and ingestion_runs)
             await conn.execute(
                 "DELETE FROM strata_core.knowledge_layers WHERE name = $1",
                 name,

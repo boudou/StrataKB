@@ -59,7 +59,7 @@ class TestCheck:
         assert len(flags) == 1
         assert flags[0].kind == "amount"
         assert flags[0].text == "1500 EUR"
-        assert flags[0].message == '"1500 EUR" not found in S1–S4'
+        assert flags[0].message == '"1500 EUR" not found in S2'
 
     def test_prose_days_flagged(self):
         draft = CLEAN.replace("with 30 days' notice", "with 13 days' notice")
@@ -99,7 +99,52 @@ class TestCheck:
         assert [(f.kind, f.passages) for f in flags] == [("quote", ["S2"])]
 
     def test_uncited_quote_searches_every_passage(self):
-        assert _flag_texts('"the late rate is 5%"') == []
+        # The draft cites elsewhere, so the quote with no citation of its own may be anywhere
+        assert _flag_texts('"the late rate is 5%". Either party may end it [S1].') == []
+
+    def test_no_citations_flagged_even_when_everything_matches(self):
+        result = check('"the late rate is 5%" and the fee is EUR 1,000.00.', PASSAGES)
+        assert [(f.kind, f.text) for f in result.flags] == [("citation", "no citation")]
+        assert result.flags[0].passages == list(PASSAGES)
+        assert result.quotes_checked == 1
+        assert result.facts_checked == 1
+        assert not result.verified
+
+    def test_no_citation_flag_listed_first_past_the_cap(self):
+        draft = " ".join(f"Q{i}Z" for i in range(1, MAX_FLAGS + 20))
+        result = check(draft, PASSAGES)
+        assert result.flags[0].text == "no citation"
+        assert len(result.flags) == MAX_FLAGS
+        assert result.flags_unlisted == 20
+
+    def test_citation_inside_a_quote_does_not_count(self):
+        # The [S1] is the document's own text, not a citation by the draft
+        passages = {"S1": "See [S1] for the form."}
+        assert [f.text for f in check('"See [S1] for the form"', passages).flags] == ["no citation"]
+        result = check('"See [S1] for the form" [S1]', passages)
+        assert result.flags == []
+        assert result.verified
+
+    @pytest.mark.parametrize(
+        "draft",
+        [
+            "Termination also requires approval from the board of directors [S1].",
+            '"..." [S1]',
+            "[S1]",
+        ],
+    )
+    def test_cited_draft_with_nothing_to_check(self, draft):
+        result = check(draft, PASSAGES)
+        assert result.flags == []
+        assert result.nothing_checked
+        assert not result.verified
+
+    @pytest.mark.parametrize("draft", ["The moon is made of cheese.", "", "   "])
+    def test_draft_with_no_citations_and_nothing_to_check_flagged(self, draft):
+        result = check(draft, PASSAGES)
+        assert [(f.kind, f.text) for f in result.flags] == [("citation", "no citation")]
+        assert result.nothing_checked
+        assert not result.verified
 
     def test_quote_with_omission(self):
         assert _flag_texts('"A fee of EUR 1,000.00 ... is reported in pacs.002" [S2]') == []
@@ -171,7 +216,7 @@ class TestCheck:
         assert check("See section 12 [S1].", passages).flags == []
 
     def test_large_hostile_draft_bounded(self):
-        draft = " ".join(f"Q{i}Z" for i in range(1, 10_000))[:MAX_DRAFT_CHARS]
+        draft = " ".join(f"Q{i}Z" for i in range(1, 10_000))[:MAX_DRAFT_CHARS - 5] + " [S1]"
         passages = {f"S{i}": "A fee of EUR 25 applies within 30 days. " * 50 for i in range(1, 51)}
         result = check(draft, passages)
         assert len(result.flags) == MAX_FLAGS
@@ -267,3 +312,131 @@ class TestFormats:
     def test_normalise_text(self):
         assert normalise_text("“A  b” – c…\n d") == '"A b" - c... d'
         assert normalise_text("a  b\n\n c", keep_lines=True) == "a b\nc"
+
+
+class TestFactScope:
+    """A sentence's facts are checked against the passages cited in that sentence."""
+
+    P = {
+        "S1": "Either party may terminate with ninety (90) days' written notice under Article 12.",
+        "S2": "Refunds take thirty days. A fee of EUR 25 applies from 4 November 2026.",
+        "S3": "Clause 7.2 sets the rate at 5%.",
+    }
+    ALL = ["S1", "S2", "S3"]
+
+    @pytest.mark.parametrize(
+        ("draft", "expected"),
+        [
+            (
+                "Either party may terminate with 30 days' written notice [S1].",
+                [("30 days", ["S1"])],
+            ),
+            ("Either party may terminate with 90 days' written notice [S1].", []),
+            # No citation in the sentence: any passage given will do
+            ("Refunds take 30 days. Either party may end it [S1].", []),
+            ("Either party may end it [S1]. Refunds take 13 days.", [("13 days", ALL)]),
+            # Several citations in one sentence: either passage will do
+            ("Notice is 90 days [S2] and the fee is EUR 25 [S1].", []),
+            # A citation right after the end belongs to the sentence before it
+            ("Notice is 30 days. [S1] The fee is EUR 25. [S2]", [("30 days", ["S1"])]),
+            # ... unless a lower-case word follows it
+            (
+                "[S1] says the fee is EUR 25. [S2] says notice is 90 days.",
+                [("EUR 25", ["S1"]), ("90 days", ["S2"])],
+            ),
+            # Line breaks end sentences; a citation stays with its own line
+            ("Intro:\n[S1] Notice is 90 days.\n[S2] Fee is EUR 25.", []),
+            # ... or goes with the line before it when alone on its line
+            ("Notice is 90 days\n[S1]\nFee is EUR 25\n[S2]", []),
+            ("- Notice is 90 days [S1]\n- Fee is EUR 25 [S2]\n- Rate is 5% [S3]", []),
+            ("| Notice | 90 days | [S1] |\n| Fee | EUR 25 | [S2] |", []),
+            # A period before a digit does not end a sentence
+            ("Under Art. 13 notice is 90 days [S1].", [("Art. 13", ["S1"])]),
+            ("The fee starts on Nov. 4 2026 [S1].", [("Nov. 4 2026", ["S1"])]),
+            # End punctuation inside a quote ends the sentence
+            (
+                'It reads "Refunds take thirty days." [S2] Notice is 30 days [S1].',
+                [("30 days", ["S1"])],
+            ),
+            ('It reads "Refunds take thirty days" [S2] and is 90 days.', [("90 days", ["S2"])]),
+            # A digit after a citation starts a new sentence
+            (
+                "Refunds take 90 days [S2]. 30 days' notice is needed [S1].",
+                [("90 days", ["S2"]), ("30 days", ["S1"])],
+            ),
+            # A citation inside a quote is the document's text
+            (
+                '"See [S1] for it", 90 days [S2].',
+                [("See [S1] for it", ALL), ("90 days", ["S2"])],
+            ),
+            # A passage that was not given: the citation flag and the fact flag
+            ("EUR 25 [S9].", [("S9", ALL), ("EUR 25", ["S9"])]),
+        ],
+    )
+    def test_sentence_scope(self, draft, expected):
+        flags = check(draft, self.P).flags
+        assert [(f.text, f.passages) for f in flags] == expected
+
+    def test_message_names_the_cited_passage(self):
+        flags = check("Either party may terminate with 30 days' notice [S1].", self.P).flags
+        assert flags[0].message == '"30 days" not found in S1'
+
+    def test_no_citation_flags_with_every_id(self):
+        flags = check("It ends [S1]. Refunds take 13 days.", self.P).flags
+        assert flags[0].message == '"13 days" not found in S1–S3'
+        assert flags[0].passages == self.ALL
+
+    def test_same_fact_in_two_scopes_is_flagged_for_each(self):
+        result = check("13 days [S1]. 13 days [S2].", self.P)
+        assert result.facts_checked == 1
+        assert [(f.text, f.passages) for f in result.flags] == [
+            ("13 days", ["S1"]),
+            ("13 days", ["S2"]),
+        ]
+
+    def test_repeat_in_one_scope_is_checked_once(self):
+        assert check("It is 30 days [S1], 30 days, thirty days [S1].", PASSAGES).facts_checked == 1
+
+    def test_citations_on_lines_of_their_own(self):
+        draft = "Notice is 90 days. [S2]\n[S1]\nFee is EUR 25.\n[S2]\n[S3]."
+        assert check(draft, self.P).verified
+
+    def test_citation_followed_by_more_text_opens_the_next_clause(self):
+        flags = check("Notice is 90 days. [S2], the fee is EUR 25 [S1].", self.P).flags
+        assert flags == []
+        # [S2] opens the second clause, so the first sentence cites nothing
+        flags = check("Notice is 13 days. [S2], the fee is EUR 25 [S2].", self.P).flags
+        assert [(f.text, f.passages) for f in flags] == [("13 days", self.ALL)]
+
+    def test_period_after_trailing_citation_goes_with_it(self):
+        flags = check("Notice is 30 days. [S1]. The fee is EUR 25.", self.P).flags
+        assert [(f.text, f.passages) for f in flags] == [("30 days", ["S1"])]
+
+    def test_unusable_cited_passage_is_not_searched(self):
+        # S2 was given but its text could not be used; S1 alone is searched
+        flags = check("Notice is 30 days [S1, S2].", {"S1": self.P["S1"]}, ["S1", "S2"]).flags
+        assert [(f.text, f.passages) for f in flags] == [("30 days", ["S1", "S2"])]
+
+    def test_many_sentences_is_fast(self):
+        draft = ("x. [S1] " * (MAX_DRAFT_CHARS // 8))[:MAX_DRAFT_CHARS]
+        started = time.monotonic()
+        check(draft, self.P)
+        assert time.monotonic() - started < 2
+
+    def test_run_of_end_marks_is_fast(self):
+        started = time.monotonic()
+        check("." * MAX_DRAFT_CHARS + "x", self.P)
+        assert time.monotonic() - started < 2
+
+    def test_many_facts_under_many_cited_ids_is_fast(self):
+        # One sentence of distinct numbers citing tens of thousands of ids
+        half = MAX_DRAFT_CHARS // 2
+        numbers = " ".join(str(n) for n in range(10000, 10000 + half // 6))[:half]
+        markers = " ".join(f"[S{n}-S{n + 50}]" for n in range(1000, 1000 + 51 * half // 14, 51))
+        passages = {f"S{n}": f"Passage {n} has no such number." for n in range(1, 51)}
+        draft = f"{numbers} {markers}"[:MAX_DRAFT_CHARS]
+        started = time.monotonic()
+        result = check(draft, passages)
+        assert time.monotonic() - started < 2
+        assert len(result.flags) == MAX_FLAGS
+        assert result.flags_unlisted > 1000

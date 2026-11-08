@@ -4,9 +4,9 @@ Analyzes interaction history and feedback signals to promote
 successful query patterns into learned_rewrites, synonyms and
 layer affinities.
 
-Rewrites and affinities are recomputed from the lookback window on
-every run, so running the promoter twice never counts the same
-evidence twice.
+Rewrites, synonyms and affinities are recomputed from the lookback
+window on every run, so running the promoter twice never counts the
+same evidence twice.
 """
 
 from __future__ import annotations
@@ -16,10 +16,14 @@ from collections import Counter, defaultdict
 
 import structlog
 
-from stratakb.learning.store import LearningStore
+from stratakb.learning.signals import REFORMULATION_MIN_SIMILARITY, content_similarity
+from stratakb.learning.store import MINED_SYNONYM_CONFIDENCE, LearningStore
 from stratakb.learning.synonyms import extract_synonym_candidates
 
 logger = structlog.get_logger()
+
+# One reformulation can be a coincidence; a pair is stored from the second on
+MIN_SYNONYM_SIGHTINGS = 2
 
 # The interaction just before ie in the same session (the query ie reformulated)
 _PREVIOUS_INTERACTION = """
@@ -162,8 +166,13 @@ class Promoter:
 
         Pairs each interaction detected as a reformulation with the
         interaction just before it in the same session, and extracts term
-        mappings from the query differences.
+        mappings from the query differences. A pair seen fewer than
+        MIN_SYNONYM_SIGHTINGS times in the window is not stored.
+
+        Returns how many pairs were written.
         """
+        await self.store.purge_weak_mined_synonyms()
+
         rows = await self.store._fetch(
             f"""
             SELECT
@@ -175,25 +184,35 @@ class Promoter:
             {_PREVIOUS_INTERACTION}
             WHERE fs.signal_name = 'reformulation'
               AND ie.created_at > now() - interval '1 day' * $1
-            ORDER BY ie.created_at DESC
-            LIMIT 100
             """,
             lookback_days,
         )
 
-        count = 0
+        sightings: Counter = Counter()
         for row in rows:
-            candidates = extract_synonym_candidates(row["query_a"], row["query_b"])
-            for c in candidates:
-                layer = row["layers"][0] if row.get("layers") else None
-                await self.store.upsert_synonym(
-                    term=c["term"],
-                    synonym=c["synonym"],
-                    layer=layer,
-                    source="pattern_mining",
-                    confidence=0.6,
-                )
-                count += 1
+            # Signals stored under the older, looser rule stay in the window
+            if (
+                content_similarity(row["query_a"], row["query_b"])
+                < REFORMULATION_MIN_SIMILARITY
+            ):
+                continue
+            layer = row["layers"][0] if row.get("layers") else None
+            for c in extract_synonym_candidates(row["query_a"], row["query_b"]):
+                sightings[(c["term"], c["synonym"], layer)] += 1
+
+        count = 0
+        for (term, synonym, layer), seen in sightings.items():
+            if seen < MIN_SYNONYM_SIGHTINGS:
+                continue
+            await self.store.upsert_synonym(
+                term=term,
+                synonym=synonym,
+                layer=layer,
+                source="pattern_mining",
+                confidence=MINED_SYNONYM_CONFIDENCE,
+                usage_count=seen,
+            )
+            count += 1
 
         return count
 
