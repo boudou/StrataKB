@@ -96,13 +96,18 @@ def summary(rows):
                 s: sum(r["status"] == s for r in group)
                 for s in sorted({r["status"] for r in group})
             },
-            "found_without_evidence": sum(r["status"] == "found" and r["rank"] is None for r in group),
-            "not_found_with_evidence": sum(r["status"] == "not_found" and r["rank"] is not None for r in group),
+            "found_without_evidence": sum(
+                r["status"] == "found" and r["rank"] is None for r in group
+            ),
+            "not_found_with_evidence": sum(
+                r["status"] == "not_found" and r["rank"] is not None for r in group
+            ),
         }
     ref = [r for r in rows if r["want"] == "refuse"]
     # Questions answered by another layer stay out of the "not in any document" total.
     outside = [r for r in ref if r["group"] != "other_layer"]
-    for name, group in [("not_in_corpus", outside)] + [(k, [r for r in ref if r["group"] == k]) for k in sorted({r["group"] for r in ref})]:
+    by_group = [(k, [r for r in ref if r["group"] == k]) for k in sorted({r["group"] for r in ref})]
+    for name, group in [("not_in_corpus", outside)] + by_group:
         n = len(group)
         out_[f"refuse:{name}"] = {
             "n": n,
