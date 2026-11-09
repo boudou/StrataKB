@@ -72,8 +72,10 @@ _FRONTMATTER_RE = re.compile(
 )
 
 # A YAML key line ('key:', '"key":' or "'key':", then a space or the line end).
-# A plain key runs up to the first ': ' and may hold spaces ('date created: 2024')
-_YAML_KEY_RE = re.compile(r"""^(?:"[^"\n]*"|'[^'\n]*'|[^\s#"'][^\n]*?)[ \t]*:(?:[ \t]|$)""")
+# A plain key runs up to the first ': ' and may hold spaces ('date created: 2024').
+# Its blanks before the ':' belong to the key: an optional run of blanks after
+# the lazy key would rescan a long run at every step (quadratic time).
+_YAML_KEY_RE = re.compile(r"""^(?:"[^"\n]*"[ \t]*|'[^'\n]*'[ \t]*|[^\s#"'][^\n]*?):(?:[ \t]|$)""")
 
 # Dotted numbers: at most 3 levels of at most 3 digits ('2026.' and
 # '1,000.00' do not match), then the text, which starts with a letter

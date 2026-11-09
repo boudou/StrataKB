@@ -7,6 +7,7 @@ through the real pipeline against the database with embeddings mocked.
 from __future__ import annotations
 
 import contextlib
+import time
 from pathlib import Path
 from unittest.mock import patch
 from uuid import uuid4
@@ -125,6 +126,26 @@ def test_frontmatter_supersedes_rules(block, expected):
 )
 def test_frontmatter_supersedes_looks_only_in_front_matter(text):
     assert frontmatter_supersedes(text) is None
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("a" + " " * 100_000 + "b", "a" + " " * 100_000 + "b"),
+        ("a" + " " * 100_000, "a"),
+        ("'a'" + " " * 100_000 + "b", "a"),
+    ],
+    ids=["between-letters", "trailing", "after-quote"],
+)
+def test_run_of_blanks_in_the_value_is_read_in_linear_time(value, expected):
+    text = _with_key(value)
+    began = time.perf_counter()
+
+    found = frontmatter_supersedes(text)
+
+    # The old patterns needed over thirty seconds for the first and the last
+    assert time.perf_counter() - began < 0.1
+    assert found == expected
 
 
 @pytest.mark.parametrize(

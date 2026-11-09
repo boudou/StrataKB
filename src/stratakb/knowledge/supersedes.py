@@ -21,9 +21,11 @@ if TYPE_CHECKING:
     from stratakb.knowledge.parsers.registry import Format
 
 # A top-level key with a value on its own line. re.ASCII: under IGNORECASE
-# alone, the long s would also spell the key.
+# alone, the long s would also spell the key. The value keeps its trailing
+# blanks (stripped below): a lazy value before optional blanks would take time
+# quadratic in a run of blanks.
 _SUPERSEDES_KEY_RE = re.compile(
-    r"^supersedes[ \t]*:[ \t]+(\S.*?)[ \t]*$",
+    r"^supersedes[ \t]*:[ \t]+(\S.*)",
     re.ASCII | re.IGNORECASE | re.MULTILINE,
 )
 
