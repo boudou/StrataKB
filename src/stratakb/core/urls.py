@@ -43,8 +43,26 @@ def url_host(url: str) -> str:
         return ""
 
 
+def _at_after_authority(url: str) -> bool:
+    """True when an "@" sits after the authority of url, read by hand.
+
+    An unencoded "/", "?" or "#" in a password ends the authority early, so the
+    parsed host and port would be the user and the start of the password.
+    """
+    start = url.find("//")
+    rest = url[start + 2 :] if start >= 0 else url
+    ends = [i for i in (rest.find(c) for c in "/?#") if i >= 0]
+    return "@" in rest[min(ends, default=len(rest)) :]
+
+
 def url_host_port(database_url: str) -> str:
-    """host:port of a database URL, never its user, password, database name or query."""
+    """host:port of a database URL, never its user, password, database name or query.
+
+    "unknown host" when the URL cannot be read safely: an "@" after the
+    authority means the parsed host would come from the credentials.
+    """
+    if _at_after_authority(database_url):
+        return "unknown host"
     parts = url_parts(database_url)
     if parts is None:
         return "localhost:5432"

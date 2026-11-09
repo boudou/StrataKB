@@ -152,6 +152,27 @@ async def test_pool_log_shows_host_and_port_only(clean_pools, url, shown):
     assert "hunter2" not in repr(logs)
 
 
+@pytest.mark.parametrize(
+    "url",
+    [
+        "postgresql://app:123/x@db/strata",
+        "postgresql://app:99/secret@db:5432/s",
+        "postgresql://app:123?x@db/s",
+        "postgresql://app:123#x@db/s",
+    ],
+)
+async def test_pool_log_hides_credentials_of_a_malformed_url(clean_pools, url):
+    factory = FakeFactory()
+    factory.gate.set()
+    with patch.object(database.asyncpg, "create_pool", factory), capture_logs() as logs:
+        await get_pool(url)
+
+    creating = [log for log in logs if log["event"] == "creating_db_pool"]
+    assert [log["url"] for log in creating] == ["unknown host"]
+    for secret in ("app", "123", "99", "secret"):
+        assert secret not in repr(creating)
+
+
 async def test_close_pool_clears_locks(clean_pools):
     factory = FakeFactory()
     factory.gate.set()
