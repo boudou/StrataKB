@@ -15,7 +15,12 @@ from stratakb.core.audit import write_audit_log
 from stratakb.core.auth import require_role
 from stratakb.core.logging import log_tool_call
 from stratakb.learning.pii import scrub_query
-from stratakb.rag.clause_lookup import ClauseMatches, in_exact_span, without_exact_spans
+from stratakb.rag.clause_lookup import (
+    ClauseMatches,
+    cap_note,
+    in_exact_span,
+    without_exact_spans,
+)
 from stratakb.rag.clause_lookup import lookup as lookup_clauses
 from stratakb.rag.confidence import (
     EXTRACTIVE_SENTENCE_THRESHOLD,
@@ -423,6 +428,8 @@ def register_rag_tools(
             return ToolFailure("Query cannot be empty.")
 
         try:
+            # Read before detection fills layers in: a cap note's layer advice
+            layer_named = bool(layers)
             # NLP layer detection — auto-detect layers if not explicitly specified
             # Layer detection with optional learned affinity blending
             detected_layers: list[str] = []
@@ -489,6 +496,7 @@ def register_rag_tools(
                 results=items,
                 auto_detected_layers=detected_layers,
                 routing_fallback=fallback_reason,
+                note=cap_note(matches, layer_named),
             )
         except Exception as e:
             return ToolFailure(str(e))
@@ -512,7 +520,10 @@ def register_rag_tools(
         low, and an interaction_id to pass to strata_feedback. A clause or
         section the query names ("clause 7.2") comes first, verbatim,
         marked "match": "exact". A result cut to fit the token budget also has
-        "cut": true: it holds only the start of the clause.
+        "cut": true: it holds only the start of the clause. When more sections
+        match than the first 10 returned, or the query names more than 10
+        references, a top-level note gives the count of matching sections not
+        returned and names the references not looked up.
 
         Args:
             query: Natural language search query, or exact terms and identifiers.
@@ -552,6 +563,8 @@ def register_rag_tools(
             return ToolFailure("Question cannot be empty.")
 
         try:
+            # Read before detection fills layers in: a cap note's layer advice
+            layer_named = bool(layers)
             # Auto-detect layers if not specified
             detected: list[str] = []
             if not layers:
@@ -650,8 +663,8 @@ def register_rag_tools(
             left_out = exact[len(chunks):]
             documents = await _cited_documents(database_url, chunks + left_out)
             passages = build_passages(chunks, documents)
-            omitted = left_out_note(
-                left_out, documents, matches.unread, matches.unread_is_minimum
+            omitted = _join_notes(
+                left_out_note(left_out, documents), cap_note(matches, layer_named)
             )
             status = answer_status(
                 max((basis_score(c, basis) for c in chunks), default=0.0), basis
@@ -754,8 +767,10 @@ def register_rag_tools(
         comes first, verbatim, once per document that has it. A named clause over
         its share of the budget comes back cut: a found answer becomes
         partly_found, with a note naming the clause and the file. A named clause
-        that does not fit, or a match past the first 10, is left out: a found
-        answer becomes partly_found, with a note giving the count and the files.
+        that does not fit is left out, and so is a matching section past the
+        first 10: a found answer becomes partly_found, with a note naming the
+        clauses left out and their files, and counting the sections not read.
+        References past the first 10 are not looked up; the note names them.
         A name the question asks about (asyncio.TaskPool, PyConfig_Merge,
         AC04, PEP 8) must be in a passage returned: when none is, the status
         is not_found and the passages are only related text; when some are

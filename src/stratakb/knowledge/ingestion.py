@@ -57,6 +57,7 @@ from stratakb.knowledge.vector_store import ChunkRecord, chunk_embed_text, inser
 if TYPE_CHECKING:
     from uuid import UUID
 
+    from stratakb.config import Settings
     from stratakb.knowledge.selection import FileEntry
 
 logger = structlog.get_logger()
@@ -184,6 +185,8 @@ async def _embed_chunks(
     chunks: list[ChunkRecord],
     embedding_model: str = "",
     embedding_dimensions: int = 0,
+    *,
+    settings: Settings | None = None,
 ) -> None:
     """Fill in the chunks' embeddings, in batches of EMBED_BATCH_SIZE to bound memory."""
     for i in range(0, len(chunks), EMBED_BATCH_SIZE):
@@ -193,6 +196,7 @@ async def _embed_chunks(
             api_key=api_key,
             model=embedding_model,
             dimensions=embedding_dimensions,
+            settings=settings,
         )
         for chunk, emb in zip(batch, embeddings):
             chunk.embedding = emb
@@ -372,6 +376,7 @@ async def ingest_documents(
     replace_all: bool = False,
     files: Sequence[FileEntry] | None = None,
     progress: Callable[[int, int], None] | None = None,
+    settings: Settings | None = None,
 ) -> IngestionResult:
     """Sync a file, a folder or a list of files under a folder into a knowledge layer.
 
@@ -430,6 +435,8 @@ async def ingest_documents(
             updated file is stored. total counts the files that may need
             storing (not secret-named, and without a carried hash equal to
             the tracked one), so done can end below total. Must not raise.
+        settings: The settings the embedding uses. Without them, the
+            environment's, read when embedding.
 
     Returns:
         IngestionResult with stats and any errors.
@@ -629,6 +636,7 @@ async def ingest_documents(
                     doc_chunks,
                     embedding_model=embedding_model,
                     embedding_dimensions=embedding_dimensions,
+                    settings=settings,
                 )
             except Exception as e:
                 logger.warning(

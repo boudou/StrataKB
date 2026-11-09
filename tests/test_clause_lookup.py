@@ -21,6 +21,7 @@ from stratakb.rag.clause_lookup import (
     ClauseMatches,
     Reference,
     _exact_chunk,
+    cap_note,
     find_references,
     fit_clauses,
     fit_to_budget,
@@ -201,11 +202,97 @@ def test_fit_clauses_drops_nothing():
     assert all(len(c["content"]) <= 200 and c["cut"] for c in fitted)
 
 
+def test_fit_to_budget_floor_is_its_cheapest_cut():
+    chunk = _exact("termination " * 200)
+
+    floor = passage_cost(fit_to_budget(chunk, 1))
+
+    assert floor == min(passage_cost(fit_to_budget(chunk, b)) for b in range(1, 300))
+
+
+def test_fit_clauses_keeps_what_an_even_split_keeps():
+    chunks = [
+        _exact("word " * 60, 100) | {"clause_path": "x" * 40},
+        _exact("word " * 200, 5000) | {"clause_path": "x" * 3},
+        _exact("word " * 200, 10000) | {"clause_path": "x" * 120},
+    ]
+    budget = 500
+
+    even = [fit_to_budget(c, budget // 3) for c in chunks]
+    assert len(pack_passages(even, budget)) == 3
+
+    assert len(pack_passages(fit_clauses(chunks, budget), budget)) == 3
+
+
 def test_short_clause_over_its_share_is_not_marked_cut():
     chunk = fit_to_budget(_exact("short"), 1)
 
     assert chunk["content"] == "short"
     assert "cut" not in chunk
+
+
+class TestCapNote:
+    def test_nothing_left_out(self):
+        assert cap_note(ClauseMatches([]), layer_named=False) is None
+
+    def test_candidate_limit_without_a_count(self):
+        matches = ClauseMatches([], 0, True, references=1)
+
+        assert cap_note(matches, layer_named=True) == "More sections may match than were read."
+
+    def test_fewer_clauses_only_for_several_references(self):
+        matches = ClauseMatches([], unread=3, references=2)
+
+        assert cap_note(matches, layer_named=True) == (
+            "3 more matching sections not read; ask about fewer clauses at a time."
+        )
+        assert cap_note(matches._replace(references=1), layer_named=True) == (
+            "3 more matching sections not read."
+        )
+
+    def test_layer_advice_only_when_none_was_named(self):
+        matches = ClauseMatches([], unread=2, unread_is_minimum=True, references=1)
+
+        assert cap_note(matches, layer_named=False) == (
+            "At least 2 more matching sections not read; name a layer to narrow the question."
+        )
+
+    def test_both_pieces_of_advice(self):
+        note = cap_note(ClauseMatches([], unread=1, references=2), layer_named=False)
+
+        assert note == (
+            "1 more matching section not read; ask about fewer clauses at a time, "
+            "or name a layer to narrow the question."
+        )
+
+    def test_references_past_the_cap_are_named(self):
+        one = ClauseMatches([], references=10, skipped_references=("Annex II",))
+        assert cap_note(one, layer_named=True) == (
+            "1 more reference not looked up: Annex II. Ask about at most 10 clauses at a time."
+        )
+
+        both = ClauseMatches(
+            [], unread=2, references=10, skipped_references=("4.1", "4.2")
+        )
+        assert cap_note(both, layer_named=True) == (
+            "2 more matching sections not read; ask about fewer clauses at a time. "
+            "2 more references not looked up: 4.1, 4.2. Ask about at most 10 clauses at a time."
+        )
+
+
+async def test_lookup_names_references_past_the_cap():
+    from stratakb.rag import clause_lookup
+
+    question = ", ".join(f"3.{i}" for i in range(1, 12))
+    resolve = AsyncMock(return_value=ClauseMatches([]))
+
+    with patch.object(clause_lookup, "resolve", resolve):
+        matches = await clause_lookup.lookup("postgresql://unused", question, None, 1500)
+
+    assert len(resolve.call_args.args[1]) == clause_lookup.MAX_REFERENCES
+    assert matches.chunks == []
+    assert matches.references == 10
+    assert matches.skipped_references == ("3.11",)
 
 
 def test_chunks_inside_an_exact_span_are_dropped():
@@ -570,10 +657,46 @@ class TestAskClause:
             )
 
         assert response["status"] == "partly_found"
-        assert "More documents match than were read" in response["note"]
-        assert "3 more matching sections" in response["note"]
+        assert response["note"].endswith("3 more matching sections not read.")
         assert detailed["answer_status"] == "partly_found"
         assert detailed["note"] == response["note"]
+
+    async def test_candidate_limit_is_noted(self, server, settings, layers):
+        layer, _ = layers
+        doc = await _document(settings.database_url, layer, "contract.md")
+        chunk = _exact_chunk(
+            {
+                "layer_name": layer, "source_file": "contract.md", "path": "7 X",
+                "doc_type": "markdown", "document_id": doc["id"], "char_start": 0,
+            },
+            doc["text"][:40],
+        )
+
+        with patch(
+            "stratakb.rag.tools._exact_clauses",
+            AsyncMock(return_value=ClauseMatches([chunk], 0, True, references=1)),
+        ):
+            response, _ = await _call(
+                server, "strata_ask", [], question="clause 2", layers=[layer],
+            )
+
+        assert response["status"] == "partly_found"
+        assert response["note"].endswith("More sections may match than were read.")
+
+    async def test_eleventh_reference_is_named(self, server, settings, layers):
+        layer, _ = layers
+        question = (
+            "clauses 3.1, 3.2, 3.3, 3.4, 3.5, 3.6, 3.7, 3.8, 3.9, 3.10 and Annex II"
+        )
+
+        response, _ = await _call(
+            server, "strata_ask", [], question=question, layers=[layer],
+        )
+
+        assert (
+            "1 more reference not looked up: Annex II. Ask about at most 10 clauses at a time."
+            in response["note"]
+        )
 
     async def test_search_keeps_a_clause_over_the_budget(self, server, settings, layers):
         _, layer = layers
@@ -589,6 +712,7 @@ class TestAskClause:
 
 async def test_cut_clause_rule_in_the_contract(server):
     assert "cut true" in server.instructions
+    assert "strata_search returns a note" in server.instructions
     assert "or not at all" in server.instructions
     assert len(server.instructions) <= 4000
     prompt = await server.get_prompt("answer_from_documents", {"question": "q"})
@@ -616,6 +740,35 @@ async def test_resolve_caps_a_label_many_documents_share(settings, tmp_path):
         assert [c["source_file"] for c in chunks] == names[:MAX_EXACT_MATCHES]
         assert {c["clause_path"] for c in chunks} == {CLAUSE_PATH}
         assert all(c["match"] == "exact" and c["content"] for c in chunks)
+    finally:
+        with contextlib.suppress(LayerNotFoundError):
+            await delete_layer(db_url, name=layer)
+
+
+async def test_match_cap_reaches_ask_and_search(server, settings, tmp_path):
+    from stratakb.knowledge.layers import LayerNotFoundError, delete_layer
+    from stratakb.rag.clause_lookup import MAX_EXACT_MATCHES
+
+    db_url = settings.database_url
+    layer = await _make_layer(db_url)
+    for i in range(MAX_EXACT_MATCHES + 3):
+        shutil.copy(FIXTURES / "contract.md", tmp_path / f"doc{i:02d}.md")
+    try:
+        await _ingest_ok(db_url, layer, tmp_path)
+
+        asked, _ = await _call(
+            server, "strata_ask", [], question="clause 2.2", layers=[layer],
+        )
+        searched, _ = await _call(
+            server, "strata_search", [], query="clause 2.2", layers=[layer],
+        )
+
+        assert asked["status"] == "partly_found"
+        assert "3 more matching sections not read." in asked["note"]
+        exact = [r for r in searched["results"] if r.get("match") == "exact"]
+        assert len(exact) == MAX_EXACT_MATCHES
+        assert searched["status"] == "ok"
+        assert searched["note"] == "3 more matching sections not read."
     finally:
         with contextlib.suppress(LayerNotFoundError):
             await delete_layer(db_url, name=layer)

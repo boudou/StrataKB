@@ -474,17 +474,6 @@ def test_left_out_note():
     two = left_out_note([chunk("7 Fees", "a.md"), chunk(None, "b.md")], {})
     assert two.startswith("2 named clauses left out, over the token budget: 7 Fees in a.md; b.md. ")
 
-    assert left_out_note([], {}, 1) == (
-        "More documents match than were read: 1 more matching section not read. "
-        "Name a layer to narrow the question."
-    )
-    assert "at least 3 more matching sections" in left_out_note([], {}, 3, True)
-
-    both = left_out_note([chunk("7 Fees", "a.md")], {}, 2)
-    assert both.startswith("1 named clause left out")
-    assert "ask for fewer at a time. More documents match" in both
-    assert "2 more matching sections" in both
-
 
 def test_left_out_note_gives_the_path_a_citation_gives():
     chunk = {
@@ -505,10 +494,11 @@ class TestSearchResponseShape:
             auto_detected_layers=["sepa"],
             routing_fallback="low_confidence",
             interaction_id="int-1",
+            note="n",
         ).to_dict()
 
         assert list(response) == [
-            "status", "query", "confidence", "results", "total",
+            "status", "query", "confidence", "results", "total", "note",
             "auto_detected_layers", "routing_fallback", "interaction_id",
         ]
         assert response["status"] == "ok"

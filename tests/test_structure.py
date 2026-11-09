@@ -18,7 +18,12 @@ import pytest
 
 from stratakb.knowledge.documents import build_document_text
 from stratakb.knowledge.ingestion import _chunk_document, _map_document, _parse_file
-from stratakb.knowledge.structure import PATH_SEPARATOR, chunk_spans, detect_sections
+from stratakb.knowledge.structure import (
+    PATH_SEPARATOR,
+    chunk_spans,
+    detect_sections,
+    frontmatter_end,
+)
 from tests.helpers import FAKE_EMBEDDING, call_tool, ingest
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -542,6 +547,22 @@ def test_underline_right_after_front_matter():
     t = "---\ntitle: Foo\n---\nIntro\n-----\n\nText.\n"
     sections = detect_sections(t)
     assert [(s.path, s.char_start) for s in sections] == [("Intro", t.index("Intro"))]
+
+
+@pytest.mark.parametrize(
+    ("line", "is_front_matter"),
+    [("a" + " " * 100_000 + "b: x", True), ("a" + " " * 100_000 + "b", False)],
+    ids=["key", "not-a-key"],
+)
+def test_run_of_blanks_in_a_front_matter_line_is_read_in_linear_time(line, is_front_matter):
+    text = f"---\n{line}\n---\n# H\n"
+    began = time.perf_counter()
+
+    end = frontmatter_end(text)
+
+    # The old key pattern needed over ten seconds for each of these
+    assert time.perf_counter() - began < 0.1
+    assert (end > 0) is is_front_matter
 
 
 def test_toc_entry_with_extra_pattern_is_skipped():

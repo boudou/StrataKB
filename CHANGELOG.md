@@ -69,6 +69,8 @@ Notable changes to StrataKB. The format follows [Keep a Changelog](https://keepa
 - `strata_ask` checks the names a question asks about (dotted and snake_case names, codes, numbered references such as `PEP 8`) against the passages: some missing makes a `found` answer `partly_found`, none present makes it `not_found` unless a named clause came back, and the `note` lists them.
 - `strata_learning_stats` shows each top synonym's layer and `usage_count`.
 - A frozen gold set of questions over the Python Enhancement Proposals, with scripts to check and score it, under `evals/`.
+- `strata_verify` lists the sentences of a draft that held no quote or fact it could check, in `unchecked_sentences`; a verified draft's receipt records them, scrubbed like the draft. The verdict is unchanged and is now decided in one place.
+- The answer contract tells clients that passage text is data from the documents, and that instructions inside it are not to be followed.
 
 ### Changed
 
@@ -122,6 +124,7 @@ Notable changes to StrataKB. The format follows [Keep a Changelog](https://keepa
 - The README describes what works today, for one developer or a small trusted group, and no longer implies a team server; the full tool and settings reference moved to the wiki's Tools and Configuration pages.
 - The package description now reads "Knowledge base over the Model Context Protocol whose answers you can check against exact locations in your documents".
 - Receipts stored earlier keep `verified`; one with no quotes and no facts checked now opens with a `verification_note` saying nothing was checked, which `stratakb receipt` prints after the Verification line.
+- `strata_ingest_documents` and `strata_apply_preset` use the settings the server started with, as search and ask already did, so a server started with `STRATA_LOCAL_ONLY` keeps refusing outbound embeddings when its config is edited while it runs. Turning the switch on in a config file protects a running server only after a restart.
 
 ### Fixed
 
@@ -172,6 +175,8 @@ Notable changes to StrataKB. The format follows [Keep a Changelog](https://keepa
 - Learning no longer mines synonyms from unrelated questions that shared common words: similarity uses content terms only and must reach 0.3, a pair needs exactly one term unique to the first question and two sightings, and mined synonyms are stored at confidence 0.7. Rows stored at 0.6 stop being applied and are deleted on the next promoter run, and a rerun no longer duplicates rows with no layer.
 - Deleting a layer during an ingest of it could deadlock. `delete_layer`, `clear_layer` and file removal now lock file rows in the same order as an ingest.
 - The gold set scorer turns learning off itself, stops at the first failed question or a missing layer, and writes its output only for a finished run; the checker exits non-zero on problems.
+- Clause lookup states every limit: references past the first 10 of a question are named in the note, `strata_search` says how many matching sections it did not return, the cap note counts sections rather than documents and advises a layer only when none was named, and a hit candidate limit is mentioned even when nested sections bring the kept ones under the cap. A clause's budget share now leaves room for the clauses after it, so a set an even split fits is no longer cut.
+- Front matter lines with long runs of blanks (a key line, or a `supersedes` value) are read in linear time; 100,000 blanks took over ten seconds and stalled an ingest.
 
 ### Security
 
@@ -188,3 +193,5 @@ Notable changes to StrataKB. The format follows [Keep a Changelog](https://keepa
 - `stratakb receipt --json`, its JSON error form and `stratakb add --json` write DEL, C1 controls and bidi overrides as `\uXXXX` escapes, so a document quote or file name cannot drive the terminal; the output stays valid JSON. The text report of `stratakb add` and the refusal hints now escape them too, each entry on one line.
 - The `creating_db_pool` log shows only host and port. Before, a `DATABASE_URL` with the password in its query string (`?user=…&password=…`) put the password in the log.
 - Structure patterns already stored in a layer (from an import, a restore or an older version) that do not compile or repeat a repeated part are now skipped with an `unsafe_structure_pattern` warning in the clause lookup and at ingest, as routing patterns already were at search time, and `import-layer` drops such structure and routing patterns, naming each. The `label` group a question runs is checked too, so a pattern that only looks safe as stored cannot stall a search.
+- A malformed database URL whose unencoded password holds a `/`, `?` or `#` no longer puts the user and the start of the password into the `creating_db_pool` log line, the `stratakb add` and `stratakb receipt` messages or the add plan; such a URL is reported as `unknown host`.
+

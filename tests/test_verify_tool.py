@@ -151,6 +151,7 @@ class TestVerifyTool:
         assert result["receipt_id"].startswith("rcpt_")
         assert result["quotes_checked"] == 1
         assert "flags" not in result
+        assert "unchecked_sentences" not in result
 
         receipt = await open_receipt(db_url, result["receipt_id"], user, "viewer")
         assert receipt["kind"] == "verify"
@@ -159,6 +160,7 @@ class TestVerifyTool:
         assert [q["quote"] for q in receipt["quotes"]] == [QUOTE, REFUND]
         assert receipt["verification"]["result"] == "verified"
         assert [p["id"] for p in receipt["verification"]["passages"]] == ["S1", "S2"]
+        assert "unchecked_sentences" not in receipt["verification"]
         # The draft is stored scrubbed; the quote keeps the document's own text
         assert IBAN not in receipt["draft"]
         assert "[IBAN_REDACTED]" in receipt["draft"]
@@ -405,6 +407,71 @@ class TestVerifyTool:
             opened = await call_tool(server, "strata_get_receipt", receipt_id=receipt_id)
         assert "verification_note" not in opened["receipt"]
         assert NOTHING_CHECKED_NOTE not in render_receipt(opened["receipt"])
+
+    async def test_unchecked_sentence_listed_and_on_receipt(
+        self, server, db_url, layer, tmp_path, user
+    ):
+        from stratakb.cli import render_receipt
+
+        doc = await _document(db_url, layer, tmp_path)
+        draft = "The moon is made of cheese. Records are kept for 30 days [S1]."
+        with _as(user):
+            result = await _verify(server, draft, [_ref(doc, QUOTE)])
+            opened = await call_tool(server, "strata_get_receipt", receipt_id=result["receipt_id"])
+        assert result["result"] == "verified"
+        assert result["receipt_id"].startswith("rcpt_")
+        assert result["unchecked_sentences"] == ["The moon is made of cheese."]
+        assert "more_unchecked_sentences" not in result
+        receipt = opened["receipt"]
+        assert receipt["verification"]["unchecked_sentences"] == ["The moon is made of cheese."]
+        lines = render_receipt(receipt).split("\n")
+        at = lines.index("Not checked (no quote or fact to compare):")
+        assert lines[at + 1] == "  The moon is made of cheese."
+        rows = await _audit_rows(db_url, user)
+        assert json.loads(rows[0]["parameters"]) == {
+            "passages": 1, "quotes": 0, "facts": 1, "flags": 0,
+            "receipt_id": result["receipt_id"],
+        }
+
+    async def test_unchecked_sentence_scrubbed_on_receipt(
+        self, server, db_url, layer, tmp_path, user
+    ):
+        from stratakb.rag.receipts import open_receipt
+
+        doc = await _document(db_url, layer, tmp_path)
+        draft = "Send it to DEUTDEFF first. Records are kept for 30 days [S1]."
+        with _as(user):
+            result = await _verify(server, draft, [_ref(doc, QUOTE)])
+        assert result["result"] == "verified"
+        assert result["unchecked_sentences"] == ["Send it to DEUTDEFF first."]
+        receipt = await open_receipt(db_url, result["receipt_id"], user, "viewer")
+        assert receipt["verification"]["unchecked_sentences"] == [
+            "Send it to [BIC_REDACTED] first."
+        ]
+        assert "DEUTDEFF" not in json.dumps(receipt["verification"])
+
+    async def test_long_unchecked_sentence_cut(self, server, db_url, layer, tmp_path, user):
+        from stratakb.rag.verify_tools import MAX_SENTENCE_CHARS
+
+        doc = await _document(db_url, layer, tmp_path)
+        long = "word " * 60 + "end."
+        with _as(user):
+            result = await _verify(
+                server, f"{long} Records are kept for 30 days [S1].", [_ref(doc, QUOTE)]
+            )
+        assert result["result"] == "verified"
+        [shown] = result["unchecked_sentences"]
+        assert len(shown) == MAX_SENTENCE_CHARS
+        assert shown.endswith("…")
+
+    async def test_flagged_lists_unchecked(self, server, db_url, layer, tmp_path, user):
+        doc = await _document(db_url, layer, tmp_path)
+        draft = "The moon is made of cheese. Records are kept for 31 days [S1]."
+        with _as(user):
+            result = await _verify(server, draft, [_ref(doc, QUOTE)])
+        assert result["result"] == "flagged"
+        assert result["unchecked_sentences"] == ["The moon is made of cheese."]
+        assert "receipt_id" not in result
 
     async def test_input_limits(self, server, user):
         with _as(user):

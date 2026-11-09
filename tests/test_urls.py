@@ -11,6 +11,15 @@ from stratakb.core.urls import url_host, url_host_port, url_parts
 
 _FAKE_URL = "postgresql://strata:secret-pw@db.example:6543/strata"
 
+# Unencoded "/", "?" or "#" in the password: urlsplit reads the user as the
+# host and the start of the password as the port.
+MALFORMED_URLS = [
+    "postgresql://app:123/x@db/strata",
+    "postgresql://app:99/secret@db:5432/s",
+    "postgresql://app:123?x@db/s",
+    "postgresql://app:123#x@db/s",
+]
+
 
 class TestUrlParsing:
     def test_url_parts(self):
@@ -59,6 +68,26 @@ class TestUrlParsing:
     def test_url_host_port_never_shows_a_query_string_password(self):
         shown = url_host_port("postgresql://db.example/strata?user=app&password=hunter2")
         assert shown == "db.example:5432"
+
+    @pytest.mark.parametrize("url", MALFORMED_URLS)
+    def test_url_host_port_never_shows_credentials_of_a_malformed_url(self, url):
+        shown = url_host_port(url)
+        assert shown == "unknown host"
+        for secret in ("app", "123", "99", "secret"):
+            assert secret not in shown
+
+    @pytest.mark.parametrize(
+        ("url", "shown"),
+        [
+            ("postgresql://app:p%2F1%3F2%233%402@db.example:6543/strata", "db.example:6543"),
+            ("postgresql://app:123%2Fx@db.example/strata", "db.example:5432"),
+            ("postgresql://app@db.example/strata", "db.example:5432"),
+            ("postgresql://app:pw@[::1]:6543/strata", "::1:6543"),
+            ("postgresql://localhost", "localhost:5432"),
+        ],
+    )
+    def test_url_host_port_of_well_formed_urls(self, url, shown):
+        assert url_host_port(url) == shown
 
 
 def test_egress_does_not_import_the_database_module():

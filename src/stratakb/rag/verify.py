@@ -15,7 +15,8 @@ A citation to a passage id that was not given is flagged too, and so is a
 draft with no citations at all, even when its quotes and facts match. A draft
 with no quote and no fact to check is not verified: there was nothing to
 compare. A paraphrase that changes the meaning without changing a fact is not
-caught.
+caught. The sentences with no quote and no fact are listed, not judged: the
+verdict covers only what was checked.
 """
 
 from __future__ import annotations
@@ -310,14 +311,24 @@ class CheckResult:
     quotes_checked: int
     facts_checked: int
     flags_unlisted: int = 0
+    # The sentences with no quote and no fact checked (at most MAX_FLAGS), and
+    # how many more there were
+    unchecked_sentences: list[str] = field(default_factory=list)
+    unchecked_unlisted: int = 0
 
-    @property
-    def nothing_checked(self) -> bool:
-        return not self.quotes_checked and not self.facts_checked
 
-    @property
-    def verified(self) -> bool:
-        return not self.flags and not self.flags_unlisted and not self.nothing_checked
+def verdict(result: CheckResult, extra_flags: int = 0) -> str:
+    """The verdict on a checked draft: flagged, nothing_checked or verified.
+
+    extra_flags counts the flags raised outside check(), such as a passage
+    that could not be used. The verdict covers only what was checked: the
+    unchecked sentences do not change it.
+    """
+    if result.flags or result.flags_unlisted or extra_flags:
+        return "flagged"
+    if not result.quotes_checked and not result.facts_checked:
+        return "nothing_checked"
+    return "verified"
 
 
 def _words_value(text: str) -> int:
@@ -546,6 +557,20 @@ class _Scope:
         return _id_range(self.ids)
 
 
+def _uncovered_sentences(lines: str, starts: list[int], covered: list[bool]) -> Iterator[str]:
+    """The text of each sentence not covered, on one line, in draft order.
+
+    A sentence that holds nothing but citations and punctuation is skipped.
+    """
+    ends = [*starts[1:], len(lines)]
+    for start, end, is_covered in zip(starts, ends, covered, strict=True):
+        if is_covered:
+            continue
+        text = normalise_text(lines[start:end])
+        if re.search(r"\w", _CITATION.sub(" ", text)):
+            yield text
+
+
 def check(
     draft: str, passages: dict[str, str], given: Sequence[str] | None = None
 ) -> CheckResult:
@@ -604,6 +629,7 @@ def check(
     # For the sentence scopes a quote's text goes, but not its end punctuation
     scoped = list(lines)
     quotes = 0
+    quote_starts: list[int] = []
     for m in _QUOTE.finditer(flat_draft):
         quote = m.group(1).strip()
         masked[m.start():m.end()] = " " * (m.end() - m.start())
@@ -612,6 +638,7 @@ def check(
         if not re.search(r"\w", quote):
             continue
         quotes += 1
+        quote_starts.append(m.start())
         cited = [pid for c in _CITATION.finditer(m.group(2)) for pid in _cited_ids(c.group(0))]
         scope = scope_of(cited)
         if not any(_quote_found(quote, index.flat) for index in scope.targets):
@@ -622,16 +649,38 @@ def check(
     # Each fact is checked once per set of citations, however often it is written
     starts, cited_ids = _sentence_scopes("".join(scoped))
     sentence_scopes = [scope_of(cited) for cited in cited_ids]
+    # A sentence is covered when it holds a quote or a fact that was checked
+    covered = [False] * len(starts)
+    for pos in quote_starts:
+        covered[bisect_right(starts, pos) - 1] = True
     facts: dict[tuple, Fact] = {}
     checked: set[tuple] = set()
     for pos, fact in _located_facts("".join(masked)):
         facts.setdefault(fact.key, fact)
-        scope = sentence_scopes[bisect_right(starts, pos) - 1]
+        sentence = bisect_right(starts, pos) - 1
+        covered[sentence] = True
+        scope = sentence_scopes[sentence]
         if (fact.key, scope) in checked:
             continue
         checked.add((fact.key, scope))
         if not any(index.has(fact) for index in scope.targets):
             flag(fact.kind, fact.text, f'"{fact.text}" not found in ', scope)
+
+    # The sentences compared with nothing are listed, not judged. When nothing
+    # was checked at all, every sentence is unchecked and none is listed
+    unchecked: list[str] = []
+    unchecked_unlisted = 0
+    if quotes or facts:
+        for text in _uncovered_sentences(lines, starts, covered):
+            if len(unchecked) < MAX_FLAGS:
+                unchecked.append(text)
+            else:
+                unchecked_unlisted += 1
     return CheckResult(
-        flags=flags, quotes_checked=quotes, facts_checked=len(facts), flags_unlisted=unlisted
+        flags=flags,
+        quotes_checked=quotes,
+        facts_checked=len(facts),
+        flags_unlisted=unlisted,
+        unchecked_sentences=unchecked,
+        unchecked_unlisted=unchecked_unlisted,
     )
