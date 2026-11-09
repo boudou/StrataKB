@@ -73,8 +73,8 @@ async def _detect_layers(database_url: str, query: str, learning_enabled: bool) 
     try:
         routing = await get_layer_routing(database_url)
         patterns = compile_patterns(routing["patterns"])
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning("routing_patterns_unavailable", error_type=type(e).__name__)
 
     affinity_scores = None
     if learning_enabled:
@@ -83,8 +83,8 @@ async def _detect_layers(database_url: str, query: str, learning_enabled: bool) 
             affinities = await LearningStore(database_url).find_layer_affinities(query)
             if affinities:
                 affinity_scores = {layer: 0.8 for layer in affinities}
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("layer_affinities_unavailable", error_type=type(e).__name__)
 
     return detect_layers_with_affinity(
         query, patterns=patterns, affinity_scores=affinity_scores
@@ -588,8 +588,8 @@ def register_rag_tools(
                 try:
                     from stratakb.learning.store import LearningStore
                     learning_store = LearningStore(database_url)
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.warning("learning_store_unavailable", error_type=type(e).__name__)
 
             # Rewrite query into domain-specific variants
             domain_context = ""
@@ -598,8 +598,8 @@ def register_rag_tools(
                     from stratakb.knowledge.layers import get_layer_routing
                     routing = await get_layer_routing(database_url)
                     domain_context = build_domain_context(routing["descriptions"])
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.warning("domain_context_unavailable", error_type=type(e).__name__)
             queries = await rewrite_query(
                 question,
                 anthropic_api_key=_settings.anthropic_api_key,
