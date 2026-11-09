@@ -121,6 +121,49 @@ class TestUrlParsing:
     def test_url_host_port_of_well_formed_urls(self, url, shown):
         assert url_host_port(url) == shown
 
+    @pytest.mark.parametrize(
+        ("url", "shown"),
+        [
+            # Host and port in the query string, read when the authority has no host
+            ("postgresql:///strata?host=db.example&port=6543", "db.example:6543"),
+            ("postgresql:///strata?host=db.example", "db.example:5432"),
+            ("postgresql:///strata?port=6543", "localhost:6543"),
+            ("postgresql:///strata?host=/var/run/postgresql", "/var/run/postgresql:5432"),
+            ("postgresql:///strata?host=h1,h2&port=5432,5433", "h1:5432,h2:5433"),
+            ("postgresql:///strata?host=h1,h2&port=6543", "h1:6543,h2:6543"),
+            # An authority host wins over the query string, as in asyncpg
+            ("postgresql://db.example/strata?host=other&port=6543", "db.example:5432"),
+            # Several hosts in the authority, each with its own port
+            ("postgresql://u:p@h1:5432,h2:5433/db", "h1:5432,h2:5433"),
+            ("postgresql://u:p@h1,h2/db", "h1:5432,h2:5432"),
+            ("postgresql://u:p@h1:6543,h2/db", "h1:6543,h2:5432"),
+            ("postgresql://u:p@[::1]:6543,db.example/db", "::1:6543,db.example:5432"),
+        ],
+    )
+    def test_url_host_port_names_the_database_asyncpg_connects_to(self, url, shown):
+        assert url_host_port(url) == shown
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "not a url at all",
+            "postgresql://u:pw@db:99999/s",
+            "postgresql://u:pw@db:0/s",
+            "postgresql://u:pw@h1:5432,h2:99999/s",
+            "postgresql://u:pw@h1,,h2/s",
+            "postgresql:///strata?host=db.example&port=abc",
+            "postgresql:///strata?host=db.example&port=99999",
+            "postgresql:///strata?host=h1,h2,h3&port=5432,5433",
+            "postgresql:///strata?sslmode",
+        ],
+    )
+    def test_url_host_port_of_an_unreadable_target(self, url):
+        assert url_host_port(url) == "unknown host"
+
+    def test_url_host_port_never_shows_query_credentials_with_a_query_host(self):
+        shown = url_host_port("postgresql:///strata?host=db.example&user=app&password=hunter2")
+        assert shown == "db.example:5432"
+
 
 def test_egress_does_not_import_the_database_module():
     code = (

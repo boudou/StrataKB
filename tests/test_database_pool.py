@@ -140,6 +140,8 @@ async def test_failed_creation_is_terminated_and_retried(clean_pools):
         ("postgresql://db.example:6543/strata?user=app&password=hunter2", "db.example:6543"),
         ("postgresql://db.example/strata?user=app&password=hunter2", "db.example:5432"),
         ("postgresql://app:hunter2@db.example:6543/strata", "db.example:6543"),
+        ("postgresql:///strata?host=db.example&port=6543&password=hunter2", "db.example:6543"),
+        ("postgresql://app:hunter2@h1:5432,h2:5433/strata", "h1:5432,h2:5433"),
     ],
 )
 async def test_pool_log_shows_host_and_port_only(clean_pools, url, shown):
@@ -149,7 +151,7 @@ async def test_pool_log_shows_host_and_port_only(clean_pools, url, shown):
         await get_pool(url)
 
     creating = [log for log in logs if log["event"] == "creating_db_pool"]
-    assert [log["url"] for log in creating] == [shown]
+    assert [log["target"] for log in creating] == [shown]
     assert "hunter2" not in repr(logs)
 
 
@@ -161,7 +163,7 @@ async def test_pool_log_hides_credentials_of_a_malformed_url(clean_pools, url):
         await get_pool(url)
 
     creating = [log for log in logs if log["event"] == "creating_db_pool"]
-    assert [log["url"] for log in creating] == ["unknown host"]
+    assert [log["target"] for log in creating] == ["unknown host"]
 
 
 async def test_close_pool_clears_locks(clean_pools):

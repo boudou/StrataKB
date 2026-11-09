@@ -28,6 +28,7 @@ from typing import TYPE_CHECKING, Any, NamedTuple
 import structlog
 
 from stratakb.core.terminal_text import one_line, terminal_safe_json, visible
+from stratakb.core.urls import url_host_port
 
 if TYPE_CHECKING:
     from stratakb.core.local_db import DownOutcome, UpState
@@ -463,7 +464,6 @@ async def _add(args: argparse.Namespace, settings: Any, root: str) -> Report:
     """
     from stratakb.core.database import close_pool
     from stratakb.core.migrations import MigrationError, ensure_schema
-    from stratakb.core.urls import url_host_port
     from stratakb.knowledge import add_folder
     from stratakb.knowledge.layers import (
         LayerExistsError,
@@ -644,7 +644,6 @@ async def _open_receipt(url: str, receipt_id: str, user_id: str, role: str) -> d
     """open_receipt, with every failure turned into a _ReceiptOpenError."""
     from stratakb.core.database import close_pool
     from stratakb.core.migrations import MigrationError
-    from stratakb.core.urls import url_host_port
     from stratakb.rag.receipts import ReceiptAccessError, open_receipt
 
     try:

@@ -51,7 +51,7 @@ async def get_pool(database_url: str) -> asyncpg.Pool:
         pool = _pools.get(database_url)
         if pool is not None:
             return pool
-        logger.info("creating_db_pool", url=url_host_port(database_url))
+        logger.info("creating_db_pool", target=url_host_port(database_url))
         pool = asyncpg.create_pool(
             database_url,
             min_size=2,
