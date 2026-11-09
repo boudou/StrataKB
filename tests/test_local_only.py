@@ -8,6 +8,7 @@ Tests cover:
 - Embedding, model loading and query rewriting refuse or skip at call time
 - A rewrite endpoint (QUERY_REWRITE_BASE_URL) is outbound unless loopback
 - core owns the rewrite egress table, and one rewrite runs its skip rule once
+- Ingestion and preset application use the settings the server was built with
 
 No database and no model are needed: the pool, the server run and the
 model classes are patched.
@@ -560,3 +561,165 @@ def test_skip_reasons_from_the_one_rule(overrides, reason):
     request = RewriteRequest(settings, settings.anthropic_api_key, settings.query_rewrite_model)
     entry = REWRITE_EGRESS.get(settings.query_rewrite_provider)
     assert rewrite_skip_reason(entry, request) == reason
+
+
+# ==========================================
+# Ingestion and presets on a built server
+# ==========================================
+
+SEPA_PRESET = str(Path(__file__).resolve().parents[1] / "examples" / "sepa" / "preset.yaml")
+
+
+def _built_settings(**overrides) -> Settings:
+    """Settings for a built server: admin, no learning store, local embedding."""
+    values = {
+        "database_url": "postgresql://test",
+        "strata_role": "admin",
+        "learning_enabled": False,
+        "embedding_backend": "local",
+        "embedding_base_url": "",
+        "openai_api_key": "",
+        "anthropic_api_key": "",
+        "strata_local_only": False,
+    }
+    values.update(overrides)
+    return _settings(**values)
+
+
+def _environment(built: Settings, **changes):
+    """Make get_settings() return the built settings with these changes."""
+    return patch("stratakb.config.get_settings", return_value=built.model_copy(update=changes))
+
+
+def _built_server(built: Settings):
+    from stratakb.mcp_server import build_server
+
+    return build_server(built)
+
+
+@pytest.mark.asyncio
+async def test_built_local_only_refuses_ingest():
+    from tests.helpers import call_tool
+
+    built = _built_settings(
+        strata_local_only=True, embedding_backend="openai", openai_api_key="sk-test"
+    )
+    ingest = AsyncMock()
+    with (
+        _environment(built, strata_local_only=False),
+        patch("stratakb.knowledge.ingestion.ingest_documents", ingest),
+        patch("openai.AsyncOpenAI") as openai_cls,
+    ):
+        result = await call_tool(
+            _built_server(built), "strata_ingest_documents", layer_name="docs", source_path="."
+        )
+
+    assert result["status"] == "error"
+    assert "STRATA_LOCAL_ONLY" in result["error"]
+    ingest.assert_not_awaited()
+    openai_cls.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_built_local_only_refuses_preset():
+    from tests.helpers import call_tool
+
+    built = _built_settings(
+        strata_local_only=True, embedding_backend="openai", openai_api_key="sk-test"
+    )
+    create = AsyncMock()
+    ingest = AsyncMock()
+    with (
+        _environment(built, strata_local_only=False),
+        patch("stratakb.knowledge.presets.create_preset_layer", create),
+        patch("stratakb.knowledge.presets.ingest_preset", ingest),
+        patch("stratakb.knowledge.tools.write_audit_log", AsyncMock()),
+        patch("openai.AsyncOpenAI") as openai_cls,
+    ):
+        result = await call_tool(
+            _built_server(built), "strata_apply_preset", preset_path=SEPA_PRESET
+        )
+
+    assert result["status"] == "error"
+    assert "STRATA_LOCAL_ONLY" in result["error"]
+    create.assert_not_awaited()
+    ingest.assert_not_awaited()
+    openai_cls.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_ingest_tools_pass_built_settings():
+    """A server started without the switch keeps its embedding path until a restart."""
+    from tests.helpers import call_tool
+
+    built = _built_settings()
+    server = _built_server(built)
+    ingest = AsyncMock(side_effect=RuntimeError("stop"))
+    preset_ingest = AsyncMock(return_value={"total_docs": 0, "total_chunks": 0})
+    with (
+        _environment(built, embedding_backend="openai", strata_local_only=True),
+        patch("stratakb.knowledge.ingestion.ingest_documents", ingest),
+        patch(
+            "stratakb.knowledge.presets.create_preset_layer",
+            AsyncMock(return_value={"status": "updated", "changes": []}),
+        ),
+        patch("stratakb.knowledge.presets.ingest_preset", preset_ingest),
+        patch("stratakb.knowledge.tools.write_audit_log", AsyncMock()),
+    ):
+        ingested = await call_tool(
+            server, "strata_ingest_documents", layer_name="docs", source_path="."
+        )
+        applied = await call_tool(server, "strata_apply_preset", preset_path=SEPA_PRESET)
+
+    assert ingested == {"status": "error", "error": "stop"}
+    assert ingest.await_args.kwargs["settings"] is built
+    assert applied["status"] == "completed"
+    assert preset_ingest.await_args.kwargs["settings"] is built
+
+
+@pytest.mark.asyncio
+async def test_ingest_preset_passes_settings_to_each_group(tmp_path):
+    from stratakb.knowledge.presets import ingest_preset, load_preset
+
+    (tmp_path / "one").mkdir()
+    (tmp_path / "two").mkdir()
+    path = tmp_path / "preset.yaml"
+    path.write_text(
+        "name: two_groups\ndisplay_name: Two Groups\n"
+        "sources:\n  - {name: one, path: one}\n  - {name: two, path: two}\n",
+        encoding="utf-8",
+    )
+    built = _built_settings()
+    result = SimpleNamespace(
+        status="completed",
+        docs_processed=0,
+        docs_failed=0,
+        chunks_created=0,
+        duration_seconds=0.0,
+    )
+    ingest = AsyncMock(return_value=result)
+    with (
+        patch("stratakb.knowledge.ingestion.clear_layer", AsyncMock()),
+        patch("stratakb.knowledge.ingestion.ingest_documents", ingest),
+    ):
+        await ingest_preset("postgresql://test", "", load_preset(str(path)), settings=built)
+
+    assert ingest.await_count == 2
+    assert all(call.kwargs["settings"] is built for call in ingest.await_args_list)
+
+
+@pytest.mark.asyncio
+async def test_embed_chunks_reads_no_settings_when_given():
+    from stratakb.knowledge.ingestion import _embed_chunks
+    from stratakb.knowledge.vector_store import ChunkRecord
+
+    built = _built_settings()
+    chunks = [ChunkRecord(content="body", embedding=[], layer_name="l", source_file="f.md")]
+    vector = [0.0] * built.embedding_dimensions
+    with (
+        patch("stratakb.config.get_settings", side_effect=AssertionError),
+        patch("stratakb.knowledge.embeddings._embed_local", return_value=[vector]),
+    ):
+        await _embed_chunks("", chunks, settings=built)
+
+    assert chunks[0].embedding == vector

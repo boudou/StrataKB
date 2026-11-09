@@ -30,6 +30,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import structlog
 import yaml
@@ -55,6 +56,9 @@ from stratakb.knowledge.layers import (
     update_layer,
 )
 from stratakb.knowledge.policy import is_secret_name
+
+if TYPE_CHECKING:
+    from stratakb.config import Settings
 
 logger = structlog.get_logger()
 
@@ -402,6 +406,8 @@ async def ingest_preset(
     openai_api_key: str,
     preset: LayerPreset,
     root: Path | None = None,
+    *,
+    settings: Settings | None = None,
 ) -> dict:
     """Replace the preset layer's chunks with a fresh ingestion of every source group.
 
@@ -410,6 +416,8 @@ async def ingest_preset(
         openai_api_key: OpenAI API key (only needed for the openai embedding backend).
         preset: The loaded preset.
         root: Documents root; defaults to the preset's own root.
+        settings: The settings every group's embedding uses. Without them,
+            the environment's, read when embedding.
 
     Returns:
         Combined ingestion results across all source groups.
@@ -447,6 +455,7 @@ async def ingest_preset(
                 openai_api_key,
                 layer_name=preset.name,
                 source_path=str(source_path),
+                settings=settings,
             )
             results["groups"][group.name] = {
                 "status": result.status,

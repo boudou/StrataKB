@@ -213,7 +213,9 @@ def build_server(settings: Settings) -> FastMCP:
     )
 
     # Register module tools
-    register_knowledge_tools(mcp, settings.database_url, settings.openai_api_key)
+    register_knowledge_tools(
+        mcp, settings.database_url, settings.openai_api_key, settings=settings
+    )
     register_rag_tools(
         mcp, settings.database_url, settings.openai_api_key, settings=settings
     )

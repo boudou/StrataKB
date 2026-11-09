@@ -6,6 +6,7 @@ Registers knowledge layer management tools with the MCP server.
 from __future__ import annotations
 
 import asyncio
+from typing import TYPE_CHECKING
 
 import structlog
 from mcp.server.fastmcp import FastMCP
@@ -26,6 +27,9 @@ from stratakb.knowledge.layers import (
     update_layer,
 )
 from stratakb.knowledge.parsers import csv_parser
+
+if TYPE_CHECKING:
+    from stratakb.config import Settings
 
 logger = structlog.get_logger()
 
@@ -114,9 +118,26 @@ def _for_caller(layer: dict, is_admin: bool) -> dict:
 
 
 def register_knowledge_tools(
-    mcp: FastMCP, database_url: str, openai_api_key: str = ""
+    mcp: FastMCP,
+    database_url: str,
+    openai_api_key: str = "",
+    *,
+    settings: Settings | None = None,
 ) -> None:
-    """Register all knowledge layer management tools on the MCP server."""
+    """Register all knowledge layer management tools on the MCP server.
+
+    `settings` are the server's: ingestion and preset application check the
+    embedding path against them and embed with them. Without them the tools
+    read the environment's settings on each call.
+    """
+
+    def _current_settings() -> Settings:
+        """The server's settings; without any, the environment's, read per call."""
+        if settings is not None:
+            return settings
+        from stratakb.config import get_settings
+
+        return get_settings()
 
     @mcp.tool()
     @require_role("viewer")
@@ -278,11 +299,10 @@ def register_knowledge_tools(
         source_path: str,
         replace_all: bool = False,
     ) -> dict:
-        from stratakb.config import get_settings
         from stratakb.knowledge.embeddings import embedding_key_error
         from stratakb.knowledge.ingestion import ingest_documents
 
-        _settings = get_settings()
+        _settings = _current_settings()
         if err := embedding_key_error(_settings, openai_api_key):
             return {"status": "error", "error": err}
 
@@ -293,6 +313,7 @@ def register_knowledge_tools(
                 layer_name=layer_name,
                 source_path=source_path,
                 replace_all=replace_all,
+                settings=_settings,
             )
             await write_audit_log(
                 database_url,
@@ -369,7 +390,6 @@ def register_knowledge_tools(
         """
         from pathlib import Path
 
-        from stratakb.config import get_settings
         from stratakb.knowledge.embeddings import embedding_key_error
         from stratakb.knowledge.layers import LayerValidationError
         from stratakb.knowledge.presets import (
@@ -380,7 +400,7 @@ def register_knowledge_tools(
             load_preset,
         )
 
-        _settings = get_settings()
+        _settings = _current_settings()
         try:
             preset = load_preset(preset_path)
         except FileNotFoundError:
@@ -443,7 +463,9 @@ def register_knowledge_tools(
                 tool_name="strata_apply_preset",
                 parameters={"layer": preset.name, "patterns": preset.archived_patterns},
             )
-        ingest_result = await ingest_preset(database_url, openai_api_key, preset, root)
+        ingest_result = await ingest_preset(
+            database_url, openai_api_key, preset, root, settings=_settings
+        )
 
         layer_text = f"Layer '{preset.name}': {layer_result['status']}"
         if layer_result["changes"]:
