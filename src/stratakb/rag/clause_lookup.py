@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import functools
 import re
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from typing import Any, NamedTuple
 
 import structlog
@@ -155,9 +155,10 @@ def question_pattern(pattern: str) -> str:
 
 
 @functools.lru_cache(maxsize=256)
-def _question_regex(pattern: str) -> re.Pattern[str] | None:
+def _question_regex(pattern: str, layer: str | None = None) -> re.Pattern[str] | None:
     """question_pattern(pattern) compiled, or None when the stored pattern
-    must not run (it does not compile or it repeats a repeated part)."""
+    must not run (it does not compile or it repeats a repeated part). The
+    warning names layer, the layer that stores the pattern, when known."""
     # Check the stored pattern and the question form: an unsafe part outside
     # the label group would not show in the label group alone, and text that
     # only looks like the label group ('[(?P<label>(a+)+)]' is a character
@@ -172,9 +173,31 @@ def _question_regex(pattern: str) -> re.Pattern[str] | None:
             regex = unanchored(pattern)
         problem = pattern_problem(regex)
     if problem is not None:
-        logger.warning("unsafe_structure_pattern", pattern=pattern, reason=problem)
+        logger.warning(
+            "unsafe_structure_pattern", pattern=pattern, reason=problem, layer=layer
+        )
         return None
     return re.compile(regex)
+
+
+def question_regexes(by_layer: Mapping[str, Iterable[object]]) -> list[re.Pattern[str]]:
+    """Each layer's structure patterns in question form, compiled, each once.
+
+    by_layer maps a layer name to its stored patterns. An entry that is not a
+    string is skipped; a pattern that must not run is skipped with a warning
+    naming its layer (one per layer that stores it).
+    """
+    seen: set[str] = set()
+    compiled: list[re.Pattern[str]] = []
+    for layer, patterns in by_layer.items():
+        for pattern in patterns:
+            if not isinstance(pattern, str):
+                continue
+            regex = _question_regex(pattern, layer)
+            if regex is not None and pattern not in seen:
+                seen.add(pattern)
+                compiled.append(regex)
+    return compiled
 
 
 def find_references(

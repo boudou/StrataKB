@@ -404,7 +404,7 @@ class TestAskDomainContext:
             patch("stratakb.knowledge.layers.get_layer_routing", routing),
             # The clause lookup reads the layer routing too: only the domain
             # context fetch is counted here
-            patch("stratakb.knowledge.layers.get_structure_patterns", AsyncMock(return_value=[])),
+            patch("stratakb.knowledge.layers.get_structure_patterns", AsyncMock(return_value={})),
             patch("stratakb.rag.retriever.search_chunks", AsyncMock(return_value=[])),
             patch("stratakb.rag.tools.write_audit_log", AsyncMock()),
             _grounded_layers(),
@@ -708,7 +708,7 @@ def _no_database():
     """Stand in for the tables strata_ask and strata_search read around the search."""
     return (
         _grounded_layers(),
-        patch("stratakb.knowledge.layers.get_structure_patterns", AsyncMock(return_value=[])),
+        patch("stratakb.knowledge.layers.get_structure_patterns", AsyncMock(return_value={})),
     )
 
 

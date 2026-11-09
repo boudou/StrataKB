@@ -19,6 +19,7 @@ from stratakb.rag.clause_lookup import (
     ClauseMatches,
     cap_note,
     in_exact_span,
+    question_regexes,
     without_exact_spans,
 )
 from stratakb.rag.clause_lookup import lookup as lookup_clauses
@@ -98,11 +99,13 @@ async def _exact_clauses(
     from stratakb.knowledge.layers import get_structure_patterns
 
     try:
-        patterns = await get_structure_patterns(database_url, layers)
+        by_layer = await get_structure_patterns(database_url, layers)
     except Exception as e:
         logger.warning("structure_patterns_unavailable", error_type=type(e).__name__)
-        patterns = []
-    return await lookup_clauses(database_url, question, layers, budget, patterns)
+        by_layer = {}
+    return await lookup_clauses(
+        database_url, question, layers, budget, question_regexes(by_layer)
+    )
 
 
 async def _answer_mode(

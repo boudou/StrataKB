@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import json
 import re
+import warnings
+from re import _parser as _sre_parser
 from typing import Literal, get_args
 
 import asyncpg
@@ -39,6 +41,8 @@ MAX_ORIGIN_LENGTH = 100
 MAX_OWNER_LENGTH = 200
 # Wildcards one archived files pattern may hold: with more, a match can take very long
 MAX_ARCHIVED_WILDCARDS = 3
+# Characters one routing, structure or archived files pattern may hold
+MAX_PATTERN_LENGTH = 500
 
 # Partial unique index on root_path (core/sql/05_add_folder.sql)
 _ROOT_PATH_INDEX = "knowledge_layers_root_path_key"
@@ -148,10 +152,59 @@ def _validate_patterns(
         raise LayerValidationError(f"{key} must be a list of strings.")
     kind = key.removesuffix("_patterns")
     for pattern in patterns:
+        # First, so a very long pattern is never compiled
+        problem = _pattern_text_problem(pattern)
+        if problem is not None:
+            raise LayerValidationError(f"Invalid {kind} pattern {_shown(pattern)}: {problem}")
         problem = pattern_problem(pattern, line_starts=line_starts)
         if problem is not None:
             raise LayerValidationError(f"Invalid {kind} pattern '{pattern}': {problem}")
+        if _future_warning(pattern):
+            raise LayerValidationError(
+                f"Invalid {kind} pattern '{pattern}': {_FUTURE_WARNING_PROBLEM}; "
+                "escape it with a backslash."
+            )
     return patterns
+
+
+_FUTURE_WARNING_PROBLEM = (
+    "it uses [ or a doubled -, &, ~ or | inside [...], which a later Python reads differently"
+)
+
+
+def _shown(pattern: str) -> str:
+    """The pattern for a message: its first 40 characters, escaped (a lone
+    surrogate cannot be encoded as UTF-8 in a tool reply)."""
+    return repr(pattern[:40]) + ("..." if len(pattern) > 40 else "")
+
+
+def _pattern_text_problem(pattern: str) -> str | None:
+    """Why pattern's text cannot be stored or is too long to match, or None.
+
+    jsonb refuses a lone surrogate and a NUL (JSON writes both as escapes);
+    a very long pattern would be matched against every path or question.
+    """
+    if len(pattern) > MAX_PATTERN_LENGTH:
+        return f"it is longer than {MAX_PATTERN_LENGTH} characters."
+    if any(c == "\0" or "\ud800" <= c <= "\udfff" for c in pattern):
+        return "it holds a lone surrogate or a NUL, which the database cannot store."
+    return None
+
+
+def _future_warning(regex: str) -> bool:
+    """True when Python warns that a later version reads regex differently.
+
+    Parsed, not compiled: re caches compiled patterns, and a cached one warns
+    no more. Only a FutureWarning counts, so a stray warning does not refuse
+    a good pattern.
+    """
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always", FutureWarning)
+        try:
+            _sre_parser.parse(regex)
+        except re.error:
+            return False
+    return any(issubclass(w.category, FutureWarning) for w in caught)
 
 
 def _validate_routing_patterns(patterns: list[str]) -> list[str]:
@@ -181,8 +234,10 @@ def _validate_archived_patterns(patterns: object) -> list[str]:
     A pattern that cannot compile or that matches nothing (a comment, "/", an
     open "[") is refused, so an admin never sees it accepted with no file
     labelled. So is one with more than MAX_ARCHIVED_WILDCARDS wildcards, whose
-    match can stall, and one with a line break or a NUL, which is not one line
-    of a .gitignore and which jsonb cannot hold.
+    match can stall, one with a line break or a NUL, which is not one line
+    of a .gitignore and which jsonb cannot hold, one with a lone surrogate or
+    more than MAX_PATTERN_LENGTH characters, and one Python warns it will read
+    differently later (a class such as "[[:alpha:]]", which .gitignore has not).
     """
     if not isinstance(patterns, list):
         raise LayerValidationError("archived_patterns must be a list of strings.")
@@ -192,6 +247,11 @@ def _validate_archived_patterns(patterns: object) -> list[str]:
         if any(c in pattern for c in "\n\r\0"):
             raise LayerValidationError(
                 f"Invalid archived files pattern {pattern!r}: it holds a line break or a NUL."
+            )
+        problem = _pattern_text_problem(pattern)
+        if problem is not None:
+            raise LayerValidationError(
+                f"Invalid archived files pattern {_shown(pattern)}: {problem}"
             )
         if _count_wildcards(pattern) > MAX_ARCHIVED_WILDCARDS:
             raise LayerValidationError(
@@ -206,6 +266,11 @@ def _validate_archived_patterns(patterns: object) -> list[str]:
         if any(p.include is None for p in compiled):
             raise LayerValidationError(
                 f"Invalid archived files pattern '{pattern}': it matches nothing."
+            )
+        if any(p.regex is not None and _future_warning(p.regex.pattern) for p in compiled):
+            raise LayerValidationError(
+                f"Invalid archived files pattern '{pattern}': {_FUTURE_WARNING_PROBLEM}; "
+                ".gitignore has no class such as [:alpha:]."
             )
     return patterns
 
@@ -794,14 +859,17 @@ async def get_answer_modes(database_url: str, layers: list[str] | None) -> list[
     return [row["answer_mode"] for row in rows]
 
 
-async def get_structure_patterns(database_url: str, layers: list[str] | None) -> list[str]:
-    """The structure patterns of the given active layers (all when None), deduplicated.
+async def get_structure_patterns(
+    database_url: str, layers: list[str] | None
+) -> dict[str, list]:
+    """The structure patterns of the given active layers (all when None), by layer.
 
     Read from the cached layer routing, so a search does not query for them.
+    Kept by layer so a warning about a stored pattern can name its layer.
     """
     by_layer = (await get_layer_routing(database_url))["structure"]
-    patterns: list[str] = []
-    for name, layer_patterns in by_layer.items():
-        if layers is None or name in layers:
-            patterns.extend(p for p in layer_patterns if p not in patterns)
-    return patterns
+    return {
+        name: layer_patterns
+        for name, layer_patterns in by_layer.items()
+        if layers is None or name in layers
+    }
