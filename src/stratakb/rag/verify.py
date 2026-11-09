@@ -192,8 +192,8 @@ _SMALL = {
 }
 _SCALES = {"hundred": 100, "thousand": 1_000, "million": 1_000_000}
 _WORD = "(?:" + "|".join(sorted([*_SMALL, *_SCALES], key=len, reverse=True)) + ")"
-# At most 12 words in one number ("nine hundred and ninety nine thousand ..."):
-# an unbounded run backtracks quadratically on a long run of number words
+# At most 12 words in one number ("nine hundred and ninety nine thousand ..."),
+# so the run stays linear (see the linear-time rules in knowledge/structure.py)
 _WORDS = rf"(?<![\w-]){_WORD}(?:(?:\s+and\s+|\s+|-){_WORD}){{0,11}}(?![\w])"
 _DIGITS = r"(?<![\w.,])(?:\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d+(?:\.\d+)?)(?:st|nd|rd|th)?(?![\w])"
 # A number in digits, in words, or both ("thirty (30)", "30 (thirty)")

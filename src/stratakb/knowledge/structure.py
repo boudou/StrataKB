@@ -43,9 +43,24 @@ logger = structlog.get_logger()
 # Joins the section names of a path
 PATH_SEPARATOR = " > "
 
+# Linear-time rules for the patterns that read document text. A line of a
+# document can hold 100,000 blanks or brackets, and the re module holds the
+# GIL, so a quadratic pattern stalls the whole server. tests/test_linear_time.py
+# runs every module-level pattern of the modules that read document text on
+# such lines; a module that starts reading document text joins its list.
+# 1. One part of a pattern owns a run of one kind of character. A lazy or
+#    open part followed by an optional run of the same characters
+#    ('(\S.*?)[ \t]*$', '[^\n]*?[ \t]*:') rescans the run at every step. Let
+#    the open part take the run (and strip it in code), or make the run
+#    possessive ('[ \t]++(.*\S)').
+# 2. An unanchored part that scans up to a closing character ('\[[^\]]*\]')
+#    rescans from every opening one when no closing one follows. Leave the
+#    opening character out of what it scans ('\[[^\[\]]*\]').
+# 3. A pattern called only on a line start (.match) or on a bounded window is
+#    listed with that call in the test, which then probes it the same way.
+
 # The heading patterns take their text greedily up to its last non-space
-# character, and '++' keeps them from splitting a run of spaces: a lazy text
-# before a trailing space run backtracks quadratically on a long run of spaces.
+# character and own their blank runs with '++' (rule 1).
 
 # Markdown ATX heading: up to 3 spaces of indent, 1-6 '#', the text (with its
 # optional closing '#'s, which _atx_text removes)
@@ -73,8 +88,7 @@ _FRONTMATTER_RE = re.compile(
 
 # A YAML key line ('key:', '"key":' or "'key':", then a space or the line end).
 # A plain key runs up to the first ': ' and may hold spaces ('date created: 2024').
-# Its blanks before the ':' belong to the key: an optional run of blanks after
-# the lazy key would rescan a long run at every step (quadratic time).
+# Its blanks before the ':' belong to the key (rule 1 above).
 _YAML_KEY_RE = re.compile(r"""^(?:"[^"\n]*"[ \t]*|'[^'\n]*'[ \t]*|[^\s#"'][^\n]*?):(?:[ \t]|$)""")
 
 # Dotted numbers: at most 3 levels of at most 3 digits ('2026.' and

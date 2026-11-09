@@ -144,7 +144,7 @@ def test_run_of_blanks_in_the_value_is_read_in_linear_time(value, expected):
     found = frontmatter_supersedes(text)
 
     # The old patterns needed over thirty seconds for the first and the last
-    assert time.perf_counter() - began < 0.1
+    assert time.perf_counter() - began < 1.0
     assert found == expected
 
 

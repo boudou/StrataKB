@@ -55,7 +55,8 @@ _BLOCK_START = re.compile(
 )
 # End punctuation, any closing quote or bracket, then whitespace or the end. It
 # starts only at the start of a run and never backtracks, so a stored document
-# cannot make it quadratic (the re module holds the GIL: that would stall the server)
+# cannot make it quadratic (the re module holds the GIL: that would stall the server).
+# Linear-time rules: knowledge/structure.py.
 _TERMINAL = re.compile(r"(?<![.!?;])[.!?;]++[\"'”’)\]]*+(?=\s|$)")
 _TOKEN_BEFORE_DOT = re.compile(r"[\w.]*\Z")
 # Characters looked back from a dot for its token, longer than any token that
