@@ -11,6 +11,7 @@ from dataclasses import replace
 from typing import get_args
 from unittest.mock import patch
 
+import pydantic_core
 import pytest
 
 from stratakb.knowledge.layers import ANSWER_MODES
@@ -28,7 +29,13 @@ from stratakb.rag.extractive import (
     select_sentences,
     split_sentences,
 )
-from stratakb.rag.passages import AnswerMode, AskResult, ExtractiveAnswer
+from stratakb.rag.passages import (
+    AnswerMode,
+    AskResult,
+    ExtractiveAnswer,
+    estimate_tokens,
+    listed_cost,
+)
 from tests.helpers import BLOCK_HIT, DOC_TEXT, LETTER, LONG_BLOCK, NINETY
 
 INVOICES = "Invoices are due within 30 days."
@@ -327,6 +334,24 @@ class TestSelectSentences:
 
         assert kept == sentences[: len(kept)]
         assert 0 < len(kept) < len(sentences)
+
+    def test_budget_is_used_to_within_one_sentence(self):
+        def tokens(items: list[dict]) -> int:
+            return estimate_tokens(pydantic_core.to_json({"answer": items}, indent=2).decode())
+
+        sentences = [
+            replace(_sentence(f"{i}" * 300, start=i * 300), score=1 - i / 100)
+            for i in range(10)
+        ]
+        chunks, documents, budget = [_chunk(0, 3000)], _BUDGET_DOCUMENTS, 1000
+
+        kept = fit_to_answer_budget(sentences, chunks, documents, budget)
+        items = [answer_item(s, chunks, documents) for s in kept]
+        added = tokens(items) - tokens([])
+        following = answer_item(sentences[len(kept)], chunks, documents)
+
+        assert 1 < len(kept) < len(sentences)
+        assert budget - listed_cost(following) < added <= budget
 
     def test_exact_sentences_stay_beside_scored_ones(self):
         candidates = [_sentence("a", exact=True), _sentence("b", start=5)]

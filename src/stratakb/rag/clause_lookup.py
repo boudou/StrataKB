@@ -27,7 +27,7 @@ import structlog
 from stratakb.knowledge.pattern_safety import pattern_problem
 from stratakb.knowledge.structure import normalise_label
 from stratakb.rag.layer_detect import pattern_text
-from stratakb.rag.passages import ask_chunk, passage_cost
+from stratakb.rag.passages import ask_chunk, chars_for_tokens, passage_cost
 
 logger = structlog.get_logger()
 
@@ -377,9 +377,9 @@ def fit_to_budget(chunk: dict[str, Any], budget: int) -> dict[str, Any]:
 def max_exact_chars(budget: int) -> int:
     """The widest exact passage, in characters, that fit_to_budget returns for budget tokens.
 
-    estimate_tokens counts about four characters per token.
+    As many characters as estimate_tokens counts as budget tokens (chars_for_tokens).
     """
-    return max(4 * budget, _MIN_TRIMMED_CHARS)
+    return max(chars_for_tokens(budget), _MIN_TRIMMED_CHARS)
 
 
 def fit_clauses(chunks: list[dict[str, Any]], budget: int) -> list[dict[str, Any]]:

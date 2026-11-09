@@ -10,7 +10,6 @@ opposite of the whole one.
 
 from __future__ import annotations
 
-import json
 import re
 from bisect import bisect_right
 from collections.abc import Sequence
@@ -18,9 +17,8 @@ from dataclasses import dataclass, replace
 from typing import Any
 
 from stratakb.rag.passages import (
-    RESPONSE_SLACK_TOKENS,
     cite,
-    estimate_tokens,
+    listed_cost,
     passage_id,
     passage_ref,
 )
@@ -294,15 +292,15 @@ def fit_to_answer_budget(
 
     Exact sentences count as best, in document order, so a clause over the budget
     keeps its start and clause_gap_note says so. As with passages, each costs its
-    text, ref and citation, taking stops before the sentence that would pass the
-    budget, and the best is always kept (MAX_SENTENCE_CHARS bounds it).
+    text, ref and citation as the response lists it (listed_cost), taking stops
+    before the sentence that would pass the budget, and the best is always kept
+    (MAX_SENTENCE_CHARS bounds it).
     """
     kept: set[Sentence] = set()
     used = 0
     for sentence in sorted(sentences, key=lambda s: s.score, reverse=True):
         item = answer_item(sentence, chunks, documents)
-        cost = estimate_tokens(json.dumps(item, indent=2, ensure_ascii=False))
-        cost += RESPONSE_SLACK_TOKENS
+        cost = listed_cost(item)
         if kept and used + cost > budget:
             break
         kept.add(sentence)

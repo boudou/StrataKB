@@ -659,9 +659,15 @@ def register_rag_tools(
             )
             confidence = collected.confidence
             basis = confidence.basis
+            # Read for every chunk packed and every named clause past them
+            documents = await _cited_documents(database_url, chunks + exact[len(chunks):])
+            # The citations are known now, replaced_by labels too: the passages as
+            # the client gets them must fit, so the last that no longer fit are dropped
+            chunks = pack_passages(
+                chunks, _settings.answer_token_budget, documents=documents
+            )
             # Packing keeps a prefix, so the named clauses past it did not fit
             left_out = exact[len(chunks):]
-            documents = await _cited_documents(database_url, chunks + left_out)
             passages = build_passages(chunks, documents)
             omitted = _join_notes(
                 left_out_note(left_out, documents), cap_note(matches, layer_named)
@@ -759,7 +765,7 @@ def register_rag_tools(
         knowledge base's terminology, runs several searches in parallel,
         reranks the results, and returns the best passages that fit a token
         budget (ANSWER_TOKEN_BUDGET, about 1,500 tokens, each passage's id,
-        ref and citation counted with its text, except a replaced_by label; at
+        ref and citation, replaced_by label too, counted with its text; at
         most 50 passages). In grounded mode the client composes the answer from the passages and
         cites them by id. When a passage comes from an extractive layer the
         server answers with the document's own sentences. A clause or section
