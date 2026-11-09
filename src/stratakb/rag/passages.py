@@ -267,14 +267,11 @@ def cut_clause_note(
 def left_out_note(
     left_out: list[dict[str, Any]],
     documents: dict[int, dict[str, Any]],
-    unread: int = 0,
-    unread_is_minimum: bool = False,
 ) -> str | None:
-    """A note on the named clauses an answer does not hold, or None.
+    """A note on the named clauses packing dropped, or None.
 
-    left_out are the clauses packing dropped, each named with its file as a
-    citation gives it; unread counts the matching sections past the match cap,
-    which were never read.
+    Each is named with its file as a citation gives it. The sections the
+    lookup caps left unread are in clause_lookup.cap_note.
     """
     sentences = []
     if left_out:
@@ -287,12 +284,6 @@ def left_out_note(
         sentences.append(
             f"{n} named {'clause' if n == 1 else 'clauses'} left out, over the token budget: "
             f"{'; '.join(items)}. Read the files, or ask for fewer at a time."
-        )
-    if unread:
-        sentences.append(
-            f"More documents match than were read: {'at least ' if unread_is_minimum else ''}"
-            f"{unread} more matching {'section' if unread == 1 else 'sections'} not read. "
-            "Name a layer to narrow the question."
         )
     return " ".join(sentences) or None
 
@@ -353,6 +344,8 @@ class SearchResponse:
     auto_detected_layers: list[str] = field(default_factory=list)
     routing_fallback: str | None = None
     interaction_id: str | None = None
+    # What the exact lookup caps left out (clause_lookup.cap_note)
+    note: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         response: dict[str, Any] = {
@@ -362,6 +355,8 @@ class SearchResponse:
             "results": self.results,
             "total": len(self.results),
         }
+        if self.note is not None:
+            response["note"] = self.note
         if self.auto_detected_layers:
             response["auto_detected_layers"] = self.auto_detected_layers
         if self.routing_fallback:

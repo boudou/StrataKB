@@ -403,8 +403,7 @@ class TestAskExtractive:
             response = await _ask(server, [], _relevant("Payment"), layers=[layer])
 
         assert response["status"] == "partly_found"
-        assert "More documents match than were read" in response["note"]
-        assert "at least 3 more matching sections" in response["note"]
+        assert "At least 3 more matching sections not read." in response["note"]
 
     async def test_matches_past_the_cap_stay_not_found_with_a_note(self, server, make_layer):
         text = f"{LONG_BLOCK}\n\nA short line on something else.\n"
@@ -423,8 +422,7 @@ class TestAskExtractive:
 
         assert response["status"] == "not_found"
         assert response["answer"] == []
-        assert "More documents match than were read" in response["note"]
-        assert "2 more matching sections" in response["note"]
+        assert "2 more matching sections not read." in response["note"]
 
     async def test_answer_stays_within_the_budget(self, server, settings, make_layer):
         sentences = [f"Clause {i} says ninety {'word ' * 370}here." for i in range(5)]

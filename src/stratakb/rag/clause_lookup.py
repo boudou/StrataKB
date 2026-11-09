@@ -11,6 +11,8 @@ the section's path. A reference that resolves nowhere is dropped, so a bare
 number that is a version or an amount never blocks retrieval.
 
 Lookup reads plain indexed columns (the label index), no full-text search.
+At most MAX_REFERENCES references are looked up and MAX_EXACT_MATCHES
+sections returned; cap_note tells the caller what those caps left out.
 """
 
 from __future__ import annotations
@@ -74,6 +76,9 @@ class ClauseMatches(NamedTuple):
     unread: int = 0
     # The candidate limit stopped the count, so more than unread may match
     unread_is_minimum: bool = False
+    # How many references were looked up, and those past MAX_REFERENCES as written
+    references: int = 0
+    skipped_references: tuple[str, ...] = ()
 
 
 def _keyword_labels(keyword: str, number: str) -> tuple[str, ...]:
@@ -175,7 +180,8 @@ def _question_regex(pattern: str) -> re.Pattern[str] | None:
 def find_references(
     question: str, extra_patterns: Iterable[str | re.Pattern[str]] = ()
 ) -> list[Reference]:
-    """The clause and section references in question, in order, without repeats.
+    """The first MAX_REFERENCES clause and section references in question, in
+    order, without repeats.
 
     extra_patterns are a layer's structure patterns (a named group 'label'
     gives the label, as in structure.detect_sections); each match of
@@ -184,6 +190,13 @@ def find_references(
     reached the layer some other way than its validated writes). Only the
     first MAX_PATTERN_QUESTION_CHARS characters of the question are read.
     """
+    return _all_references(question, extra_patterns)[:MAX_REFERENCES]
+
+
+def _all_references(
+    question: str, extra_patterns: Iterable[str | re.Pattern[str]]
+) -> list[Reference]:
+    """find_references without the MAX_REFERENCES cap."""
     question = pattern_text(question)
     found: list[tuple[int, Reference]] = []
     covered: list[tuple[int, int]] = []
@@ -219,7 +232,7 @@ def find_references(
         if ref.labels not in seen:
             seen.add(ref.labels)
             references.append(ref)
-    return references[:MAX_REFERENCES]
+    return references
 
 
 async def resolve(
@@ -334,7 +347,9 @@ def fit_to_budget(chunk: dict[str, Any], budget: int) -> dict[str, Any]:
     The cut text is still the document's text from char_start, and char_end
     moves with it; "cut" marks a chunk that lost text, so both answer modes can
     say part of the clause is missing. At least _MIN_TRIMMED_CHARS characters are
-    kept, so a clause no longer than that comes back whole and unmarked.
+    kept (cut back to a word break past half of them), so a clause no longer
+    than that comes back whole and unmarked; fit_to_budget(chunk, 1) is the
+    cheapest cut.
     """
     if passage_cost(chunk) <= budget:
         return chunk
@@ -342,6 +357,7 @@ def fit_to_budget(chunk: dict[str, Any], budget: int) -> dict[str, Any]:
     if len(content) <= _MIN_TRIMMED_CHARS:
         return chunk
     cut = len(content)
+    trimmed = chunk
     while cut > _MIN_TRIMMED_CHARS:
         cut = max(int(cut * 0.9), _MIN_TRIMMED_CHARS)
         piece = content[:cut]
@@ -354,10 +370,8 @@ def fit_to_budget(chunk: dict[str, Any], budget: int) -> dict[str, Any]:
         }
         if passage_cost(trimmed) <= budget:
             return trimmed
-    piece = content[:_MIN_TRIMMED_CHARS].rstrip()
-    return {
-        **chunk, "content": piece, "char_end": chunk["char_start"] + len(piece), "cut": True,
-    }
+    # The last pass cut at _MIN_TRIMMED_CHARS: the floor
+    return trimmed
 
 
 def max_exact_chars(budget: int) -> int:
@@ -371,14 +385,18 @@ def max_exact_chars(budget: int) -> int:
 def fit_clauses(chunks: list[dict[str, Any]], budget: int) -> list[dict[str, Any]]:
     """Each chunk fit to the budget left, divided by the chunks still to fit, in order.
 
-    A chunk's floor (fit_to_budget) can pass its share, and the later ones then
-    share what is left. None is dropped, even when nothing is left: each of
-    those comes back at its floor, and packing decides what fits.
+    A chunk's share never eats into the floors (fit_to_budget(chunk, 1)) of the
+    chunks after it, so a later clause an even split keeps is not pushed out.
+    A chunk's own floor can pass its share, and the later ones then share what
+    is left. None is dropped, even when nothing is left: each of those comes
+    back at its floor, and packing decides what fits.
     """
+    floors = [passage_cost(fit_to_budget(chunk, 1)) for chunk in chunks]
     fitted: list[dict[str, Any]] = []
     remaining = budget
     for i, chunk in enumerate(chunks):
-        piece = fit_to_budget(chunk, max(remaining // (len(chunks) - i), 1))
+        share = min(remaining // (len(chunks) - i), remaining - sum(floors[i + 1:]))
+        piece = fit_to_budget(chunk, max(share, 1))
         fitted.append(piece)
         remaining -= passage_cost(piece)
     return fitted
@@ -396,15 +414,56 @@ async def lookup(
     The chunks are empty when the question names no section, none resolves, or
     the lookup fails; retrieval then runs as usual.
     """
-    references = find_references(question, extra_patterns)
-    if not references:
+    found = _all_references(question, extra_patterns)
+    if not found:
         return ClauseMatches([])
+    references = found[:MAX_REFERENCES]
     try:
         matches = await resolve(database_url, references, layers)
     except Exception as e:
         logger.warning("clause_lookup_failed", error_type=type(e).__name__)
         return ClauseMatches([])
-    return matches._replace(chunks=fit_clauses(matches.chunks, budget))
+    return matches._replace(
+        chunks=fit_clauses(matches.chunks, budget),
+        references=len(references),
+        skipped_references=tuple(ref.text for ref in found[MAX_REFERENCES:]),
+    )
+
+
+def cap_note(matches: ClauseMatches, layer_named: bool) -> str | None:
+    """A note on what the lookup caps left out, or None.
+
+    Matching sections past MAX_EXACT_MATCHES are counted (when the candidate
+    limit was hit and none is counted, more may still match), with advice only where it
+    helps: fewer clauses when more than one reference was looked up, a layer
+    when the caller named none. References past MAX_REFERENCES are named as
+    written: they were not looked up.
+    """
+    sentences = []
+    base = None
+    if matches.unread:
+        n = matches.unread
+        base = (
+            f"{'At least ' if matches.unread_is_minimum else ''}{n} more matching "
+            f"{'section' if n == 1 else 'sections'} not read"
+        )
+    elif matches.unread_is_minimum:
+        base = "More sections may match than were read"
+    if base is not None:
+        advice = []
+        if matches.references > 1:
+            advice.append("ask about fewer clauses at a time")
+        if not layer_named:
+            advice.append("name a layer to narrow the question")
+        sentences.append(base + ("; " + ", or ".join(advice) if advice else "") + ".")
+    if matches.skipped_references:
+        n = len(matches.skipped_references)
+        sentences.append(
+            f"{n} more {'reference' if n == 1 else 'references'} not looked up: "
+            f"{', '.join(matches.skipped_references)}. "
+            f"Ask about at most {MAX_REFERENCES} clauses at a time."
+        )
+    return " ".join(sentences) or None
 
 
 def in_exact_span(
