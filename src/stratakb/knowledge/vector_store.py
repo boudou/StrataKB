@@ -186,14 +186,19 @@ async def re_embed_layer(
         Stats dict with layer_name, chunks_updated, model, dimensions, duration_seconds.
 
     Raises:
-        ValueError: new_dimensions differs from the shared column's size.
+        ValueError: new_dimensions differs from the shared column's size, or the
+            embedding setup cannot run: unknown backend, missing key, or blocked
+            by STRATA_LOCAL_ONLY.
         RuntimeError: an all-layer re-embed resized the column while this one ran.
     """
     import time
 
     from stratakb.config import get_settings
+    from stratakb.knowledge.embeddings import embedding_key_error
 
     settings = get_settings()
+    if err := embedding_key_error(settings, settings.openai_api_key):
+        raise ValueError(err)
     if not new_dimensions:
         new_dimensions = settings.embedding_dimensions
 
@@ -302,15 +307,20 @@ async def re_embed_all_layers(
         previous_dimensions, resized and duration_seconds.
 
     Raises:
-        ValueError: the new size exceeds what the search index supports.
+        ValueError: the new size exceeds what the search index supports, or the
+            embedding setup cannot run: unknown backend, missing key, or blocked
+            by STRATA_LOCAL_ONLY.
         TimeoutError: a phase 2 statement took longer than locked_timeout;
             nothing changed.
     """
     import time
 
     from stratakb.config import get_settings
+    from stratakb.knowledge.embeddings import embedding_key_error
 
     settings = get_settings()
+    if err := embedding_key_error(settings, settings.openai_api_key):
+        raise ValueError(err)
     target = int(new_dimensions or settings.embedding_dimensions)
 
     # The shipped schema always has the HNSW index, so no column can be wider than this

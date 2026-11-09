@@ -561,6 +561,7 @@ def register_rag_tools(
         mode: AnswerMode | None = None,
     ) -> AskResult | ToolFailure:
         """Run strata_ask; the tool below documents the arguments."""
+        from stratakb.knowledge.embeddings import embedding_key_error
         from stratakb.rag.query_rewriter import (
             build_domain_context,
             rewrite_configured,
@@ -569,6 +570,10 @@ def register_rag_tools(
         from stratakb.rag.retriever import search_chunks
 
         _settings = _current_settings()
+        # Before layer detection and the rewrite, so a question never leaves the
+        # machine for a search that cannot run
+        if err := embedding_key_error(_settings, openai_api_key):
+            return ToolFailure(err)
 
         if not question or not question.strip():
             return ToolFailure("Question cannot be empty.")

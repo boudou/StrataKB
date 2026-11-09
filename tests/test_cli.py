@@ -490,6 +490,50 @@ def test_remote_embedding_url_runs_when_local_only_is_off():
     apply_mock.assert_awaited_once()
 
 
+def test_missing_openai_key_refuses_add(cli_env, capsys):
+    settings = _settings(embedding_backend="openai", openai_api_key="")
+    with patch("stratakb.config.get_settings", return_value=settings):
+        code, plan_mock, apply_mock = _run(["add", ROOT])
+    assert code == 2
+    plan_mock.assert_not_called()
+    apply_mock.assert_not_called()
+    cli_env["schema"].assert_not_awaited()
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "OPENAI_API_KEY" in captured.err
+
+
+def test_missing_openai_key_refusal_json(capsys):
+    settings = _settings(embedding_backend="openai", openai_api_key="")
+    with patch("stratakb.config.get_settings", return_value=settings):
+        code, _, apply_mock = _run(["add", ROOT, "--json"])
+    assert code == 2
+    apply_mock.assert_not_called()
+    data = json.loads(capsys.readouterr().out)
+    assert tuple(data) == REPORT_KEYS
+    assert data["reason"] == "embedding_setup"
+    assert data["exit_code"] == 2
+    assert data["layer"] is None
+    assert not any(data["counts"].values())
+
+
+def test_unknown_backend_refuses_add(capsys):
+    settings = _settings(embedding_backend="opnai", openai_api_key="sk-test")
+    with patch("stratakb.config.get_settings", return_value=settings):
+        code, _, apply_mock = _run(["add", ROOT])
+    assert code == 2
+    apply_mock.assert_not_called()
+    assert "Unknown embedding backend opnai" in capsys.readouterr().err
+
+
+def test_openai_key_lets_add_run():
+    settings = _settings(embedding_backend="openai", openai_api_key="sk-test")
+    with patch("stratakb.config.get_settings", return_value=settings):
+        code, _, apply_mock = _run(["add", ROOT])
+    assert code == 0
+    apply_mock.assert_awaited_once()
+
+
 def test_add_leaves_offline_flags_when_local_only_is_off(monkeypatch):
     monkeypatch.setenv("HF_HUB_OFFLINE", "0")
     code, _, _ = _run(["add", ROOT])

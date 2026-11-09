@@ -893,23 +893,33 @@ class TestApplyPresetScript:
     """scripts/apply_preset.py reports layer changes and exits 1 on a refused layer."""
 
     @staticmethod
-    def _run(layer_result, capsys):
+    def _run(layer_result, capsys, settings=None, extra_args=()):
         import importlib.util
         import json
         import sys
 
+        from structlog.testing import capture_logs
+
+        from stratakb.config import Settings
+
+        if settings is None:
+            settings = Settings(_env_file=None, embedding_backend="local")
         script = Path(__file__).parent.parent / "scripts" / "apply_preset.py"
         spec = importlib.util.spec_from_file_location("apply_preset_script", script)
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
         code = 0
         with (
-            patch.object(sys, "argv", ["apply_preset.py", str(SEPA_PRESET)]),
+            patch.object(sys, "argv", ["apply_preset.py", str(SEPA_PRESET), *extra_args]),
+            # The script's settings, not the shell's config
+            patch.object(module, "get_settings", return_value=settings),
             patch.object(module, "configure_logging"),
+            # Keeps the parsers' log lines off stdout, which holds only the JSON
+            capture_logs(),
             patch.object(module, "close_pool", new_callable=AsyncMock),
             patch.object(
                 module, "create_preset_layer", new_callable=AsyncMock, return_value=layer_result
-            ),
+            ) as create,
             patch.object(
                 module, "ingest_preset", new_callable=AsyncMock, return_value={"total_docs": 0}
             ) as ingest,
@@ -918,24 +928,58 @@ class TestApplyPresetScript:
                 module.main()
             except SystemExit as e:
                 code = e.code
-        return code, json.loads(capsys.readouterr().out), ingest
+        return code, json.loads(capsys.readouterr().out), ingest, create
 
     def test_reports_layer_changes(self, capsys):
-        code, out, ingest = self._run(
-            {"status": "updated", "changes": ["chunk_config"], "message": ""}, capsys
+        from stratakb.config import Settings
+
+        settings = Settings(_env_file=None, embedding_backend="local")
+        code, out, ingest, _ = self._run(
+            {"status": "updated", "changes": ["chunk_config"], "message": ""},
+            capsys,
+            settings=settings,
         )
         assert code == 0
         assert out["layer"] == "updated"
         assert out["layer_changes"] == ["chunk_config"]
         ingest.assert_awaited_once()
+        # The check and the embedding use the same settings
+        assert ingest.await_args.kwargs["settings"] is settings
 
     def test_refused_exits_1_without_ingest(self, capsys):
-        code, out, ingest = self._run(
+        code, out, ingest, _ = self._run(
             {"status": "refused", "changes": [], "message": "not ours"}, capsys
         )
         assert code == 1
         assert out == {"layer": "refused", "error": "not ours"}
         ingest.assert_not_awaited()
+
+    def test_missing_key_exits_1_before_any_write(self, capsys):
+        from tests.helpers import openai_settings
+
+        code, out, ingest, create = self._run(
+            {"status": "created", "changes": [], "message": ""},
+            capsys,
+            settings=openai_settings(openai_api_key=""),
+        )
+        assert code == 1
+        assert out["layer"] == "refused"
+        assert "API key" in out["error"]
+        create.assert_not_awaited()
+        ingest.assert_not_awaited()
+
+    def test_dry_run_needs_no_key(self, capsys):
+        from tests.helpers import openai_settings
+
+        code, out, _, create = self._run(
+            {"status": "created", "changes": [], "message": ""},
+            capsys,
+            settings=openai_settings(openai_api_key=""),
+            extra_args=("--dry-run",),
+        )
+        assert code == 0
+        assert out["layer"] != "refused"
+        create.assert_not_awaited()
 
 
 class TestPresetToolRegistration:
