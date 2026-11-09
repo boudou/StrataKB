@@ -37,6 +37,11 @@ class TestFindNames:
             ("Which fields does pacs.008 require?", ["pacs.008"]),
             ("How does the TaskPool work?", ["TaskPool"]),
             ("Is RFC 2119 cited by ISO 20022?", ["RFC 2119", "ISO 20022"]),
+            ("What does PYTHONQUILLMODE do?", ["PYTHONQUILLMODE"]),
+            ("How do I add a HEALTHCHECK to a Dockerfile?", ["HEALTHCHECK"]),
+            ("Does PEP 8 say HTTP or PYTHONHASHSEED?", ["PEP 8", "PYTHONHASHSEED"]),
+            ("PYTHONQUILLMODE?", ["PYTHONQUILLMODE"]),
+            ("Is PYTHONPATH read before PYTHONHOME?", ["PYTHONPATH", "PYTHONHOME"]),
         ],
     )
     def test_names_are_found(self, question, expected):
@@ -53,6 +58,9 @@ class TestFindNames:
             "see [S1]",
             "x86 and v2 on A4 paper",
             "What does SEPA say about fees?",
+            "Does HTTP send JSON to the API?",
+            "Is the WSGI server told the DATE?",
+            "HOW DO I SET PYTHONQUILLMODE?",
             f"why was {IBAN} rejected?",
             f"why was {IBAN.replace(' ', '')} rejected?",
         ],

@@ -177,6 +177,32 @@ class TestGrounded:
 
         assert response["status"] == "found"
 
+    async def test_absent_name_in_capitals_is_not_found(self, server):
+        response = await _ask(
+            server,
+            [_hit("docs", "PYTHONHASHSEED sets the hash seed.")],
+            "What does PYTHONQUILLMODE do?",
+        )
+
+        assert response["status"] == "not_found"
+        assert "`PYTHONQUILLMODE`" in response["note"]
+
+    @pytest.mark.parametrize(
+        "question",
+        [
+            "Does HTTP send JSON?",
+            "What does PEP 8 say about SEPA?",
+            "HOW DO I SET PYTHONQUILLMODE?",
+        ],
+    )
+    async def test_acronyms_keep_the_status(self, server, question):
+        response = await _ask(
+            server, [_hit("docs", "PEP 8 says tasks run in a pool of workers.")], question
+        )
+
+        assert response["status"] == "found"
+        assert "note" not in response
+
     async def test_question_without_names_keeps_its_status(self, server):
         response = await _ask(server, [_hit("docs")], "q")
 

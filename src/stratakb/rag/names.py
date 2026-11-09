@@ -5,7 +5,11 @@ __match_kwargs__, config["timeout"], AC04, PEP 9123) is answered only by a
 passage that holds the name. find_names picks out code-like names and
 numbered references; check_names looks for them in the text going back to
 the caller. Ordinary words never count as names: a name needs a digit, an
-underscore, a dot, brackets or a capital inside a word. Clause references
+underscore, a dot, brackets or a capital inside a word, or is a word of 8
+or more capitals (PYTHONHASHSEED, HEALTHCHECK). Shorter capitals are
+acronyms (HTTP, JSON, SEPA), and in a question written in capitals (3
+capital words or more, and most of its words) no word counts for being in
+capitals. Clause references
 ("clause 2.2", "7.2.1") belong to the exact clause lookup, and IBAN-shaped
 values are account data: neither is ever a name.
 
@@ -36,6 +40,8 @@ _KEY = re.compile(r"""\[\s*["']?([A-Za-z_][\w.-]*)["']?\s*\]""")
 _SNAKE = re.compile(r"(?<![\w])_*[A-Za-z0-9]+(?:_[A-Za-z0-9]+)+(?![\w])")
 _CAMEL = re.compile(r"(?<![\w])\w*[a-z][A-Z]\w*(?![\w])")
 _NUMBERED = re.compile(r"(?<![\w])([A-Z]{2,8})[\s:#-]?(\d+)(?!\w|\.\d)")
+# A word in capitals long enough not to be an acronym, such as PYTHONHASHSEED
+_CAPITALS = re.compile(r"(?<![\w])[A-Z]{8,}(?![\w])")
 # A passage id pasted back into a follow-up question, such as [S1]
 _PASSAGE_ID = re.compile(r"[Ss]\d+")
 # Letters and a number, read apart so PEP 8 is found as PEP8 or pep-0008
@@ -126,6 +132,13 @@ def _identifier(text: str) -> Name | None:
     return _plain(text)
 
 
+def _shouted(text: str) -> bool:
+    """Whether text is written in capitals: 3 words or more, and most of its words."""
+    words = re.findall(r"[A-Za-z]{2,}", text)
+    capitals = sum(w.isupper() for w in words)
+    return capitals >= 3 and capitals * 2 > len(words)
+
+
 def find_names(question: str) -> list[Name]:
     """The code-like names and numbered references in question, in question order.
 
@@ -135,7 +148,8 @@ def find_names(question: str) -> list[Name]:
     case, spacing or a number's leading zeros are kept once, as first written.
     At most MAX_NAMES.
     """
-    work = list(normalise_text(pattern_text(question)))
+    text = normalise_text(pattern_text(question))
+    work = list(text)
     found: list[tuple[int, Name]] = []
     for pattern in (*ACCOUNT_PATTERNS, *CLAUSE_PATTERNS):
         for _ in _take(work, pattern):
@@ -159,6 +173,9 @@ def find_names(question: str) -> list[Name]:
     for m in _take(work, _NUMBERED):
         if m.group(1).upper() not in _CLAUSE_KEYWORDS:
             found.append((m.start(), _numbered(m.group(0), m.group(1), m.group(2))))
+    if not _shouted(text):
+        for m in _take(work, _CAPITALS):
+            found.append((m.start(), _plain(m.group(0))))
 
     names: list[Name] = []
     seen: set[str] = set()

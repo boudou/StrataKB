@@ -144,7 +144,7 @@ Clients that show MCP prompts also offer the same steps as the prompt `answer_fr
 
 **When a question names more clauses than fit.** The budget is shared in order: each named clause gets what is left, divided by the clauses still to fit, keeping each later clause's first 200 characters (cut at a word). A clause that no longer fits is left out whole, and so is any after it; a `found` answer becomes `partly_found`, and the `note` names each clause and file. At most 10 matches are read (by reference, then path); the note counts unread matching sections ("at least" past the limit of 50 candidates), without files, and suggests fewer clauses or a layer where that helps. If that limit was hit with none unread, it says more may match. Only the first 10 references are looked up; the note names the rest. The note is outside `ANSWER_TOKEN_BUDGET`. `strata_search` returns up to 10 exact results, with a top-level `note` saying the same.
 
-**Missing names.** In `strata_ask`, passages lacking a name the question uses (`PEP 8`, `AC04`) turn `found` into `partly_found`; all missing, with no named clause returned, gives `not_found`.
+**Missing names.** In `strata_ask`, passages lacking a name the question uses (`PEP 8`, `AC04`, `PYTHONHASHSEED`) turn `found` into `partly_found`; all missing, with no named clause returned, gives `not_found`.
 
 **Opening a receipt.** Use `strata_get_receipt`, the resource `strata://receipts/{receipt_id}` or the command line, `uv run stratakb receipt <id>` ([what it prints](https://github.com/boudou/StrataKB/wiki/Asking-and-Searching#checking-a-drafted-answer)). Each quote appears in its surrounding text, marked current, changed or gone. Receipts are kept for `RECEIPT_RETENTION_DAYS` (90 by default).
 
