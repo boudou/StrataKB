@@ -1,7 +1,8 @@
 """Receipts: a stored, checkable record of what the server returned or verified.
 
-A receipt holds the question and any draft answer (both always PII-scrubbed),
-the answer mode and each quote with the document version it came from (id,
+A receipt holds the question and any draft answer (both always PII-scrubbed;
+text a caller adds to the verification is scrubbed by that caller), the answer
+mode and each quote with the document version it came from (id,
 version, SHA-256, offsets, clause path, text origin) and the quote's own text,
 so it still opens after its source changed or was deleted. Opening one shows every quote in its
 surrounding text with a status: current, changed or gone. Issuing and opening
@@ -98,7 +99,9 @@ async def issue_receipt(
     text) is read from the stored document, so a receipt records what the
     knowledge base holds, not what a caller claims. The question and the
     draft are scrubbed with scrub_query whatever LEARNING_STORE_RAW_QUERIES
-    says.
+    says. verification is stored as given: a caller that puts text from the
+    draft in it scrubs that text first (verify_draft scrubs the unchecked
+    sentences).
 
     Raises:
         ReceiptError: For an unknown kind, an unknown document or a span

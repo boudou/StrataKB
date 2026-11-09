@@ -10,7 +10,7 @@ from __future__ import annotations
 import contextlib
 import json
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 from uuid import uuid4
 
 import pytest
@@ -432,6 +432,53 @@ class TestVerifyTool:
             "passages": 1, "quotes": 0, "facts": 1, "flags": 0,
             "receipt_id": result["receipt_id"],
         }
+
+    async def test_unchecked_list_capped_end_to_end(self, server, db_url, layer, tmp_path, user):
+        from stratakb.cli import render_receipt
+        from stratakb.rag.verify import MAX_UNCHECKED_SENTENCES
+
+        doc = await _document(db_url, layer, tmp_path)
+        draft = "\n".join(
+            ["No fact here."] * (MAX_UNCHECKED_SENTENCES + 10)
+            + ["Records are kept for 30 days [S1]."]
+        )
+        with _as(user):
+            result = await _verify(server, draft, [_ref(doc, QUOTE)])
+            opened = await call_tool(server, "strata_get_receipt", receipt_id=result["receipt_id"])
+        assert result["result"] == "verified"
+        assert result["unchecked_sentences"] == ["No fact here."] * MAX_UNCHECKED_SENTENCES
+        assert result["more_unchecked_sentences"] == 10
+        receipt = opened["receipt"]
+        verification = receipt["verification"]
+        assert verification["unchecked_sentences"] == ["No fact here."] * MAX_UNCHECKED_SENTENCES
+        assert verification["more_unchecked_sentences"] == 10
+        lines = render_receipt(receipt).split("\n")
+        at = lines.index("Not checked (no quote or fact to compare):")
+        end = at + 1 + MAX_UNCHECKED_SENTENCES
+        assert lines[at + 1 : end] == ["  No fact here."] * MAX_UNCHECKED_SENTENCES
+        assert lines[end] == "  and 10 more"
+
+    async def test_flagged_path_does_not_scrub(self, server, db_url, layer, tmp_path, user):
+        from stratakb.learning.pii import scrub_query
+
+        doc = await _document(db_url, layer, tmp_path)
+        scrub = Mock(wraps=scrub_query)
+        with _as(user), patch("stratakb.rag.verify_tools.scrub_query", scrub):
+            flagged = await _verify(
+                server,
+                "The moon is made of cheese. Records are kept for 31 days [S1].",
+                [_ref(doc, QUOTE)],
+            )
+            assert flagged["result"] == "flagged"
+            assert flagged["unchecked_sentences"] == ["The moon is made of cheese."]
+            scrub.assert_not_called()
+            verified = await _verify(
+                server,
+                "Send it to DEUTDEFF first. Records are kept for 30 days [S1].",
+                [_ref(doc, QUOTE)],
+            )
+        assert verified["result"] == "verified"
+        scrub.assert_called_with("Send it to DEUTDEFF first.")
 
     async def test_unchecked_sentence_scrubbed_on_receipt(
         self, server, db_url, layer, tmp_path, user

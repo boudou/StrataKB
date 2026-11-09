@@ -763,11 +763,11 @@ def render_receipt(receipt: dict) -> str:
         lines.append(f"Question: {receipt['question']}")
     if receipt.get("draft"):
         lines.append(f"Draft: {receipt['draft']}")
-    if receipt.get("verification"):
-        lines.append(_verification_line(receipt["verification"]))
+    verification = receipt.get("verification") or {}
+    if verification:
+        lines.append(_verification_line(verification))
     if receipt.get("verification_note"):
         lines.append(receipt["verification_note"])
-    verification = receipt.get("verification") or {}
     if verification.get("unchecked_sentences"):
         lines.append("Not checked (no quote or fact to compare):")
         lines.extend(f"  {sentence}" for sentence in verification["unchecked_sentences"])

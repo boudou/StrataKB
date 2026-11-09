@@ -33,6 +33,8 @@ from stratakb.rag.passages import passage_id
 
 # At most this many flags are listed; the rest are only counted
 MAX_FLAGS = 50
+# At most this many unchecked sentences are listed; the rest are only counted
+MAX_UNCHECKED_SENTENCES = 50
 
 # Curly and typographic quote marks, dashes and spaces, mapped to plain ones
 _TRANSLATE = str.maketrans(
@@ -311,10 +313,15 @@ class CheckResult:
     quotes_checked: int
     facts_checked: int
     flags_unlisted: int = 0
-    # The sentences with no quote and no fact checked (at most MAX_FLAGS), and
-    # how many more there were
+    # The sentences with no quote and no fact checked (at most
+    # MAX_UNCHECKED_SENTENCES), and how many more there were
     unchecked_sentences: list[str] = field(default_factory=list)
     unchecked_unlisted: int = 0
+
+
+def _nothing_checked(quotes: int, facts: int) -> bool:
+    """Whether the draft had no quote and no fact to compare."""
+    return not quotes and not facts
 
 
 def verdict(result: CheckResult, extra_flags: int = 0) -> str:
@@ -326,7 +333,7 @@ def verdict(result: CheckResult, extra_flags: int = 0) -> str:
     """
     if result.flags or result.flags_unlisted or extra_flags:
         return "flagged"
-    if not result.quotes_checked and not result.facts_checked:
+    if _nothing_checked(result.quotes_checked, result.facts_checked):
         return "nothing_checked"
     return "verified"
 
@@ -571,58 +578,77 @@ def _uncovered_sentences(lines: str, starts: list[int], covered: list[bool]) -> 
             yield text
 
 
-def check(
-    draft: str, passages: dict[str, str], given: Sequence[str] | None = None
-) -> CheckResult:
-    """Check the draft's citations, quotes and facts against the passages.
+class _Capped:
+    """A list of at most limit items; the items past it are only counted."""
 
-    passages maps an id (S1, S2, ...) to the passage's stored text. given
-    lists every id the caller passed, including ones whose text could not be
-    used (it defaults to the keys of passages); a citation outside it is
-    flagged.
-    """
-    given_ids = list(given if given is not None else passages)
-    lines = _strip_list_markers(normalise_text(draft, keep_lines=True))
-    flat_draft = normalise_text(lines)
-    indexes = {pid: _PassageIndex(text) for pid, text in passages.items()}
-    flags: list[Flag] = []
-    seen: set[tuple[str, str, _Scope]] = set()
-    unlisted = 0
-    scopes: dict[tuple[str, ...], _Scope] = {}
+    def __init__(self, limit: int) -> None:
+        self.limit = limit
+        self.items: list = []
+        self.unlisted = 0
 
-    def scope_of(cited: Sequence[str]) -> _Scope:
-        """The scope of these citations; with none, all the passages given."""
-        ids = tuple(cited or given_ids)
-        if ids not in scopes:
-            scopes[ids] = _Scope(ids, indexes)
-        return scopes[ids]
-
-    def flag(kind: str, text: str, message: str, scope: _Scope) -> None:
-        """Flag once per kind, text and scope; message goes before the scope's label."""
-        nonlocal unlisted
-        if (kind, text, scope) in seen:
-            return
-        seen.add((kind, text, scope))
-        if len(flags) < MAX_FLAGS:
-            flags.append(Flag(kind, text, f"{message}{scope.label}", list(scope.ids)))
+    def add(self, item: object) -> None:
+        if len(self.items) < self.limit:
+            self.items.append(item)
         else:
-            unlisted += 1
+            self.unlisted += 1
 
+
+class _Checking:
+    """What the stages of one check() share: the passages, the scopes and the flags.
+
+    One scope per set of ids for the whole call: a scope is hashed by
+    identity, so the flag dedup and the per-scope fact check rely on it.
+    """
+
+    def __init__(self, passages: dict[str, str], given_ids: list[str]) -> None:
+        self.given_ids = given_ids
+        self.indexes = {pid: _PassageIndex(text) for pid, text in passages.items()}
+        self.scopes: dict[tuple[str, ...], _Scope] = {}
+        self.seen: set[tuple[str, str, _Scope]] = set()
+        self.flags = _Capped(MAX_FLAGS)
+
+    def scope_of(self, cited: Sequence[str]) -> _Scope:
+        """The scope of these citations; with none, all the passages given."""
+        ids = tuple(cited or self.given_ids)
+        if ids not in self.scopes:
+            self.scopes[ids] = _Scope(ids, self.indexes)
+        return self.scopes[ids]
+
+    def flag(self, kind: str, text: str, message: str, scope: _Scope) -> None:
+        """Flag once per kind, text and scope; message goes before the scope's label."""
+        if (kind, text, scope) in self.seen:
+            return
+        self.seen.add((kind, text, scope))
+        self.flags.add(Flag(kind, text, f"{message}{scope.label}", list(scope.ids)))
+
+
+def _check_citations(state: _Checking, flat_draft: str) -> None:
+    """Flag a draft with no citations, and each citation of an id not given."""
     # First, so the cap on flags cannot drop it. A [S1] inside a quote is the
     # document's text; the citations right after a quote stay
     if not _CITATION.search(_QUOTE.sub(r" \2", flat_draft)):
-        flag(
+        state.flag(
             "citation",
             "no citation",
             "The draft has no citations; cite each claim as [S1]. The passages given are ",
-            scope_of(()),
+            state.scope_of(()),
         )
-
     for marker in _CITATION.finditer(flat_draft):
         for pid in _cited_ids(marker.group(0)):
-            if pid not in given_ids:
-                flag("citation", pid, f"{pid} is cited, but the passages given are ", scope_of(()))
+            if pid not in state.given_ids:
+                message = f"{pid} is cited, but the passages given are "
+                state.flag("citation", pid, message, state.scope_of(()))
 
+
+def _check_quotes(
+    state: _Checking, flat_draft: str, lines: str
+) -> tuple[int, list[int], list[str], list[str]]:
+    """Check each quote against its scope.
+
+    Returns the number of quotes checked, where each starts, the draft with
+    quotes and citations blanked (for the fact check) and the draft with the
+    quotes' text blanked (for the sentence scopes).
+    """
     # Quotes are checked whole; their text is then left out of the fact check
     masked = list(flat_draft)
     # flat_draft and lines have the same length: each line break is one space.
@@ -640,23 +666,33 @@ def check(
         quotes += 1
         quote_starts.append(m.start())
         cited = [pid for c in _CITATION.finditer(m.group(2)) for pid in _cited_ids(c.group(0))]
-        scope = scope_of(cited)
+        scope = state.scope_of(cited)
         if not any(_quote_found(quote, index.flat) for index in scope.targets):
-            flag("quote", quote, f'Quote "{quote}" not found in ', scope)
+            state.flag("quote", quote, f'Quote "{quote}" not found in ', scope)
     for marker in _CITATION.finditer(flat_draft):
         masked[marker.start():marker.end()] = " " * (marker.end() - marker.start())
+    return quotes, quote_starts, masked, scoped
 
+
+def _check_facts(
+    state: _Checking, masked: list[str], scoped: list[str], quote_starts: list[int]
+) -> tuple[int, list[int], list[bool]]:
+    """Check each fact outside the quotes against its sentence's scope.
+
+    Returns the number of distinct facts, where each sentence starts and
+    whether each sentence holds a quote or a fact that was checked.
+    """
     # Each fact is checked once per set of citations, however often it is written
     starts, cited_ids = _sentence_scopes("".join(scoped))
-    sentence_scopes = [scope_of(cited) for cited in cited_ids]
+    sentence_scopes = [state.scope_of(cited) for cited in cited_ids]
     # A sentence is covered when it holds a quote or a fact that was checked
     covered = [False] * len(starts)
     for pos in quote_starts:
         covered[bisect_right(starts, pos) - 1] = True
-    facts: dict[tuple, Fact] = {}
+    facts: set[tuple] = set()
     checked: set[tuple] = set()
     for pos, fact in _located_facts("".join(masked)):
-        facts.setdefault(fact.key, fact)
+        facts.add(fact.key)
         sentence = bisect_right(starts, pos) - 1
         covered[sentence] = True
         scope = sentence_scopes[sentence]
@@ -664,23 +700,48 @@ def check(
             continue
         checked.add((fact.key, scope))
         if not any(index.has(fact) for index in scope.targets):
-            flag(fact.kind, fact.text, f'"{fact.text}" not found in ', scope)
+            state.flag(fact.kind, fact.text, f'"{fact.text}" not found in ', scope)
+    return len(facts), starts, covered
 
-    # The sentences compared with nothing are listed, not judged. When nothing
-    # was checked at all, every sentence is unchecked and none is listed
-    unchecked: list[str] = []
-    unchecked_unlisted = 0
-    if quotes or facts:
+
+def _unchecked_sentences(
+    lines: str, starts: list[int], covered: list[bool], quotes: int, facts: int
+) -> _Capped:
+    """The sentences compared with nothing, capped at MAX_UNCHECKED_SENTENCES.
+
+    They are listed, not judged. When nothing was checked at all, every
+    sentence is unchecked and none is listed.
+    """
+    unchecked = _Capped(MAX_UNCHECKED_SENTENCES)
+    if not _nothing_checked(quotes, facts):
         for text in _uncovered_sentences(lines, starts, covered):
-            if len(unchecked) < MAX_FLAGS:
-                unchecked.append(text)
-            else:
-                unchecked_unlisted += 1
+            unchecked.add(text)
+    return unchecked
+
+
+def check(
+    draft: str, passages: dict[str, str], given: Sequence[str] | None = None
+) -> CheckResult:
+    """Check the draft's citations, quotes and facts against the passages.
+
+    passages maps an id (S1, S2, ...) to the passage's stored text. given
+    lists every id the caller passed, including ones whose text could not be
+    used (it defaults to the keys of passages); a citation outside it is
+    flagged.
+    """
+    state = _Checking(passages, list(given if given is not None else passages))
+    lines = _strip_list_markers(normalise_text(draft, keep_lines=True))
+    flat_draft = normalise_text(lines)
+    # In this order: the flags are listed, and capped, in the order raised
+    _check_citations(state, flat_draft)
+    quotes, quote_starts, masked, scoped = _check_quotes(state, flat_draft, lines)
+    facts, starts, covered = _check_facts(state, masked, scoped, quote_starts)
+    unchecked = _unchecked_sentences(lines, starts, covered, quotes, facts)
     return CheckResult(
-        flags=flags,
+        flags=state.flags.items,
         quotes_checked=quotes,
-        facts_checked=len(facts),
-        flags_unlisted=unlisted,
-        unchecked_sentences=unchecked,
-        unchecked_unlisted=unchecked_unlisted,
+        facts_checked=facts,
+        flags_unlisted=state.flags.unlisted,
+        unchecked_sentences=unchecked.items,
+        unchecked_unlisted=unchecked.unlisted,
     )
