@@ -22,6 +22,12 @@ def no_server_identity(monkeypatch):
     monkeypatch.setattr("stratakb.core.auth._server_identity", None)
 
 
+@pytest.fixture(autouse=True)
+def no_failed_schema_checks(monkeypatch):
+    """ensure_schema remembers a failure for seconds; keep that inside one test."""
+    monkeypatch.setattr("stratakb.core.migrations._failed", {})
+
+
 @pytest.fixture
 def no_sdk_env(monkeypatch):
     """Keep SDK keys, base-URL overrides and the rewrite model from the shell out of a test."""
@@ -149,8 +155,10 @@ def clear_checked():
     from stratakb.core import migrations
 
     migrations._checked.clear()
+    migrations._failed.clear()
     yield
     migrations._checked.clear()
+    migrations._failed.clear()
 
 
 @pytest.fixture
@@ -166,6 +174,7 @@ async def restore_schema(db_url):
     yield
     await replay_migrations(db_url)
     migrations._checked.clear()
+    migrations._failed.clear()
     await migrations.ensure_schema(db_url)
 
 

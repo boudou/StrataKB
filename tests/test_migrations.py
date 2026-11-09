@@ -666,6 +666,54 @@ async def test_broken_file_raises_naming_it(db_url):
     assert 9001 not in await recorded_versions(db_url)
 
 
+async def test_failure_runs_once_in_a_burst(db_url):
+    with (
+        _with_extra(9004, "94_broken.sql", "SELEC 1"),
+        capture_logs() as logs,
+    ):
+        errors = []
+        for _ in range(5):
+            with pytest.raises(migrations.MigrationError, match="94_broken.sql") as exc:
+                await migrations.ensure_schema(db_url)
+            errors.append(str(exc.value))
+    runs = [e for e in logs if e["event"] == "applying_migration" and e["version"] == 9004]
+    assert len(runs) == 1
+    assert len(set(errors)) == 1
+    assert "psql -f" in errors[0]
+    assert db_url not in migrations._checked
+
+
+async def test_failure_is_tried_again_after_the_wait(db_url):
+    with _with_extra(9005, "95_broken.sql", "SELEC 1"):
+        with pytest.raises(migrations.MigrationError):
+            await migrations.ensure_schema(db_url)
+        failed_at = migrations._failed[db_url][0]
+        with (
+            patch.object(
+                migrations.time, "monotonic",
+                return_value=failed_at + migrations._RETRY_AFTER_S,
+            ),
+            capture_logs() as logs,
+            pytest.raises(migrations.MigrationError),
+        ):
+            await migrations.ensure_schema(db_url)
+    assert [e["version"] for e in logs if e["event"] == "applying_migration"] == [9005]
+
+
+async def test_success_forgets_the_failure(db_url):
+    with (
+        _with_extra(9006, "96_broken.sql", "SELEC 1"),
+        pytest.raises(migrations.MigrationError),
+    ):
+        await migrations.ensure_schema(db_url)
+    migrations._failed[db_url] = (0.0, migrations._failed[db_url][1])
+
+    await migrations.ensure_schema(db_url)
+
+    assert db_url not in migrations._failed
+    assert db_url in migrations._checked
+
+
 async def test_still_missing_file_has_generic_message(db_url):
     with (
         _with_extra(9003, "93_noop.sql", "SELECT 1"),
@@ -757,6 +805,7 @@ async def test_table_lock_names_the_file(db_url, restore_schema):
         await holder.close()
 
     migrations._checked.clear()
+    migrations._failed.clear()
     await migrations.ensure_schema(db_url)
     assert 12 in await recorded_versions(db_url)
 

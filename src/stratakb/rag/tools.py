@@ -227,6 +227,25 @@ def _cited_ends(chunks: list[dict[str, Any]], reach: int = 0) -> dict[int, int]:
     return ends
 
 
+async def _read_cited_documents(
+    database_url: str, ends: dict[int, int]
+) -> dict[int, dict[str, Any]]:
+    """The stored documents named in ends, each read up to its end, in one query.
+
+    The schema is brought up to date first, so a database the startup update
+    missed is updated here, and one that cannot be updated raises the
+    MigrationError that names the cause and the fix. Any failure is raised.
+    """
+    from stratakb.core.database import get_pool
+    from stratakb.core.migrations import ensure_schema
+    from stratakb.knowledge.documents import fetch_cited_documents
+
+    await ensure_schema(database_url)
+    pool = await get_pool(database_url)
+    async with pool.acquire() as conn:
+        return await fetch_cited_documents(conn, ends)
+
+
 async def _cited_documents(
     database_url: str, chunks: list[dict[str, Any]]
 ) -> dict[int, dict[str, Any]]:
@@ -239,14 +258,7 @@ async def _cited_documents(
     if not ends:
         return {}
     try:
-        from stratakb.core.database import get_pool
-        from stratakb.core.migrations import ensure_schema
-        from stratakb.knowledge.documents import fetch_cited_documents
-
-        await ensure_schema(database_url)
-        pool = await get_pool(database_url)
-        async with pool.acquire() as conn:
-            return await fetch_cited_documents(conn, ends)
+        return await _read_cited_documents(database_url, ends)
     except Exception as e:
         logger.warning("cited_documents_fetch_failed", error_type=type(e).__name__)
         return {}
@@ -270,7 +282,10 @@ async def _extract_answer(
     nothing to quote, the answer is not_found and has no receipt. A named clause
     with a part left out makes a found answer partly_found, with a note. Unlike a
     grounded answer it fails when the documents cannot be read or the model
-    cannot load: there is no answer without them.
+    cannot load: there is no answer without them. The documents are read by
+    _read_cited_documents, so a database the startup update missed is updated
+    here, and one that cannot be updated fails with the MigrationError that
+    names the cause and the fix.
     refused_note says the caller asked for a mode the layers do not allow.
     omitted_note says named clauses never reached chunks: it makes a found answer
     partly_found too, and a not_found answer keeps it, so "not in the documents"
@@ -280,15 +295,8 @@ async def _extract_answer(
     the answer is not_found, before any receipt; when some are missing, a found
     answer becomes partly_found. The note names the missing ones.
     """
-    from stratakb.core.database import get_pool
-    from stratakb.knowledge.documents import fetch_cited_documents
-
     ends = _cited_ends(chunks, SENTENCE_REACH)
-    documents: dict[int, dict[str, Any]] = {}
-    if ends:
-        pool = await get_pool(database_url)
-        async with pool.acquire() as conn:
-            documents = await fetch_cited_documents(conn, ends)
+    documents = await _read_cited_documents(database_url, ends) if ends else {}
     # Splitting and scoring are CPU-bound: kept off the event loop
     candidates = await asyncio.to_thread(candidate_sentences, chunks, documents, ends)
     try:
