@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from urllib.parse import urlsplit
+
+_AUTHORITY_END = re.compile(r"[/?#]")
 
 
 @dataclass(frozen=True)
@@ -17,8 +20,30 @@ class UrlParts:
     password: str | None = field(default=None, repr=False)
 
 
+def _at_after_authority(url: str) -> bool:
+    """True when an "@" sits after the authority of url, read by hand.
+
+    An unencoded "/", "?" or "#" in a password ends the authority early, so the
+    parsed host and port would be the user and the start of the password.
+
+    A well-formed URL with an "@" in its path, query or fragment
+    ("postgresql://db.example/strata?user=me@corp") cannot be told apart from
+    that shape, so it is refused too: failing safe is intended.
+    """
+    start = url.find("//")
+    rest = url[start + 2 :] if start >= 0 else url
+    end = _AUTHORITY_END.search(rest)
+    return end is not None and "@" in rest[end.start() :]
+
+
 def url_parts(url: str) -> UrlParts | None:
-    """The parts of url, or None when it cannot be parsed (an invalid port included)."""
+    """The parts of url, or None when it cannot be parsed (an invalid port included).
+
+    None too when an "@" sits after the authority: the host, port and user
+    would then be read from the credentials.
+    """
+    if _at_after_authority(url):
+        return None
     try:
         parts = urlsplit(url)
         return UrlParts(
@@ -35,35 +60,24 @@ def url_parts(url: str) -> UrlParts | None:
 def url_host(url: str) -> str:
     """The host of url, or "" when it names none or cannot be parsed.
 
-    The port is not read, so an invalid port does not hide the host.
+    The port is not read, so an invalid port does not hide the host. An "@"
+    after the authority gives "", as the host would be read from the user name.
     """
+    if _at_after_authority(url):
+        return ""
     try:
         return urlsplit(url).hostname or ""
     except ValueError:
         return ""
 
 
-def _at_after_authority(url: str) -> bool:
-    """True when an "@" sits after the authority of url, read by hand.
-
-    An unencoded "/", "?" or "#" in a password ends the authority early, so the
-    parsed host and port would be the user and the start of the password.
-    """
-    start = url.find("//")
-    rest = url[start + 2 :] if start >= 0 else url
-    ends = [i for i in (rest.find(c) for c in "/?#") if i >= 0]
-    return "@" in rest[min(ends, default=len(rest)) :]
-
-
 def url_host_port(database_url: str) -> str:
     """host:port of a database URL, never its user, password, database name or query.
 
-    "unknown host" when the URL cannot be read safely: an "@" after the
-    authority means the parsed host would come from the credentials.
+    "unknown host" whenever url_parts cannot read the URL: an invalid port, an
+    unclosed bracket, or an "@" after the authority.
     """
-    if _at_after_authority(database_url):
-        return "unknown host"
     parts = url_parts(database_url)
     if parts is None:
-        return "localhost:5432"
+        return "unknown host"
     return f"{parts.host or 'localhost'}:{parts.port or 5432}"
