@@ -21,7 +21,14 @@ def test_instructions_length_and_phrases(server):
     instructions = server.instructions
     assert len(instructions) <= 4000
     assert instructions.index(_ANSWER_CONTRACT[0]) < 500
-    for phrase in ("strata_verify", "receipt", "verbatim", "not in the documents", "not_found"):
+    for phrase in (
+        "strata_verify",
+        "receipt",
+        "verbatim",
+        "not in the documents",
+        "not_found",
+        "unchecked_sentences",
+    ):
         assert phrase in instructions
     for rule in _ANSWER_CONTRACT:
         assert rule in instructions

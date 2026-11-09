@@ -168,7 +168,9 @@ _ANSWER_CONTRACT = (
     "kind passage is about a ref, not the draft: pass the refs exactly as strata_ask returned them "
     "and verify again, and if it stays, say the answer is unverified. When the result is "
     "nothing_checked, the draft has no quote or fact to check and no receipt: quote the passage "
-    "that supports it and verify again, or say the answer is unverified.",
+    "that supports it and verify again, or say the answer is unverified. When the result lists "
+    "unchecked_sentences, those sentences had no quote or fact to compare: tell the reader they "
+    "were not checked.",
     "In extractive mode show answer verbatim, each sentence with its citation, and any note or "
     "warning.",
     "Always show the receipt id when there is one: receipt_id from strata_verify, or from "

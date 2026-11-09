@@ -7,7 +7,9 @@ the layer's chunk_size long, or, for a span that starts where a stored
 section starts and ends inside it, at most as long as the widest exact
 clause strata_ask can return, so a citation cannot be widened to a whole
 document. A verified draft gets a receipt, and a draft with nothing to check
-gets none; every call is audited with counts only, never the draft.
+gets none; every call is audited with counts only, never the draft. The
+sentences with no quote and no fact are returned in unchecked_sentences and
+recorded on the receipt: the result covers only what was checked.
 """
 
 from __future__ import annotations
@@ -26,10 +28,11 @@ from stratakb.core.database import get_pool
 from stratakb.core.logging import log_tool_call
 from stratakb.core.migrations import ensure_schema
 from stratakb.knowledge.layers import DEFAULT_CHUNK_SIZE
+from stratakb.learning.pii import scrub_query
 from stratakb.rag.clause_lookup import max_exact_chars
 from stratakb.rag.passages import ChunkRef, DocumentRef, parse_ref, passage_id
 from stratakb.rag.receipts import ReceiptError, issue_receipt, readable_layers
-from stratakb.rag.verify import MAX_FLAGS, Flag, check
+from stratakb.rag.verify import MAX_FLAGS, Flag, check, verdict
 
 if TYPE_CHECKING:
     from stratakb.config import Settings
@@ -39,6 +42,8 @@ logger = structlog.get_logger()
 # Limits on one call, so a check stays quick
 MAX_PASSAGES = 50
 MAX_DRAFT_CHARS = 50_000
+# An unchecked sentence is shown cut to this many characters
+MAX_SENTENCE_CHARS = 200
 
 # A passage that is not a stored section's start may be at most this many
 # times its layer's chunk_size long
@@ -56,6 +61,13 @@ _NOTHING_CHECKED = (
     'Quote the passage that supports it as "..." [S1] and verify again, or say the answer is '
     "unverified."
 )
+
+
+def _shown(text: str) -> str:
+    """text, cut to MAX_SENTENCE_CHARS characters with an ellipsis when longer."""
+    if len(text) <= MAX_SENTENCE_CHARS:
+        return text
+    return text[: MAX_SENTENCE_CHARS - 1].rstrip() + "…"
 
 
 class _RefusedError(Exception):
@@ -226,11 +238,13 @@ async def verify_draft(
     texts = {p.id: p.text for p in passages if p.text is not None}
     # Pure-Python and CPU-bound: kept off the event loop
     result = await asyncio.to_thread(check, draft, texts, given)
-    flags = [
+    passage_flags = [
         Flag("passage", p.ref, f"{p.id} ({p.ref}) {p.problem}", [p.id])
         for p in passages
         if p.problem
-    ] + result.flags
+    ]
+    outcome = verdict(result, extra_flags=len(passage_flags))
+    flags = passage_flags + result.flags
     total = len(flags) + result.flags_unlisted
     counts = {
         "quotes": result.quotes_checked,
@@ -239,19 +253,31 @@ async def verify_draft(
     }
     response: dict = {
         "status": "ok",
-        "result": "flagged" if total else "verified",
+        "result": outcome,
         "quotes_checked": result.quotes_checked,
         "facts_checked": result.facts_checked,
     }
-    if total:
+    if outcome == "nothing_checked":
+        # Every sentence is unchecked here; the note says so
+        response["note"] = _NOTHING_CHECKED
+        await audit("nothing_checked", **counts)
+        return response
+
+    unchecked: dict = {}
+    if result.unchecked_sentences:
+        response["unchecked_sentences"] = [_shown(s) for s in result.unchecked_sentences]
+        unchecked["unchecked_sentences"] = [
+            _shown(scrub_query(s)) for s in result.unchecked_sentences
+        ]
+    if result.unchecked_unlisted:
+        response["more_unchecked_sentences"] = result.unchecked_unlisted
+        unchecked["more_unchecked_sentences"] = result.unchecked_unlisted
+    if outcome == "flagged":
         response["flags"] = [f.to_dict() for f in flags[:MAX_FLAGS]]
         if total > MAX_FLAGS:
             response["more_flags"] = total - MAX_FLAGS
         await audit("flagged", **counts)
         return response
-    if result.nothing_checked:
-        await audit("nothing_checked", **counts)
-        return {**response, "result": "nothing_checked", "note": _NOTHING_CHECKED}
 
     try:
         receipt_id = await issue_receipt(
@@ -262,9 +288,10 @@ async def verify_draft(
             quotes=[asdict(p.span) for p in passages if p.span is not None],
             draft=draft,
             verification={
-                "result": "verified",
+                "result": outcome,
                 "passages": [{"id": p.id, "ref": p.ref} for p in passages],
                 **counts,
+                **unchecked,
             },
             tool_name=tool_name,
         )
@@ -303,7 +330,10 @@ def register_verify_tools(
         all is flagged. A draft with citations but no quote or fact to check
         returns nothing_checked, with no receipt. A verified draft
         gets a receipt (open it with strata_get_receipt). A paraphrase that
-        changes the meaning without changing a fact is not caught.
+        changes the meaning without changing a fact is not caught. Sentences
+        with no quote or fact are returned in unchecked_sentences and recorded
+        on the receipt: the result covers only what was checked, so tell the
+        reader those sentences were not checked.
 
         Args:
             draft: The answer as written, citing passages as [S1], [S2], ...

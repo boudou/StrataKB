@@ -7,7 +7,14 @@ from decimal import Decimal
 
 import pytest
 
-from stratakb.rag.verify import MAX_FLAGS, check, extract_facts, normalise_text
+from stratakb.rag.verify import (
+    MAX_FLAGS,
+    CheckResult,
+    check,
+    extract_facts,
+    normalise_text,
+    verdict,
+)
 from stratakb.rag.verify_tools import MAX_DRAFT_CHARS
 
 PASSAGES = {
@@ -41,7 +48,7 @@ class TestCheck:
     def test_clean_draft_verified(self):
         result = check(CLEAN, PASSAGES)
         assert result.flags == []
-        assert result.verified
+        assert verdict(result) == "verified"
         assert result.quotes_checked == 1
         assert result.facts_checked >= 10
 
@@ -108,7 +115,7 @@ class TestCheck:
         assert result.flags[0].passages == list(PASSAGES)
         assert result.quotes_checked == 1
         assert result.facts_checked == 1
-        assert not result.verified
+        assert verdict(result) == "flagged"
 
     def test_no_citation_flag_listed_first_past_the_cap(self):
         draft = " ".join(f"Q{i}Z" for i in range(1, MAX_FLAGS + 20))
@@ -123,7 +130,7 @@ class TestCheck:
         assert [f.text for f in check('"See [S1] for the form"', passages).flags] == ["no citation"]
         result = check('"See [S1] for the form" [S1]', passages)
         assert result.flags == []
-        assert result.verified
+        assert verdict(result) == "verified"
 
     @pytest.mark.parametrize(
         "draft",
@@ -136,15 +143,15 @@ class TestCheck:
     def test_cited_draft_with_nothing_to_check(self, draft):
         result = check(draft, PASSAGES)
         assert result.flags == []
-        assert result.nothing_checked
-        assert not result.verified
+        assert verdict(result) == "nothing_checked"
 
     @pytest.mark.parametrize("draft", ["The moon is made of cheese.", "", "   "])
     def test_draft_with_no_citations_and_nothing_to_check_flagged(self, draft):
         result = check(draft, PASSAGES)
         assert [(f.kind, f.text) for f in result.flags] == [("citation", "no citation")]
-        assert result.nothing_checked
-        assert not result.verified
+        assert result.quotes_checked == 0
+        assert result.facts_checked == 0
+        assert verdict(result) == "flagged"
 
     def test_quote_with_omission(self):
         assert _flag_texts('"A fee of EUR 1,000.00 ... is reported in pacs.002" [S2]') == []
@@ -221,7 +228,7 @@ class TestCheck:
         result = check(draft, passages)
         assert len(result.flags) == MAX_FLAGS
         assert result.flags_unlisted == result.facts_checked - MAX_FLAGS
-        assert not result.verified
+        assert verdict(result) == "flagged"
 
     @pytest.mark.parametrize(
         "unit",
@@ -399,7 +406,7 @@ class TestFactScope:
 
     def test_citations_on_lines_of_their_own(self):
         draft = "Notice is 90 days. [S2]\n[S1]\nFee is EUR 25.\n[S2]\n[S3]."
-        assert check(draft, self.P).verified
+        assert verdict(check(draft, self.P)) == "verified"
 
     def test_citation_followed_by_more_text_opens_the_next_clause(self):
         flags = check("Notice is 90 days. [S2], the fee is EUR 25 [S1].", self.P).flags
@@ -440,3 +447,60 @@ class TestFactScope:
         assert time.monotonic() - started < 2
         assert len(result.flags) == MAX_FLAGS
         assert result.flags_unlisted > 1000
+
+
+class TestUncheckedSentences:
+    """Sentences with no quote and no fact are listed, and leave the verdict alone."""
+
+    P = {"S1": "The fee is EUR 25 from 2026-11-04."}
+
+    def test_moon_sentence_listed(self):
+        draft = "The moon is made of cheese. The fee is EUR 25 [S1]."
+        result = check(draft, {"S1": "The fee is EUR 25."})
+        assert result.flags == []
+        assert result.quotes_checked == 0
+        assert result.facts_checked == 1
+        assert result.unchecked_sentences == ["The moon is made of cheese."]
+        assert verdict(result) == "verified"
+
+    def test_covered_draft_lists_none(self):
+        result = check("The fee is EUR 25 [S1]. It applies from 2026-11-04 [S1].", self.P)
+        assert result.unchecked_sentences == []
+        assert result.unchecked_unlisted == 0
+
+    def test_repeated_fact_covers_each_sentence(self):
+        # The second sentence's fact is not checked again, but it was compared
+        result = check("The fee is EUR 25 [S1]. Again, EUR 25 [S1].", self.P)
+        assert result.unchecked_sentences == []
+
+    def test_quote_covers_its_sentence(self):
+        result = check('"The fee is EUR 25" [S1]. Nothing else here [S1].', self.P)
+        assert result.unchecked_sentences == ["Nothing else here [S1]."]
+
+    def test_empty_quote_does_not_cover(self):
+        result = check('See "..." here [S1]. The fee is EUR 25 [S1].', self.P)
+        assert result.unchecked_sentences == ['See "..." here [S1].']
+
+    def test_citation_only_line_not_listed(self):
+        assert check("The fee is EUR 25.\n[S1]", self.P).unchecked_sentences == []
+
+    def test_list_is_capped(self):
+        draft = "\n".join(["No fact here."] * 60 + ["The fee is EUR 25 [S1]."])
+        result = check(draft, self.P)
+        assert result.unchecked_sentences == ["No fact here."] * MAX_FLAGS
+        assert result.unchecked_unlisted == 10
+        assert verdict(result) == "verified"
+
+    def test_verdict_counts_outside_flags(self):
+        result = check("The fee is EUR 25 [S1].", self.P)
+        assert verdict(result) == "verified"
+        assert verdict(result, extra_flags=1) == "flagged"
+
+    @pytest.mark.parametrize("draft", ["The moon is made of cheese.", "No facts here [S1]."])
+    def test_nothing_checked_lists_none(self, draft):
+        # Every sentence is unchecked; listing them would add nothing
+        assert check(draft, self.P).unchecked_sentences == []
+
+    def test_check_result_has_no_verdict(self):
+        assert not hasattr(CheckResult, "verified")
+        assert not hasattr(CheckResult, "nothing_checked")
