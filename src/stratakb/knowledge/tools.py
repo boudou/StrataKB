@@ -270,7 +270,7 @@ def register_knowledge_tools(
 
         Patterns are in .gitignore style, matched against each file's path
         relative to its folder: "archive/", "*-2024.md", "!keep.md". The last
-        match wins, so the order counts. Each may hold at most three wildcards.
+        match wins, so the order counts. Each may hold at most three wildcards and 500 characters.
         An empty list clears them. Citations of a matching file are labelled
         as archived from the next ask on, with no new ingest. Archived files
         are not the layer's "archived" status, which covers the whole layer.

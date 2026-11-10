@@ -32,6 +32,17 @@ READONLY_READABLE = (
     "strata_vectors.documents",
 )
 
+# Unencoded "/", "?" or "#" in the password: urlsplit reads the user as the
+# host and the start of the password as the port. core/urls.py reads no host
+# from any of them.
+MALFORMED_URLS = [
+    "postgresql://app:123/x@db/strata",
+    "postgresql://app:99/secret@db:5432/s",
+    "postgresql://app:123?x@db/s",
+    "postgresql://app:123#x@db/s",
+    "https://user:12/x@api.example",
+]
+
 # The example presets
 
 REPO_DIR = Path(__file__).parent.parent

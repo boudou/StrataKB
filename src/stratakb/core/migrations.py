@@ -12,6 +12,7 @@ PostgreSQL's postgres and template databases.
 from __future__ import annotations
 
 import enum
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -383,6 +384,13 @@ _OWNS_STRATA_OBJECTS = f"""
 # Database URLs whose schema is known to be current in this process
 _checked: set[str] = set()
 
+# Seconds a failed check is remembered: calls in the meantime get its error
+# again, so a burst of calls does not open a connection and wait for locks each
+_RETRY_AFTER_S = 10
+
+# Database URLs whose last check failed: when (time.monotonic()) and the error
+_failed: dict[str, tuple[float, Exception]] = {}
+
 
 class MigrationError(Exception):
     """The schema is out of date and could not be updated."""
@@ -510,6 +518,8 @@ async def ensure_schema(
     advisory lock. A migration whose objects already exist is recorded
     without running its file; a file that runs must leave its presence query
     true. Connection errors (a connect timeout included) propagate unchanged.
+    A failure is remembered for _RETRY_AFTER_S seconds: calls for the same
+    URL in that time raise the same error without trying again.
 
     Args:
         database_url: The database to check and update.
@@ -524,7 +534,23 @@ async def ensure_schema(
     """
     if database_url in _checked:
         return
+    failed = _failed.get(database_url)
+    if failed is not None and time.monotonic() - failed[0] < _RETRY_AFTER_S:
+        # A fresh traceback each time, so a stored error does not grow one
+        raise failed[1].with_traceback(None)
 
+    try:
+        await _apply_missing(database_url, on_setup)
+    except Exception as e:
+        _failed[database_url] = (time.monotonic(), e)
+        raise
+    _failed.pop(database_url, None)
+
+
+async def _apply_missing(
+    database_url: str, on_setup: Callable[[str], None] | None
+) -> None:
+    """ensure_schema without the memory of a failure; marks database_url checked."""
     migrations = list(MIGRATIONS)
     async with connect_once(database_url, timeout=_TIMEOUT_S) as conn:
         present: dict[int, bool] = {}

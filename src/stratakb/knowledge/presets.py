@@ -28,6 +28,7 @@ Example (see examples/ for complete presets):
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -62,6 +63,10 @@ if TYPE_CHECKING:
 
 logger = structlog.get_logger()
 
+# A YAML value that starts with * (an alias) or ! (a tag): a list item, a
+# mapping value or an entry in a [...] or {...} flow collection
+_VALUE_START = re.compile(r"(?:^\s*-\s+|:\s+|[\[{,]\s*)[*!]")
+
 
 @dataclass
 class SourceGroup:
@@ -94,6 +99,17 @@ class LayerPreset:
     root: Path | None = None
 
 
+def _at_value_start(text: str, error: yaml.YAMLError) -> bool:
+    """True when the YAML error sits on a line with a value starting with * or !,
+    so quoting a pattern is the likely fix (not for a tab or a bad indent)."""
+    lines = text.splitlines()
+    for name in ("context_mark", "problem_mark"):
+        mark = getattr(error, name, None)
+        if mark is not None and mark.line < len(lines) and _VALUE_START.search(lines[mark.line]):
+            return True
+    return False
+
+
 def load_preset(preset_path: str | Path) -> LayerPreset:
     """Read and validate a preset YAML file.
 
@@ -102,12 +118,12 @@ def load_preset(preset_path: str | Path) -> LayerPreset:
         LayerValidationError: If the preset is malformed.
     """
     path = Path(preset_path)
+    text = path.read_text(encoding="utf-8")
     try:
-        data = yaml.safe_load(path.read_text(encoding="utf-8"))
+        data = yaml.safe_load(text)
     except yaml.YAMLError as e:
-        raise LayerValidationError(
-            f"Preset {path} is not valid YAML; quote a pattern that starts with * or !: {e}"
-        ) from e
+        hint = "; quote a pattern that starts with * or !" if _at_value_start(text, e) else ""
+        raise LayerValidationError(f"Preset {path} is not valid YAML{hint}: {e}") from e
     if not isinstance(data, dict):
         raise LayerValidationError(f"Preset {path} must be a YAML mapping.")
 

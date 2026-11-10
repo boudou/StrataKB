@@ -350,6 +350,7 @@ async def test_public_grant_is_named(db_url, readonly_role):
     finally:
         await owner_execute(db_url, "REVOKE SELECT ON strata_core.audit_log FROM PUBLIC")
         migrations._checked.clear()
+        migrations._failed.clear()
         await migrations.ensure_schema(db_url)
     assert 6 in await recorded_versions(db_url)
 

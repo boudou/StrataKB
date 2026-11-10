@@ -7,6 +7,8 @@ Tests cover:
 - Vectors of the wrong length are refused on both backends
 - strata_search, strata_ingest_documents and strata_apply_preset need no OpenAI key
   with a base URL
+- strata_ask refuses an embedding setup that cannot run before layer detection and
+  the rewrite; re-embedding refuses it before it reads a chunk
 - is_model_cached needs config.json and the weights, and never downloads
 - The OpenAI path refuses an empty key without a base URL
 - An unknown backend is refused with or without a key, before any file is read
@@ -304,6 +306,60 @@ class TestToolKeyChecks:
         assert "API key" in result["error"]
         # The key is checked before anything is written
         create.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("overrides", "key", "expected"),
+        [
+            ({}, "", "API key"),
+            ({"embedding_backend": "opnai"}, "sk-openai", "Unknown embedding backend opnai"),
+            ({"strata_local_only": True}, "sk-openai", "STRATA_LOCAL_ONLY"),
+        ],
+        ids=["no_key", "unknown_backend", "local_only"],
+    )
+    async def test_ask_refuses_before_rewriting(self, overrides, key, expected):
+        from stratakb.rag.tools import register_rag_tools
+
+        fn = capture_tools(register_rag_tools, "postgresql://test", key)["strata_ask"]
+        detect = AsyncMock(return_value=[])
+        rewrite = AsyncMock(return_value="rewritten")
+        search = AsyncMock(return_value=[])
+        with (
+            patch(
+                "stratakb.config.get_settings",
+                return_value=openai_settings(learning_enabled=False, **overrides),
+            ),
+            patch("stratakb.rag.tools._detect_layers", detect),
+            patch("stratakb.rag.query_rewriter.rewrite_query", rewrite),
+            patch("stratakb.rag.retriever.search_chunks", search),
+        ):
+            result = await fn(question="What is a mandate?")
+        assert result["status"] == "error"
+        assert expected in result["error"]
+        # The question never reached layer detection, the rewrite provider or the search
+        detect.assert_not_awaited()
+        rewrite.assert_not_awaited()
+        search.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("all_layers", [False, True], ids=["one_layer", "all_layers"])
+    async def test_re_embed_refuses_before_reading_chunks(self, all_layers):
+        from stratakb.knowledge import vector_store
+
+        get_pool = AsyncMock()
+        with (
+            patch(
+                "stratakb.config.get_settings",
+                return_value=openai_settings(openai_api_key=""),
+            ),
+            patch("stratakb.knowledge.vector_store.get_pool", get_pool),
+            pytest.raises(ValueError, match="API key"),
+        ):
+            if all_layers:
+                await vector_store.re_embed_all_layers("postgresql://test")
+            else:
+                await vector_store.re_embed_layer("postgresql://test", "docs")
+        get_pool.assert_not_awaited()
 
 
 # ── is_model_cached ──────────────────────────────────────

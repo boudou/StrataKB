@@ -35,7 +35,7 @@ from stratakb.core.egress import (
     outbound_providers,
     rewrite_skip_reason,
 )
-from tests.helpers import call_health, capture_tools
+from tests.helpers import MALFORMED_URLS, call_health, capture_tools
 
 pytestmark = pytest.mark.usefixtures("no_sdk_env")
 
@@ -145,6 +145,13 @@ def test_rewrite_endpoint_hides_credentials():
     p = providers[0]
     assert p.destination == "10.0.0.5"
     assert not any("pw" in str(v) for v in vars(p).values())
+
+
+@pytest.mark.parametrize("url", MALFORMED_URLS)
+def test_malformed_endpoint_url_names_no_user(url):
+    settings = _settings(embedding_backend="openai", embedding_base_url=url)
+    assert [p.destination for p in outbound_providers(settings)] == ["unknown host"]
+    assert [p.destination for p in outbound_providers(_rewrite_endpoint(url))] == ["unknown host"]
 
 
 def test_rewrite_endpoint_without_model_is_not_outbound():

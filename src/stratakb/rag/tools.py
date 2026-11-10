@@ -19,6 +19,7 @@ from stratakb.rag.clause_lookup import (
     ClauseMatches,
     cap_note,
     in_exact_span,
+    question_regexes,
     without_exact_spans,
 )
 from stratakb.rag.clause_lookup import lookup as lookup_clauses
@@ -73,8 +74,8 @@ async def _detect_layers(database_url: str, query: str, learning_enabled: bool) 
     try:
         routing = await get_layer_routing(database_url)
         patterns = compile_patterns(routing["patterns"])
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning("routing_patterns_unavailable", error_type=type(e).__name__)
 
     affinity_scores = None
     if learning_enabled:
@@ -83,8 +84,8 @@ async def _detect_layers(database_url: str, query: str, learning_enabled: bool) 
             affinities = await LearningStore(database_url).find_layer_affinities(query)
             if affinities:
                 affinity_scores = {layer: 0.8 for layer in affinities}
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("layer_affinities_unavailable", error_type=type(e).__name__)
 
     return detect_layers_with_affinity(
         query, patterns=patterns, affinity_scores=affinity_scores
@@ -98,11 +99,13 @@ async def _exact_clauses(
     from stratakb.knowledge.layers import get_structure_patterns
 
     try:
-        patterns = await get_structure_patterns(database_url, layers)
+        by_layer = await get_structure_patterns(database_url, layers)
     except Exception as e:
         logger.warning("structure_patterns_unavailable", error_type=type(e).__name__)
-        patterns = []
-    return await lookup_clauses(database_url, question, layers, budget, patterns)
+        by_layer = {}
+    return await lookup_clauses(
+        database_url, question, layers, budget, question_regexes(by_layer)
+    )
 
 
 async def _answer_mode(
@@ -227,6 +230,25 @@ def _cited_ends(chunks: list[dict[str, Any]], reach: int = 0) -> dict[int, int]:
     return ends
 
 
+async def _read_cited_documents(
+    database_url: str, ends: dict[int, int]
+) -> dict[int, dict[str, Any]]:
+    """The stored documents named in ends, each read up to its end, in one query.
+
+    The schema is brought up to date first, so a database the startup update
+    missed is updated here, and one that cannot be updated raises the
+    MigrationError that names the cause and the fix. Any failure is raised.
+    """
+    from stratakb.core.database import get_pool
+    from stratakb.core.migrations import ensure_schema
+    from stratakb.knowledge.documents import fetch_cited_documents
+
+    await ensure_schema(database_url)
+    pool = await get_pool(database_url)
+    async with pool.acquire() as conn:
+        return await fetch_cited_documents(conn, ends)
+
+
 async def _cited_documents(
     database_url: str, chunks: list[dict[str, Any]]
 ) -> dict[int, dict[str, Any]]:
@@ -239,14 +261,7 @@ async def _cited_documents(
     if not ends:
         return {}
     try:
-        from stratakb.core.database import get_pool
-        from stratakb.core.migrations import ensure_schema
-        from stratakb.knowledge.documents import fetch_cited_documents
-
-        await ensure_schema(database_url)
-        pool = await get_pool(database_url)
-        async with pool.acquire() as conn:
-            return await fetch_cited_documents(conn, ends)
+        return await _read_cited_documents(database_url, ends)
     except Exception as e:
         logger.warning("cited_documents_fetch_failed", error_type=type(e).__name__)
         return {}
@@ -270,7 +285,10 @@ async def _extract_answer(
     nothing to quote, the answer is not_found and has no receipt. A named clause
     with a part left out makes a found answer partly_found, with a note. Unlike a
     grounded answer it fails when the documents cannot be read or the model
-    cannot load: there is no answer without them.
+    cannot load: there is no answer without them. The documents are read by
+    _read_cited_documents, so a database the startup update missed is updated
+    here, and one that cannot be updated fails with the MigrationError that
+    names the cause and the fix.
     refused_note says the caller asked for a mode the layers do not allow.
     omitted_note says named clauses never reached chunks: it makes a found answer
     partly_found too, and a not_found answer keeps it, so "not in the documents"
@@ -280,15 +298,8 @@ async def _extract_answer(
     the answer is not_found, before any receipt; when some are missing, a found
     answer becomes partly_found. The note names the missing ones.
     """
-    from stratakb.core.database import get_pool
-    from stratakb.knowledge.documents import fetch_cited_documents
-
     ends = _cited_ends(chunks, SENTENCE_REACH)
-    documents: dict[int, dict[str, Any]] = {}
-    if ends:
-        pool = await get_pool(database_url)
-        async with pool.acquire() as conn:
-            documents = await fetch_cited_documents(conn, ends)
+    documents = await _read_cited_documents(database_url, ends) if ends else {}
     # Splitting and scoring are CPU-bound: kept off the event loop
     candidates = await asyncio.to_thread(candidate_sentences, chunks, documents, ends)
     try:
@@ -550,6 +561,7 @@ def register_rag_tools(
         mode: AnswerMode | None = None,
     ) -> AskResult | ToolFailure:
         """Run strata_ask; the tool below documents the arguments."""
+        from stratakb.knowledge.embeddings import embedding_key_error
         from stratakb.rag.query_rewriter import (
             build_domain_context,
             rewrite_configured,
@@ -558,6 +570,10 @@ def register_rag_tools(
         from stratakb.rag.retriever import search_chunks
 
         _settings = _current_settings()
+        # Before layer detection and the rewrite, so a question never leaves the
+        # machine for a search that cannot run
+        if err := embedding_key_error(_settings, openai_api_key):
+            return ToolFailure(err)
 
         if not question or not question.strip():
             return ToolFailure("Question cannot be empty.")
@@ -580,8 +596,8 @@ def register_rag_tools(
                 try:
                     from stratakb.learning.store import LearningStore
                     learning_store = LearningStore(database_url)
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.warning("learning_store_unavailable", error_type=type(e).__name__)
 
             # Rewrite query into domain-specific variants
             domain_context = ""
@@ -590,8 +606,8 @@ def register_rag_tools(
                     from stratakb.knowledge.layers import get_layer_routing
                     routing = await get_layer_routing(database_url)
                     domain_context = build_domain_context(routing["descriptions"])
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.warning("domain_context_unavailable", error_type=type(e).__name__)
             queries = await rewrite_query(
                 question,
                 anthropic_api_key=_settings.anthropic_api_key,
@@ -659,9 +675,15 @@ def register_rag_tools(
             )
             confidence = collected.confidence
             basis = confidence.basis
+            # Read for every chunk packed and every named clause past them
+            documents = await _cited_documents(database_url, chunks + exact[len(chunks):])
+            # The citations are known now, replaced_by labels too: the passages as
+            # the client gets them must fit, so the last that no longer fit are dropped
+            chunks = pack_passages(
+                chunks, _settings.answer_token_budget, documents=documents
+            )
             # Packing keeps a prefix, so the named clauses past it did not fit
             left_out = exact[len(chunks):]
-            documents = await _cited_documents(database_url, chunks + left_out)
             passages = build_passages(chunks, documents)
             omitted = _join_notes(
                 left_out_note(left_out, documents), cap_note(matches, layer_named)
@@ -759,7 +781,7 @@ def register_rag_tools(
         knowledge base's terminology, runs several searches in parallel,
         reranks the results, and returns the best passages that fit a token
         budget (ANSWER_TOKEN_BUDGET, about 1,500 tokens, each passage's id,
-        ref and citation counted with its text, except a replaced_by label; at
+        ref and citation, replaced_by label too, counted with its text; at
         most 50 passages). In grounded mode the client composes the answer from the passages and
         cites them by id. When a passage comes from an extractive layer the
         server answers with the document's own sentences. A clause or section

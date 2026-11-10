@@ -28,6 +28,7 @@ from typing import TYPE_CHECKING, Any, NamedTuple
 import structlog
 
 from stratakb.core.terminal_text import one_line, terminal_safe_json, visible
+from stratakb.core.urls import url_host_port
 
 if TYPE_CHECKING:
     from stratakb.core.local_db import DownOutcome, UpState
@@ -428,12 +429,19 @@ def _run_add(args: argparse.Namespace) -> int:
         )
 
         keep_hugging_face_offline()
-        # Only the embedding side: add never rewrites queries, so an Anthropic
-        # key or a remote rewrite endpoint does not stop it
         if provider := embedding_provider(settings):
             from stratakb.knowledge.add_folder import refused
 
             return _finish(refused("local_only", refusal_line(provider), root=root), args)
+
+    # Only the embedding side: add never rewrites queries, so an Anthropic
+    # key or a remote rewrite endpoint does not stop it
+    from stratakb.knowledge.embeddings import embedding_key_error
+
+    if err := embedding_key_error(settings, settings.openai_api_key):
+        from stratakb.knowledge.add_folder import refused
+
+        return _finish(refused("embedding_setup", err, root=root), args)
 
     try:
         report = asyncio.run(_add(args, settings, root))
@@ -463,7 +471,6 @@ async def _add(args: argparse.Namespace, settings: Any, root: str) -> Report:
     """
     from stratakb.core.database import close_pool
     from stratakb.core.migrations import MigrationError, ensure_schema
-    from stratakb.core.urls import url_host_port
     from stratakb.knowledge import add_folder
     from stratakb.knowledge.layers import (
         LayerExistsError,
@@ -644,7 +651,6 @@ async def _open_receipt(url: str, receipt_id: str, user_id: str, role: str) -> d
     """open_receipt, with every failure turned into a _ReceiptOpenError."""
     from stratakb.core.database import close_pool
     from stratakb.core.migrations import MigrationError
-    from stratakb.core.urls import url_host_port
     from stratakb.rag.receipts import ReceiptAccessError, open_receipt
 
     try:
@@ -764,11 +770,11 @@ def render_receipt(receipt: dict) -> str:
         lines.append(f"Question: {receipt['question']}")
     if receipt.get("draft"):
         lines.append(f"Draft: {receipt['draft']}")
-    if receipt.get("verification"):
-        lines.append(_verification_line(receipt["verification"]))
+    verification = receipt.get("verification") or {}
+    if verification:
+        lines.append(_verification_line(verification))
     if receipt.get("verification_note"):
         lines.append(receipt["verification_note"])
-    verification = receipt.get("verification") or {}
     if verification.get("unchecked_sentences"):
         lines.append("Not checked (no quote or fact to compare):")
         lines.extend(f"  {sentence}" for sentence in verification["unchecked_sentences"])

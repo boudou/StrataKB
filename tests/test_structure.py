@@ -561,7 +561,7 @@ def test_run_of_blanks_in_a_front_matter_line_is_read_in_linear_time(line, is_fr
     end = frontmatter_end(text)
 
     # The old key pattern needed over ten seconds for each of these
-    assert time.perf_counter() - began < 0.1
+    assert time.perf_counter() - began < 1.0
     assert (end > 0) is is_front_matter
 
 

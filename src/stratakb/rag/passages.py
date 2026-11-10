@@ -35,13 +35,16 @@ AnswerMode = Literal["grounded", "extractive"]
 
 # The most passages an answer returns, and results the learning loop stores
 MAX_PASSAGES = 50
-# The tokens a passage costs in the response beyond its own indent-2 JSON: the
-# deeper indentation inside the response's passages list and the page, lines,
-# page_end, the date and date_source values and the archived key a stored
-# document adds (measured on FastMCP's indent-2 JSON with six-digit spans and
-# three-digit pages: about 133 characters). A replaced_by label is not counted:
-# packing runs before documents are read, a path can be 500 characters, and
-# raising this for every passage would cost all answers room for a rare key
+# Characters per token in estimate_tokens' rough count
+CHARS_PER_TOKEN = 4
+# The estimate of what a passage costs in the response beyond its own indent-2
+# JSON, used before the documents are read (pack_passages without documents,
+# and clause_lookup through passage_cost): the deeper indentation inside the
+# response's passages list and the page, lines, page_end, the date and
+# date_source values and the archived key a stored document adds (measured on
+# FastMCP's indent-2 JSON with six-digit spans and three-digit pages: about
+# 133 characters). A replaced_by label is not in it: strata_ask packs again
+# with the real citations once the documents are read
 RESPONSE_SLACK_TOKENS = 34
 
 _PASSAGE_ID = re.compile(r"[Ss]([1-9][0-9]*)")
@@ -115,8 +118,23 @@ def ask_chunk(
 
 
 def estimate_tokens(text: str) -> int:
-    """A rough token count: about four characters per token."""
-    return math.ceil(len(text) / 4)
+    """A rough token count: CHARS_PER_TOKEN characters per token."""
+    return math.ceil(len(text) / CHARS_PER_TOKEN)
+
+
+def chars_for_tokens(tokens: int) -> int:
+    """The characters estimate_tokens counts as this many tokens."""
+    return tokens * CHARS_PER_TOKEN
+
+
+def listed_cost(item: dict[str, Any]) -> int:
+    """The tokens item costs as one element of a list in the response.
+
+    Its own indent-2 JSON, each line indented 4 spaces deeper (a list in the
+    response's top-level object), and the comma and newline before the next.
+    """
+    text = json.dumps(item, indent=2, ensure_ascii=False)
+    return estimate_tokens(text + " " * (4 * (text.count("\n") + 1)) + ",\n")
 
 
 def passage_cost(chunk: dict[str, Any]) -> int:
@@ -125,17 +143,30 @@ def passage_cost(chunk: dict[str, Any]) -> int:
     return estimate_tokens(passage) + RESPONSE_SLACK_TOKENS
 
 
-def pack_passages(chunks: list[dict[str, Any]], budget: int) -> list[dict[str, Any]]:
+def pack_passages(
+    chunks: list[dict[str, Any]],
+    budget: int,
+    *,
+    documents: dict[int, dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
     """The leading chunks, in order, whose passages fit the token budget.
 
-    Each passage costs its text plus its id, ref and citation (passage_cost).
-    Packing stops before the chunk that would pass the budget, and after
-    MAX_PASSAGES passages; the first chunk is always kept, however long.
+    Without documents each passage costs the estimate made before they are
+    read (passage_cost: its text, id, ref and citation, and the slack a stored
+    document adds). With documents, an empty dict too, each costs its passage
+    as the response lists it (listed_cost), with its real id and citation,
+    replaced_by label included. Packing stops before the chunk that would pass
+    the budget, and after MAX_PASSAGES passages; the first chunk is always
+    kept, however long.
     """
+    candidates = chunks[:MAX_PASSAGES]
+    if documents is None:
+        costs = [passage_cost(chunk) for chunk in candidates]
+    else:
+        costs = [listed_cost(p) for p in build_passages(candidates, documents)]
     kept: list[dict[str, Any]] = []
     used = 0
-    for chunk in chunks[:MAX_PASSAGES]:
-        cost = passage_cost(chunk)
+    for chunk, cost in zip(candidates, costs, strict=True):
         if kept and used + cost > budget:
             break
         kept.append(chunk)

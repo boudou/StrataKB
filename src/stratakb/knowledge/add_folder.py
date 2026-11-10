@@ -103,7 +103,9 @@ _POSIX_SYSTEM_DIRS = (
     "/usr", "/var", "/System", "/Library", "/Applications",
 )
 
-_LINK = re.compile(r"\[([^\]]*)\]\([^)]*\)")
+# A Markdown link, whose text is kept. Neither part scans past a '[' or ']', so
+# a run of brackets is read in linear time (the rules in knowledge/structure.py).
+_LINK = re.compile(r"\[([^\[\]]*)\]\([^)\[\]]*\)")
 _RULE_LINE = re.compile(r"^[=\-~^*+#_`]+$")
 
 

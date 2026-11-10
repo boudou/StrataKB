@@ -32,7 +32,7 @@ from stratakb.learning.pii import scrub_query
 from stratakb.rag.clause_lookup import max_exact_chars
 from stratakb.rag.passages import ChunkRef, DocumentRef, parse_ref, passage_id
 from stratakb.rag.receipts import ReceiptError, issue_receipt, readable_layers
-from stratakb.rag.verify import MAX_FLAGS, Flag, check, verdict
+from stratakb.rag.verify import MAX_FLAGS, CheckResult, Flag, check, verdict
 
 if TYPE_CHECKING:
     from stratakb.config import Settings
@@ -68,6 +68,22 @@ def _shown(text: str) -> str:
     if len(text) <= MAX_SENTENCE_CHARS:
         return text
     return text[: MAX_SENTENCE_CHARS - 1].rstrip() + "…"
+
+
+def _unchecked(result: CheckResult, *, scrubbed: bool = False) -> dict:
+    """The unchecked sentences and how many more there were, each key only when set.
+
+    With scrubbed, each sentence is PII-scrubbed before it is cut, so a cut
+    cannot split an account number past the scrubber's patterns.
+    """
+    unchecked: dict = {}
+    if result.unchecked_sentences:
+        unchecked["unchecked_sentences"] = [
+            _shown(scrub_query(s) if scrubbed else s) for s in result.unchecked_sentences
+        ]
+    if result.unchecked_unlisted:
+        unchecked["more_unchecked_sentences"] = result.unchecked_unlisted
+    return unchecked
 
 
 class _RefusedError(Exception):
@@ -263,15 +279,7 @@ async def verify_draft(
         await audit("nothing_checked", **counts)
         return response
 
-    unchecked: dict = {}
-    if result.unchecked_sentences:
-        response["unchecked_sentences"] = [_shown(s) for s in result.unchecked_sentences]
-        unchecked["unchecked_sentences"] = [
-            _shown(scrub_query(s)) for s in result.unchecked_sentences
-        ]
-    if result.unchecked_unlisted:
-        response["more_unchecked_sentences"] = result.unchecked_unlisted
-        unchecked["more_unchecked_sentences"] = result.unchecked_unlisted
+    response.update(_unchecked(result))
     if outcome == "flagged":
         response["flags"] = [f.to_dict() for f in flags[:MAX_FLAGS]]
         if total > MAX_FLAGS:
@@ -291,7 +299,8 @@ async def verify_draft(
                 "result": outcome,
                 "passages": [{"id": p.id, "ref": p.ref} for p in passages],
                 **counts,
-                **unchecked,
+                # The receipt stores no PII; the response returns the caller's own text
+                **_unchecked(result, scrubbed=True),
             },
             tool_name=tool_name,
         )

@@ -30,7 +30,7 @@ from stratakb.rag.clause_lookup import (
     unanchored,
     without_exact_spans,
 )
-from stratakb.rag.passages import pack_passages, passage_cost
+from stratakb.rag.passages import estimate_tokens, pack_passages, passage_cost
 from stratakb.rag.retriever import SearchResult
 from tests.helpers import ingest
 
@@ -178,6 +178,13 @@ def test_fit_to_budget_keeps_offsets():
 def test_max_exact_chars():
     assert max_exact_chars(1500) == 6000
     assert max_exact_chars(10) == 200
+
+
+def test_max_exact_chars_follows_the_token_ratio(monkeypatch):
+    monkeypatch.setattr("stratakb.rag.passages.CHARS_PER_TOKEN", 3)
+
+    assert max_exact_chars(1500) == 4500
+    assert estimate_tokens("x" * 4500) == 1500
 
 
 def test_fit_clauses_shares_what_a_floor_leaves():

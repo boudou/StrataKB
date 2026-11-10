@@ -20,7 +20,7 @@ import pytest
 
 from stratakb.knowledge.policy import MAX_RELATIVE_PATH
 from stratakb.rag.extractive import Sentence, fit_to_answer_budget
-from stratakb.rag.passages import build_passages, cite, estimate_tokens, passage_cost
+from stratakb.rag.passages import build_passages, cite, estimate_tokens, pack_passages
 from tests.helpers import ingest, write_file
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -354,23 +354,67 @@ def test_chunk_without_offsets_has_no_label():
     assert "replaced_by" not in cite(chunk, document)
 
 
-def test_grounded_label_is_not_counted_and_overshoots_by_its_length():
-    def tokens(passage: dict) -> int:
-        return estimate_tokens(pydantic_core.to_json({"passages": [passage]}, indent=2).decode())
+def _passages_tokens(passages: list[dict]) -> int:
+    """The tokens passages add to a grounded response as FastMCP serializes it."""
+    def tokens(response: dict) -> int:
+        return estimate_tokens(pydantic_core.to_json(response, indent=2).decode())
 
-    label = "x" * MAX_RELATIVE_PATH
-    chunk = {"chunk_id": "c", "content": "x", "layer": "l", "doc_type": "markdown",
-             "metadata": {}, "source_file": "a.md", "document_id": 1,
-             "char_start": 0, "char_end": 1}
-    document = {"relative_path": "a.md", "page_map": None, "text": "x"}
-    cost = passage_cost(chunk)
+    response = {"status": "found", "mode": "grounded", "passages": []}
+    return tokens({**response, "passages": passages}) - tokens(response)
 
-    plain = build_passages([chunk], {1: document})[0]
-    labelled = build_passages([chunk], {1: {**document, "replaced_by": label}})[0]
 
-    assert labelled["citation"]["replaced_by"] == label
-    assert passage_cost(chunk) == cost
-    assert 0 < tokens(labelled) - tokens(plain) <= estimate_tokens(label) + 8
+def _labelled_chunks(count: int) -> tuple[list[dict], dict]:
+    """count chunks of 100 characters into one document whose citation has a label."""
+    chunks = [
+        {"chunk_id": f"c{i}", "content": "x" * 100, "layer": "l", "doc_type": "markdown",
+         "metadata": {}, "source_file": "a.md", "document_id": 1,
+         "char_start": i * 100, "char_end": (i + 1) * 100}
+        for i in range(count)
+    ]
+    document = {"relative_path": "a.md", "page_map": None, "text": "x" * (count * 100),
+                "replaced_by": "x" * MAX_RELATIVE_PATH}
+    return chunks, document
+
+
+def test_grounded_budget_counts_the_label():
+    chunks, labelled = _labelled_chunks(6)
+    budget = 1000
+
+    kept = pack_passages(chunks, budget, documents={1: labelled})
+    passages = build_passages(kept, {1: labelled})
+
+    # The estimate made before documents are read leaves the label out
+    assert pack_passages(chunks, budget) == chunks
+    assert all(p["citation"]["replaced_by"] == labelled["replaced_by"] for p in passages)
+    assert _passages_tokens(passages) <= budget
+    assert 1 < len(kept) < len(chunks)
+
+
+async def test_grounded_answer_with_labels_fits_the_budget(server, settings):
+    from stratakb.rag.retriever import SearchResult
+
+    chunks, labelled = _labelled_chunks(20)
+    results = [
+        SearchResult(
+            chunk_id=chunk["chunk_id"], content=chunk["content"], score=1.0,
+            layer_name="docs", source_file="a.md", source_section="section",
+            doc_type="markdown", metadata={}, similarity=0.9, document_id=1,
+            char_start=chunk["char_start"], char_end=chunk["char_end"],
+        )
+        for chunk in chunks
+    ]
+    with (
+        patch("stratakb.rag.retriever.search_chunks", AsyncMock(return_value=results)),
+        patch("stratakb.rag.tools._cited_documents", AsyncMock(return_value={1: labelled})),
+    ):
+        response = _payload(await server.call_tool(
+            "strata_ask", {"question": "q", "layers": ["docs"], "top_k": 20}
+        ))
+
+    passages = response["passages"]
+    assert 1 < len(passages) < len(chunks)
+    assert all(p["citation"]["replaced_by"] == labelled["replaced_by"] for p in passages)
+    assert _passages_tokens(passages) <= settings.answer_token_budget
 
 
 def test_extractive_budget_counts_the_label():

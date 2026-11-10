@@ -501,6 +501,36 @@ class TestUncheckedSentences:
         # Every sentence is unchecked; listing them would add nothing
         assert check(draft, self.P).unchecked_sentences == []
 
+    def test_unchecked_cap_is_its_own(self, monkeypatch):
+        monkeypatch.setattr("stratakb.rag.verify.MAX_UNCHECKED_SENTENCES", 3)
+        draft = "\n".join(["No fact here."] * 60 + ["The fee is EUR 25 [S1]."])
+        result = check(draft, self.P)
+        assert result.unchecked_sentences == ["No fact here."] * 3
+        assert result.unchecked_unlisted == 57
+        # The flag cap stays MAX_FLAGS
+        flagged = check(" ".join(f"Q{i}Z" for i in range(1, MAX_FLAGS + 20)) + " [S1]", PASSAGES)
+        assert len(flagged.flags) == MAX_FLAGS
+
+    @pytest.mark.parametrize(
+        "draft",
+        [
+            "The moon is made of cheese.",
+            "No facts here [S1].",
+            "The fee is EUR 25 [S1].",
+            '"The fee is EUR 25" [S1]. Nothing else [S1].',
+        ],
+    )
+    def test_nothing_checked_one_rule(self, draft):
+        result = check(draft, self.P)
+        nothing = not result.flags and result.quotes_checked == result.facts_checked == 0
+        assert (verdict(result) == "nothing_checked") == nothing
+        if verdict(result) == "nothing_checked":
+            assert result.unchecked_sentences == []
+
+    def test_stage_split_keeps_flag_order(self):
+        result = check('"absent text" and EUR 99.', PASSAGES)
+        assert [f.kind for f in result.flags] == ["citation", "quote", "amount"]
+
     def test_check_result_has_no_verdict(self):
         assert not hasattr(CheckResult, "verified")
         assert not hasattr(CheckResult, "nothing_checked")

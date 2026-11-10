@@ -761,3 +761,53 @@ class TestSettingTheMode:
             assert next(r for r in rows if r["name"] == name)["answer_mode"] == "extractive"
         finally:
             await delete_layer(db_url, name=name)
+
+
+async def _one_migration_behind(db_url: str) -> None:
+    """Undo the last migration, as a database the startup update did not reach."""
+    from stratakb.core import migrations
+    from tests.helpers import owner_execute
+
+    last = migrations.MIGRATIONS[-1]
+    assert last.file == "16_archived_patterns.sql"
+    await owner_execute(
+        db_url,
+        f"""
+        ALTER TABLE strata_core.knowledge_layers DROP COLUMN archived_patterns;
+        DELETE FROM strata_core.schema_migrations WHERE version = {last.version};
+        """,
+    )
+    migrations._checked.clear()
+
+
+class TestSchemaBehind:
+    async def test_extractive_ask_updates_the_schema_and_answers(
+        self, server, settings, make_layer, restore_schema
+    ):
+        from tests.helpers import recorded_versions
+
+        layer, document_id = await make_layer("extractive")
+        await _one_migration_behind(settings.database_url)
+
+        response = await _ask(server, [_hit(layer, document_id)], layers=[layer])
+
+        assert response["status"] == "found"
+        assert response["mode"] == "extractive"
+        assert response["answer"][0]["text"] == NINETY
+        assert 16 in await recorded_versions(settings.database_url)
+
+    async def test_failed_update_names_the_cause_and_the_fix(
+        self, server, settings, make_layer, restore_schema
+    ):
+        from stratakb.core import migrations
+
+        layer, document_id = await make_layer("extractive")
+        await _one_migration_behind(settings.database_url)
+
+        with patch.object(migrations, "_load_sql", return_value="SELEC 1"):
+            response = await _ask(server, [_hit(layer, document_id)], layers=[layer])
+
+        assert response["status"] == "error"
+        assert "16_archived_patterns.sql failed" in response["error"]
+        assert "as the database owner (psql -f)" in response["error"]
+        assert "archived_patterns does not exist" not in response["error"]
