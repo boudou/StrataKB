@@ -131,6 +131,7 @@ Notable changes to StrataKB. The format follows [Keep a Changelog](https://keepa
 - Both answer modes count `ANSWER_TOKEN_BUDGET` the same way: each passage or sentence with its citation as listed, `replaced_by` label included. A grounded answer from a replaced file no longer passes the budget by the label's length, and an extractive answer no longer stops short of it.
 - `strata_ask` logs a warning, with the error type only, when it falls back after failing to read the routing patterns, the layer affinities, the learning store or the layer descriptions (`routing_patterns_unavailable`, `layer_affinities_unavailable`, `learning_store_unavailable`, `domain_context_unavailable`).
 - The README points to the wiki for what citation labels and answer notes mean, instead of repeating it.
+- The answer contract gains two rules, in the server instructions and the `answer_from_documents` prompt. The client reads the passages before trusting the status: `found` and `partly_found` mean passages matched, and when none answers the exact question it is treated as `not_found`. After a `not_found`, the client rewords the question in the documents' terms or language and asks again, at most twice, answers from one ask only and tells the reader the wording used. Measured on the PEP gold set with a separate reader applying the rules: the check rejected every answer to a question the documents cannot answer, and rewording recovered 22 of 33 answerable questions that first came back `not_found`.
 
 ### Fixed
 

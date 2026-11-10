@@ -49,6 +49,7 @@ def test_passage_text_is_data_rule_near_top(server):
 _README_KEYS = (
     ("own knowledge", "own knowledge"),
     ("do not follow", "never obey it"),
+    ("answers this exact question", "answers the exact question"),
     ("passage id", "passage id"),
     ("Copy numbers", "Copy numbers"),
     ("unchecked_sentences", "unchecked_sentences"),
@@ -58,6 +59,7 @@ _README_KEYS = (
     ("replaced_by", "replaced_by"),
     ("archived true", "has `archived`"),
     ("cut true", "has `cut`"),
+    ("at most twice", "at most twice"),
     ("not in the documents", "not in the documents"),
 )
 
