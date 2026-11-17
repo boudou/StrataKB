@@ -24,6 +24,7 @@ from stratakb.core.migrations import MigrationError
 from stratakb.knowledge import add_folder
 from stratakb.knowledge.add_folder import REPORT_KEYS, Plan, Report
 from stratakb.knowledge.layers import LayerExistsError, LayerValidationError, RootTakenError
+from stratakb.knowledge.selection import SelectionResult
 from tests.helpers import ROOT, add_report
 
 DB_URL = "postgresql://strata:secret_pw@db.example:5433/strata"
@@ -201,6 +202,45 @@ def test_exit_2_on_a_plan_refusal(capsys):
     assert data["layer"] == "docs"
     assert data["created"] is False
     assert "already exists" in captured.err
+
+
+_IGNORED = [("a.rst", "ignored_by_gitignore"), ("sub/b.rst", "ignored_by_gitignore")]
+
+
+def test_nothing_to_add_refusal_json_carries_the_exclusions(capsys):
+    hint = "No file in /docs can be added: git ignores 2 files here, by the ignore rules."
+    plan = _plan(
+        action=None,
+        refusal=("nothing_to_add", hint),
+        selection=SelectionResult(mode="git", excluded=list(_IGNORED), git_root="/repo"),
+    )
+    code, _, apply_mock = _run(["add", ROOT, "--json"], plan=plan)
+    assert code == 2
+    apply_mock.assert_not_called()
+    captured = capsys.readouterr()
+    data = json.loads(captured.out)
+    assert data["reason"] == "nothing_to_add"
+    assert data["mode"] == "git"
+    assert data["excluded_by_reason"] == {"ignored_by_gitignore": 2}
+    assert data["excluded"] == [
+        {"path": "a.rst", "reason": "ignored_by_gitignore"},
+        {"path": "sub/b.rst", "reason": "ignored_by_gitignore"},
+    ]
+    assert "git ignores 2 files here" in captured.err
+
+
+def test_other_refusals_keep_empty_exclusions(capsys):
+    plan = _plan(
+        action=None,
+        refusal=("name_taken", "A layer named 'docs' already exists."),
+        selection=SelectionResult(mode="git", excluded=list(_IGNORED)),
+    )
+    code, _, _ = _run(["add", ROOT, "--json"], plan=plan)
+    assert code == 2
+    data = json.loads(capsys.readouterr().out)
+    assert data["reason"] == "name_taken"
+    assert data["excluded_by_reason"] == {}
+    assert data["excluded"] == []
 
 
 def test_exit_3_when_the_database_is_unreachable(cli_env, capsys):

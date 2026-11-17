@@ -23,7 +23,7 @@ import asyncio
 import contextlib
 import os
 import sys
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Collection, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NamedTuple
 
@@ -486,7 +486,11 @@ async def _add(args: argparse.Namespace, settings: Any, root: str) -> Report:
     layer: str | None = None
 
     def refuse(
-        reason: str, hint: str, exit_code: int = EXIT_REFUSED, mode: str | None = None
+        reason: str,
+        hint: str,
+        exit_code: int = EXIT_REFUSED,
+        mode: str | None = None,
+        excluded: Collection[tuple[str, str]] = (),
     ) -> Report:
         return add_folder.refused(
             reason,
@@ -496,6 +500,7 @@ async def _add(args: argparse.Namespace, settings: Any, root: str) -> Report:
             mode=mode,
             db_target=target,
             exit_code=exit_code,
+            excluded=excluded,
         )
 
     options = add_folder.Options(
@@ -517,7 +522,13 @@ async def _add(args: argparse.Namespace, settings: Any, root: str) -> Report:
         if plan.refusal is not None:
             reason, hint = plan.refusal
             mode = plan.selection.mode if plan.selection is not None else None
-            return refuse(reason, hint, mode=mode)
+            # Only nothing_to_add explains itself through the exclusions
+            excluded = (
+                plan.selection.excluded
+                if reason == "nothing_to_add" and plan.selection is not None
+                else ()
+            )
+            return refuse(reason, hint, mode=mode, excluded=excluded)
 
         confirmed, refusal = _confirmations(plan, options)
         if refusal is not None:

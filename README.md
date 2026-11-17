@@ -46,7 +46,7 @@ Run `uv run stratakb db up` again any time: it starts the database if it was sto
 uv run stratakb add path/to/docs
 ```
 
-It creates a layer named after the folder and reads the documents in it: PDF, Word, Markdown, HTML, plain text and more. It skips files that look like secrets, code or build output, and tells you what it skipped and why (`--json` lists every file). Run it again after you edit the documents: it reads only what changed.
+It creates a layer named after the folder and reads the documents in it: PDF, Word, Markdown, HTML, plain text and more. It skips files that look like secrets, code or build output, and tells you what it skipped and why (`--json` lists every file). Inside a git repository it follows the repository's ignore rules; when they leave nothing to add, it says so, names the repository and says how to add the folder anyway. Run it again after you edit the documents: it reads only what changed.
 
 The first run downloads a model of about 420 MB into your Hugging Face cache, and the first question downloads one of about 90 MB. To keep everything on this machine, see [Where your data goes](#where-your-data-goes).
 
