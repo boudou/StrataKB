@@ -391,9 +391,24 @@ class TestRefAndCitation:
         with patch(
             "stratakb.core.migrations.ensure_schema",
             AsyncMock(side_effect=MigrationError("out of date")),
-        ) as ensure:
-            assert await _cited_documents("postgresql://unused", [chunk]) == {}
+        ) as ensure, pytest.raises(MigrationError, match="out of date"):
+            await _cited_documents("postgresql://unused", [chunk])
         ensure.assert_awaited_once_with("postgresql://unused")
+
+    async def test_cited_documents_other_failure_cites_by_file_name(self):
+        from structlog.testing import capture_logs
+
+        from stratakb.rag.tools import _cited_documents
+
+        chunk = {"chunk_id": "c", "document_id": 1, "char_start": 0, "char_end": 3}
+
+        with (
+            patch("stratakb.core.migrations.ensure_schema", AsyncMock(side_effect=OSError("down"))),
+            capture_logs() as logs,
+        ):
+            assert await _cited_documents("postgresql://unused", [chunk]) == {}
+        failed = [e for e in logs if e["event"] == "cited_documents_fetch_failed"]
+        assert [e["error_type"] for e in failed] == ["OSError"]
 
     def test_citation_across_pages_names_the_last_page(self):
         text = "one\n\ntwo"

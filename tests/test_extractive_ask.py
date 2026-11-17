@@ -16,6 +16,7 @@ from uuid import uuid4
 
 import pytest
 from mcp.server.fastmcp.exceptions import ToolError
+from structlog.testing import capture_logs
 
 from stratakb.rag.clause_lookup import ClauseMatches
 from stratakb.rag.confidence import RERANK_THRESHOLDS
@@ -821,8 +822,47 @@ class TestSchemaBehind:
     ):
         layer, document_id = await make_layer("extractive")
         async with _one_migration_behind(settings.database_url, sql="SELEC 1"):
-            response = await _ask(server, [_hit(layer, document_id)], layers=[layer])
+            with capture_logs() as logs:
+                response = await _ask(server, [_hit(layer, document_id)], layers=[layer])
 
         assert response["status"] == "error"
         assert "9101_ask_schema_probe.sql failed" in response["error"]
         assert "as the database owner (psql -f)" in response["error"]
+        # The schema is checked once per ask, so the first ask's error is not a replay
+        assert "tried again" not in response["error"]
+        applied = [e for e in logs if e["event"] == "applying_migration"]
+        assert [e["version"] for e in applied] == [9101]
+
+    async def test_grounded_ask_cites_by_file_name_and_says_why(
+        self, server, settings, make_layer
+    ):
+        layer, document_id = await make_layer("grounded")
+        async with _one_migration_behind(settings.database_url, sql="SELEC 1"):
+            with capture_logs() as logs:
+                response = await _ask(server, [_hit(layer, document_id)], layers=[layer])
+
+        assert response["status"] != "error"
+        assert response["mode"] == "grounded"
+        assert response["passages"]
+        citation = response["passages"][0]["citation"]
+        assert citation["file"] == "hit.md"
+        assert citation["lines"] is None
+        assert response["note"].startswith(
+            "Passages are cited by file name only: the database schema is out of date."
+        )
+        assert "9101_ask_schema_probe.sql failed" in response["note"]
+        behind = [e for e in logs if e["event"] == "cited_documents_schema_out_of_date"]
+        assert len(behind) == 1
+        assert "9101_ask_schema_probe.sql" in behind[0]["error"]
+
+    async def test_grounded_ask_other_read_failure_has_no_note(self, server, make_layer):
+        layer, document_id = await make_layer("grounded")
+        with patch(
+            "stratakb.rag.tools._read_cited_documents", AsyncMock(side_effect=OSError("down"))
+        ):
+            response = await _ask(server, [_hit(layer, document_id)], layers=[layer])
+
+        assert response["mode"] == "grounded"
+        assert response["passages"]
+        assert response["passages"][0]["citation"]["file"] == "hit.md"
+        assert "note" not in response
