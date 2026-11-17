@@ -24,7 +24,7 @@ from typing import Any, NamedTuple
 
 import structlog
 
-from stratakb.knowledge.pattern_safety import pattern_problem
+from stratakb.knowledge.pattern_safety import pattern_problem, regex_problem
 from stratakb.knowledge.structure import normalise_label
 from stratakb.rag.layer_detect import pattern_text
 from stratakb.rag.passages import ask_chunk, chars_for_tokens, passage_cost
@@ -157,8 +157,8 @@ def question_pattern(pattern: str) -> str:
 @functools.lru_cache(maxsize=256)
 def _question_regex(pattern: str, layer: str | None = None) -> re.Pattern[str] | None:
     """question_pattern(pattern) compiled, or None when the stored pattern
-    must not run (it does not compile or it repeats a repeated part). The
-    warning names layer, the layer that stores the pattern, when known."""
+    must not run (pattern_problem refuses it). The warning names layer, the
+    layer that stores the pattern, when known."""
     # Check the stored pattern and the question form: an unsafe part outside
     # the label group would not show in the label group alone, and text that
     # only looks like the label group ('[(?P<label>(a+)+)]' is a character
@@ -171,7 +171,9 @@ def _question_regex(pattern: str, layer: str | None = None) -> re.Pattern[str] |
         except re.error:
             # The label group alone does not compile (it refers to another group)
             regex = unanchored(pattern)
-        problem = pattern_problem(regex)
+        # Regex checks only: the stored text passed the text checks, and the
+        # question form of a pattern at the length cap can be a little longer
+        problem = regex_problem(regex)
     if problem is not None:
         logger.warning(
             "unsafe_structure_pattern", pattern=pattern, reason=problem, layer=layer
@@ -209,8 +211,8 @@ def find_references(
     extra_patterns are a layer's structure patterns (a named group 'label'
     gives the label, as in structure.detect_sections); each match of
     question_pattern anywhere in the question is a reference. A stored
-    pattern that does not compile or repeats a repeated part is skipped (it
-    reached the layer some other way than its validated writes). Only the
+    pattern that pattern_problem refuses is skipped (it reached the layer
+    some other way than its validated writes). Only the
     first MAX_PATTERN_QUESTION_CHARS characters of the question are read.
     """
     return _all_references(question, extra_patterns)[:MAX_REFERENCES]

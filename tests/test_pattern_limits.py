@@ -19,13 +19,13 @@ import pytest
 from structlog.testing import capture_logs
 
 from stratakb.knowledge.layers import (
-    MAX_PATTERN_LENGTH,
     LayerValidationError,
     _validate_archived_patterns,
     _validate_routing_patterns,
     _validate_structure_patterns,
     create_layer,
 )
+from stratakb.knowledge.pattern_safety import MAX_PATTERN_LENGTH
 from stratakb.knowledge.presets import load_preset
 from stratakb.rag.clause_lookup import question_regexes
 
@@ -153,6 +153,18 @@ def test_safe_pattern_in_two_layers_is_returned_once():
 
     assert len(compiled) == 1
     assert isinstance(compiled[0], re.Pattern)
+
+
+def test_question_form_of_a_pattern_at_the_cap_is_used():
+    # Without a label group the question form swaps the leading ^ for a longer
+    # lookbehind, so it is over the cap; only the stored text is held to it
+    pattern = "^" + uuid4().hex
+    pattern += "a" * (MAX_PATTERN_LENGTH - len(pattern))
+    with capture_logs() as logs:
+        compiled = question_regexes({"l": [pattern]})
+
+    assert len(compiled) == 1
+    assert not [e for e in logs if e["event"] == "unsafe_structure_pattern"]
 
 
 async def test_exact_clauses_hands_compiled_patterns_to_the_lookup():

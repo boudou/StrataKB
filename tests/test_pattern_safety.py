@@ -1,9 +1,10 @@
 """Unsafe layer patterns never run (stratakb.knowledge.pattern_safety).
 
-Every write path refuses a pattern that does not compile or repeats a
-repeated part; these tests cover a pattern that reached the layer row
-another way: skipped at question time, at ingest and by routing, and
-dropped by import-layer.
+Every write path refuses a pattern that does not compile, repeats a
+repeated part, is too long, holds a NUL or lone surrogate, or makes Python
+warn; these tests cover a pattern that reached the layer row another way:
+skipped at question time, at ingest and by routing, and dropped by
+import-layer.
 """
 
 from __future__ import annotations
@@ -15,8 +16,10 @@ import json
 import re
 import subprocess
 import time
+import warnings
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
 from uuid import uuid4
 
 import asyncpg
@@ -61,6 +64,13 @@ def test_other_problems():
     assert pattern_problem(1) == "it is not a string."
 
 
+def test_warning_pattern_is_refused_before_compiling():
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        assert usable_patterns([f"[[:alpha:]]{uuid4().hex}"], kind="routing") == []
+    assert not [w for w in caught if issubclass(w.category, FutureWarning)]
+
+
 def test_usable_patterns_keeps_safe_ones_in_order():
     with capture_logs() as logs:
         usable = usable_patterns(
@@ -88,6 +98,77 @@ async def test_refusal_says_the_check_is_strict(db_url):
 
 
 # --- question time ------------------------------------------------------------
+
+
+@pytest.fixture
+def settings():
+    from stratakb.config import Settings, get_settings
+
+    return Settings(
+        _env_file=None,
+        database_url=get_settings().database_url,
+        learning_enabled=False,
+        reranking_enabled=False,
+        strata_user="test-user",
+        strata_role="viewer",
+    )
+
+
+@pytest.fixture
+def server(settings):
+    """A StrataKB server on the test database, its settings patched in everywhere."""
+    from stratakb.mcp_server import build_server
+
+    with (
+        patch("stratakb.config.get_settings", return_value=settings),
+        patch("stratakb.rag.tools.write_audit_log", AsyncMock()),
+        patch("stratakb.learning.tools.write_audit_log", AsyncMock()),
+        patch(
+            "stratakb.rag.query_rewriter.rewrite_query",
+            AsyncMock(side_effect=lambda question, **_: [question]),
+        ),
+    ):
+        yield build_server(settings)
+
+
+async def test_ask_skips_long_and_warning_patterns(server, db_url):
+    from stratakb.knowledge import layers
+    from stratakb.knowledge.layers import LayerNotFoundError, create_layer, delete_layer
+
+    name = f"test_safety_{uuid4().hex[:10]}"
+    tag = uuid4().hex
+    routing = ["a" * 600 + tag, f"[[:alpha:]]{tag}"]
+    structure = [rf"^(?P<label>ZZ{tag}-\d+)" + "q?" * 300, rf"^(?P<label>[[A-Z]{tag}-\d+)"]
+    await create_layer(db_url, name=name, display_name="Safety")
+    try:
+        conn = await asyncpg.connect(db_url)
+        try:
+            await conn.execute(
+                "UPDATE strata_core.knowledge_layers SET routing_patterns = $1::jsonb, "
+                "structure_patterns = $2::jsonb WHERE name = $3",
+                json.dumps(routing), json.dumps(structure), name,
+            )
+        finally:
+            await conn.close()
+        layers._routing_cache.clear()
+        with (
+            patch("stratakb.rag.retriever.search_chunks", AsyncMock(return_value=[])),
+            capture_logs() as logs,
+        ):
+            await server.call_tool("strata_ask", {"question": f"what is {uuid4().hex}?"})
+        mine = [e for e in logs if e.get("layer") == name]
+        routing_skips = [e for e in mine if e["event"] == "unsafe_routing_pattern"]
+        structure_skips = [e for e in mine if e["event"] == "unsafe_structure_pattern"]
+        assert len(routing_skips) == 2
+        assert len(structure_skips) == 2
+        reasons = " ".join(e["reason"] for e in routing_skips + structure_skips)
+        assert "longer than 500 characters" in reasons
+        assert "later Python" in reasons
+    finally:
+        layers._routing_cache.clear()
+        with contextlib.suppress(LayerNotFoundError):
+            await delete_layer(db_url, name=name)
+
 
 
 def test_unsafe_stored_pattern_finds_no_reference():
@@ -184,6 +265,58 @@ async def test_ingest_skips_unsafe_structure_pattern(db_url, tmp_path):
             await delete_layer(db_url, name=name)
 
 
+async def test_ingest_skips_long_and_warning_structure_patterns(db_url, tmp_path):
+    from stratakb.knowledge.layers import LayerNotFoundError, create_layer, delete_layer
+
+    name = f"test_safety_{uuid4().hex[:10]}"
+    await create_layer(
+        db_url, name=name, display_name="Safety",
+        chunk_config={"chunk_size": 200, "chunk_overlap": 40},
+    )
+    try:
+        conn = await asyncpg.connect(db_url)
+        try:
+            await conn.execute(
+                "UPDATE strata_core.knowledge_layers SET structure_patterns = $1::jsonb "
+                "WHERE name = $2",
+                json.dumps([
+                    r"^(?P<label>AT-\d+)(?:" + "q?" * 300 + ")",
+                    r"^(?P<label>[[A-Z]+-\d+)",
+                    r"^(?P<label>REQ-\d+)",
+                ]),
+                name,
+            )
+        finally:
+            await conn.close()
+        source = tmp_path / "docs"
+        source.mkdir()
+        (source / "rules.txt").write_text(
+            "REQ-1 The payer must be named.\n\nAT-44 The payee's account.\n\nBT-7 The amount.\n",
+            encoding="utf-8",
+        )
+        with capture_logs() as logs:
+            result = await ingest(db_url, name, source)
+        assert result.docs_failed == 0
+        assert [e["event"] for e in logs].count("unsafe_structure_pattern") == 2
+
+        conn = await asyncpg.connect(db_url)
+        try:
+            labels = {r["label"] for r in await conn.fetch(
+                "SELECT s.label FROM strata_vectors.document_sections s "
+                "JOIN strata_vectors.documents d ON d.id = s.document_id "
+                "JOIN strata_core.knowledge_layers l ON l.id = d.layer_id WHERE l.name = $1",
+                name,
+            )}
+        finally:
+            await conn.close()
+        assert "req-1" in labels
+        assert "at-44" not in labels
+        assert "bt-7" not in labels
+    finally:
+        with contextlib.suppress(LayerNotFoundError):
+            await delete_layer(db_url, name=name)
+
+
 # --- import-layer -------------------------------------------------------------
 
 
@@ -234,6 +367,21 @@ def test_import_drops_unsafe_patterns(monkeypatch, tmp_path, capsys):
     assert "Dropped the routing pattern '(a+)+$' of layer 'x'" in out
     assert "Dropped the structure pattern '^(?P<label>(AT-\\d+)+)' of layer 'x'" in out
     assert out.index("Dropped the ") < out.index("Importing")
+
+
+def test_import_drops_long_warning_and_surrogate_patterns(monkeypatch, tmp_path, capsys):
+    long = "a" * 600
+    data = _export_file(_layer_part([long, r"\bsepa\b", "\ud800x"], [r"^[[:alpha:]]"]))
+    fed = _import(monkeypatch, tmp_path, data)
+    assert _stored_patterns(fed) == ([r"\bsepa\b"], [])
+    out = capsys.readouterr().out
+    out.encode("utf-8")
+    assert out.count("Dropped the ") == 3
+    assert f"Dropped the routing pattern {long[:40]!r}... of layer 'x'" in out
+    assert long[:41] not in out
+    assert "Dropped the routing pattern '\\ud800x' of layer 'x'" in out
+    assert "Dropped the structure pattern '^[[:alpha:]]' of layer 'x'" in out
+    assert out.rindex("Dropped the ") < out.index("Importing")
 
 
 def test_import_keeps_a_safe_file_byte_identical(monkeypatch, tmp_path, capsys):

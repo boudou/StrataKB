@@ -43,9 +43,9 @@ def pattern_text(question: str) -> str:
 
 
 def compile_patterns(raw: dict[str, list[str]]) -> dict[str, list[re.Pattern[str]]]:
-    """Compile routing patterns per layer, dropping any that are invalid regex,
-    repeat a repeated part (one stored before such patterns were refused, or
-    imported) or are not strings. A layer left with none is omitted.
+    """Compile routing patterns per layer, dropping any that pattern_problem
+    refuses (one stored before such patterns were refused, or imported) or
+    are not strings. A layer left with none is omitted.
 
     The result is cached by content, so a search with an unchanged pattern
     set neither re-parses it nor logs a dropped pattern again. Callers must

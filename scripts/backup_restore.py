@@ -35,7 +35,7 @@ from pathlib import Path
 from typing import NamedTuple, NoReturn
 
 from stratakb.knowledge.layers import LAYER_COLUMN_NAMES
-from stratakb.knowledge.pattern_safety import pattern_problem
+from stratakb.knowledge.pattern_safety import pattern_problem, shown_pattern
 
 ROOT = Path(__file__).parent.parent
 BACKUP_DIR = ROOT / "backups"
@@ -528,8 +528,9 @@ _PATTERN_COLUMNS = {"routing_patterns": False, "structure_patterns": True}
 def _with_safe_patterns(sql: bytes) -> bytes:
     """The export file without the layer patterns the server refuses to run.
 
-    Every other write path refuses a pattern that does not compile or repeats
-    a repeated part; an older export may still hold one. Each dropped pattern
+    Every other write path refuses a pattern that is too long, holds a NUL or
+    a lone surrogate, makes Python warn, does not compile or repeats a
+    repeated part; an older export may still hold one. Each dropped pattern
     is named. The file comes back unchanged when nothing is dropped.
     """
     span = _layer_row_span(sql)
@@ -556,7 +557,10 @@ def _with_safe_patterns(sql: bytes) -> bytes:
                 kept.append(pattern)
             else:
                 kind = column.removesuffix("_patterns")
-                print(f"Dropped the {kind} pattern '{pattern}' of layer '{name}': {problem}")
+                print(
+                    f"Dropped the {kind} pattern {shown_pattern(pattern)} "
+                    f"of layer '{name}': {problem}"
+                )
         if len(kept) < len(patterns):
             fields[index] = _copy_text(json.dumps(kept))
             changed = True
