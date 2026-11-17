@@ -24,7 +24,7 @@ from stratakb.config import (
     local_database_url,
 )
 from stratakb.core.database import connect_once
-from stratakb.core.urls import url_parts
+from stratakb.core.urls import url_parts, url_targets
 
 CONTAINER = "stratakb-db"
 VOLUME = "stratakb-data"
@@ -130,12 +130,19 @@ async def _host_port() -> int:
 
 
 def points_here(database_url: str, port: int) -> bool:
-    """True when database_url is the container's database on this port."""
+    """True when database_url is the container's database on this port.
+
+    Host and port are read as url_host_port reads them; a URL that names no
+    host, or several, counts as elsewhere.
+    """
+    targets = url_targets(database_url, implicit_localhost=False)
     parts = url_parts(database_url)
     return (
-        parts is not None
-        and parts.host in _LOCAL_HOSTS
-        and (parts.port or 5432) == port
+        targets is not None
+        and len(targets) == 1
+        and targets[0][0] in _LOCAL_HOSTS
+        and targets[0][1] == port
+        and parts is not None
         and parts.database == LOCAL_DB_NAME
         and parts.user == LOCAL_DB_USER
         and parts.password == LOCAL_DB_PASSWORD

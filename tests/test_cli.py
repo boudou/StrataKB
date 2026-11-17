@@ -844,6 +844,12 @@ def test_db_up_bad_port_exits_2(capsys):
         ("postgresql://strata:strata_dev_password@localhost:5433/other", False),
         ("postgresql://strata:strata_dev_password@db.example:5433/strata", False),
         ("postgresql://strata:strata_dev_password@localhost:99999/strata", False),
+        # Host and port read the way url_host_port reads them
+        ("postgresql://strata:strata_dev_password@/strata?host=127.0.0.1&port=5433", True),
+        ("postgresql://strata:strata_dev_password@/strata?host=127.0.0.1", False),
+        ("postgresql://strata:strata_dev_password@/strata?port=5433", False),
+        ("postgresql://strata:strata_dev_password@127.0.0.1:5433/strata?options=a@b", False),
+        ("postgresql://strata:strata_dev_password@localhost:5433,db.example:5433/strata", False),
     ],
 )
 def test_points_here(url, expected):

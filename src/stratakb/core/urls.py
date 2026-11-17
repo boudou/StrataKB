@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from urllib.parse import parse_qs, unquote, urlsplit
+from urllib.parse import SplitResult, parse_qsl, unquote, urlsplit
 
 _AUTHORITY_END = re.compile(r"[/?#]")
 _BRACKETED_HOST = re.compile(r"\[([^\]]+)\](?::([0-9]+))?")
@@ -39,16 +39,27 @@ def _at_after_authority(url: str) -> bool:
     return end is not None and "@" in rest[end.start() :]
 
 
+def _split(url: str) -> SplitResult | None:
+    """url split into its parts, or None when an "@" sits after the authority
+    or it cannot be split. Every reader below starts here."""
+    if _at_after_authority(url):
+        return None
+    try:
+        return urlsplit(url)
+    except ValueError:
+        return None
+
+
 def url_parts(url: str) -> UrlParts | None:
     """The parts of url, or None when it cannot be parsed (an invalid port included).
 
     None too when an "@" sits after the authority: the host, port and user
     would then be read from the credentials.
     """
-    if _at_after_authority(url):
+    parts = _split(url)
+    if parts is None:
         return None
-    try:
-        parts = urlsplit(url)
+    try:  # .port raises only when read
         return UrlParts(
             host=parts.hostname or "",
             port=parts.port,
@@ -66,53 +77,69 @@ def url_host(url: str) -> str:
     The port is not read, so an invalid port does not hide the host. An "@"
     after the authority gives "", as the host would be read from the user name.
     """
-    if _at_after_authority(url):
-        return ""
-    try:
-        return urlsplit(url).hostname or ""
-    except ValueError:
-        return ""
+    parts = _split(url)
+    return (parts.hostname or "") if parts is not None else ""
 
 
 def url_host_port(database_url: str) -> str:
     """host:port of a database URL, never its user, password, database name or query.
 
-    The target asyncpg connects to: the hosts of the authority, else the host
-    and port of the query string, else localhost; each host with its own port
-    (5432 when none is given), several joined by ",". "unknown host" whenever
-    the target cannot be read: not a postgresql:// URL, an invalid or
-    out-of-range port, an unclosed bracket, an empty host in a list, ports that
-    do not match the hosts, or an "@" after the authority.
+    The target the URL names, read the way asyncpg reads it: the hosts of the
+    authority, else the host and port of the query string, else localhost;
+    each host with its own port (5432 when none is given), several joined by
+    ",", IPv6 hosts in brackets ("[::1]:6543"). "unknown host" whenever the
+    target cannot be read: not a postgresql:// URL, an invalid or out-of-range
+    port, an unclosed bracket, an empty host in a list, ports that do not match
+    the hosts (an implicit localhost counts as one), or an "@" after the
+    authority. Only the URL is read, not PGHOST/PGPORT, a service file or
+    asyncpg's Unix-socket defaults, so a URL with no host shows localhost.
     """
-    targets = _targets(database_url)
+    targets = url_targets(database_url)
     if targets is None:
         return "unknown host"
-    return ",".join(f"{host}:{port}" for host, port in targets)
+    return ",".join(_host_port_text(host, port) for host, port in targets)
 
 
-def _targets(url: str) -> list[tuple[str, int]] | None:
-    """The (host, port) pairs asyncpg reads from url, or None when it cannot."""
-    if _at_after_authority(url):
+def _host_port_text(host: str, port: int) -> str:
+    """host:port, with an IPv6 host in brackets so the two can be told apart."""
+    if ":" in host and not host.startswith("/"):
+        return f"[{host}]:{port}"
+    return f"{host}:{port}"
+
+
+def url_targets(
+    database_url: str, *, implicit_localhost: bool = True
+) -> list[tuple[str, int]] | None:
+    """The (host, port) pairs asyncpg reads from database_url, or None when it cannot.
+
+    Hosts are bare ("::1"). A URL that names no host gives localhost, or None
+    when implicit_localhost is False. See url_host_port for what is read.
+    """
+    parts = _split(database_url)
+    if parts is None or parts.scheme not in _DATABASE_SCHEMES:
         return None
-    try:
-        parts = urlsplit(url)
-        query = parse_qs(parts.query, strict_parsing=True) if parts.query else {}
+    host_text = port_text = ""
+    try:  # asyncpg parses the query strictly first, whatever the authority holds
+        for key, value in parse_qsl(parts.query, strict_parsing=True) if parts.query else ():
+            if key == "host":
+                host_text = value
+            elif key == "port":
+                port_text = value
     except ValueError:
         return None
-    if parts.scheme not in _DATABASE_SCHEMES:
-        return None
     hostlist = parts.netloc.rpartition("@")[2]
-    if hostlist:
+    if hostlist:  # asyncpg ignores the query host and port then
         return _host_ports(hostlist, None, unquote_parts=True)
-    values = {key: value[-1] for key, value in query.items()}
     ports = None
-    if values.get("port"):
-        ports = [_port(text) for text in values["port"].split(",")]
+    if port_text:
+        ports = [_port(text) for text in port_text.split(",")]
         if None in ports:
             return None
-    if values.get("host"):
-        return _host_ports(values["host"], ports, unquote_parts=False)
-    return [("localhost", port) for port in ports or [_DEFAULT_PORT]]
+    if not host_text:
+        if not implicit_localhost:
+            return None
+        host_text = "localhost"
+    return _host_ports(host_text, ports, unquote_parts=False)
 
 
 def _host_ports(
@@ -124,8 +151,11 @@ def _host_ports(
     serves every host, several must match the hosts one to one.
     """
     specs = hostlist.split(",")
-    if ports is not None and len(ports) > 1 and len(ports) != len(specs):
-        return None
+    if ports is not None:
+        if len(ports) == 1:
+            ports = ports * len(specs)
+        elif len(ports) != len(specs):
+            return None
     targets = []
     for i, spec in enumerate(specs):
         if spec.startswith("/"):  # a Unix socket directory
@@ -142,7 +172,7 @@ def _host_ports(
         if not host:
             return None
         if ports is not None:
-            port = ports[i] if len(ports) > 1 else ports[0]
+            port = ports[i]
         elif port_text:
             port = _port(port_text)
             if port is None:
