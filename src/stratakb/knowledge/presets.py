@@ -36,9 +36,11 @@ from typing import TYPE_CHECKING
 import structlog
 import yaml
 
+from stratakb.core.audit import write_audit_log
 from stratakb.knowledge.ingestion import _chunk_document, _discover_files, _parse_file
 from stratakb.knowledge.layers import (
     DEFAULT_ANSWER_MODE,
+    LayerError,
     LayerExistsError,
     LayerNotFoundError,
     LayerOriginError,
@@ -488,3 +490,70 @@ async def ingest_preset(
             results["total_errors"] += 1
 
     return results
+
+
+async def apply_preset(
+    database_url: str,
+    openai_api_key: str,
+    preset: LayerPreset,
+    root: Path | None = None,
+    *,
+    settings: Settings,
+    tool_name: str,
+    parameters: dict,
+) -> dict:
+    """Apply a preset for real: check the embedding path, write the layer, ingest, audit.
+
+    tool_name names the caller in both audit entries; parameters are the
+    apply_preset entry's. Returns {"status": "error", "error": ...} when nothing
+    was written (embedding setup, a refused layer, a LayerError), else
+    {"status": "completed", "layer", "layer_changes", "ingestion"}.
+    """
+    # Imported here so tests that patch it in its own module reach this call
+    from stratakb.knowledge.embeddings import embedding_key_error
+
+    if err := embedding_key_error(settings, openai_api_key):
+        return {"status": "error", "error": err}
+
+    try:
+        layer_result = await create_preset_layer(database_url, preset)
+        error = layer_result["message"] if layer_result["status"] == "refused" else None
+    except LayerError as e:
+        error = str(e)
+    if error is not None:
+        # Nothing was changed, so there is nothing to audit
+        return {"status": "error", "error": error}
+    # Written before the ingest: the patterns are stored, and it can raise
+    if "archived_patterns" in layer_result["changes"] or (
+        layer_result["status"] == "created" and preset.archived_patterns
+    ):
+        await write_audit_log(
+            database_url,
+            action="set_archived_patterns",
+            tool_name=tool_name,
+            parameters={"layer": preset.name, "patterns": preset.archived_patterns},
+        )
+    ingest_result = await ingest_preset(
+        database_url, openai_api_key, preset, root, settings=settings
+    )
+
+    layer_text = f"Layer '{preset.name}': {layer_result['status']}"
+    if layer_result["changes"]:
+        layer_text += f" ({', '.join(layer_result['changes'])})"
+    await write_audit_log(
+        database_url,
+        action="apply_preset",
+        tool_name=tool_name,
+        parameters=parameters,
+        result_summary=(
+            f"{layer_text}, ingested {ingest_result['total_docs']} docs, "
+            f"{ingest_result['total_chunks']} chunks"
+        ),
+    )
+
+    return {
+        "status": "completed",
+        "layer": layer_result["status"],
+        "layer_changes": layer_result["changes"],
+        "ingestion": ingest_result,
+    }

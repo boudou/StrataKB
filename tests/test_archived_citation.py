@@ -419,7 +419,7 @@ async def _apply(tmp_path: Path, line: str | None, layer_result: dict, ingest_mo
             AsyncMock(return_value=layer_result),
         ),
         patch("stratakb.knowledge.presets.ingest_preset", ingest_preset),
-        patch("stratakb.knowledge.tools.write_audit_log", audit),
+        patch("stratakb.knowledge.presets.write_audit_log", audit),
         contextlib.suppress(RuntimeError),
     ):
         result = await fn(preset_path=str(_write_preset(tmp_path, line=line)))

@@ -206,7 +206,7 @@ Then ask from your client, for example *"How long should a line of Python be?"*.
 
 ## Roles and audit
 
-StrataKB has viewer, operator and admin roles. `STRATA_USER` and `STRATA_ROLE` are self-declared, so whoever starts the server picks the role: the Quick start sets `admin` because that one person runs everything. The server reads both once, when it starts, so changing either takes a restart. `stratakb receipt` reads both per run; `stratakb add`, only `STRATA_USER`. Roles separate duties and do not enforce security; see [SECURITY.md](SECURITY.md).
+StrataKB has viewer, operator and admin roles. `STRATA_USER` and `STRATA_ROLE` are self-declared, so whoever starts the server picks the role: the Quick start sets `admin` because that one person runs everything. The server reads both once, when it starts, so changing either takes a restart. `stratakb receipt` reads both per run; `stratakb add`, only `STRATA_USER`. `scripts/apply_preset.py` also reads only `STRATA_USER`, and records the same audit entries as `strata_apply_preset` under the tool name `script:apply_preset`. Roles separate duties and do not enforce security; see [SECURITY.md](SECURITY.md).
 
 The audit log records searches and changes under that declared name. The `strata_readonly` role can read five tables only: `strata_core.knowledge_layers`, `strata_core.ingestion_runs`, `strata_core.ingested_files`, `strata_vectors.chunks` and `strata_vectors.documents`. It cannot read the audit log, the users table or anything in `strata_learning`.
 

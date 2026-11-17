@@ -640,7 +640,7 @@ async def test_built_local_only_refuses_preset():
         _environment(built, strata_local_only=False),
         patch("stratakb.knowledge.presets.create_preset_layer", create),
         patch("stratakb.knowledge.presets.ingest_preset", ingest),
-        patch("stratakb.knowledge.tools.write_audit_log", AsyncMock()),
+        patch("stratakb.knowledge.presets.write_audit_log", AsyncMock()),
         patch("openai.AsyncOpenAI") as openai_cls,
     ):
         result = await call_tool(
@@ -672,6 +672,7 @@ async def test_ingest_tools_pass_built_settings():
         ),
         patch("stratakb.knowledge.presets.ingest_preset", preset_ingest),
         patch("stratakb.knowledge.tools.write_audit_log", AsyncMock()),
+        patch("stratakb.knowledge.presets.write_audit_log", AsyncMock()),
     ):
         ingested = await call_tool(
             server, "strata_ingest_documents", layer_name="docs", source_path="."

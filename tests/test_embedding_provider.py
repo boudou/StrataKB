@@ -289,7 +289,7 @@ class TestToolKeyChecks:
             ),
             patch("stratakb.knowledge.presets.create_preset_layer", create),
             patch("stratakb.knowledge.presets.ingest_preset", ingest),
-            patch("stratakb.knowledge.tools.write_audit_log", AsyncMock()),
+            patch("stratakb.knowledge.presets.write_audit_log", AsyncMock()),
         ):
             result = await fn(preset_path=preset)
         assert result["status"] == "completed"

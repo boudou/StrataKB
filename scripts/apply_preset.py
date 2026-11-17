@@ -1,7 +1,8 @@
 """Create or update a knowledge layer from a preset file and ingest its sources.
 
 Same as the strata_apply_preset MCP tool, for ingestions too long to run
-inside a tool call.
+inside a tool call. It writes the same audit entries as the tool, under the
+tool name script:apply_preset, with STRATA_USER as the user.
 
 Usage:
     uv run python scripts/apply_preset.py examples/sepa/preset.yaml
@@ -20,18 +21,18 @@ from pathlib import Path
 from stratakb.config import get_settings
 from stratakb.core.database import close_pool
 from stratakb.core.logging import configure_logging
-from stratakb.knowledge.embeddings import embedding_key_error
-from stratakb.knowledge.presets import (
-    create_preset_layer,
-    dry_run_parse,
-    ingest_preset,
-    load_preset,
-)
+from stratakb.knowledge.layers import LayerError
+from stratakb.knowledge.presets import apply_preset, dry_run_parse, load_preset
 
 
 async def _apply(preset_path: Path, docs_root: Path | None, dry_run: bool) -> dict:
     settings = get_settings()
-    preset = load_preset(preset_path)
+    try:
+        preset = load_preset(preset_path)
+    except FileNotFoundError:
+        return {"layer": "refused", "error": f"Preset not found: {preset_path}"}
+    except (LayerError, ValueError) as e:
+        return {"layer": "refused", "error": str(e)}
 
     if dry_run:
         result = dry_run_parse(preset, docs_root)
@@ -44,21 +45,25 @@ async def _apply(preset_path: Path, docs_root: Path | None, dry_run: bool) -> di
             "errors": result.errors,
         }
 
-    # Before the layer is written: a run that cannot embed changes nothing
-    if err := embedding_key_error(settings, settings.openai_api_key):
-        return {"layer": "refused", "error": err}
-
     try:
-        layer = await create_preset_layer(settings.database_url, preset)
-        if layer["status"] == "refused":
-            return {"layer": "refused", "error": layer["message"]}
-        ingestion = await ingest_preset(
+        result = await apply_preset(
             settings.database_url, settings.openai_api_key, preset, docs_root,
             settings=settings,
+            tool_name="script:apply_preset",
+            parameters={
+                "preset_path": str(preset_path),
+                "docs_root": str(docs_root) if docs_root else None,
+            },
         )
     finally:
         await close_pool()
-    return {"layer": layer["status"], "layer_changes": layer["changes"], "ingestion": ingestion}
+    if result["status"] == "error":
+        return {"layer": "refused", "error": result["error"]}
+    return {
+        "layer": result["layer"],
+        "layer_changes": result["layer_changes"],
+        "ingestion": result["ingestion"],
+    }
 
 
 def main() -> None:

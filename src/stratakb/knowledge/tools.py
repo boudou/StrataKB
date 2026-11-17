@@ -16,7 +16,6 @@ from stratakb.core.auth import check_role, get_current_user, require_role
 from stratakb.core.logging import log_tool_call
 from stratakb.knowledge.layers import (
     DEFAULT_ANSWER_MODE,
-    LayerError,
     LayerExistsError,
     LayerNotFoundError,
     LayerValidationError,
@@ -390,13 +389,11 @@ def register_knowledge_tools(
         """
         from pathlib import Path
 
-        from stratakb.knowledge.embeddings import embedding_key_error
         from stratakb.knowledge.layers import LayerValidationError
         from stratakb.knowledge.presets import (
+            apply_preset,
             check_preset_layer,
-            create_preset_layer,
             dry_run_parse,
-            ingest_preset,
             load_preset,
         )
 
@@ -442,48 +439,12 @@ def register_knowledge_tools(
                 "layer_check": layer_check,
             }
 
-        if err := embedding_key_error(_settings, openai_api_key):
-            return {"status": "error", "error": err}
-
-        try:
-            layer_result = await create_preset_layer(database_url, preset)
-            error = layer_result["message"] if layer_result["status"] == "refused" else None
-        except LayerError as e:
-            error = str(e)
-        if error is not None:
-            # Nothing was changed, so there is nothing to audit
-            return {"status": "error", "error": error}
-        # Written before the ingest: the patterns are stored, and it can raise
-        if "archived_patterns" in layer_result["changes"] or (
-            layer_result["status"] == "created" and preset.archived_patterns
-        ):
-            await write_audit_log(
-                database_url,
-                action="set_archived_patterns",
-                tool_name="strata_apply_preset",
-                parameters={"layer": preset.name, "patterns": preset.archived_patterns},
-            )
-        ingest_result = await ingest_preset(
-            database_url, openai_api_key, preset, root, settings=_settings
-        )
-
-        layer_text = f"Layer '{preset.name}': {layer_result['status']}"
-        if layer_result["changes"]:
-            layer_text += f" ({', '.join(layer_result['changes'])})"
-        await write_audit_log(
+        return await apply_preset(
             database_url,
-            action="apply_preset",
+            openai_api_key,
+            preset,
+            root,
+            settings=_settings,
             tool_name="strata_apply_preset",
             parameters={"preset_path": preset_path, "docs_root": docs_root},
-            result_summary=(
-                f"{layer_text}, ingested {ingest_result['total_docs']} docs, "
-                f"{ingest_result['total_chunks']} chunks"
-            ),
         )
-
-        return {
-            "status": "completed",
-            "layer": layer_result["status"],
-            "layer_changes": layer_result["changes"],
-            "ingestion": ingest_result,
-        }
