@@ -26,6 +26,7 @@ def no_server_identity(monkeypatch):
 def no_failed_schema_checks(monkeypatch):
     """ensure_schema remembers a failure for seconds; keep that inside one test."""
     monkeypatch.setattr("stratakb.core.migrations._failed", {})
+    monkeypatch.setattr("stratakb.core.migrations._in_flight", {})
 
 
 @pytest.fixture
@@ -128,7 +129,7 @@ def _migrate_test_db():
     except (OSError, asyncpg.PostgresError):
         pass
     finally:
-        migrations._checked.clear()
+        migrations.reset_memory()
 
 
 @pytest.fixture
@@ -154,11 +155,9 @@ def clear_checked():
     """Forget which databases ensure_schema has checked, before and after a test."""
     from stratakb.core import migrations
 
-    migrations._checked.clear()
-    migrations._failed.clear()
+    migrations.reset_memory()
     yield
-    migrations._checked.clear()
-    migrations._failed.clear()
+    migrations.reset_memory()
 
 
 @pytest.fixture
@@ -173,8 +172,7 @@ async def restore_schema(db_url):
 
     yield
     await replay_migrations(db_url)
-    migrations._checked.clear()
-    migrations._failed.clear()
+    migrations.reset_memory()
     await migrations.ensure_schema(db_url)
 
 

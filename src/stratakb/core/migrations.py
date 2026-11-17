@@ -11,7 +11,11 @@ PostgreSQL's postgres and template databases.
 
 from __future__ import annotations
 
+import asyncio
+import copy
 import enum
+import functools
+import math
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -384,12 +388,27 @@ _OWNS_STRATA_OBJECTS = f"""
 # Database URLs whose schema is known to be current in this process
 _checked: set[str] = set()
 
-# Seconds a failed check is remembered: calls in the meantime get its error
-# again, so a burst of calls does not open a connection and wait for locks each
+# Seconds a failed check is remembered: calls in the meantime get a copy of
+# its error, so a burst of calls does not open a connection and wait for locks each
 _RETRY_AFTER_S = 10
 
-# Database URLs whose last check failed: when (time.monotonic()) and the error
+# Database URLs whose last check failed: when (time.monotonic()) and the error,
+# which is never raised again itself (callers raise copies)
 _failed: dict[str, tuple[float, Exception]] = {}
+
+# Database URLs whose check is running, and the task running it: calls that
+# arrive meanwhile wait for it instead of opening their own connection
+_in_flight: dict[str, asyncio.Task[Exception | None]] = {}
+
+# Added to an error replayed from _failed
+_RETRY_NOTE = "The check is tried again in {seconds} s."
+
+
+def reset_memory() -> None:
+    """Forget every check this process made: passed, failed and running (for tests)."""
+    _checked.clear()
+    _failed.clear()
+    _in_flight.clear()
 
 
 class MigrationError(Exception):
@@ -517,9 +536,11 @@ async def ensure_schema(
     Runs once per process and database URL, in one transaction under an
     advisory lock. A migration whose objects already exist is recorded
     without running its file; a file that runs must leave its presence query
-    true. Connection errors (a connect timeout included) propagate unchanged.
-    A failure is remembered for _RETRY_AFTER_S seconds: calls for the same
-    URL in that time raise the same error without trying again.
+    true. Connection errors (a connect timeout included) propagate with their
+    type. Calls for the same URL that arrive while a check runs wait for it.
+    For _RETRY_AFTER_S seconds after a failure, calls raise a copy of its
+    error, of the same type, saying when the check runs again. on_setup is
+    called only by the call that starts the check.
 
     Args:
         database_url: The database to check and update.
@@ -535,16 +556,54 @@ async def ensure_schema(
     if database_url in _checked:
         return
     failed = _failed.get(database_url)
-    if failed is not None and time.monotonic() - failed[0] < _RETRY_AFTER_S:
-        # A fresh traceback each time, so a stored error does not grow one
-        raise failed[1].with_traceback(None)
+    if failed is not None:
+        elapsed = time.monotonic() - failed[0]
+        if elapsed < _RETRY_AFTER_S:
+            raise _replay(failed[1], _RETRY_AFTER_S - elapsed) from failed[1]
 
+    task = _in_flight.get(database_url)
+    loop = asyncio.get_running_loop()
+    # A task from another event loop (each asyncio.run has its own) cannot be awaited
+    if task is None or task.done() or task.get_loop() is not loop:
+        task = loop.create_task(_check(database_url, on_setup))
+        _in_flight[database_url] = task
+        task.add_done_callback(functools.partial(_forget_task, database_url))
+    # shield: a caller that is cancelled does not cancel the check the others wait for
+    error = await asyncio.shield(task)
+    if error is not None:
+        # Each caller raises its own copy, so no caller's exception chain or
+        # traceback lands on another's; chained to the original for its traceback
+        raise copy.copy(error) from error
+
+
+async def _check(
+    database_url: str, on_setup: Callable[[str], None] | None
+) -> Exception | None:
+    """Run one check and remember its outcome; returns the error instead of raising it."""
     try:
         await _apply_missing(database_url, on_setup)
     except Exception as e:
         _failed[database_url] = (time.monotonic(), e)
-        raise
+        return e
     _failed.pop(database_url, None)
+    return None
+
+
+def _replay(error: Exception, remaining: float) -> Exception:
+    """A new error like a remembered one, saying when the check runs again."""
+    note = _RETRY_NOTE.format(seconds=max(1, math.ceil(remaining)))
+    if isinstance(error, MigrationError):
+        return MigrationError(f"{error} {note}")
+    # Other types (connection errors) keep their text, which callers may match on
+    replayed = copy.copy(error)
+    # A list of its own: the copy would share the original's
+    replayed.__notes__ = [*getattr(error, "__notes__", ()), note]
+    return replayed
+
+
+def _forget_task(database_url: str, task: asyncio.Task[Exception | None]) -> None:
+    if _in_flight.get(database_url) is task:
+        del _in_flight[database_url]
 
 
 async def _apply_missing(

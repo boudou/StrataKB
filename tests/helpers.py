@@ -497,6 +497,24 @@ async def replay_migrations(db_url: str) -> None:
         await owner_execute(db_url, migrations._load_sql(m.file))
 
 
+@contextlib.contextmanager
+def extra_migration(version: int, name: str, sql: str, presence: str = "SELECT false"):
+    """Patch MIGRATIONS with one extra migration whose file is sql (never present by default)."""
+    from stratakb.core import migrations
+
+    real_load = migrations._load_sql
+
+    def load(file_name: str) -> str:
+        return sql if file_name == name else real_load(file_name)
+
+    extra = migrations.Migration(version, name, presence)
+    with (
+        patch.object(migrations, "MIGRATIONS", [*migrations.MIGRATIONS, extra]),
+        patch.object(migrations, "_load_sql", side_effect=load),
+    ):
+        yield
+
+
 def url_with_credentials(url: str, user: str, password: str) -> str:
     """url with only the user and password replaced."""
     parts = urlsplit(url)

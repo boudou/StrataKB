@@ -7,7 +7,6 @@ on the same database.
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import re
 import time
 from unittest.mock import patch
@@ -20,6 +19,7 @@ from structlog.testing import capture_logs
 from stratakb.core import migrations
 from tests.helpers import (
     READONLY_READABLE,
+    extra_migration,
     owner_execute,
     readonly_privileges,
     recorded_versions,
@@ -45,22 +45,6 @@ def readonly_url(db_url):
     if urlsplit(url).path != urlsplit(db_url).path:
         pytest.skip("READONLY_DATABASE_URL points at another database")
     return url
-
-
-@contextlib.contextmanager
-def _with_extra(version: int, name: str, sql: str):
-    """Patch MIGRATIONS with one extra, never-present migration whose file is sql."""
-    real_load = migrations._load_sql
-
-    def load(file_name: str) -> str:
-        return sql if file_name == name else real_load(file_name)
-
-    extra = migrations.Migration(version, name, "SELECT false")
-    with (
-        patch.object(migrations, "MIGRATIONS", [*migrations.MIGRATIONS, extra]),
-        patch.object(migrations, "_load_sql", side_effect=load),
-    ):
-        yield
 
 
 def test_schema_migrations_ddl_matches_05():
@@ -232,7 +216,7 @@ async def test_builds_an_empty_database(fresh_url):
     finally:
         await conn.close()
 
-    migrations._checked.clear()
+    migrations.reset_memory()
     with capture_logs() as logs:
         await migrations.ensure_schema(fresh_url)
     assert not [entry for entry in logs if entry["event"] == "applying_migration"]
@@ -257,7 +241,7 @@ async def test_setting_up_names_the_database(fresh_url):
     assert f"{parts.username}:" not in logged
     assert f"{parts.username}@" not in logged
 
-    migrations._checked.clear()
+    migrations.reset_memory()
     with capture_logs() as logs:
         await migrations.ensure_schema(fresh_url, on_setup=seen.append)
     assert not [entry for entry in logs if entry["event"] == "setting_up_database"]
@@ -311,7 +295,7 @@ def test_reserved_database_names(name, kind):
 
 async def test_records_01_and_02_on_an_existing_database(db_url, restore_schema):
     await migrations.ensure_schema(db_url)
-    migrations._checked.clear()
+    migrations.reset_memory()
     await owner_execute(
         db_url, "DELETE FROM strata_core.schema_migrations WHERE version IN (1, 2)"
     )
@@ -657,7 +641,7 @@ async def test_concurrent_calls(db_url, restore_schema):
 
 async def test_broken_file_raises_naming_it(db_url):
     with (
-        _with_extra(9001, "90_broken.sql", "SELEC 1"),
+        extra_migration(9001, "90_broken.sql", "SELEC 1"),
         pytest.raises(migrations.MigrationError, match="90_broken.sql") as exc,
     ):
         await migrations.ensure_schema(db_url)
@@ -668,7 +652,7 @@ async def test_broken_file_raises_naming_it(db_url):
 
 async def test_failure_runs_once_in_a_burst(db_url):
     with (
-        _with_extra(9004, "94_broken.sql", "SELEC 1"),
+        extra_migration(9004, "94_broken.sql", "SELEC 1"),
         capture_logs() as logs,
     ):
         errors = []
@@ -678,13 +662,86 @@ async def test_failure_runs_once_in_a_burst(db_url):
             errors.append(str(exc.value))
     runs = [e for e in logs if e["event"] == "applying_migration" and e["version"] == 9004]
     assert len(runs) == 1
-    assert len(set(errors)) == 1
+    assert "tried again" not in errors[0]
+    assert errors[1:] == [f"{errors[0]} The check is tried again in 10 s."] * 4
     assert "psql -f" in errors[0]
     assert db_url not in migrations._checked
 
 
+async def test_concurrent_failures_share_one_check(db_url):
+    real_connect = migrations.connect_once
+    connects = []
+
+    def counting_connect(*args, **kwargs):
+        connects.append(args)
+        return real_connect(*args, **kwargs)
+
+    with (
+        extra_migration(9007, "97_broken.sql", "SELEC 1"),
+        patch.object(migrations, "connect_once", side_effect=counting_connect),
+        capture_logs() as logs,
+    ):
+        errors = await asyncio.gather(
+            *(migrations.ensure_schema(db_url) for _ in range(10)), return_exceptions=True
+        )
+    runs = [e for e in logs if e["event"] == "applying_migration" and e["version"] == 9007]
+    assert len(connects) == 1
+    assert len(runs) == 1
+    assert all(isinstance(e, migrations.MigrationError) for e in errors)
+    assert len({id(e) for e in errors}) == 10
+    assert db_url not in migrations._in_flight
+
+
+async def test_each_caller_gets_its_own_error(db_url):
+    caught = []
+    with extra_migration(9008, "98_broken.sql", "SELEC 1"):
+        with pytest.raises(migrations.MigrationError) as first:
+            await migrations.ensure_schema(db_url)
+        caught.append(first.value)
+        try:
+            raise KeyError("unrelated")
+        except KeyError:
+            with pytest.raises(migrations.MigrationError) as second:
+                await migrations.ensure_schema(db_url)
+            caught.append(second.value)
+        with pytest.raises(migrations.MigrationError) as third:
+            await migrations.ensure_schema(db_url)
+        caught.append(third.value)
+    assert len({id(e) for e in caught}) == 3
+    assert not isinstance(caught[0].__context__, KeyError)
+    assert not isinstance(caught[2].__context__, KeyError)
+
+
+async def test_repeated_error_says_when_it_is_tried_again(db_url):
+    with extra_migration(9009, "99_broken.sql", "SELEC 1"):
+        with pytest.raises(migrations.MigrationError) as first:
+            await migrations.ensure_schema(db_url)
+        failed_at = migrations._failed[db_url][0]
+        with (
+            patch.object(migrations.time, "monotonic", return_value=failed_at + 7.5),
+            pytest.raises(migrations.MigrationError) as again,
+        ):
+            await migrations.ensure_schema(db_url)
+    assert "tried again" not in str(first.value)
+    assert str(again.value) == f"{first.value} The check is tried again in 3 s."
+
+
+async def test_remembered_connection_error_keeps_its_type(db_url):
+    user = urlsplit(db_url).username or "strata"
+    bad_url = url_with_credentials(db_url, user, "wrong-password")
+    with pytest.raises(asyncpg.InvalidPasswordError) as first:
+        await migrations.ensure_schema(bad_url)
+    with pytest.raises(asyncpg.InvalidPasswordError) as again:
+        await migrations.ensure_schema(bad_url)
+    assert again.value is not first.value
+    assert str(again.value) == str(first.value)
+    assert not getattr(first.value, "__notes__", None)
+    assert len(again.value.__notes__) == 1
+    assert re.fullmatch(r"The check is tried again in \d+ s\.", again.value.__notes__[0])
+
+
 async def test_failure_is_tried_again_after_the_wait(db_url):
-    with _with_extra(9005, "95_broken.sql", "SELEC 1"):
+    with extra_migration(9005, "95_broken.sql", "SELEC 1"):
         with pytest.raises(migrations.MigrationError):
             await migrations.ensure_schema(db_url)
         failed_at = migrations._failed[db_url][0]
@@ -702,7 +759,7 @@ async def test_failure_is_tried_again_after_the_wait(db_url):
 
 async def test_success_forgets_the_failure(db_url):
     with (
-        _with_extra(9006, "96_broken.sql", "SELEC 1"),
+        extra_migration(9006, "96_broken.sql", "SELEC 1"),
         pytest.raises(migrations.MigrationError),
     ):
         await migrations.ensure_schema(db_url)
@@ -716,7 +773,7 @@ async def test_success_forgets_the_failure(db_url):
 
 async def test_still_missing_file_has_generic_message(db_url):
     with (
-        _with_extra(9003, "93_noop.sql", "SELECT 1"),
+        extra_migration(9003, "93_noop.sql", "SELECT 1"),
         pytest.raises(migrations.MigrationError, match="93_noop.sql") as exc,
     ):
         await migrations.ensure_schema(db_url)
@@ -750,9 +807,9 @@ async def test_non_owner_schema_present(db_url, readonly_url, restore_schema):
 
 async def test_non_owner_schema_missing(db_url, readonly_url):
     await migrations.ensure_schema(db_url)
-    migrations._checked.clear()
+    migrations.reset_memory()
     with (
-        _with_extra(9002, "92_probe.sql", "CREATE TABLE strata_core.migration_probe (id INT)"),
+        extra_migration(9002, "92_probe.sql", "CREATE TABLE strata_core.migration_probe (id INT)"),
         pytest.raises(migrations.MigrationError, match="may not update it") as exc,
     ):
         await migrations.ensure_schema(readonly_url)
@@ -762,7 +819,7 @@ async def test_non_owner_schema_missing(db_url, readonly_url):
 
 async def test_held_advisory_lock_times_out(db_url):
     await migrations.ensure_schema(db_url)
-    migrations._checked.clear()
+    migrations.reset_memory()
     holder = await asyncpg.connect(db_url)
     try:
         await holder.execute("SELECT pg_advisory_lock($1)", migrations._MIGRATION_LOCK_KEY)
@@ -781,7 +838,7 @@ async def test_held_advisory_lock_times_out(db_url):
 
 async def test_table_lock_names_the_file(db_url, restore_schema):
     await migrations.ensure_schema(db_url)
-    migrations._checked.clear()
+    migrations.reset_memory()
     await owner_execute(
         db_url,
         """
@@ -804,15 +861,14 @@ async def test_table_lock_names_the_file(db_url, restore_schema):
         await tx.rollback()
         await holder.close()
 
-    migrations._checked.clear()
-    migrations._failed.clear()
+    migrations.reset_memory()
     await migrations.ensure_schema(db_url)
     assert 12 in await recorded_versions(db_url)
 
 
 async def test_missing_usage_names_the_privilege(db_url, probe_url):
     await migrations.ensure_schema(db_url)
-    migrations._checked.clear()
+    migrations.reset_memory()
     with pytest.raises(migrations.MigrationError) as exc:
         await migrations.ensure_schema(probe_url)
     message = str(exc.value)
@@ -825,7 +881,7 @@ async def test_missing_usage_names_the_privilege(db_url, probe_url):
 async def test_schema_migrations_lock_names_the_table(db_url):
     await migrations.ensure_schema(db_url)
     # The table stage reads schema_migrations on every run
-    migrations._checked.clear()
+    migrations.reset_memory()
     holder = await asyncpg.connect(db_url)
     tx = holder.transaction()
     try:
@@ -845,7 +901,7 @@ async def test_schema_migrations_lock_names_the_table(db_url):
     finally:
         await tx.rollback()
         await holder.close()
-        migrations._checked.clear()
+        migrations.reset_memory()
 
 
 async def test_repairs_01_only(fresh_url):

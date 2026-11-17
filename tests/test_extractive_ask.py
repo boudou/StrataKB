@@ -768,51 +768,61 @@ class TestSettingTheMode:
             await delete_layer(db_url, name=name)
 
 
-async def _one_migration_behind(db_url: str) -> None:
-    """Undo the last migration, as a database the startup update did not reach."""
-    from stratakb.core import migrations
-    from tests.helpers import owner_execute
+@contextlib.asynccontextmanager
+async def _one_migration_behind(
+    db_url: str, sql: str = "CREATE TABLE strata_core.ask_schema_probe (id INT)"
+):
+    """Add one migration the database lacks, as a database the startup update did not reach.
 
-    last = migrations.MIGRATIONS[-1]
-    assert last.file == "16_archived_patterns.sql"
-    await owner_execute(
-        db_url,
-        f"""
-        ALTER TABLE strata_core.knowledge_layers DROP COLUMN archived_patterns;
-        DELETE FROM strata_core.schema_migrations WHERE version = {last.version};
-        """,
-    )
-    migrations._checked.clear()
+    The migration is the test's own (its file is sql), so the test does not
+    depend on which real migration is newest; its table and record are removed
+    afterwards.
+    """
+    from stratakb.core import migrations
+    from tests.helpers import extra_migration, owner_execute
+
+    migrations.reset_memory()
+    try:
+        with extra_migration(
+            9101,
+            "9101_ask_schema_probe.sql",
+            sql,
+            presence="SELECT to_regclass('strata_core.ask_schema_probe') IS NOT NULL",
+        ):
+            yield
+    finally:
+        await owner_execute(
+            db_url,
+            """
+            DROP TABLE IF EXISTS strata_core.ask_schema_probe;
+            DELETE FROM strata_core.schema_migrations WHERE version = 9101;
+            """,
+        )
+        migrations.reset_memory()
 
 
 class TestSchemaBehind:
     async def test_extractive_ask_updates_the_schema_and_answers(
-        self, server, settings, make_layer, restore_schema
+        self, server, settings, make_layer
     ):
         from tests.helpers import recorded_versions
 
         layer, document_id = await make_layer("extractive")
-        await _one_migration_behind(settings.database_url)
+        async with _one_migration_behind(settings.database_url):
+            response = await _ask(server, [_hit(layer, document_id)], layers=[layer])
 
-        response = await _ask(server, [_hit(layer, document_id)], layers=[layer])
-
-        assert response["status"] == "found"
-        assert response["mode"] == "extractive"
-        assert response["answer"][0]["text"] == NINETY
-        assert 16 in await recorded_versions(settings.database_url)
+            assert response["status"] == "found"
+            assert response["mode"] == "extractive"
+            assert response["answer"][0]["text"] == NINETY
+            assert 9101 in await recorded_versions(settings.database_url)
 
     async def test_failed_update_names_the_cause_and_the_fix(
-        self, server, settings, make_layer, restore_schema
+        self, server, settings, make_layer
     ):
-        from stratakb.core import migrations
-
         layer, document_id = await make_layer("extractive")
-        await _one_migration_behind(settings.database_url)
-
-        with patch.object(migrations, "_load_sql", return_value="SELEC 1"):
+        async with _one_migration_behind(settings.database_url, sql="SELEC 1"):
             response = await _ask(server, [_hit(layer, document_id)], layers=[layer])
 
         assert response["status"] == "error"
-        assert "16_archived_patterns.sql failed" in response["error"]
+        assert "9101_ask_schema_probe.sql failed" in response["error"]
         assert "as the database owner (psql -f)" in response["error"]
-        assert "archived_patterns does not exist" not in response["error"]

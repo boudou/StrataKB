@@ -229,7 +229,7 @@ async def test_unrevokable_06_is_refused(db_url, readonly_role, probe_url):
         """,
     )
     try:
-        migrations._checked.clear()
+        migrations.reset_memory()
         with pytest.raises(migrations.MigrationError, match="06_readonly_grants.sql") as exc:
             await migrations.ensure_schema(probe_url)
         # The re-check after the file, not the older out-of-date branch
@@ -248,7 +248,7 @@ async def test_unrevokable_06_is_refused(db_url, readonly_role, probe_url):
         finally:
             await conn.close()
     finally:
-        migrations._checked.clear()
+        migrations.reset_memory()
         await migrations.ensure_schema(db_url)
     assert 6 in await recorded_versions(db_url)
 
@@ -307,7 +307,7 @@ async def test_applies_missing_08_grants_documents(db_url, readonly_role, restor
     finally:
         await conn.close()
 
-    migrations._checked.clear()
+    migrations.reset_memory()
     await migrations.ensure_schema(db_url)
 
     assert "strata_vectors.documents" in _readable(await readonly_privileges(db_url))
@@ -338,7 +338,7 @@ async def test_public_grant_is_named(db_url, readonly_role):
         """,
     )
     try:
-        migrations._checked.clear()
+        migrations.reset_memory()
         with pytest.raises(migrations.MigrationError, match="06_readonly_grants.sql") as exc:
             await migrations.ensure_schema(db_url)
         message = str(exc.value)
@@ -349,8 +349,7 @@ async def test_public_grant_is_named(db_url, readonly_role):
         assert "psql -f" not in message
     finally:
         await owner_execute(db_url, "REVOKE SELECT ON strata_core.audit_log FROM PUBLIC")
-        migrations._checked.clear()
-        migrations._failed.clear()
+        migrations.reset_memory()
         await migrations.ensure_schema(db_url)
     assert 6 in await recorded_versions(db_url)
 
