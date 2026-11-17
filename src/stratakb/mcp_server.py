@@ -21,6 +21,7 @@ from pydantic import Field
 
 # get_settings is imported where it is called, never here: a module-level binding
 # made while a test patches stratakb.config.get_settings keeps the mock for good
+from stratakb import __version__
 from stratakb.config import Settings, config_file_missing, dotenv_warning
 from stratakb.core.audit import query_audit_log, write_audit_log
 from stratakb.core.auth import require_role, set_server_identity
@@ -220,6 +221,8 @@ def build_server(settings: Settings) -> FastMCP:
         instructions=_INSTRUCTIONS,
         lifespan=functools.partial(_lifespan, settings=settings),
     )
+    # FastMCP 1.x takes no version argument and otherwise reports the SDK's version
+    mcp._mcp_server.version = __version__
 
     # Register module tools
     register_knowledge_tools(
@@ -281,9 +284,9 @@ def _register_admin_tools(mcp: FastMCP, settings: Settings) -> None:
         model, and whether the vector column's size matches EMBEDDING_DIMENSIONS.
         A missing model or a size mismatch turns overall to degraded; restart
         the server after fixing either. The report shows the settings the
-        server started with.
+        server started with. It also reports the StrataKB version.
         """
-        result: dict[str, object] = {}
+        result: dict[str, object] = {"version": __version__}
 
         # Check database
         db_status = await check_connection(settings.database_url)

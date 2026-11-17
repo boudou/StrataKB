@@ -118,3 +118,53 @@ async def test_two_servers_use_their_own_database_url():
     for server in (server_a, server_b):
         names = {tool.name for tool in await server.list_tools()}
         assert admin_tools <= names
+
+
+def test_version_matches_pyproject():
+    """The package version is the one pyproject.toml writes."""
+    import tomllib
+
+    import stratakb
+
+    data = tomllib.loads((Path(__file__).parent.parent / "pyproject.toml").read_text("utf-8"))
+    assert stratakb.__version__ == data["project"]["version"]
+
+
+def test_server_reports_strata_version(server):
+    """A client sees the StrataKB version on connect, not the MCP SDK's."""
+    import importlib.metadata
+
+    import stratakb
+
+    version = server._mcp_server.create_initialization_options().server_version
+    assert version == stratakb.__version__
+    assert version != importlib.metadata.version("mcp")
+
+
+async def test_health_reports_version():
+    """strata_admin_health reports the StrataKB version."""
+    import stratakb
+    from stratakb.config import get_settings
+    from tests.helpers import call_health
+
+    result = await call_health(get_settings())
+    assert result["version"] == stratakb.__version__
+
+
+def test_version_falls_back_when_not_installed():
+    """A source tree that was never installed reports 0+unknown."""
+    import importlib
+    import importlib.metadata
+
+    import stratakb
+
+    try:
+        with patch(
+            "importlib.metadata.version",
+            side_effect=importlib.metadata.PackageNotFoundError("stratakb"),
+        ):
+            importlib.reload(stratakb)
+            assert stratakb.__version__ == "0+unknown"
+    finally:
+        importlib.reload(stratakb)
+    assert stratakb.__version__ != "0+unknown"

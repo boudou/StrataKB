@@ -18,6 +18,8 @@ from pathlib import Path
 
 import pytest
 
+import stratakb
+
 REPO = Path(__file__).parent.parent
 SEPA_PRESET = REPO / "examples" / "sepa" / "preset.yaml"
 TIMEOUT = 30
@@ -105,6 +107,7 @@ def test_stdio_session_carries_only_json_rpc():
         })
         init = server.reply(1)
         assert init["result"]["serverInfo"]["name"]
+        assert init["result"]["serverInfo"]["version"] == stratakb.__version__
         assert "strata_verify" in init["result"]["instructions"]
 
         server.send({"method": "notifications/initialized"})
