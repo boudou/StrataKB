@@ -9,6 +9,7 @@ import sys
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
+import pytest
 from structlog.testing import capture_logs
 
 from stratakb.config import Settings
@@ -219,3 +220,106 @@ class TestApplyPresetScript:
         assert out == {"layer": "refused", "error": f"Preset not found: {path}"}
         create.assert_not_awaited()
         audit.assert_not_awaited()
+
+
+def _bad_inputs():
+    """Bad inputs as (id, build): build(tmp_path) gives the preset path and docs root."""
+
+    def write(tmp_path, data):
+        path = tmp_path / "preset.yaml"
+        path.write_bytes(data)
+        return str(path), None
+
+    def file_root(tmp_path):
+        (tmp_path / "file.txt").write_text("x", encoding="utf-8")
+        return str(SEPA_PRESET), str(tmp_path / "file.txt")
+
+    sources = b"sources:\n  - {name: docs, path: docs}\n"
+    return [
+        ("missing file", lambda t: (str(t / "missing.yaml"), None)),
+        ("folder", lambda t: (str(t), None)),
+        ("not utf-8", lambda t: write(t, b"name: caf\xe9\n")),
+        ("invalid name", lambda t: write(t, b"name: Ops-Runbooks\ndisplay_name: Ops\n" + sources)),
+        ("name not a string", lambda t: write(t, b"name: 123\ndisplay_name: Ops\n" + sources)),
+        ("sources not a list", lambda t: write(t, b"name: ops\ndisplay_name: Ops\nsources: 5\n")),
+        ("missing docs root", lambda t: (str(SEPA_PRESET), str(t / "nowhere"))),
+        ("docs root is a file", file_root),
+    ]
+
+
+class TestToolAndScriptRefuseAlike:
+    """The tool and the script run the same input checks, with the same refusal text."""
+
+    @staticmethod
+    async def _tool(layer_result=None, check=None, **kwargs):
+        from stratakb.knowledge.tools import register_knowledge_tools
+
+        fn = capture_tools(register_knowledge_tools, "postgresql://test", "")[
+            "strata_apply_preset"
+        ]
+        create = AsyncMock(return_value=layer_result)
+        ingest = AsyncMock(return_value={"total_docs": 0, "total_chunks": 0})
+        audit = AsyncMock()
+        check = check or AsyncMock(return_value={"status": "would_create", "changes": []})
+        with (
+            patch("stratakb.core.auth.get_current_user", return_value=("tester", "admin")),
+            patch("stratakb.config.get_settings", return_value=_local_settings()),
+            patch("stratakb.knowledge.presets.create_preset_layer", create),
+            patch("stratakb.knowledge.presets.ingest_preset", ingest),
+            patch("stratakb.knowledge.presets.write_audit_log", audit),
+            patch("stratakb.knowledge.presets.check_preset_layer", check),
+            capture_logs(),
+        ):
+            result = await fn(**kwargs)
+        return result, create, ingest, audit
+
+    @pytest.mark.parametrize("dry_run", [False, True], ids=["apply", "dry_run"])
+    @pytest.mark.parametrize(
+        "build", [b for _, b in _bad_inputs()], ids=[i for i, _ in _bad_inputs()]
+    )
+    async def test_same_refusal(self, capsys, tmp_path, build, dry_run):
+        preset_path, docs_root = build(tmp_path)
+        args = []
+        if docs_root is not None:
+            args += ["--docs-root", docs_root]
+        if dry_run:
+            args.append("--dry-run")
+        code, out, s_ingest, s_create, s_audit, err = await asyncio.to_thread(
+            TestApplyPresetScript._run, None, capsys, preset=preset_path, extra_args=args
+        )
+        tool, t_create, t_ingest, t_audit = await self._tool(
+            preset_path=preset_path, docs_root=docs_root, dry_run=dry_run
+        )
+
+        assert tool["status"] == "error"
+        assert out == {"layer": "refused", "error": tool["error"]}
+        assert code == 1
+        assert "Traceback" not in err
+        for mock in (s_create, s_ingest, s_audit, t_create, t_ingest, t_audit):
+            mock.assert_not_awaited()
+
+    async def test_same_dry_run_report(self, capsys):
+        code, out, *_ = await asyncio.to_thread(
+            TestApplyPresetScript._run, None, capsys, extra_args=("--dry-run",)
+        )
+        tool, *_ = await self._tool(preset_path=str(SEPA_PRESET), dry_run=True)
+
+        assert code == 0
+        assert tool.pop("layer_check") == {"status": "would_create", "changes": []}
+        assert json.loads(json.dumps(tool)) == out
+        assert out["status"] == "dry_run_complete"
+        assert out["layer"] == "sepa"
+        assert out["group_stats"]
+
+    def test_dry_run_of_a_preset_named_refused_exits_0(self, capsys, tmp_path):
+        path = tmp_path / "preset.yaml"
+        path.write_text(
+            "name: refused\ndisplay_name: Refused\nsources:\n  - {name: docs, path: docs}\n",
+            encoding="utf-8",
+        )
+        code, out, *_ = TestApplyPresetScript._run(
+            None, capsys, preset=path, extra_args=("--dry-run",)
+        )
+        assert code == 0
+        assert out["layer"] == "refused"
+        assert out["status"] == "dry_run_complete"

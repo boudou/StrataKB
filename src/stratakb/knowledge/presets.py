@@ -132,6 +132,13 @@ def load_preset(preset_path: str | Path) -> LayerPreset:
     for key in ("name", "display_name", "sources"):
         if not data.get(key):
             raise LayerValidationError(f"Preset {path} is missing '{key}'.")
+    # Wrong YAML types would otherwise end in a TypeError further down
+    if not isinstance(data["name"], str):
+        raise LayerValidationError(f"Preset {path}: 'name' must be a string.")
+    if not isinstance(data["sources"], (list, str)):
+        raise LayerValidationError(f"Preset {path}: 'sources' must be a list.")
+    if data.get("root") and not isinstance(data["root"], str):
+        raise LayerValidationError(f"Preset {path}: 'root' must be a string.")
 
     _validate_name(data["name"])
     display_name = _validate_display_name(data["display_name"])
@@ -149,7 +156,13 @@ def load_preset(preset_path: str | Path) -> LayerPreset:
 
     sources = []
     for raw in data["sources"]:
-        if not isinstance(raw, dict) or not raw.get("name") or not raw.get("path"):
+        if (
+            not isinstance(raw, dict)
+            or not raw.get("name")
+            or not raw.get("path")
+            or not isinstance(raw["name"], str)
+            or not isinstance(raw["path"], str)
+        ):
             raise LayerValidationError(f"Every source in {path} needs a 'name' and a 'path'.")
         sources.append(
             SourceGroup(
@@ -175,6 +188,58 @@ def load_preset(preset_path: str | Path) -> LayerPreset:
         sources=sources,
         root=root,
     )
+
+
+class PresetInputError(Exception):
+    """A preset path, preset file or documents root that cannot be used.
+
+    The message is the refusal text shown to the caller.
+    """
+
+
+def open_preset(
+    preset_path: str | Path, docs_root: str | Path | None = None
+) -> tuple[LayerPreset, Path | None]:
+    """Check a preset path and documents root, and load the preset.
+
+    The input checks the MCP tool and scripts/apply_preset.py share, so both
+    refuse the same inputs with the same text, before anything is written.
+
+    Args:
+        preset_path: Path to the preset YAML file, as the caller gave it.
+        docs_root: Directory the source paths are relative to; empty or None
+            means the preset's own root.
+
+    Returns:
+        The loaded preset and the documents root (None when not given).
+
+    Raises:
+        PresetInputError: With the refusal text.
+    """
+    # On Windows, reading a folder raises PermissionError, so check it first
+    if Path(preset_path).is_dir():
+        raise PresetInputError(f"Preset path is a folder, not a file: {preset_path}")
+    try:
+        preset = load_preset(preset_path)
+    except FileNotFoundError:
+        raise PresetInputError(f"Preset not found: {preset_path}") from None
+    except UnicodeDecodeError:
+        raise PresetInputError(f"Preset {preset_path} is not UTF-8 text.") from None
+    except OSError as e:
+        raise PresetInputError(
+            f"Preset could not be read: {preset_path} ({e.strerror or type(e).__name__})"
+        ) from None
+    except (LayerError, ValueError) as e:
+        raise PresetInputError(str(e)) from None
+
+    if not docs_root:
+        return preset, None
+    root = Path(docs_root)
+    if not root.exists():
+        raise PresetInputError(f"Documents root not found: {docs_root}")
+    if not root.is_dir():
+        raise PresetInputError(f"Documents root is not a folder: {docs_root}")
+    return preset, root
 
 
 # ─── Dry-run parsing ────────────────────────────────────────────────
@@ -223,6 +288,28 @@ def dry_run_parse(preset: LayerPreset, root: Path | None = None) -> DryRunResult
         total_chunks=result.total_chunks,
     )
     return result
+
+
+def dry_run_report(preset: LayerPreset, result: DryRunResult) -> dict:
+    """The dry-run report the MCP tool and scripts/apply_preset.py both return."""
+    return {
+        "status": "dry_run_complete",
+        "layer": preset.name,
+        "total_files": result.total_files,
+        "parsed_files": result.parsed_files,
+        "failed_files": result.failed_files,
+        "total_chunks": result.total_chunks,
+        "group_stats": {
+            name: {
+                "files": stats["files"],
+                "parsed": stats["parsed"],
+                "failed": stats["failed"],
+                "chunks": stats["chunks"],
+            }
+            for name, stats in result.group_stats.items()
+        },
+        "errors": result.errors[:20] if result.errors else None,
+    }
 
 
 def _parse_source_group(preset: LayerPreset, root: Path, group: SourceGroup) -> dict:

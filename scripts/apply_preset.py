@@ -16,43 +16,38 @@ import argparse
 import asyncio
 import json
 import sys
-from pathlib import Path
 
 from stratakb.config import get_settings
 from stratakb.core.database import close_pool
 from stratakb.core.logging import configure_logging
-from stratakb.knowledge.layers import LayerError
-from stratakb.knowledge.presets import apply_preset, dry_run_parse, load_preset
+from stratakb.knowledge.presets import (
+    PresetInputError,
+    apply_preset,
+    dry_run_parse,
+    dry_run_report,
+    open_preset,
+)
 
 
-async def _apply(preset_path: Path, docs_root: Path | None, dry_run: bool) -> dict:
+async def _apply(preset_path: str, docs_root: str | None, dry_run: bool) -> dict:
     settings = get_settings()
+    # The same checks and refusal texts as the strata_apply_preset tool
     try:
-        preset = load_preset(preset_path)
-    except FileNotFoundError:
-        return {"layer": "refused", "error": f"Preset not found: {preset_path}"}
-    except (LayerError, ValueError) as e:
+        preset, root = open_preset(preset_path, docs_root)
+    except PresetInputError as e:
         return {"layer": "refused", "error": str(e)}
 
     if dry_run:
-        result = dry_run_parse(preset, docs_root)
-        return {
-            "layer": preset.name,
-            "total_files": result.total_files,
-            "parsed_files": result.parsed_files,
-            "failed_files": result.failed_files,
-            "total_chunks": result.total_chunks,
-            "errors": result.errors,
-        }
+        return dry_run_report(preset, dry_run_parse(preset, root))
 
     try:
         result = await apply_preset(
-            settings.database_url, settings.openai_api_key, preset, docs_root,
+            settings.database_url, settings.openai_api_key, preset, root,
             settings=settings,
             tool_name="script:apply_preset",
             parameters={
-                "preset_path": str(preset_path),
-                "docs_root": str(docs_root) if docs_root else None,
+                "preset_path": preset_path,
+                "docs_root": docs_root or None,
             },
         )
     finally:
@@ -68,9 +63,9 @@ async def _apply(preset_path: Path, docs_root: Path | None, dry_run: bool) -> di
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("preset", type=Path, help="Path to the preset YAML file")
+    parser.add_argument("preset", type=str, help="Path to the preset YAML file")
     parser.add_argument(
-        "--docs-root", type=Path, default=None,
+        "--docs-root", type=str, default=None,
         help="Directory the preset's source paths are relative to (default: the preset's folder)",
     )
     parser.add_argument(
@@ -83,7 +78,8 @@ def main() -> None:
     result = asyncio.run(_apply(args.preset, args.docs_root, args.dry_run))
     json.dump(result, sys.stdout, indent=2, default=str)
     print()
-    if result.get("layer") == "refused":
+    # Not layer == "refused": a dry run of a preset named "refused" succeeded
+    if "error" in result:
         sys.exit(1)
 
 

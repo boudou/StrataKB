@@ -387,27 +387,20 @@ def register_knowledge_tools(
                        Defaults to the preset's own folder.
             dry_run: If True, only parse files and report stats.
         """
-        from pathlib import Path
-
-        from stratakb.knowledge.layers import LayerValidationError
         from stratakb.knowledge.presets import (
+            PresetInputError,
             apply_preset,
             check_preset_layer,
             dry_run_parse,
-            load_preset,
+            dry_run_report,
+            open_preset,
         )
 
         _settings = _current_settings()
         try:
-            preset = load_preset(preset_path)
-        except FileNotFoundError:
-            return {"status": "error", "error": f"Preset not found: {preset_path}"}
-        except (LayerValidationError, ValueError) as e:
+            preset, root = open_preset(preset_path, docs_root)
+        except PresetInputError as e:
             return {"status": "error", "error": str(e)}
-
-        root = Path(docs_root) if docs_root else None
-        if root is not None and not root.exists():
-            return {"status": "error", "error": f"Documents root not found: {docs_root}"}
 
         if dry_run:
             result = await asyncio.to_thread(dry_run_parse, preset, root)
@@ -419,25 +412,7 @@ def register_knowledge_tools(
                 # No message: it can hold the database URL
                 logger.warning("preset_layer_check_failed", error_type=type(e).__name__)
                 layer_check = {"status": "unknown", "changes": []}
-            return {
-                "status": "dry_run_complete",
-                "layer": preset.name,
-                "total_files": result.total_files,
-                "parsed_files": result.parsed_files,
-                "failed_files": result.failed_files,
-                "total_chunks": result.total_chunks,
-                "group_stats": {
-                    name: {
-                        "files": stats["files"],
-                        "parsed": stats["parsed"],
-                        "failed": stats["failed"],
-                        "chunks": stats["chunks"],
-                    }
-                    for name, stats in result.group_stats.items()
-                },
-                "errors": result.errors[:20] if result.errors else None,
-                "layer_check": layer_check,
-            }
+            return {**dry_run_report(preset, result), "layer_check": layer_check}
 
         return await apply_preset(
             database_url,

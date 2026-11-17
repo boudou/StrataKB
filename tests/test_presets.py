@@ -88,6 +88,35 @@ class TestLoadPreset:
         with pytest.raises(LayerValidationError, match="sources"):
             load_preset(path)
 
+    @pytest.mark.parametrize(
+        ("body", "message"),
+        [
+            (
+                "name: 123\ndisplay_name: Ops\nsources:\n  - {name: docs, path: docs}\n",
+                "'name' must be a string.",
+            ),
+            (
+                "name: runbooks\ndisplay_name: Ops\nroot: 5\n"
+                "sources:\n  - {name: docs, path: docs}\n",
+                "'root' must be a string.",
+            ),
+            (
+                "name: runbooks\ndisplay_name: Ops\nsources: 5\n",
+                "'sources' must be a list.",
+            ),
+            (
+                "name: runbooks\ndisplay_name: Ops\nsources:\n  - {name: docs, path: 5}\n",
+                "needs a 'name' and a 'path'.",
+            ),
+        ],
+    )
+    def test_wrong_yaml_types_rejected(self, tmp_path, body, message):
+        # A TypeError here would end the script in a traceback
+        path = _write_preset(tmp_path, body)
+        with pytest.raises(LayerValidationError) as exc:
+            load_preset(path)
+        assert str(exc.value).endswith(message)
+
     def test_invalid_name_rejected(self, tmp_path):
         path = _write_preset(tmp_path, (
             "name: Ops-Runbooks\n"

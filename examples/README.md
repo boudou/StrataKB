@@ -7,7 +7,7 @@ uv run python scripts/apply_preset.py examples/sepa/preset.yaml --dry-run   # ch
 uv run python scripts/apply_preset.py examples/sepa/preset.yaml             # build the layer
 ```
 
-To keep the documents elsewhere, pass `--docs-root /path/to/docs` (or `docs_root` to the `strata_apply_preset` tool). Missing folders are skipped and reported with their download link.
+To keep the documents elsewhere, pass `--docs-root /path/to/docs` (or `docs_root` to the `strata_apply_preset` tool). Missing folders are skipped and reported with their download link. A documents root that does not exist, or is not a folder, is refused before anything is written, by both the script and the tool.
 
 Standards documents are published under their publishers' terms, so `.gitignore` keeps downloaded PDFs, DOCX, XSD and ZIP files under `examples/` out of git. It also keeps the PEPs clone (`peps/source/`) out of git.
 
