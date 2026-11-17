@@ -349,7 +349,10 @@ class TestReEmbed:
         """With the openai backend and no base URL, every batch gets the OpenAI key.
 
         The check and every batch read the settings passed in, never the environment's.
+        The stats and log lines name the model the backend resolves to.
         """
+        from structlog.testing import capture_logs
+
         from stratakb.core.database import get_pool
         from stratakb.knowledge.vector_store import (
             ChunkRecord,
@@ -390,6 +393,7 @@ class TestReEmbed:
                     side_effect=embed_openai,
                 ) as mock,
                 patch("stratakb.config.get_settings", env_settings),
+                capture_logs() as logs,
             ):
                 if all_layers:
                     stats = await re_embed_all_layers(
@@ -406,6 +410,17 @@ class TestReEmbed:
             assert all(call.args[1] == "sk-test" for call in mock.call_args_list)
             assert all(call.kwargs["base_url"] == "" for call in mock.call_args_list)
             env_settings.assert_not_called()
+            # openai_settings() keeps the local default model, which openai resolves
+            assert stats["model"] == "text-embedding-3-large"
+            models = {
+                e["event"]: e["model"]
+                for e in logs
+                if e["event"] in ("re_embed_started", "re_embed_complete")
+            }
+            assert models == {
+                "re_embed_started": "text-embedding-3-large",
+                "re_embed_complete": "text-embedding-3-large",
+            }
         finally:
             await delete_layer_chunks(db_url, layer)
 

@@ -164,6 +164,30 @@ async def ensure_hnsw_index(database_url: str) -> None:
         logger.info("hnsw_index_created")
 
 
+def _re_embed_settings(settings: Settings | None) -> Settings:
+    """Return the settings a re-embed runs with, refusing a setup that cannot embed.
+
+    None reads the environment's settings. Raises ValueError for an unknown
+    backend, a missing key, or a setup blocked by STRATA_LOCAL_ONLY.
+    """
+    from stratakb.knowledge.embeddings import embedding_key_error
+
+    if settings is None:
+        from stratakb.config import get_settings
+
+        settings = get_settings()
+    if err := embedding_key_error(settings, settings.openai_api_key):
+        raise ValueError(err)
+    return settings
+
+
+def _re_embed_model(settings: Settings) -> str:
+    """Return the model the configured backend embeds with, for stats and logs."""
+    from stratakb.knowledge.embeddings import resolve_embedding_model
+
+    return resolve_embedding_model(settings.embedding_backend, settings.embedding_model)
+
+
 async def re_embed_layer(
     database_url: str,
     layer_name: str,
@@ -199,14 +223,7 @@ async def re_embed_layer(
     """
     import time
 
-    from stratakb.knowledge.embeddings import embedding_key_error
-
-    if settings is None:
-        from stratakb.config import get_settings
-
-        settings = get_settings()
-    if err := embedding_key_error(settings, settings.openai_api_key):
-        raise ValueError(err)
+    settings = _re_embed_settings(settings)
     if not new_dimensions:
         new_dimensions = settings.embedding_dimensions
 
@@ -255,7 +272,7 @@ async def re_embed_layer(
         "re_embed_complete",
         layer=layer_name,
         chunks_updated=updated,
-        model=settings.embedding_model,
+        model=_re_embed_model(settings),
         dimensions=new_dimensions,
         duration=round(duration, 1),
     )
@@ -263,7 +280,7 @@ async def re_embed_layer(
     return {
         "layer_name": layer_name,
         "chunks_updated": updated,
-        "model": settings.embedding_model,
+        "model": _re_embed_model(settings),
         "dimensions": new_dimensions,
         "duration_seconds": round(duration, 1),
     }
@@ -326,15 +343,8 @@ async def re_embed_all_layers(
     """
     import time
 
-    from stratakb.knowledge.embeddings import embedding_key_error
-
-    if settings is None:
-        from stratakb.config import get_settings
-
-        settings = get_settings()
-    if err := embedding_key_error(settings, settings.openai_api_key):
-        raise ValueError(err)
-    target = int(new_dimensions or settings.embedding_dimensions)
+    settings = _re_embed_settings(settings)
+    target =int(new_dimensions or settings.embedding_dimensions)
 
     # The shipped schema always has the HNSW index, so no column can be wider than this
     if target > _HNSW_MAX_DIMENSIONS:
@@ -372,7 +382,7 @@ async def re_embed_all_layers(
         layers="all",
         layer_count=len(layers),
         chunks_updated=updated,
-        model=settings.embedding_model,
+        model=_re_embed_model(settings),
         dimensions=target,
         previous_dimensions=size,
         duration=round(duration, 1),
@@ -381,7 +391,7 @@ async def re_embed_all_layers(
     return {
         "layers": layers,
         "chunks_updated": updated,
-        "model": settings.embedding_model,
+        "model": _re_embed_model(settings),
         "dimensions": target,
         "previous_dimensions": size,
         "resized": size != target,
@@ -572,8 +582,8 @@ async def _re_embed_batches(
 
     Takes a pool or a connection, so a caller can keep every statement on its
     own connection or transaction. write(ids, embeddings) stores the vectors.
-    settings and its OpenAI key reach every embed_texts call, so the caller's
-    check and the embedding read the same values.
+    settings reach every embed_texts call, which takes the OpenAI key from
+    them, so the caller's check and the embedding read the same values.
     timeout applies to the reads here (None keeps the pool's command timeout).
     log_ctx tags the log lines.
 
@@ -588,7 +598,7 @@ async def _re_embed_batches(
         db, layer_name=layer_name, unstaged_only=unstaged_only, timeout=timeout
     )
     logger.info(
-        "re_embed_started", **log_ctx, total_chunks=total, model=settings.embedding_model
+        "re_embed_started", **log_ctx, total_chunks=total, model=_re_embed_model(settings)
     )
 
     counts: dict[str, int] = {}
@@ -608,7 +618,6 @@ async def _re_embed_batches(
             break
         embeddings = await embed_texts(
             [_re_embed_text(r) for r in batch],
-            api_key=settings.openai_api_key,
             dimensions=dimensions,
             settings=settings,
         )
