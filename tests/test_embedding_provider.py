@@ -8,7 +8,8 @@ Tests cover:
 - strata_search, strata_ingest_documents and strata_apply_preset need no OpenAI key
   with a base URL
 - strata_ask refuses an embedding setup that cannot run before layer detection and
-  the rewrite; re-embedding refuses it before it reads a chunk
+  the rewrite; re-embedding refuses it, and STRATA_LOCAL_ONLY with OpenAI, before it
+  reads a chunk
 - is_model_cached needs config.json and the weights, and never downloads
 - The OpenAI path refuses an empty key without a base URL
 - An unknown backend is refused with or without a key, before any file is read
@@ -342,24 +343,47 @@ class TestToolKeyChecks:
         search.assert_not_awaited()
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("passed", [False, True], ids=["env_settings", "passed_settings"])
     @pytest.mark.parametrize("all_layers", [False, True], ids=["one_layer", "all_layers"])
-    async def test_re_embed_refuses_before_reading_chunks(self, all_layers):
+    async def test_re_embed_refuses_before_reading_chunks(self, all_layers, passed):
         from stratakb.knowledge import vector_store
 
+        settings = openai_settings(openai_api_key="", embedding_base_url="")
         get_pool = AsyncMock()
+        kwargs = {"settings": settings} if passed else {}
         with (
-            patch(
-                "stratakb.config.get_settings",
-                return_value=openai_settings(openai_api_key=""),
-            ),
+            patch("stratakb.config.get_settings", return_value=settings),
             patch("stratakb.knowledge.vector_store.get_pool", get_pool),
             pytest.raises(ValueError, match="API key"),
         ):
             if all_layers:
-                await vector_store.re_embed_all_layers("postgresql://test")
+                await vector_store.re_embed_all_layers("postgresql://test", **kwargs)
             else:
-                await vector_store.re_embed_layer("postgresql://test", "docs")
+                await vector_store.re_embed_layer("postgresql://test", "docs", **kwargs)
         get_pool.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("all_layers", [False, True], ids=["one_layer", "all_layers"])
+    async def test_re_embed_local_only_refuses_before_reading_chunks(self, all_layers):
+        """STRATA_LOCAL_ONLY refuses re-embedding to OpenAI before any chunk is read."""
+        from stratakb.knowledge import vector_store
+
+        settings = openai_settings(
+            openai_api_key="sk-test", embedding_base_url="", strata_local_only=True
+        )
+        get_pool = AsyncMock()
+        embed = AsyncMock()
+        with (
+            patch("stratakb.knowledge.vector_store.get_pool", get_pool),
+            patch("stratakb.knowledge.embeddings.embed_texts", embed),
+            pytest.raises(ValueError, match="STRATA_LOCAL_ONLY is on"),
+        ):
+            if all_layers:
+                await vector_store.re_embed_all_layers("postgresql://test", settings=settings)
+            else:
+                await vector_store.re_embed_layer("postgresql://test", "docs", settings=settings)
+        get_pool.assert_not_awaited()
+        embed.assert_not_awaited()
 
 
 # ── is_model_cached ──────────────────────────────────────

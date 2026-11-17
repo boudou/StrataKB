@@ -9,11 +9,15 @@ import contextlib
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import asyncpg
 import structlog
 
 from stratakb.core.database import get_pool
+
+if TYPE_CHECKING:
+    from stratakb.config import Settings
 
 logger = structlog.get_logger()
 
@@ -166,6 +170,7 @@ async def re_embed_layer(
     *,
     batch_size: int = 100,
     new_dimensions: int = 0,
+    settings: Settings | None = None,
 ) -> dict:
     """Re-embed all chunks in a layer using the current embedding model.
 
@@ -181,6 +186,7 @@ async def re_embed_layer(
         layer_name: Layer to re-embed.
         batch_size: Number of chunks to embed per batch.
         new_dimensions: New vector dimensions (0 = auto from config).
+        settings: The settings to use. Defaults to the environment's, read here.
 
     Returns:
         Stats dict with layer_name, chunks_updated, model, dimensions, duration_seconds.
@@ -193,10 +199,12 @@ async def re_embed_layer(
     """
     import time
 
-    from stratakb.config import get_settings
     from stratakb.knowledge.embeddings import embedding_key_error
 
-    settings = get_settings()
+    if settings is None:
+        from stratakb.config import get_settings
+
+        settings = get_settings()
     if err := embedding_key_error(settings, settings.openai_api_key):
         raise ValueError(err)
     if not new_dimensions:
@@ -236,6 +244,7 @@ async def re_embed_layer(
         start,
         batch_size=batch_size,
         write=write,
+        settings=settings,
         layer_name=layer_name,
         layer=layer_name,
     )
@@ -282,6 +291,7 @@ async def re_embed_all_layers(
     batch_size: int = 100,
     new_dimensions: int = 0,
     locked_timeout: float = _LOCKED_STATEMENT_TIMEOUT,
+    settings: Settings | None = None,
 ) -> dict:
     """Re-embed every chunk of every layer, resizing the shared vector column once.
 
@@ -301,6 +311,7 @@ async def re_embed_all_layers(
         new_dimensions: New vector dimensions (0 = auto from config).
         locked_timeout: Seconds each statement of phase 2 may take, instead of
             the pool's command timeout.
+        settings: The settings to use. Defaults to the environment's, read here.
 
     Returns:
         Stats dict with per-layer counts, chunks_updated, dimensions,
@@ -315,10 +326,12 @@ async def re_embed_all_layers(
     """
     import time
 
-    from stratakb.config import get_settings
     from stratakb.knowledge.embeddings import embedding_key_error
 
-    settings = get_settings()
+    if settings is None:
+        from stratakb.config import get_settings
+
+        settings = get_settings()
     if err := embedding_key_error(settings, settings.openai_api_key):
         raise ValueError(err)
     target = int(new_dimensions or settings.embedding_dimensions)
@@ -334,10 +347,15 @@ async def re_embed_all_layers(
     start = time.monotonic()
     # Every statement stays on this connection: the staging table belongs to its session
     async with pool.acquire() as conn, _staging_table(conn):
-        await _stage_all(conn, target, start, batch_size=batch_size)
+        await _stage_all(conn, target, start, batch_size=batch_size, settings=settings)
         try:
             layers, size = await _swap_in(
-                conn, target, start, batch_size=batch_size, timeout=locked_timeout
+                conn,
+                target,
+                start,
+                batch_size=batch_size,
+                timeout=locked_timeout,
+                settings=settings,
             )
         except (TimeoutError, asyncpg.QueryCanceledError) as e:
             raise TimeoutError(
@@ -391,7 +409,9 @@ async def _staging_table(conn):
                 logger.warning("re_embed_staging_not_dropped", error=type(e).__name__)
 
 
-async def _stage_all(conn, target: int, start: float, *, batch_size: int) -> None:
+async def _stage_all(
+    conn, target: int, start: float, *, batch_size: int, settings: Settings
+) -> None:
     """Phase 1: embed every chunk and stage the vectors, without locking the chunks table.
 
     Chunks added meanwhile are staged in up to _MAX_STAGING_PASSES extra passes,
@@ -405,7 +425,9 @@ async def _stage_all(conn, target: int, start: float, *, batch_size: int) -> Non
             *_vector_params(ids, embeddings),
         )
 
-    await _re_embed_batches(conn, target, start, batch_size=batch_size, write=stage, layers="all")
+    await _re_embed_batches(
+        conn, target, start, batch_size=batch_size, write=stage, settings=settings, layers="all"
+    )
     # The unstaged-only anti-join reads the staging table: give the planner its size
     await conn.execute(f"ANALYZE {_STAGING}")
     for _ in range(_MAX_STAGING_PASSES):
@@ -418,6 +440,7 @@ async def _stage_all(conn, target: int, start: float, *, batch_size: int) -> Non
             start,
             batch_size=batch_size,
             write=stage,
+            settings=settings,
             unstaged_only=True,
             layers="all",
             phase="stage_new",
@@ -430,7 +453,7 @@ async def _stage_all(conn, target: int, start: float, *, batch_size: int) -> Non
 
 
 async def _swap_in(
-    conn, target: int, start: float, *, batch_size: int, timeout: float
+    conn, target: int, start: float, *, batch_size: int, timeout: float, settings: Settings
 ) -> tuple[dict[str, int], int]:
     """Phase 2: one transaction that locks, resizes if needed and writes the new vectors.
 
@@ -465,6 +488,7 @@ async def _swap_in(
             start,
             batch_size=batch_size,
             write=update,
+            settings=settings,
             unstaged_only=True,
             timeout=timeout,
             layers="all",
@@ -538,6 +562,7 @@ async def _re_embed_batches(
     *,
     batch_size: int,
     write,
+    settings: Settings,
     layer_name: str | None = None,
     unstaged_only: bool = False,
     timeout: float | None = None,
@@ -547,6 +572,8 @@ async def _re_embed_batches(
 
     Takes a pool or a connection, so a caller can keep every statement on its
     own connection or transaction. write(ids, embeddings) stores the vectors.
+    settings and its OpenAI key reach every embed_texts call, so the caller's
+    check and the embedding read the same values.
     timeout applies to the reads here (None keeps the pool's command timeout).
     log_ctx tags the log lines.
 
@@ -555,14 +582,13 @@ async def _re_embed_batches(
     """
     import time
 
-    from stratakb.config import get_settings
     from stratakb.knowledge.embeddings import embed_texts
 
     total = await _count_chunks(
         db, layer_name=layer_name, unstaged_only=unstaged_only, timeout=timeout
     )
     logger.info(
-        "re_embed_started", **log_ctx, total_chunks=total, model=get_settings().embedding_model
+        "re_embed_started", **log_ctx, total_chunks=total, model=settings.embedding_model
     )
 
     counts: dict[str, int] = {}
@@ -580,7 +606,12 @@ async def _re_embed_batches(
         )
         if not batch:
             break
-        embeddings = await embed_texts([_re_embed_text(r) for r in batch], dimensions=dimensions)
+        embeddings = await embed_texts(
+            [_re_embed_text(r) for r in batch],
+            api_key=settings.openai_api_key,
+            dimensions=dimensions,
+            settings=settings,
+        )
         await write([r["id"] for r in batch], embeddings)
         for r in batch:
             counts[r["layer_name"]] = counts.get(r["layer_name"], 0) + 1

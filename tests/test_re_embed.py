@@ -344,6 +344,72 @@ class TestReEmbed:
             await delete_layer_chunks(db_url, layer)
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("all_layers", [False, True], ids=["one_layer", "all_layers"])
+    async def test_re_embed_passes_the_openai_key(self, db_url, all_layers):
+        """With the openai backend and no base URL, every batch gets the OpenAI key.
+
+        The check and every batch read the settings passed in, never the environment's.
+        """
+        from stratakb.core.database import get_pool
+        from stratakb.knowledge.vector_store import (
+            ChunkRecord,
+            delete_layer_chunks,
+            insert_chunks,
+            re_embed_all_layers,
+            re_embed_layer,
+        )
+        from tests.helpers import openai_settings
+
+        layer = "test_re_embed_openai_key"
+        pool = await get_pool(db_url)
+        size = await vector_column_size(pool)
+        settings = openai_settings(
+            openai_api_key="sk-test",
+            embedding_dimensions=size,
+            embedding_base_url="",
+            strata_local_only=False,
+        )
+
+        async def embed_openai(texts, api_key, model, dimensions, base_url=""):
+            return [[0.2] * dimensions for _ in texts]
+
+        try:
+            await delete_layer_chunks(db_url, layer)
+            await insert_chunks(db_url, [
+                ChunkRecord(
+                    content=f"chunk {n}", embedding=[0.1] * size, layer_name=layer,
+                    metadata={"page": n}, source_file="doc.md", doc_type="md",
+                )
+                for n in range(3)
+            ])
+            env_settings = MagicMock()
+            with (
+                patch(
+                    "stratakb.knowledge.embeddings._embed_openai",
+                    new_callable=AsyncMock,
+                    side_effect=embed_openai,
+                ) as mock,
+                patch("stratakb.config.get_settings", env_settings),
+            ):
+                if all_layers:
+                    stats = await re_embed_all_layers(
+                        db_url, batch_size=2, new_dimensions=size, settings=settings
+                    )
+                    assert stats["layers"][layer] == 3
+                else:
+                    stats = await re_embed_layer(
+                        db_url, layer, batch_size=2, settings=settings
+                    )
+                    assert stats["chunks_updated"] == 3
+
+            assert mock.await_count >= 2
+            assert all(call.args[1] == "sk-test" for call in mock.call_args_list)
+            assert all(call.kwargs["base_url"] == "" for call in mock.call_args_list)
+            env_settings.assert_not_called()
+        finally:
+            await delete_layer_chunks(db_url, layer)
+
+    @pytest.mark.asyncio
     async def test_re_embed_all_layers_embeds_before_locking(self, db_url):
         """The model runs while no lock blocks searches or ingests on the chunks table."""
         from stratakb.core.database import get_pool
