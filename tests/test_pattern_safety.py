@@ -388,3 +388,87 @@ def test_import_keeps_a_safe_file_byte_identical(monkeypatch, tmp_path, capsys):
     data = _export_file(_layer_part([r"\bsepa\b"], [r"^(?P<label>AT-\d{2})"]))
     assert _import(monkeypatch, tmp_path, data) == data
     assert "Dropped" not in capsys.readouterr().out
+
+
+# The knowledge_layers columns of an export from before format lines
+_LEGACY_LAYER_COLUMNS = ("id", "name", "display_name", "description", "metadata_schema",
+                         "chunk_config", "routing_patterns", "status", "doc_count",
+                         "chunk_count", "last_ingested", "created_at", "updated_at")
+
+
+def _legacy_row(routing: list[str]) -> bytes:
+    """One legacy knowledge_layers row in COPY text, holding these routing patterns."""
+    values = {c: "\\N" for c in _LEGACY_LAYER_COLUMNS}
+    values.update(name="x", routing_patterns=br._copy_text(json.dumps(routing)).decode())
+    return "\t".join(values[c] for c in _LEGACY_LAYER_COLUMNS).encode() + b"\n"
+
+
+def _legacy_file(row: bytes) -> bytes:
+    """An export from before format lines, with this knowledge_layers row."""
+    data = (b"-- StrataKB Layer Export\n-- Layer: x\n-- Date: 2026-01-01T00:00:00\n-- Chunks: 0\n\n"
+            b"BEGIN;\n\nDELETE FROM strata_vectors.chunks WHERE layer_name = 'x';\n\n"
+            b"COPY strata_core.knowledge_layers (" + ", ".join(_LEGACY_LAYER_COLUMNS).encode()
+            + b") FROM stdin;\n" + row + b"\\.\n\nCOMMIT;\n")
+    assert br.export_format(data) is None
+    return data
+
+
+def _legacy_routing(data: bytes) -> list:
+    columns, start, end = br._layer_row_span(data)
+    row = dict(zip(columns, map(br._copy_field, data[start:end].split(b"\t")), strict=True))
+    return json.loads(row["routing_patterns"])
+
+
+def test_legacy_import_drops_unsafe_patterns(monkeypatch, tmp_path, capsys):
+    fed = _import(monkeypatch, tmp_path, _legacy_file(_legacy_row(["(a+)+$", r"\bsepa\b"])))
+    assert _legacy_routing(fed) == [r"\bsepa\b"]
+    out = capsys.readouterr().out
+    assert out.count("Dropped the routing pattern '(a+)+$' of layer 'x'") == 1
+    assert out.count("Dropped the ") == 1
+    assert out.index("Dropped the ") < out.index("Importing")
+    assert "made by an older version" in out
+
+
+def test_legacy_import_names_before_the_prompt(monkeypatch, tmp_path, capsys):
+    psql = []
+    monkeypatch.setattr(br, "_psql", lambda *a, **k: psql.append(k))
+    seen = []
+
+    def answer(prompt):
+        seen.append(capsys.readouterr().out)
+        return "n"
+
+    monkeypatch.setattr("builtins.input", answer)
+    src = tmp_path / "layer.sql.gz"
+    with gzip.open(src, "wb") as f:
+        f.write(_legacy_file(_legacy_row(["(a+)+$", r"\bsepa\b"])))
+    br.cmd_import_layer(SimpleNamespace(input=str(src), yes=False, root=None))
+    assert len(seen) == 1
+    assert "Dropped the routing pattern '(a+)+$' of layer 'x'" in seen[0]
+    assert psql == []
+
+
+def test_legacy_import_keeps_a_safe_file_byte_identical(monkeypatch, tmp_path, capsys):
+    data = _legacy_file(_legacy_row([r"\bsepa\b"]))
+    assert _import(monkeypatch, tmp_path, data) == data
+    assert "Dropped" not in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("row", [
+    b"\\N\tx\t\\N\n",
+    "\t".join("\\N" if c != "routing_patterns" else "not json" for c in _LEGACY_LAYER_COLUMNS)
+    .encode() + b"\n",
+], ids=["too-few-fields", "patterns-not-json"])
+def test_legacy_import_refuses_an_unreadable_layer_row(monkeypatch, tmp_path, capsys, row):
+    psql = []
+    monkeypatch.setattr(br, "_psql", lambda *a, **k: psql.append(k))
+    src = tmp_path / "layer.sql.gz"
+    with gzip.open(src, "wb") as f:
+        f.write(_legacy_file(row))
+    with pytest.raises(SystemExit) as exc:
+        br.cmd_import_layer(SimpleNamespace(input=str(src), yes=True, root=None))
+    assert exc.value.code == 1
+    assert psql == []
+    err = capsys.readouterr().err
+    assert "layer.sql.gz holds a layer row this version cannot check" in err
+    assert "Import failed: nothing was changed." in err

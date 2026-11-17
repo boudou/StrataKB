@@ -627,10 +627,36 @@ def _import_current(src: Path, sql: bytes, root: str | None, yes: bool) -> None:
     print(f"Import complete. The layer's folder is now {root}." if root else "Import complete.")
 
 
+def _legacy_with_safe_patterns(src: Path, sql: bytes) -> bytes:
+    """A legacy file without its unsafe layer patterns; exits when its layer row cannot be checked.
+
+    A file with no layer row, or an empty layer block, holds no pattern and
+    comes back as it is.
+    """
+    copy = sql.find(f"COPY {LAYERS.name} (".encode())
+    if copy < 0:
+        return sql
+    row_start = sql.find(b"\n", copy) + 1
+    row_end = sql.find(b"\n", row_start)
+    if row_start == 0 or sql[row_start:row_end if row_end >= 0 else None] == b"\\.":
+        return sql
+    try:
+        if _layer_row_span(sql) is None:
+            raise ValueError("its fields do not match its columns")
+        return _with_safe_patterns(sql)
+    except ValueError as e:
+        _refuse_import(f"{src.name} holds a layer row this version cannot check: {e}.")
+
+
 def _import_legacy(src: Path, sql: bytes, root: str | None, yes: bool) -> None:
-    """Import a file from before format lines, which tolerates what already exists."""
+    """Import a file from before format lines, which tolerates what already exists.
+
+    Its layer patterns are checked as a current file's are, before the
+    confirmation, so each unsafe one is dropped and named.
+    """
     if root:
         _refuse_import("--root needs a newer export: this file has no file tracking to move.")
+    sql = _legacy_with_safe_patterns(src, sql)
     if not _confirm_import(src, yes):
         return
     print(f"Importing {len(sql) / 1024 / 1024:.1f} MB...")
