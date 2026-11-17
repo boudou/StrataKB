@@ -392,7 +392,9 @@ class TestVerifyTool:
         assert receipt["verification"]["result"] == "verified"
         assert receipt["verification_note"] == NOTHING_CHECKED_NOTE
         lines = render_receipt(receipt).split("\n")
-        at = next(i for i, line in enumerate(lines) if line.startswith("Verification:"))
+        at = next(
+            i for i, line in enumerate(lines) if line.startswith("Verification when issued, ")
+        )
         assert lines[at + 1] == NOTHING_CHECKED_NOTE
 
     @pytest.mark.parametrize(("quotes", "facts"), [(1, 0), (0, 1)])

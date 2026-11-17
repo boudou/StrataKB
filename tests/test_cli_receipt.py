@@ -271,23 +271,50 @@ _VERIFIED_RECEIPT = {
 }
 
 
+_VERIFIED_LINE = (
+    "Verification when issued, 2026-11-07: verified (quotes checked: 2, facts checked: 1);"
+    " each quote's status below is checked now"
+)
+
+
 def test_render_receipt_shows_the_verification():
     lines = cli.render_receipt(_VERIFIED_RECEIPT).splitlines()
-    assert "Verification: verified (quotes checked: 2, facts checked: 1, flags: 0)" in lines
+    assert _VERIFIED_LINE in lines
+    assert not any("flags:" in line for line in lines)
     assert lines.index("Draft: D") < lines.index("No quotes.")
+
+
+def test_render_receipt_shows_a_changed_quote_under_the_verification():
+    """The verification is from issue time; the quote status is worked out now."""
+    quote = {
+        "file": "policy.md",
+        "layer": "docs",
+        "version": 1,
+        "clause_path": None,
+        "char_start": 0,
+        "char_end": 5,
+        "status": "changed",
+        "note": "source changed since this answer (v1 → v2)",
+        "context_before": "",
+        "quote": "Hello",
+        "context_after": "",
+    }
+    lines = cli.render_receipt({**_VERIFIED_RECEIPT, "quotes": [quote]}).splitlines()
+    assert _VERIFIED_LINE in lines
+    assert "[1] policy.md (layer docs, v1, chars 0-5): changed" in lines
 
 
 def test_render_receipt_escapes_the_verification():
     verification = {**_VERIFIED_RECEIPT["verification"], "result": "x\x9b"}
     text = cli.render_receipt({**_VERIFIED_RECEIPT, "verification": verification})
     assert "\x9b" not in text
-    assert "Verification: x\\x9b (" in text
+    assert "Verification when issued, 2026-11-07: x\\x9b (" in text
 
 
 def test_receipt_without_verification_has_no_such_line(cited, capsys):
     receipt_id, _ = cited
     assert _main(["receipt", receipt_id]) == cli.EXIT_OK
-    assert "Verification:" not in capsys.readouterr().out
+    assert "Verification when issued" not in capsys.readouterr().out
 
 
 def test_verified_draft_prints_its_verification(db_url, layer, tmp_path, capsys):
@@ -309,10 +336,13 @@ def test_verified_draft_prints_its_verification(db_url, layer, tmp_path, capsys)
 
     receipt_id = _run(verified())
     assert _main(["receipt", receipt_id]) == cli.EXIT_OK
+    lines = capsys.readouterr().out.splitlines()
+    issued = next(line for line in lines if line.startswith("Issued "))
+    date = issued.removeprefix("Issued ")[:10]
     assert (
-        "Verification: verified (quotes checked: 1, facts checked: 0, flags: 0)"
-        in capsys.readouterr().out
-    )
+        f"Verification when issued, {date}: verified (quotes checked: 1, facts checked: 0);"
+        " each quote's status below is checked now"
+    ) in lines
 
 
 def test_receipt_does_not_import_add_folder_or_the_server():

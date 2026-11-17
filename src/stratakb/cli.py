@@ -766,12 +766,16 @@ def render_text(report: Report) -> str:
     return "\n".join(one_line(line) for line in lines)
 
 
-def _verification_line(verification: dict[str, Any]) -> str:
-    """The stored result of strata_verify, as --json carries it."""
+def _verification_line(verification: dict[str, Any], issued_on: str) -> str:
+    """The check strata_verify made when the receipt was issued.
+
+    Quote statuses are worked out on opening. No flags count: strata_verify
+    issues a receipt only when nothing was flagged.
+    """
     return (
-        f"Verification: {verification['result']} "
-        f"(quotes checked: {verification['quotes']}, facts checked: {verification['facts']}, "
-        f"flags: {verification['flags']})"
+        f"Verification when issued, {issued_on}: {verification['result']} "
+        f"(quotes checked: {verification['quotes']}, facts checked: {verification['facts']}); "
+        "each quote's status below is checked now"
     )
 
 
@@ -792,7 +796,7 @@ def render_receipt(receipt: dict) -> str:
         lines.append(f"Draft: {receipt['draft']}")
     verification = receipt.get("verification") or {}
     if verification:
-        lines.append(_verification_line(verification))
+        lines.append(_verification_line(verification, str(receipt["issued_at"])[:10]))
     if receipt.get("verification_note"):
         lines.append(receipt["verification_note"])
     if verification.get("unchecked_sentences"):
