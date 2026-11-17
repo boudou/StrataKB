@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING
 
 import structlog
 from mcp.server.fastmcp import FastMCP
+from mcp.types import ToolAnnotations
 
 from stratakb.core.audit import write_audit_log
 from stratakb.core.auth import check_role, get_current_user, require_role
@@ -25,7 +26,7 @@ from stratakb.knowledge.layers import (
     list_layers,
     update_layer,
 )
-from stratakb.knowledge.parsers import csv_parser
+from stratakb.knowledge.parsers import csv_parser, pdf_parser, yaml_parser
 
 if TYPE_CHECKING:
     from stratakb.config import Settings
@@ -34,8 +35,11 @@ logger = structlog.get_logger()
 
 
 def _ingest_description() -> str:
-    """The strata_ingest_documents description; a docstring cannot name the row limit."""
-    limit = f"{csv_parser.MAX_ROWS:,}"
+    """The strata_ingest_documents description; a docstring cannot name the parser limits."""
+    rows = f"{csv_parser.MAX_ROWS:,}"
+    entries = f"{pdf_parser.MAX_OUTLINE_ENTRIES:,}"
+    depth = pdf_parser.MAX_OUTLINE_DEPTH
+    props = yaml_parser.MAX_SCHEMA_PROPERTIES
     return f"""Ingest documents into a knowledge layer, syncing with the source folder.
 
     Parses files, chunks text, generates embeddings, and stores in the
@@ -52,14 +56,23 @@ def _ingest_description() -> str:
     credentials, e.g. client_secret.json) are always skipped and never
     opened; one ingested earlier is removed. Empty files are reported as
     no text, not as failures: skipped, or removed if ingested earlier.
-    files_skipped counts the skipped files. A PDF that looks scanned
-    (more than half its pages have an image and under 200 characters of
-    text) is stored for the text it has and counted in files_flagged;
-    it also counts as added or updated. A CSV over {limit} rows is stored
-    for its first {limit} rows and also counted in files_flagged. flagged
-    lists these files with file, reason ("probably_scanned" or "truncated")
-    and count: how many rows or other items were left out, null when the
-    parser did not count.
+    files_skipped counts the skipped files.
+
+    Some files are stored but flagged: they count as added or updated, are
+    counted in files_flagged, and flagged lists them with file, reason and
+    count (how many items were left out, null when the parser did not
+    count). Reason "probably_scanned": a PDF where more than half the pages
+    have an image and under 200 characters of text; it is stored for the
+    text it has. Reason "truncated": A CSV over {rows} rows is stored for
+    its first {rows} rows (count: rows left out); a PDF outline over
+    {entries} entries or deeper than {depth} levels is read up to those
+    limits and the text is stored in full (count: outline entries left
+    out); an OpenAPI schema with more than {props} properties lists the
+    first {props} (count: properties left out, over the whole file).
+    Properties of a nested schema whose type is given, of a $ref schema
+    (shown by name) and of a schema nested more than two levels deep are
+    not listed and not counted. A PDF that is both probably scanned and
+    over the outline limits is flagged probably_scanned only.
 
     Unchanged means the same file content (SHA-256). A change to the
     layer's chunk_config or to the embedding model is not detected: use
@@ -138,7 +151,7 @@ def register_knowledge_tools(
 
         return get_settings()
 
-    @mcp.tool()
+    @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False))
     @require_role("viewer")
     @log_tool_call
     async def strata_list_knowledge_layers() -> dict:
@@ -155,7 +168,14 @@ def register_knowledge_tools(
             "total": len(layers),
         }
 
-    @mcp.tool()
+    @mcp.tool(
+        annotations=ToolAnnotations(
+            readOnlyHint=False,
+            destructiveHint=False,
+            idempotentHint=True,
+            openWorldHint=False,
+        ),
+    )
     @require_role("admin")
     @log_tool_call
     async def strata_create_knowledge_layer(
@@ -218,7 +238,7 @@ def register_knowledge_tools(
         except LayerValidationError as e:
             return {"status": "error", "error": str(e)}
 
-    @mcp.tool()
+    @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False))
     @require_role("viewer")
     @log_tool_call
     async def strata_get_layer_status(name: str) -> dict:
@@ -236,7 +256,14 @@ def register_knowledge_tools(
         except LayerNotFoundError as e:
             return {"status": "error", "error": str(e)}
 
-    @mcp.tool()
+    @mcp.tool(
+        annotations=ToolAnnotations(
+            readOnlyHint=False,
+            destructiveHint=True,
+            idempotentHint=True,
+            openWorldHint=False,
+        ),
+    )
     @require_role("admin")
     @log_tool_call
     async def strata_delete_knowledge_layer(name: str) -> dict:
@@ -261,7 +288,14 @@ def register_knowledge_tools(
         except LayerNotFoundError as e:
             return {"status": "error", "error": str(e)}
 
-    @mcp.tool()
+    @mcp.tool(
+        annotations=ToolAnnotations(
+            readOnlyHint=False,
+            destructiveHint=True,
+            idempotentHint=True,
+            openWorldHint=False,
+        ),
+    )
     @require_role("admin")
     @log_tool_call
     async def strata_set_archived_patterns(layer_name: str, patterns: list[str]) -> dict:
@@ -290,7 +324,15 @@ def register_knowledge_tools(
         )
         return {"status": "updated", "layer": _serialize(layer)}
 
-    @mcp.tool(description=_ingest_description())
+    @mcp.tool(
+        description=_ingest_description(),
+        annotations=ToolAnnotations(
+            readOnlyHint=False,
+            destructiveHint=True,
+            idempotentHint=True,
+            openWorldHint=False,
+        ),
+    )
     @require_role("admin")
     @log_tool_call
     async def strata_ingest_documents(
@@ -344,16 +386,19 @@ def register_knowledge_tools(
                 "rebuilt_legacy": result.rebuilt_legacy,
                 "duration_seconds": round(result.duration_seconds, 1),
                 "errors": result.errors if result.errors else None,
-                "flagged": [
-                    {"file": f.relative_path, "reason": f.reason, "count": f.count}
-                    for f in result.files
-                    if f.outcome == "flagged"
-                ] or None,
+                "flagged": result.flagged_rows(),
             }
         except Exception as e:
             return {"status": "error", "error": str(e)}
 
-    @mcp.tool()
+    @mcp.tool(
+        annotations=ToolAnnotations(
+            readOnlyHint=False,
+            destructiveHint=True,
+            idempotentHint=True,
+            openWorldHint=False,
+        ),
+    )
     @require_role("admin")
     @log_tool_call
     async def strata_apply_preset(
@@ -373,6 +418,9 @@ def register_knowledge_tools(
         3. Ingests every source folder listed in the preset
 
         The result lists the layer settings that changed (layer_changes).
+        The ingestion result lists, per source group, the files stored but
+        flagged (files_flagged, and flagged with file, reason and count, as
+        strata_ingest_documents returns them); total_flagged counts them.
         Source folders that are missing are skipped and reported together with
         their download link, if the preset gives one. Use dry_run=True to check
         that all files parse, without embeddings; it also reports which layer

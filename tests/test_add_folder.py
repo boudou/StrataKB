@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import contextlib
 import json
+import shutil
+import subprocess
 from pathlib import Path
 from typing import NamedTuple
 from unittest.mock import AsyncMock, patch
@@ -501,6 +503,56 @@ async def test_nothing_to_add(folder_db_url, tmp_path):
     name = unique_layer_name()
     p = await add_folder.plan(folder_db_url, root, Options(name=name))
     assert p.refusal is not None and p.refusal[0] == "nothing_to_add"
+    assert p.refusal[1] == (
+        f"No file in {p.root} can be added: every file is excluded or skipped."
+    )
+    await _assert_nothing_written(folder_db_url, p, name)
+
+
+def _git(root: Path, *args: str) -> None:
+    subprocess.run(["git", "-C", str(root), *args], check=True, capture_output=True)
+
+
+_needs_git = pytest.mark.skipif(shutil.which("git") is None, reason="git is not installed")
+
+
+@_needs_git
+async def test_nothing_to_add_names_the_git_ignore_rules(folder_db_url, tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-q")
+    write_file(repo / ".gitignore", "docs/\n")
+    write_file(repo / "docs" / "a.rst", "Title\n=====\n\nText.\n")
+    write_file(repo / "docs" / "sub" / "b.rst", "Other\n=====\n\nText.\n")
+    name = unique_layer_name()
+
+    p = await add_folder.plan(folder_db_url, repo / "docs", Options(name=name))
+
+    assert p.refusal is not None and p.refusal[0] == "nothing_to_add"
+    hint = p.refusal[1]
+    assert "git ignores 2 files here" in hint
+    assert p.selection is not None and p.selection.git_root is not None
+    assert f"of the repository at {p.selection.git_root}" in hint
+    assert "git check-ignore -v" in hint
+    assert "git add -f" in hint
+    await _assert_nothing_written(folder_db_url, p, name)
+
+
+@_needs_git
+async def test_nothing_to_add_empty_git_folder_keeps_the_generic_hint(folder_db_url, tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-q")
+    (repo / "empty").mkdir()
+    name = unique_layer_name()
+
+    p = await add_folder.plan(folder_db_url, repo / "empty", Options(name=name))
+
+    assert p.selection is not None and p.selection.mode == "git"
+    assert p.refusal == (
+        "nothing_to_add",
+        f"No file in {p.root} can be added: every file is excluded or skipped.",
+    )
     await _assert_nothing_written(folder_db_url, p, name)
 
 

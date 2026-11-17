@@ -17,7 +17,10 @@ from stratakb.knowledge.parsers.document import ParsedDocument, ParsedPage, Pars
 
 logger = structlog.get_logger()
 
-# Properties listed per schema; the rest are counted and the file is flagged
+# Properties listed per schema; the rest are counted and the file is flagged.
+# Properties of a nested schema whose type is given, of a $ref schema (shown
+# by its name) and of a schema nested more than two levels deep are neither
+# listed nor counted: the summary leaves them out by design, not at a limit.
 MAX_SCHEMA_PROPERTIES = 15
 
 
@@ -74,7 +77,10 @@ def _schema_summary(schema: dict | None, depth: int = 0) -> tuple[str, int]:
     """Generate a human-readable summary of a JSON schema.
 
     Returns the summary text and the number of properties left out of it
-    (those past MAX_SCHEMA_PROPERTIES, nested summaries included).
+    (those past MAX_SCHEMA_PROPERTIES, nested summaries included). Properties
+    of a nested schema whose type is given, of a $ref schema (shown by its
+    name) and of a schema nested more than two levels deep are neither listed
+    nor counted.
     """
     if not schema or depth > 2:
         return "", 0

@@ -73,6 +73,11 @@ def parse_args(argv):
         choices=MODES,
         help="the answer mode to ask for (default: none, so the layer's own mode decides)",
     )
+    parser.add_argument(
+        "--allow-partial",
+        action="store_true",
+        help="score a layer whose last ingestion run ended partial (some files failed)",
+    )
     args = parser.parse_args(argv)
     if not args.timeout > 0:
         parser.error("--timeout: must be more than 0 seconds")
@@ -202,8 +207,12 @@ def when(value):
     return value.isoformat() if isinstance(value, datetime) else value
 
 
-async def check_layer(database_url, layer):
-    """The layer's status and its latest ingestion run; stops on one not fit to score."""
+async def check_layer(database_url, layer, allow_partial=False):
+    """The layer's status and its latest ingestion run; stops on one not fit to score.
+
+    A run that ended partial stops it too, unless allow_partial: the pinned corpus
+    ingests whole, so missing documents would be scored as retrieval misses.
+    """
     from stratakb.knowledge.layers import (
         LayerNotFoundError,
         get_layer_status,
@@ -231,6 +240,12 @@ async def check_layer(database_url, layer):
                 f"layer {layer}: its last ingestion run ({run['completed_at']}) is"
                 f" {run['status']}, build it again"
             )
+        if run["status"] == "partial" and not allow_partial:
+            raise RunStoppedError(
+                f"layer {layer}: its last ingestion run ({run['completed_at']}) is partial,"
+                f" {run['docs_failed']} documents failed; build it again, or pass"
+                " --allow-partial to score it without them"
+            )
     print(
         f"Layer {layer}: {status.get('doc_count')} documents, {status['chunk_count']} chunks,"
         f" last ingested {when(status.get('last_ingested'))}, last run "
@@ -242,7 +257,7 @@ async def check_layer(database_url, layer):
             f"Warning: {run['docs_failed']} documents failed in that run; the layer lacks them",
             file=sys.stderr,
         )
-    return {"status": status, "last_run": run}
+    return {"status": status, "last_run": run, "allow_partial": allow_partial}
 
 
 def commit():
@@ -291,6 +306,7 @@ def run_block(settings, layer, checked, timeout, started, mode=None):
             "chunk_count": status.get("chunk_count"),
             "last_ingested": when(status.get("last_ingested")),
             "last_run": checked["last_run"],
+            "allow_partial": checked["allow_partial"],
             "answer_mode": status.get("answer_mode"),
         },
         "answer": {
@@ -394,7 +410,9 @@ async def ask(server, row, layer, timeout=DEFAULT_TIMEOUT, mode=None):
     return r
 
 
-async def score(gold, layer, cross, out, timeout=DEFAULT_TIMEOUT, *, mode=None):
+async def score(
+    gold, layer, cross, out, timeout=DEFAULT_TIMEOUT, *, mode=None, allow_partial=False
+):
     from stratakb.config import get_settings
     from stratakb.core.database import close_pool
     from stratakb.mcp_server import build_server
@@ -404,7 +422,7 @@ async def score(gold, layer, cross, out, timeout=DEFAULT_TIMEOUT, *, mode=None):
     started = datetime.now(UTC).isoformat()
     rows = []
     try:
-        checked = await check_layer(settings.database_url, layer)
+        checked = await check_layer(settings.database_url, layer, allow_partial)
         # From here on, a file at --out can only be this run's, written when it finishes
         out.unlink(missing_ok=True)
         server = build_server(settings)
@@ -467,7 +485,10 @@ def main(argv=None):
 
     configure_logging("ERROR")
     try:
-        run_loop(score(gold, args.layer, cross, args.out, args.timeout, mode=args.mode))
+        run_loop(score(
+            gold, args.layer, cross, args.out, args.timeout,
+            mode=args.mode, allow_partial=args.allow_partial,
+        ))
     except QuestionTimeoutError as e:
         # The interpreter would wait on the way out for a thread the timed-out question
         # left running, so leave without waiting

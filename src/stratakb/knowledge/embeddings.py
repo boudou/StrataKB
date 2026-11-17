@@ -238,7 +238,8 @@ async def embed_texts(
 
     Args:
         texts: List of text strings to embed.
-        api_key: OpenAI API key (only needed for openai backend).
+        api_key: OpenAI API key (only needed for openai backend). Defaults to
+            settings.openai_api_key; a non-empty value wins.
         model: Model name override. Defaults to config value.
         dimensions: Output vector dimensions override. Defaults to config value.
         backend: "local" or "openai". Defaults to config value.
@@ -267,11 +268,12 @@ async def embed_texts(
         # and model.encode() is CPU-intensive on every call.
         vectors = await asyncio.to_thread(_embed_local, texts, model)
     else:
-        if err := embedding_key_error(settings, api_key, backend):
+        openai_key = api_key or settings.openai_api_key
+        if err := embedding_key_error(settings, openai_key, backend):
             raise ValueError(err)
         # A custom endpoint gets its own key, never the OpenAI one
         base_url = settings.embedding_base_url
-        key = settings.embedding_api_key if base_url else api_key
+        key = settings.embedding_api_key if base_url else openai_key
         vectors = await _embed_openai(texts, key, model, dimensions, base_url=base_url)
 
     _check_dimensions(vectors, model, dimensions)

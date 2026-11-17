@@ -525,7 +525,10 @@ async def ingest_preset(
             the environment's, read when embedding.
 
     Returns:
-        Combined ingestion results across all source groups.
+        Combined ingestion results across all source groups. Each completed
+        group carries files_flagged and flagged (the files stored but flagged,
+        with paths relative to that group's folder, or None); total_flagged
+        sums them.
     """
     from stratakb.knowledge.ingestion import clear_layer, ingest_documents
 
@@ -540,6 +543,7 @@ async def ingest_preset(
         "total_docs": 0,
         "total_chunks": 0,
         "total_errors": 0,
+        "total_flagged": 0,
     }
 
     for group in preset.sources:
@@ -567,11 +571,14 @@ async def ingest_preset(
                 "docs_processed": result.docs_processed,
                 "docs_failed": result.docs_failed,
                 "chunks_created": result.chunks_created,
+                "files_flagged": result.files_flagged,
+                "flagged": result.flagged_rows(),
                 "duration_seconds": round(result.duration_seconds, 1),
             }
             results["total_docs"] += result.docs_processed
             results["total_chunks"] += result.chunks_created
             results["total_errors"] += result.docs_failed
+            results["total_flagged"] += result.files_flagged
         except Exception as e:
             results["groups"][group.name] = {"status": "error", "error": str(e)}
             results["total_errors"] += 1

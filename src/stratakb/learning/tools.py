@@ -6,6 +6,7 @@ Registers feedback, stats, and reset tools.
 from __future__ import annotations
 
 from mcp.server.fastmcp import FastMCP
+from mcp.types import ToolAnnotations
 
 from stratakb.core.audit import write_audit_log
 from stratakb.core.auth import require_role
@@ -55,7 +56,14 @@ async def _resolve_passage_ids(
 def register_learning_tools(mcp: FastMCP, database_url: str) -> None:
     """Register learning system tools on the MCP server."""
 
-    @mcp.tool()
+    @mcp.tool(
+        annotations=ToolAnnotations(
+            readOnlyHint=False,
+            destructiveHint=False,
+            idempotentHint=False,
+            openWorldHint=False,
+        ),
+    )
     @require_role("viewer")
     @log_tool_call
     async def strata_feedback(
@@ -183,7 +191,7 @@ def register_learning_tools(mcp: FastMCP, database_url: str) -> None:
             }
         return {"status": "ok", "message": "Feedback recorded. Thank you!"}
 
-    @mcp.tool()
+    @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False))
     @require_role("viewer")
     @log_tool_call
     async def strata_learning_stats(
@@ -203,7 +211,14 @@ def register_learning_tools(mcp: FastMCP, database_url: str) -> None:
         stats = await store.get_stats(layer=layer)
         return {"status": "ok", **stats}
 
-    @mcp.tool()
+    @mcp.tool(
+        annotations=ToolAnnotations(
+            readOnlyHint=False,
+            destructiveHint=True,
+            idempotentHint=True,
+            openWorldHint=False,
+        ),
+    )
     @require_role("admin")
     @log_tool_call
     async def strata_reset_learning(

@@ -153,8 +153,16 @@ class TestEmbeddings:
     @pytest.mark.asyncio
     async def test_missing_api_key_raises_openai_backend(self):
         from stratakb.knowledge.embeddings import embed_texts
+        from tests.helpers import openai_settings
 
-        with pytest.raises(ValueError, match="API key"):
+        # Pinned: a configured OPENAI_API_KEY would now fill in the empty api_key
+        with (
+            patch(
+                "stratakb.config.get_settings",
+                return_value=openai_settings(openai_api_key="", embedding_base_url=""),
+            ),
+            pytest.raises(ValueError, match="API key"),
+        ):
             await embed_texts(["hello"], api_key="", backend="openai")
 
 

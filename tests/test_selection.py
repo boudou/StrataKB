@@ -85,6 +85,42 @@ def test_git_mode_selection(tmp_path):
 
 
 @needs_git
+def test_git_mode_fully_ignored_folder_lists_the_ignored_files(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-q")
+    _write(repo / ".gitignore", "docs/\n")
+    _write(repo / "docs" / "a.rst")
+    _write(repo / "docs" / "sub" / "b.rst")
+
+    result = select_files(repo / "docs")
+
+    assert result.mode == "git"
+    assert result.entries == []
+    assert result.excluded == [
+        ("a.rst", "ignored_by_gitignore"),
+        ("sub/b.rst", "ignored_by_gitignore"),
+    ]
+    assert result.git_root is not None
+    assert Path(result.git_root).samefile(repo)
+
+
+@needs_git
+def test_git_mode_empty_folder_lists_nothing_ignored(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-q")
+    _write(repo / ".gitignore", "*.log\n")
+    (repo / "empty").mkdir()
+
+    result = select_files(repo / "empty")
+
+    assert result.mode == "git"
+    assert result.entries == []
+    assert result.excluded == []
+
+
+@needs_git
 def test_git_mode_symlink(tmp_path):
     root = tmp_path / "repo"
     root.mkdir()
