@@ -372,6 +372,66 @@ def test_confirm_answers(monkeypatch, capsys):
     assert "Go? [y/N]" in captured.err
 
 
+# ── Escaped terminal output ──────────────────────────────
+
+HOSTILE = "evil\x1b]0;pwned\x07\x9b2J‮\nend"
+RAW = ("\x1b", "\x07", "\x9b", "‮")
+
+
+def test_confirm_prompt_escapes_a_hostile_folder_name(monkeypatch, capsys):
+    monkeypatch.setattr("sys.stdin", io.StringIO("n\n"))
+    with (
+        patch.object(cli, "_stdin_is_tty", return_value=True),
+        patch.object(cli, "_confirm", REAL_CONFIRM),
+    ):
+        code, _, apply_mock = _run(["add", ROOT], plan=_plan({"broad_path"}, root=HOSTILE))
+    assert code == 2
+    apply_mock.assert_not_called()
+    err = capsys.readouterr().err
+    assert "evil\\x1b]0;pwned\\x07\\x9b2J\\u202e\\nend is a broad path" in err
+    assert not any(char in err for char in RAW)
+    # The whole question and its [y/N] sit on one line (the typed answer ends it)
+    prompt = next(line for line in err.splitlines() if "[y/N]" in line)
+    assert prompt.startswith("evil\\x1b")
+    assert "Add it anyway? [y/N] " in prompt
+
+
+def test_usage_error_escapes_the_argument(capsys):
+    assert cli.main(["add", ROOT, "--bogus\x1b[2J"]) == 2
+    err = capsys.readouterr().err
+    assert "--bogus\\x1b[2J" in err
+    assert "\x1b" not in err
+
+
+def test_db_up_error_is_escaped(capsys):
+    error = local_db.LocalDbError("docker start stratakb-db failed: \x1b]0;pwned\x07")
+    with patch.object(local_db, "up", AsyncMock(side_effect=error)):
+        assert cli.main(["db", "up"]) == 3
+    err = capsys.readouterr().err
+    assert "failed: \\x1b]0;pwned\\x07" in err
+    assert "\x1b" not in err and "\x07" not in err
+
+
+def test_setup_notice_is_escaped(cli_env, capsys):
+    async def set_up(url, *, on_setup=None):
+        on_setup("db\x1b[2J:5433/strata")
+
+    cli_env["schema"].side_effect = set_up
+    code, _, _ = _run(["add", ROOT])
+    assert code == 0
+    err = capsys.readouterr().err
+    assert "empty database at db\\x1b[2J:5433/strata." in err
+    assert "\x1b" not in err
+
+
+def test_writers_escape(capsys):
+    cli._out("a\x1b[2Jb\nc")
+    cli._err("x", end="")
+    captured = capsys.readouterr()
+    assert captured.out == "a\\x1b[2Jb\nc\n"
+    assert captured.err == "x"
+
+
 # ── Model notice and offline flags ───────────────────────
 
 

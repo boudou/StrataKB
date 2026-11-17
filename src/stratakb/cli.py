@@ -10,7 +10,9 @@
 Each subcommand is a subparser and a handler; a new one adds both and
 nothing else. The command owns the terminal (prompts, progress, the report
 and the exit code); add_folder makes every decision. stdout carries only
-the report; prompts, progress and hints go to stderr. `add` and `receipt`
+the report; prompts, progress and hints go to stderr. Both writers escape
+unprintable characters (core.terminal_text.visible), so a folder name or an
+error message cannot send escape codes to the terminal. `add` and `receipt`
 never import the server.
 """
 
@@ -236,12 +238,12 @@ def _usage_error(error: _UsageError, argv: list[str]) -> int:
 
 
 def _out(text: str) -> None:
-    sys.stdout.write(text + "\n")
+    sys.stdout.write(visible(text) + "\n")
     sys.stdout.flush()
 
 
-def _err(text: str) -> None:
-    sys.stderr.write(text + "\n")
+def _err(text: str, end: str = "\n") -> None:
+    sys.stderr.write(visible(text) + end)
     sys.stderr.flush()
 
 
@@ -271,12 +273,12 @@ def _stdin_is_tty() -> bool:
 
 def _confirm(question: str) -> bool:
     """Ask on stderr and read one line from stdin; only y or yes confirms."""
-    sys.stderr.write(f"{question} [y/N] ")
-    sys.stderr.flush()
+    # One line by construction: a newline in a folder name must not fake another prompt
+    _err(f"{one_line(question)} [y/N] ", end="")
     answer = sys.stdin.readline()
     if not answer.endswith("\n"):
         # End of input: finish the prompt line
-        sys.stderr.write("\n")
+        _err("")
     return answer.strip().lower() in ("y", "yes")
 
 
@@ -298,6 +300,7 @@ class _Progress:
         self.shown = False
 
     def __call__(self, done: int, total: int) -> None:
+        # Raw on purpose: the \r is layout and the text is two integers
         sys.stderr.write(f"\rembedding {done}/{total}")
         sys.stderr.flush()
         self.shown = True
@@ -678,7 +681,7 @@ async def _open_receipt(url: str, receipt_id: str, user_id: str, role: str) -> d
 
 def _receipt_failed(message: str, args: argparse.Namespace, exit_code: int) -> int:
     """One line on stderr; with --json, the tool's error form on stdout too."""
-    _err(visible(message))
+    _err(message)
     if args.json:
         _out(terminal_safe_json({"status": "error", "error": message}))
     return exit_code
