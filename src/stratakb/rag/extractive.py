@@ -24,9 +24,6 @@ from stratakb.rag.passages import (
     take_within_budget,
 )
 
-# Characters read past a document's last cited span, to finish its last sentence
-SENTENCE_REACH = 1000
-
 # The most sentences chosen by score; an exact clause's sentences come on top
 MAX_SENTENCES = 5
 
@@ -35,6 +32,15 @@ MAX_SENTENCES = 5
 # list, a log, YAML) can make one "sentence" of a whole block; it is not cut,
 # because half a sentence can say the opposite, so it is not quoted at all
 MAX_SENTENCE_CHARS = 2000
+
+# Characters read past a document's last cited span, to finish its last sentence.
+# At least MAX_SENTENCE_CHARS, so any quotable sentence a chunk touches ends
+# inside the read; twice that, because the last span of a cut read is dropped as
+# possibly incomplete, and the extra reach almost always puts a later sentence there
+SENTENCE_REACH = 2 * MAX_SENTENCE_CHARS
+
+# The most locations too_long_note names before it counts the rest
+MAX_NOTED_SENTENCES = 3
 
 # The note when a mode asked for could not loosen a layer's
 GROUNDED_REFUSED_NOTE = (
@@ -70,6 +76,15 @@ _ABBREVIATIONS = frozenset(
         "para", "paras", "pp", "prof", "ref", "resp", "sec", "secs", "vol", "vs",
     }
 )
+# Words that a single letter after them labels ("Annex A."), so its dot ends a
+# sentence; after any other word the letter is an initial ("J. Smith")
+_LETTER_LABELS = frozenset(
+    {
+        "annex", "appendix", "attachment", "exhibit", "schedule", "part", "section",
+        "chapter", "article", "clause", "table", "figure", "form", "option", "plan",
+        "type", "class", "step", "phase", "item", "group",
+    }
+)
 
 
 def _blocks(text: str) -> list[tuple[int, int]]:
@@ -101,8 +116,16 @@ def _is_sentence_end(text: str, sentence_start: int, match: re.Match[str]) -> bo
     look_from = max(sentence_start, match.start() - _TOKEN_REACH)
     token = _TOKEN_BEFORE_DOT.search(text, look_from, match.start()).group()
     last = token.rsplit(".", 1)[-1].lower()
-    if last in _ABBREVIATIONS or (len(last) == 1 and last.isalpha()):
+    if last in _ABBREVIATIONS:
         return False
+    if len(last) == 1 and last.isalpha():
+        # An initial, unless the token is the letter alone and a label precedes it
+        # ("See Annex A."). String methods on the bounded window, not a regex
+        before = text[look_from : match.start() - len(token)]
+        if token.lower() != last or not before[-1:].isspace():
+            return False
+        word = before.rstrip().rsplit(None, 1)[-1:] or [""]
+        return word[0].lstrip("([\"'").lower() in _LETTER_LABELS
     # "7. Payment": the number of a clause, with nothing before it
     is_number = token[:1].isdigit() and token.replace(".", "").isdigit()
     return not (is_number and not text[sentence_start : match.start() - len(token)].strip())
@@ -157,6 +180,16 @@ def _cut_by_read(
     return span == spans[-1] and len(text) >= read_end
 
 
+def _unquotable(
+    span: tuple[int, int], spans: Sequence[tuple[int, int]], text: str, read_end: int
+) -> bool:
+    """True for a sentence an answer never quotes: cut by the read, or too long.
+
+    The one rule candidate_sentences, clause_gap_note and too_long_note share.
+    """
+    return _cut_by_read(span, spans, text, read_end) or span[1] - span[0] > MAX_SENTENCE_CHARS
+
+
 def effective_mode(requested: str | None, layer_modes: Sequence[str]) -> tuple[str, str | None]:
     """The mode an answer runs in and a note when the request could not loosen it.
 
@@ -195,9 +228,9 @@ def candidate_sentences(
     documents hold each document's text up to read_ends. Sentences come from
     the document text, not from each chunk, so an overlap between chunks gives
     no duplicates and a chunk's cut gives no fragments. A chunk without a stored
-    document or offsets gives none. When the read reached read_ends it may have
-    cut the document's last sentence, wherever the cut landed, so that one is
-    left out. So is a span longer than MAX_SENTENCE_CHARS.
+    document or offsets gives none. An _unquotable sentence is left out: when
+    the read reached read_ends it may have cut the document's last sentence,
+    wherever the cut landed, and a span may pass MAX_SENTENCE_CHARS.
     """
     spans_by_document: dict[int, list[tuple[int, int]]] = {}
     seen: set[tuple[int, int, int]] = set()
@@ -213,9 +246,7 @@ def candidate_sentences(
             spans_by_document[document_id] = split_sentences(text)
         spans = spans_by_document[document_id]
         for start, end in _touched_spans(spans, chunk_start, chunk_end):
-            if _cut_by_read((start, end), spans, text, read_ends[document_id]):
-                continue
-            if end - start > MAX_SENTENCE_CHARS:
+            if _unquotable((start, end), spans, text, read_ends[document_id]):
                 continue
             if (document_id, start, end) in seen:
                 continue
@@ -315,8 +346,8 @@ def clause_gap_note(
     """A note naming each clause the question names that kept is missing part of, or None.
 
     Half a clause can say the opposite of the whole one, so an answer must say
-    when it leaves part of one out: a sentence candidate_sentences skips as too
-    long or cut by the read, or text past the token budget, whether the clause
+    when it leaves part of one out: an _unquotable sentence (too long or cut by
+    the read), or text past the token budget, whether the clause
     lookup cut it or fit_to_answer_budget did.
     """
     kept_spans = {(s.document_id, s.start, s.end) for s in kept}
@@ -331,9 +362,7 @@ def clause_gap_note(
         spans = split_sentences(text)
         too_long, over_budget = False, bool(chunk.get("cut"))
         for span in _touched_spans(spans, chunk["char_start"], chunk["char_end"]):
-            if _cut_by_read(span, spans, text, read_ends[document_id]) or (
-                span[1] - span[0] > MAX_SENTENCE_CHARS
-            ):
+            if _unquotable(span, spans, text, read_ends[document_id]):
                 too_long = True
             elif (document_id, *span) not in kept_spans:
                 over_budget = True
@@ -351,4 +380,78 @@ def clause_gap_note(
                 f"{name} is only partly quoted: {' and '.join(reasons)}. "
                 f"Read the whole clause in {document['relative_path']}."
             )
+    return " ".join(notes) or None
+
+
+def too_long_note(
+    chunks: Sequence[dict[str, Any]],
+    documents: dict[int, dict[str, Any]],
+    read_ends: dict[int, int],
+) -> str | None:
+    """Where each _unquotable sentence the chunks touch starts, or None.
+
+    candidate_sentences skips such a sentence, so it may answer the question
+    but is never quoted: the note names its file, line and page, at
+    most MAX_NOTED_SENTENCES of them, in chunk order.
+    """
+    locations: list[str] = []
+    seen: set[tuple[int, int]] = set()
+    spans_by_document: dict[int, list[tuple[int, int]]] = {}
+    for chunk in chunks:
+        document_id = chunk.get("document_id")
+        document = documents.get(document_id)
+        chunk_start, chunk_end = chunk.get("char_start"), chunk.get("char_end")
+        if document is None or chunk_start is None or chunk_end is None:
+            continue
+        text = document["text"]
+        if document_id not in spans_by_document:
+            spans_by_document[document_id] = split_sentences(text)
+        spans = spans_by_document[document_id]
+        for span in _touched_spans(spans, chunk_start, chunk_end):
+            if (
+                not _unquotable(span, spans, text, read_ends[document_id])
+                or (document_id, span[0]) in seen
+            ):
+                continue
+            seen.add((document_id, span[0]))
+            # A span starts on a non-blank character, so one line is cited
+            where = cite({**chunk, "char_start": span[0], "char_end": span[0] + 1}, document)
+            location = f"{where['file']} line {where['lines']}"
+            if where["page"] is not None:
+                location += f", page {where['page']}"
+            locations.append(location)
+    if not locations:
+        return None
+    named = "; ".join(locations[:MAX_NOTED_SENTENCES])
+    if len(locations) > MAX_NOTED_SENTENCES:
+        named += f", and {len(locations) - MAX_NOTED_SENTENCES} more"
+    if len(locations) == 1:
+        return f"A sentence too long to quote word for word may answer this: it starts at {named}."
+    return f"Sentences too long to quote word for word may answer this: they start at {named}."
+
+
+def heading_only_note(
+    chunks: Sequence[dict[str, Any]],
+    documents: dict[int, dict[str, Any]],
+) -> str | None:
+    """A note naming each clause the question names that holds only its heading, or None.
+
+    A bare heading answers nothing, so it is not quoted. A clause the lookup cut
+    is left to clause_gap_note.
+    """
+    notes = []
+    for chunk in chunks:
+        document = documents.get(chunk.get("document_id"))
+        if chunk.get("match") != "exact" or document is None or chunk.get("cut"):
+            continue
+        if chunk.get("char_start") is None or chunk.get("char_end") is None:
+            continue
+        spans = split_sentences(document["text"])
+        if _touched_spans(spans, chunk["char_start"], chunk["char_end"]):
+            continue
+        name = chunk.get("clause_path") or "The clause the question names"
+        notes.append(
+            f"{name} in {document['relative_path']} holds only its heading: "
+            "there is no text under it to quote."
+        )
     return " ".join(notes) or None

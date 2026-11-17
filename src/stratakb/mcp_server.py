@@ -198,8 +198,9 @@ _ANSWER_CONTRACT = (
     "at most twice. Answer from one ask only: use its passages, pass only its refs to "
     "strata_verify, and tell the reader the wording that was used.",
     'When status is still not_found, say "not in the documents" and give next_step, even if '
-    "passages came back. When it is partly_found, answer what the passages support and say what "
-    "they leave open. When it is error, report the error.",
+    "passages came back; when next_step says a sentence is too long to quote, say that and "
+    "where it starts instead. When it is partly_found, answer what the passages support and "
+    "say what they leave open. When it is error, report the error.",
 )
 
 _INSTRUCTIONS = (

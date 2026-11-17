@@ -38,7 +38,9 @@ from stratakb.rag.extractive import (
     clause_gap_note,
     effective_mode,
     fit_to_answer_budget,
+    heading_only_note,
     select_sentences,
+    too_long_note,
 )
 from stratakb.rag.names import Name, check_names, find_names, missing_names_note
 from stratakb.rag.passages import (
@@ -308,6 +310,9 @@ async def _extract_answer(
     is in the chunks or the chosen sentences, and no named clause was returned,
     the answer is not_found, before any receipt; when some are missing, a found
     answer becomes partly_found. The note names the missing ones.
+    With no sentence chosen, the note also says where each touched sentence too
+    long to quote starts (too_long, so next_step says to open it there), and
+    which named clause holds only its heading.
     """
     thresholds = reranker_profile(model_name).thresholds
     ends = _cited_ends(chunks, SENTENCE_REACH)
@@ -327,8 +332,12 @@ async def _extract_answer(
     if not sentences:
         legacy_note = LEGACY_ONLY_NOTE if chunks and not ends else None
         names_note = missing_names_note(check_names(names, _name_texts(chunks)), related=False)
-        note = _join_notes(refused_note, names_note, legacy_note, omitted_note)
-        return ExtractiveAnswer([], None, "not_found", note)
+        heading_note = await asyncio.to_thread(heading_only_note, chunks, documents)
+        long_note = await asyncio.to_thread(too_long_note, chunks, documents, ends)
+        note = _join_notes(
+            refused_note, names_note, legacy_note, heading_note, long_note, omitted_note
+        )
+        return ExtractiveAnswer([], None, "not_found", note, too_long=long_note is not None)
     # A sentence can reach past its chunk, so its own text counts too
     check = check_names(names, [*_name_texts(chunks), *(s.text for s in sentences)])
     names_note = missing_names_note(check, related=False)
@@ -651,10 +660,16 @@ def register_rag_tools(
                 if _settings.reranking_enabled and candidates:
                     from stratakb.rag.reranker import rerank_results
 
-                    chunks = await asyncio.to_thread(
-                        rerank_results, question, candidates, top_k,
-                        _settings.reranking_model,
-                    )
+                    try:
+                        chunks = await asyncio.to_thread(
+                            rerank_results, question, candidates, top_k,
+                            _settings.reranking_model,
+                        )
+                    except Exception as e:
+                        logger.warning("reranking_failed", error_type=type(e).__name__)
+                        raise RuntimeError(
+                            f"Reranking needs the reranker model; see Troubleshooting. {e}"
+                        ) from e
                     # The reranker's relevance probabilities (0-1)
                     basis = "rerank"
                     thresholds = rerank_thresholds
@@ -841,7 +856,8 @@ def register_rag_tools(
         each with its ref, citation and text_origin, plus a receipt_id (open it
         with strata_get_receipt). Give them as they are, do not rephrase them.
         not_found means no sentence was relevant enough or short enough to
-        quote: do not guess.
+        quote: do not guess. When a sentence too long to quote may answer, the
+        note says where it starts and next_step says so.
 
         Args:
             question: Natural language question.

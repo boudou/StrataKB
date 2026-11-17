@@ -56,6 +56,11 @@ _NOT_FOUND_STEP = (
     "Nothing in the knowledge base answers this. If no layer covers the topic, "
     "add a folder with `stratakb add`; for an exact identifier or term, try strata_search."
 )
+# An extractive not_found whose passages touch a sentence too long to quote
+TOO_LONG_STEP = (
+    "A sentence that may answer this is too long to quote word for word: open it where "
+    "the note says it starts, or ask again in the documents' own terms to find a shorter one."
+)
 _NEXT_STEPS: dict[AnswerMode, dict[str, str]] = {
     "grounded": {
         "not_found": _NOT_FOUND_STEP,
@@ -379,8 +384,13 @@ def sources_from(chunks: list[dict[str, Any]], basis: str) -> list[dict[str, Any
     return list(sources.values())
 
 
-def next_step(status: str, mode: AnswerMode) -> str | None:
-    """What to do when the answer was not, or only partly, found."""
+def next_step(status: str, mode: AnswerMode, *, too_long: bool = False) -> str | None:
+    """What to do when the answer was not, or only partly, found.
+
+    too_long marks a not_found whose passages touch a sentence too long to quote.
+    """
+    if status == "not_found" and too_long:
+        return TOO_LONG_STEP
     return _NEXT_STEPS[mode].get(status)
 
 
@@ -439,13 +449,15 @@ class ExtractiveAnswer:
 
     sentences come from extractive.answer_item, receipt_id is None when there
     are none, status is judged on them, and note says why the answer is not the
-    one asked for.
+    one asked for. too_long is True when no sentence was chosen and a passage
+    touches one too long to quote (the note says where it starts).
     """
 
     sentences: list[dict[str, Any]]
     receipt_id: str | None
     status: AnswerStatus
     note: str | None
+    too_long: bool = False
 
     def fields(self, *, with_scores: bool) -> dict[str, Any]:
         """The response fields only an extractive answer has."""
@@ -496,6 +508,10 @@ class AskResult:
     def to_dict(self, response_format: ResponseFormat = "concise") -> dict[str, Any]:
         return self.detailed() if response_format == "detailed" else self.concise()
 
+    def _next_step(self) -> str | None:
+        too_long = self.extraction is not None and self.extraction.too_long
+        return next_step(self.status, self.mode, too_long=too_long)
+
     def concise(self) -> dict[str, Any]:
         """The answer status, the mode, the passages and any note (grounded) or the
         answer and its receipt (extractive), the next step when there is one, and
@@ -507,7 +523,7 @@ class AskResult:
             response["passages"] = self.passages
             if self.note is not None:
                 response["note"] = self.note
-        if step := next_step(self.status, self.mode):
+        if step := self._next_step():
             response["next_step"] = step
         if self.interaction_id is not None:
             response["interaction_id"] = self.interaction_id
@@ -529,7 +545,7 @@ class AskResult:
         }
         if self.extraction is None and self.note is not None:
             response["note"] = self.note
-        if step := next_step(self.status, self.mode):
+        if step := self._next_step():
             response["next_step"] = step
         if self.sources is not None:
             response["sources"] = self.sources

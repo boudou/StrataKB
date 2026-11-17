@@ -26,6 +26,7 @@ def test_instructions_length_and_phrases(server):
         "receipt",
         "verbatim",
         "not in the documents",
+        "too long to quote",
         "not_found",
         "unchecked_sentences",
     ):
