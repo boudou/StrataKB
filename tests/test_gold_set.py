@@ -6,12 +6,14 @@ the scorer on a stub server. Only the tests named so use the test database.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import importlib.util
 import json
 import re
 import subprocess
 import sys
+from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 from uuid import uuid4
 
@@ -26,6 +28,9 @@ SCORER = EVALS / "score_gold.py"
 
 # sha256 and row count of every frozen file. A label corrected under the rule in
 # evals/README.md changes these and the README's table in the same commit.
+# A stub strata_ask call that never returns
+HANG = object()
+
 PINNED = {
     "batch1/gold.jsonl": (
         "b98bb221db2ba95cbeb5077cb7df6f1cda686c150e71da0a6107a358aa104ce4", 125,
@@ -291,18 +296,27 @@ def scorer_input(tmp_path):
     return folder
 
 
-def _score(folder, layer, out, *extra, failing=None, layer_status=None, asked=None):
+def _last_run(runs=None):
+    """The layer's latest ingestion run stubbed: `runs` (default: none recorded)."""
+    return patch("stratakb.knowledge.layers.last_ingestion_run", AsyncMock(return_value=runs))
+
+
+def _score(folder, layer, out, *extra, failing=None, layer_status=None, asked=None, runs=None):
     """Run the scorer on a stub server; returns the questions it asked and the layers.
 
-    `failing` maps a question to a reply to return, or an exception to raise.
+    `failing` maps a question to a reply to return, an exception to raise, or HANG
+    for a call that never returns.
     `layer_status` replaces the check of the layer, which otherwise passes.
     `asked` is a list to collect the questions in, for a run that stops.
+    `runs` is the layer's latest ingestion run (default: none recorded).
     """
 
     async def call_tool(name, arguments):
         assert name == "strata_ask"
         calls.append((arguments["question"], arguments["layers"]))
         failure = (failing or {}).get(arguments["question"])
+        if failure is HANG:
+            await asyncio.Event().wait()
         if isinstance(failure, Exception):
             raise failure
         if failure:
@@ -321,8 +335,9 @@ def _score(folder, layer, out, *extra, failing=None, layer_status=None, asked=No
         patch("stratakb.core.logging.configure_logging"),
         patch(
             "stratakb.knowledge.layers.get_layer_status",
-            layer_status or AsyncMock(return_value={"chunk_count": 3}),
+            layer_status or AsyncMock(return_value={"id": "layer-id", "chunk_count": 3}),
         ),
+        _last_run(runs),
     ):
         _load(SCORER).main(
             ["--gold", str(folder / "gold.jsonl"), "--layer", layer, "--out", str(out), *extra]
@@ -393,17 +408,23 @@ def test_scorer_refuses_a_missing_output_folder_before_any_question(scorer_input
         {"status": "error", "error": "the model is broken"},
         RuntimeError("the model is broken"),
         {"status": "something new", "error": "the model is broken"},
+        TimeoutError("the model is broken"),
     ],
-    ids=["error-reply", "raises", "unknown-status"],
+    ids=["error-reply", "raises", "unknown-status", "tool-raises-timeout"],
 )
 def test_a_failed_question_stops_the_run_and_writes_nothing(scorer_input, tmp_path, failure):
     out = tmp_path / "out.json"
     out.write_text('{"summary": "an earlier run"}', encoding="utf-8")
     asked = []
 
-    with pytest.raises(SystemExit) as e:
+    with (
+        patch("os._exit", side_effect=SystemExit) as exit_now,
+        pytest.raises(SystemExit) as e,
+    ):
         _score(scorer_input, "peps_small", out, failing={"other layer?": failure}, asked=asked)
 
+    # A failure the tool reports, even a TimeoutError of its own, is not the scorer's timeout
+    exit_now.assert_not_called()
     assert e.value.code
     assert "f1" in str(e.value.code)
     assert "the model is broken" in str(e.value.code)
@@ -481,8 +502,9 @@ def test_scorer_builds_its_server_with_learning_off(scorer_input, tmp_path, monk
         patch("stratakb.core.logging.configure_logging"),
         patch(
             "stratakb.knowledge.layers.get_layer_status",
-            AsyncMock(return_value={"chunk_count": 3}),
+            AsyncMock(return_value={"id": "layer-id", "chunk_count": 3}),
         ),
+        _last_run(),
     ):
         _load(SCORER).main([
             "--gold", str(scorer_input / "gold.jsonl"),
@@ -491,6 +513,130 @@ def test_scorer_builds_its_server_with_learning_off(scorer_input, tmp_path, monk
         ])
 
     assert [settings.learning_enabled for settings in built] == [False]
+
+
+def test_a_question_that_never_returns_stops_the_run(scorer_input, tmp_path, capsys):
+    out = tmp_path / "out.json"
+    out.write_text('{"summary": "an earlier run"}', encoding="utf-8")
+    asked = []
+
+    # The scorer leaves through os._exit, so a thread the question left cannot hold it
+    with (
+        patch("os._exit", side_effect=SystemExit) as exit_now,
+        pytest.raises(SystemExit),
+    ):
+        _score(
+            scorer_input, "peps_small", out, "--timeout", "0.05",
+            failing={"other layer?": HANG}, asked=asked,
+        )
+
+    exit_now.assert_called_once_with(1)
+    assert "question f1 timed out after 0.05 s" in capsys.readouterr().err
+    assert not out.exists()
+    assert [question for question, _ in asked] == ["small?", "other layer?"]
+
+
+@pytest.mark.parametrize("value", ["0", "-5", "nan"])
+def test_scorer_refuses_a_timeout_that_is_not_positive(scorer_input, tmp_path, value, capsys):
+    with (
+        patch("stratakb.mcp_server.build_server") as build_server,
+        pytest.raises(SystemExit) as e,
+    ):
+        _load(SCORER).main([
+            "--gold", str(scorer_input / "gold.jsonl"),
+            "--layer", "peps_small",
+            "--out", str(tmp_path / "out.json"),
+            "--timeout", value,
+        ])
+    assert e.value.code != 0
+    assert "--timeout" in capsys.readouterr().err
+    build_server.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("run", "reason"),
+    [
+        ({"status": "failed", "completed_at": "2026-11-01T10:00:00+00:00"}, "is failed"),
+        ({"status": "new", "completed_at": "2026-11-01T10:00:00+00:00"}, "is new"),
+    ],
+    ids=["failed", "unknown-status"],
+)
+def test_a_layer_whose_last_ingest_did_not_complete_stops_before_any_question(
+    scorer_input, tmp_path, run, reason
+):
+    out = tmp_path / "out.json"
+    out.write_text("an earlier run", encoding="utf-8")
+    asked = []
+
+    with pytest.raises(SystemExit) as e:
+        _score(scorer_input, "peps_small", out, asked=asked, runs=run)
+
+    assert "peps_small" in str(e.value.code)
+    assert reason in str(e.value.code)
+    assert asked == []
+    assert out.read_text(encoding="utf-8") == "an earlier run"
+
+
+def test_a_partly_ingested_layer_is_scored_with_a_warning(scorer_input, tmp_path, capsys):
+    run = {
+        "status": "partial", "docs_processed": 7, "docs_failed": 1,
+        "started_at": "2026-11-01T09:00:00+00:00", "completed_at": "2026-11-01T10:00:00+00:00",
+    }
+    out = tmp_path / "out.json"
+
+    _score(scorer_input, "peps_small", out, runs=run)
+
+    err = capsys.readouterr().err
+    assert "last run partial at 2026-11-01T10:00:00+00:00" in err
+    assert "1 documents failed" in err
+    assert json.loads(out.read_text(encoding="utf-8"))["run"]["layer"]["last_run"] == run
+
+
+def test_results_say_what_was_scored(scorer_input, tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("ANSWER_TOKEN_BUDGET", "1234")
+    status = {
+        "id": "layer-id", "chunk_count": 412, "doc_count": 8, "answer_mode": "grounded",
+        "chunk_config": {"chunk_size": 1500, "chunk_overlap": 100},
+        "last_ingested": datetime(2026, 11, 1, 10, tzinfo=UTC),
+    }
+    out = tmp_path / "out.json"
+    _score(
+        scorer_input, "peps_small", out, "--timeout", "30",
+        layer_status=AsyncMock(return_value=status),
+    )
+
+    run =json.loads(out.read_text(encoding="utf-8"))["run"]
+    head = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=REPO_DIR, capture_output=True, text=True, check=True
+    ).stdout.strip()
+    assert run["commit"].removesuffix("-dirty") == head
+    assert run["started"] <= run["finished"]
+    assert run["timeout_s"] == 30
+    assert run["layer"] == {
+        "name": "peps_small", "chunk_size": 1500, "chunk_overlap": 100,
+        "doc_count": 8, "chunk_count": 412, "last_ingested": "2026-11-01T10:00:00+00:00",
+        "last_run": None, "answer_mode": "grounded",
+    }
+    answer = run["answer"]
+    assert answer["answer_token_budget"] == 1234
+    assert answer["learning_enabled"] is False
+    assert (answer["top_k"], answer["response_format"]) == (10, "detailed")
+    assert set(answer["thresholds"]) >= {"high_score", "medium_score"}
+    assert "last ingested 2026-11-01T10:00:00+00:00, last run not recorded" in (
+        capsys.readouterr().err
+    )
+
+
+def test_a_layer_without_chunk_settings_records_the_defaults(scorer_input, tmp_path):
+    from stratakb.knowledge.layers import DEFAULT_CHUNK_OVERLAP, DEFAULT_CHUNK_SIZE
+
+    out = tmp_path / "out.json"
+    _score(scorer_input, "peps_small", out)
+
+    layer = json.loads(out.read_text(encoding="utf-8"))["run"]["layer"]
+    assert (layer["chunk_size"], layer["chunk_overlap"]) == (
+        DEFAULT_CHUNK_SIZE, DEFAULT_CHUNK_OVERLAP
+    )
 
 
 @pytest.fixture
@@ -593,3 +739,57 @@ async def test_database_layer_without_chunks_stops_the_run(db_url, cleanup):
         await scorer.check_layer(db_url, name)
     with pytest.raises(scorer.RunStoppedError, match="does not exist"):
         await scorer.check_layer(db_url, f"{name}_gone")
+
+
+async def _add_run(db_url, layer, status, *, minutes_ago):
+    """Record an ingestion run of the layer that ended `minutes_ago` minutes ago."""
+    from stratakb.core.database import get_pool
+
+    pool = await get_pool(db_url)
+    await pool.execute(
+        """
+        INSERT INTO strata_core.ingestion_runs (layer_id, source_path, status, started_at,
+                                                completed_at)
+        SELECT id, '/corpus', $2, NOW() - make_interval(mins => $3 + 1),
+               NOW() - make_interval(mins => $3)
+        FROM strata_core.knowledge_layers WHERE name = $1
+        """,
+        layer, status, minutes_ago,
+    )
+
+
+async def test_database_layer_whose_last_ingest_failed_stops_the_run(db_url, filled_layer):
+    """A failed run after a completed one refuses the layer; a completed one after it, not."""
+    scorer = _load(SCORER)
+    await _add_run(db_url, filled_layer, "completed", minutes_ago=60)
+    await _add_run(db_url, filled_layer, "failed", minutes_ago=30)
+
+    with pytest.raises(scorer.RunStoppedError, match="last ingestion run .* is failed"):
+        await scorer.check_layer(db_url, filled_layer)
+
+    await _add_run(db_url, filled_layer, "completed", minutes_ago=10)
+    checked = await scorer.check_layer(db_url, filled_layer)
+    assert checked["last_run"]["status"] == "completed"
+    assert checked["last_run"]["completed_at"]
+
+
+async def test_database_results_record_the_layer_settings(
+    db_url, filled_layer, scorer_input, tmp_path, no_sdk_env
+):
+    text = (scorer_input / "gold.jsonl").read_text(encoding="utf-8")
+    gold = [json.loads(line) for line in text.splitlines()]
+    out = tmp_path / "out.json"
+    await _add_run(db_url, filled_layer, "completed", minutes_ago=5)
+
+    with (
+        patch("stratakb.rag.retriever.search_chunks", AsyncMock(return_value=[])),
+        patch(
+            "stratakb.rag.query_rewriter.rewrite_query",
+            AsyncMock(side_effect=lambda question, **_: [question]),
+        ),
+    ):
+        await _load(SCORER).score(gold, filled_layer, {"f1"}, out)
+
+    layer = json.loads(out.read_text(encoding="utf-8"))["run"]["layer"]
+    assert (layer["chunk_size"], layer["chunk_count"]) == (1000, 1)
+    assert layer["last_run"]["status"] == "completed"

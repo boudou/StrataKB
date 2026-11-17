@@ -132,6 +132,23 @@ class TestRerankerProfile:
         assert len(warnings) == 1
         assert warnings[0]["model"] == "someone/other-reranker"
 
+    @pytest.mark.parametrize(
+        ("overrides", "expected"),
+        [
+            ({"reranking_model": _GTE}, ((0.9, 0.86), 3)),
+            ({"reranking_model": _GTE, "reranking_candidate_multiplier": 2}, ((0.9, 0.86), 2)),
+            ({"reranking_model": _DEFAULT}, ((0.8, 0.5), 1)),
+            (
+                {"reranking_enabled": False, "reranking_candidate_multiplier": 3},
+                ((0.6, 0.45), None),
+            ),
+        ],
+        ids=["gte", "override", "default", "off"],
+    )
+    def test_ranking_settings(self, reranker, overrides, expected):
+        thresholds, multiplier = reranker.ranking_settings(_settings(**overrides))
+        assert ((thresholds.high_score, thresholds.medium_score), multiplier) == expected
+
 
 class TestAskPool:
     @pytest.mark.asyncio

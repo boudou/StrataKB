@@ -428,6 +428,27 @@ async def get_layer_status(database_url: str, *, name: str) -> dict:
     return _layer_dict(row)
 
 
+async def last_ingestion_run(database_url: str, layer_id: str) -> dict | None:
+    """The layer's latest ingestion run, or None when none was recorded.
+
+    A run is recorded when it ends (ingestion._record_run), so a run still in
+    progress has no row yet and every row has its completed_at.
+    """
+    await ensure_schema(database_url)
+    pool = await get_pool(database_url)
+    row = await pool.fetchrow(
+        """
+        SELECT status, docs_processed, docs_failed, started_at, completed_at
+        FROM strata_core.ingestion_runs
+        WHERE layer_id = $1
+        ORDER BY completed_at DESC
+        LIMIT 1
+        """,
+        layer_id,
+    )
+    return dict(row) if row is not None else None
+
+
 async def find_layer_by_root(database_url: str, root_path: str) -> dict | None:
     """Return the layer that holds root_path, or None."""
     await ensure_schema(database_url)

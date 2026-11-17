@@ -7,11 +7,19 @@ from __future__ import annotations
 
 import threading
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import structlog
 
 from stratakb.knowledge.embeddings import ModelKind, _hub_repo, load_cached_first
-from stratakb.rag.confidence import RERANK_THRESHOLDS, ConfidenceThresholds
+from stratakb.rag.confidence import (
+    RERANK_THRESHOLDS,
+    SIMILARITY_THRESHOLDS,
+    ConfidenceThresholds,
+)
+
+if TYPE_CHECKING:
+    from stratakb.config import Settings
 
 logger = structlog.get_logger()
 
@@ -70,6 +78,22 @@ def reranker_profile(model_name: str) -> RerankerProfile:
         _uncalibrated_warned.add(model_name)
         logger.warning("uncalibrated_reranker", model=model_name)
     return _DEFAULT_PROFILE
+
+
+def ranking_settings(settings: Settings) -> tuple[ConfidenceThresholds, int | None]:
+    """The thresholds strata_ask judges by and its rerank pool multiplier.
+
+    With reranking on: the model's profile thresholds and its pool multiplier,
+    unless RERANKING_CANDIDATE_MULTIPLIER overrides it. With reranking off: the
+    similarity thresholds and no multiplier.
+    """
+    if not settings.reranking_enabled:
+        return SIMILARITY_THRESHOLDS, None
+    profile = reranker_profile(settings.reranking_model)
+    return (
+        profile.thresholds,
+        settings.reranking_candidate_multiplier or profile.pool_multiplier,
+    )
 
 
 _reranker = None

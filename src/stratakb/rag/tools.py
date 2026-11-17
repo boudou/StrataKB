@@ -57,7 +57,7 @@ from stratakb.rag.passages import (
     sources_from,
 )
 from stratakb.rag.receipts import issue_receipt
-from stratakb.rag.reranker import reranker_profile
+from stratakb.rag.reranker import ranking_settings, reranker_profile
 
 if TYPE_CHECKING:
     from stratakb.config import Settings
@@ -630,14 +630,9 @@ def register_rag_tools(
 
             # The reranker's candidate pool: the model's own multiple of top_k
             # unless the setting overrides it, never more than a search returns
+            rerank_thresholds, multiplier = ranking_settings(_settings)
             pool = top_k
-            rerank_thresholds = None
-            if _settings.reranking_enabled:
-                profile = reranker_profile(_settings.reranking_model)
-                rerank_thresholds = profile.thresholds
-                multiplier = (
-                    _settings.reranking_candidate_multiplier or profile.pool_multiplier
-                )
+            if multiplier is not None:
                 pool = min(top_k * multiplier, _MAX_RERANK_POOL)
 
             async def _collect(

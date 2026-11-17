@@ -7,23 +7,38 @@ On peps_full: every question but the refusals is answerable; refusals must be re
 Of the files, only the --out file is written, and only by a run that finished. Learning is off
 whatever the settings say, so a question writes only its audit row: see evals/README.md.
 
-Stops with a non-zero exit before any question on a layer that is missing or empty, and at the
-first question that fails.
+Stops with a non-zero exit before any question on a layer that is missing, empty or whose last
+ingestion run failed, and at the first question that fails or takes longer than --timeout.
+The results file starts with a "run" block: the commit, the time, the layer's chunk settings
+and counts, and the answer settings, so two results files say whether they can be compared.
 """
 import argparse
 import asyncio
+import dataclasses
 import json
+import os
 import re
 import statistics
+import subprocess
 import sys
 import time
+from datetime import UTC, datetime
 from pathlib import Path
 
 FROZEN = Path(__file__).resolve().parent / "gold"
+REPO = Path(__file__).resolve().parent.parent
+# strata_ask's own default, passed so the results file can say what was asked
+TOP_K = 10
+RESPONSE_FORMAT = "detailed"
+DEFAULT_TIMEOUT = 120.0
 
 
 class RunStoppedError(Exception):
     """The run cannot produce a score worth reading; the message says why."""
+
+
+class QuestionTimeoutError(RunStoppedError):
+    """A question took longer than the timeout."""
 
 
 def parse_args(argv):
@@ -38,7 +53,15 @@ def parse_args(argv):
         type=Path,
         help="the checker's cross-layer refusal ids (default: cross_refusals.json beside --gold)",
     )
+    parser.add_argument(
+        "--timeout",
+        type=float,
+        default=DEFAULT_TIMEOUT,
+        help=f"seconds one question may take before the run stops (default: {DEFAULT_TIMEOUT:g})",
+    )
     args = parser.parse_args(argv)
+    if not args.timeout > 0:
+        parser.error("--timeout: must be more than 0 seconds")
     if args.cross_refusals is None:
         args.cross_refusals = args.gold.with_name("cross_refusals.json")
     for name, path in (("--gold", args.gold), ("--cross-refusals", args.cross_refusals)):
@@ -128,8 +151,17 @@ def summary(rows):
     return out_
 
 
+def when(value):
+    return value.isoformat() if isinstance(value, datetime) else value
+
+
 async def check_layer(database_url, layer):
-    from stratakb.knowledge.layers import LayerNotFoundError, get_layer_status
+    """The layer's status and its latest ingestion run; stops on one not fit to score."""
+    from stratakb.knowledge.layers import (
+        LayerNotFoundError,
+        get_layer_status,
+        last_ingestion_run,
+    )
 
     try:
         status = await get_layer_status(database_url, name=layer)
@@ -139,13 +171,100 @@ async def check_layer(database_url, layer):
         raise RunStoppedError(f"cannot read layer {layer}: {type(e).__name__}: {e}") from e
     if not status["chunk_count"]:
         raise RunStoppedError(f"layer {layer} holds no chunks, build it first")
-
-
-async def ask(server, row, layer):
     try:
-        r = payload(await server.call_tool("strata_ask", {
-            "question": row["question"], "layers": [layer], "response_format": "detailed",
-        }))
+        run = await last_ingestion_run(database_url, status["id"])
+    except Exception as e:
+        raise RunStoppedError(
+            f"cannot read the ingestion runs of layer {layer}: {type(e).__name__}: {e}"
+        ) from e
+    if run is not None:
+        run = {k: when(v) for k, v in run.items()}
+        if run["status"] not in ("completed", "partial"):
+            raise RunStoppedError(
+                f"layer {layer}: its last ingestion run ({run['completed_at']}) is"
+                f" {run['status']}, build it again"
+            )
+    print(
+        f"Layer {layer}: {status.get('doc_count')} documents, {status['chunk_count']} chunks,"
+        f" last ingested {when(status.get('last_ingested'))}, last run "
+        + (f"{run['status']} at {run['completed_at']}" if run else "not recorded"),
+        file=sys.stderr,
+    )
+    if run is not None and run["status"] == "partial":
+        print(
+            f"Warning: {run['docs_failed']} documents failed in that run; the layer lacks them",
+            file=sys.stderr,
+        )
+    return {"status": status, "last_run": run}
+
+
+def commit():
+    """HEAD of the repository, with "-dirty" when the tree has changes; None without git."""
+    try:
+        head = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=REPO, capture_output=True, text=True, check=True
+        ).stdout.strip()
+        changes = subprocess.run(
+            ["git", "status", "--porcelain", "--untracked-files=no"],
+            cwd=REPO, capture_output=True, text=True, check=True,
+        ).stdout.strip()
+    except (OSError, subprocess.CalledProcessError):
+        return None
+    return f"{head}-dirty" if changes else head
+
+
+def run_block(settings, layer, checked, timeout, started):
+    """What was scored and how: enough to tell whether two results files compare."""
+    from stratakb.knowledge.layers import DEFAULT_CHUNK_OVERLAP, DEFAULT_CHUNK_SIZE
+    from stratakb.rag.query_rewriter import rewrite_configured
+    from stratakb.rag.reranker import ranking_settings
+
+    status = checked["status"]
+    chunk_config = status.get("chunk_config") or {}
+    thresholds, multiplier = ranking_settings(settings)
+    return {
+        "commit": commit(),
+        "started": started,
+        "finished": datetime.now(UTC).isoformat(),
+        "layer": {
+            "name": layer,
+            "chunk_size": chunk_config.get("chunk_size", DEFAULT_CHUNK_SIZE),
+            "chunk_overlap": chunk_config.get("chunk_overlap", DEFAULT_CHUNK_OVERLAP),
+            "doc_count": status.get("doc_count"),
+            "chunk_count": status.get("chunk_count"),
+            "last_ingested": when(status.get("last_ingested")),
+            "last_run": checked["last_run"],
+            "answer_mode": status.get("answer_mode"),
+        },
+        "answer": {
+            "top_k": TOP_K,
+            "response_format": RESPONSE_FORMAT,
+            "answer_token_budget": settings.answer_token_budget,
+            "embedding_model": settings.embedding_model,
+            "hybrid_search_enabled": settings.hybrid_search_enabled,
+            "reranking_enabled": settings.reranking_enabled,
+            "reranking_model": settings.reranking_model if settings.reranking_enabled else None,
+            "reranking_candidate_multiplier": multiplier,
+            "thresholds": dataclasses.asdict(thresholds),
+            "query_rewrite": rewrite_configured(settings),
+            "learning_enabled": settings.learning_enabled,
+        },
+        "timeout_s": timeout,
+    }
+
+
+async def ask(server, row, layer, timeout=DEFAULT_TIMEOUT):
+    call = asyncio.ensure_future(server.call_tool("strata_ask", {
+        "question": row["question"], "layers": [layer], "top_k": TOP_K,
+        "response_format": RESPONSE_FORMAT,
+    }))
+    # asyncio.wait, not wait_for: a TimeoutError the tool raises itself is a failure, not this
+    done, _ = await asyncio.wait({call}, timeout=timeout)
+    if not done:
+        call.cancel()
+        raise QuestionTimeoutError(f"question {row['id']} timed out after {timeout:g} s")
+    try:
+        r = payload(call.result())
     except Exception as e:
         raise RunStoppedError(f"question {row['id']} failed: {type(e).__name__}: {e}") from e
     if r.get("status") != "ok":
@@ -153,16 +272,17 @@ async def ask(server, row, layer):
     return r
 
 
-async def score(gold, layer, cross, out):
+async def score(gold, layer, cross, out, timeout=DEFAULT_TIMEOUT):
     from stratakb.config import get_settings
     from stratakb.core.database import close_pool
     from stratakb.mcp_server import build_server
 
     # Set here, so neither the environment nor a config file can turn it back on
     settings = get_settings().model_copy(update={"learning_enabled": False})
+    started = datetime.now(UTC).isoformat()
     rows = []
     try:
-        await check_layer(settings.database_url, layer)
+        checked = await check_layer(settings.database_url, layer)
         # From here on, a file at --out can only be this run's, written when it finishes
         out.unlink(missing_ok=True)
         server = build_server(settings)
@@ -171,7 +291,7 @@ async def score(gold, layer, cross, out):
             if want is None:
                 continue
             t = time.perf_counter()
-            r = await ask(server, row, layer)
+            r = await ask(server, row, layer, timeout)
             seconds = time.perf_counter() - t
             ps = r.get("passages") or []
             rows.append({
@@ -191,9 +311,26 @@ async def score(gold, layer, cross, out):
     finally:
         await close_pool()
     s = summary(rows)
-    result = {"layer": layer, "summary": s, "rows": rows}
+    run = run_block(settings, layer, checked, timeout, started)
+    result = {"layer": layer, "run": run, "summary": s, "rows": rows}
     out.write_text(json.dumps(result, ensure_ascii=False, indent=1), encoding="utf-8")
     print(json.dumps(s, indent=1))
+
+
+def run_loop(coro):
+    """asyncio.run without waiting on worker threads at the end.
+
+    A question that timed out may leave a thread behind that never ends (a stalled
+    model download, say); asyncio.run would wait for it before returning.
+    """
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        return loop.run_until_complete(coro)
+    finally:
+        loop.run_until_complete(loop.shutdown_asyncgens())
+        asyncio.set_event_loop(None)
+        loop.close()
 
 
 def main(argv=None):
@@ -205,7 +342,13 @@ def main(argv=None):
 
     configure_logging("ERROR")
     try:
-        asyncio.run(score(gold, args.layer, cross, args.out))
+        run_loop(score(gold, args.layer, cross, args.out, args.timeout))
+    except QuestionTimeoutError as e:
+        # The interpreter would wait on the way out for a thread the timed-out question
+        # left running, so leave without waiting
+        sys.stderr.write(f"Stopped, no results written: {e}\n")
+        sys.stderr.flush()
+        os._exit(1)
     except RunStoppedError as e:
         sys.exit(f"Stopped, no results written: {e}")
 

@@ -61,10 +61,19 @@ uv run python evals/score_gold.py --gold evals/gold/batch1/gold.jsonl \
   --layer peps_small --out ../peps-eval/batch1_small.json
 ```
 
-The scorer stops with a non-zero exit in two cases, so a broken run cannot pass for a normal one:
+Before the first question it prints the layer's document and chunk counts, when it was last ingested and how its last ingestion run ended, so a layer left from an older corpus shows up. It stops with a non-zero exit in these cases, so a broken run cannot pass for a normal one:
 
-- **The layer is missing or empty.** It stops before any question, because such a layer would score every refusal as correct. A file already at `--out` is left alone.
-- **A question fails.** It stops at that question and leaves no file at `--out`. A file from an earlier run is deleted when the questions start, so what is there after a run is that run's.
+- **The layer is missing or empty, or its last ingestion run failed.** It stops before any question, because such a layer would score every refusal as correct, or score a half-built layer as if it were whole. A file already at `--out` is left alone. A run is recorded only when it ends, so the scorer cannot see one still in progress: let the ingest finish first. A run that ended `partial` (some files failed) is scored, with a warning naming how many documents failed.
+- **A question fails, or takes longer than `--timeout` seconds** (default 120). It stops at that question and leaves no file at `--out`. A file from an earlier run is deleted when the questions start, so what is there after a run is that run's.
+
+The results file opens with a `run` block, so two files say whether they can be compared:
+
+| Key | What it holds |
+| --- | --- |
+| `commit`, `started`, `finished` | The repository's `HEAD`, with `-dirty` when tracked files have changes, and the UTC start and end of the run |
+| `layer` | The layer's `chunk_size` and `chunk_overlap`, document and chunk counts, last ingest time, last ingestion run and `answer_mode` |
+| `answer` | What `strata_ask` was asked and with which settings: `top_k`, `response_format`, `answer_token_budget`, embedding and reranking models, the reranker's candidate multiplier, the confidence `thresholds`, whether hybrid search, query rewriting and learning were on |
+| `timeout_s` | The per-question timeout |
 
 Both scripts print their usage with `--help`, or when an argument is missing, and stop before doing anything else.
 
