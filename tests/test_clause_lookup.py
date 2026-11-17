@@ -30,7 +30,7 @@ from stratakb.rag.clause_lookup import (
     unanchored,
     without_exact_spans,
 )
-from stratakb.rag.passages import estimate_tokens, pack_passages, passage_cost
+from stratakb.rag.passages import estimate_tokens, passage_cost, take_within_budget
 from stratakb.rag.retriever import SearchResult
 from tests.helpers import ingest
 
@@ -160,6 +160,11 @@ def _exact(text: str, start: int = 100) -> dict:
     }
 
 
+def _fits(pieces: list[dict], budget: int) -> int:
+    """How many leading pieces fit the budget on the estimate fit_clauses trims by."""
+    return len(take_within_budget(pieces, passage_cost, budget))
+
+
 def test_fit_to_budget_keeps_offsets():
     text = " ".join(f"word{i}" for i in range(2000))
     chunk = _exact(text)
@@ -194,9 +199,9 @@ def test_fit_clauses_shares_what_a_floor_leaves():
 
     even = [fit_to_budget(c, budget // 3) for c in chunks]
     assert passage_cost(even[0]) > budget // 3
-    assert len(pack_passages(even, budget)) == 2
+    assert _fits(even, budget) == 2
 
-    assert len(pack_passages(fit_clauses(chunks, budget), budget)) == 3
+    assert _fits(fit_clauses(chunks, budget), budget) == 3
 
 
 def test_fit_clauses_drops_nothing():
@@ -226,9 +231,9 @@ def test_fit_clauses_keeps_what_an_even_split_keeps():
     budget = 500
 
     even = [fit_to_budget(c, budget // 3) for c in chunks]
-    assert len(pack_passages(even, budget)) == 3
+    assert _fits(even, budget) == 3
 
-    assert len(pack_passages(fit_clauses(chunks, budget), budget)) == 3
+    assert _fits(fit_clauses(chunks, budget), budget) == 3
 
 
 def test_short_clause_over_its_share_is_not_marked_cut():

@@ -21,6 +21,7 @@ from stratakb.rag.passages import (
     listed_cost,
     passage_id,
     passage_ref,
+    take_within_budget,
 )
 
 # Characters read past a document's last cited span, to finish its last sentence
@@ -297,15 +298,11 @@ def fit_to_answer_budget(
     before the sentence that would pass the budget, and the best is always kept
     (MAX_SENTENCE_CHARS bounds it).
     """
-    kept: set[Sentence] = set()
-    used = 0
-    for sentence in sorted(sentences, key=lambda s: s.score, reverse=True):
-        item = answer_item(sentence, chunks, documents)
-        cost = listed_cost(item)
-        if kept and used + cost > budget:
-            break
-        kept.add(sentence)
-        used += cost
+    kept = set(take_within_budget(
+        sorted(sentences, key=lambda s: s.score, reverse=True),
+        lambda s: listed_cost(answer_item(s, chunks, documents)),
+        budget,
+    ))
     return [s for s in sentences if s in kept]
 
 

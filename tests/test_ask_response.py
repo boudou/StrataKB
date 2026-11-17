@@ -29,13 +29,16 @@ from stratakb.rag.passages import (
     cut_clause_note,
     estimate_tokens,
     left_out_note,
+    listed_cost,
     pack_passages,
     parse_ref,
     passage_cost,
     passage_id,
     passage_number,
     passage_ref,
+    reading_window,
     sources_from,
+    take_within_budget,
 )
 from stratakb.rag.retriever import SearchResult
 
@@ -142,6 +145,32 @@ def _clause_result(layer, document_id, *, similarity=0.9):
     )
 
 
+def _stored_chunks(count: int) -> tuple[list[dict], dict]:
+    """count chunks of 100 characters, one per line of one stored document without a label."""
+    lines = [chr(ord("a") + i % 26) * 100 for i in range(count)]
+    chunks = [
+        {"chunk_id": f"c{i}", "content": line, "layer": "docs", "doc_type": "markdown",
+         "metadata": {}, "source_file": "a.md", "document_id": 1,
+         "char_start": i * 101, "char_end": i * 101 + 100}
+        for i, line in enumerate(lines)
+    ]
+    document = {"relative_path": "docs/a.md", "page_map": None, "text": "\n".join(lines),
+                "doc_date": "2026-03-04", "doc_date_source": "front_matter"}
+    return chunks, document
+
+
+def _stored_results(chunks: list[dict]) -> list[SearchResult]:
+    return [
+        SearchResult(
+            chunk_id=chunk["chunk_id"], content=chunk["content"], score=1.0,
+            layer_name="docs", source_file="a.md", source_section=None,
+            doc_type="markdown", metadata={}, similarity=0.9, document_id=1,
+            char_start=chunk["char_start"], char_end=chunk["char_end"],
+        )
+        for chunk in chunks
+    ]
+
+
 async def _ask(server, results, **arguments) -> dict:
     with patch("stratakb.rag.retriever.search_chunks", AsyncMock(return_value=results)):
         return _payload(await server.call_tool("strata_ask", {"question": "q", **arguments}))
@@ -156,16 +185,36 @@ async def _delete_interaction(db_url: str, interaction_id: str) -> None:
     )
 
 
+def _listed(chunk: dict) -> int:
+    """What a chunk costs as a passage the response lists, cited by its file name."""
+    return listed_cost(build_passages([chunk], {})[0])
+
+
+def _kept(chunks: list[dict], budget: int) -> list[dict]:
+    return pack_passages(chunks, budget, {})[0]
+
+
 class TestPacking:
     def test_budget_packs_passages(self):
         chunks = [{"chunk_id": f"c{i}", "content": "x" * 1000} for i in range(10)]
 
         # 1,000 characters are about 250 tokens, plus the passage's JSON
-        cost = passage_cost(chunks[0])
-        assert cost > 250 + RESPONSE_SLACK_TOKENS
-        assert len(pack_passages(chunks, 500)) == 500 // cost == 1
-        assert len(pack_passages(chunks, 1500)) == 1500 // cost == 4
-        assert pack_passages(chunks, 1500) == chunks[:4]
+        cost = _listed(chunks[0])
+        assert cost > 250
+        assert len(_kept(chunks, 500)) == 500 // cost == 1
+        assert len(_kept(chunks, 1500)) == 1500 // cost == 4
+        assert _kept(chunks, 1500) == chunks[:4]
+
+    def test_pack_returns_the_passages_it_packed(self):
+        chunks = [{"chunk_id": f"c{i}", "content": "x" * 1000} for i in range(10)]
+
+        kept, passages = pack_passages(chunks, 1500, {})
+
+        assert passages == build_passages(kept, {})
+        assert pack_passages([], 1500, {}) == ([], [])
+
+    def test_slack_counts_citation_values_only(self):
+        assert RESPONSE_SLACK_TOKENS == 19
 
     def test_cost_counts_citation(self):
         bare = {"chunk_id": "a", "content": ""}
@@ -177,21 +226,20 @@ class TestPacking:
 
         assert passage_cost(bare) > RESPONSE_SLACK_TOKENS
         assert passage_cost(cited) > passage_cost(bare)
-        # The cost is the passage's own JSON plus the response slack
-        passage = json.dumps(build_passages([cited], {})[0], indent=2, ensure_ascii=False)
-        assert passage_cost(cited) == estimate_tokens(passage) + RESPONSE_SLACK_TOKENS
+        # The cost is the passage as the response lists it plus the citation slack
+        assert passage_cost(cited) == _listed(cited) + RESPONSE_SLACK_TOKENS
 
     def test_at_most_max_passages(self):
         chunks = [{"chunk_id": f"c{i}", "content": "x"} for i in range(60)]
 
-        assert pack_passages(chunks, 100_000) == chunks[:MAX_PASSAGES]
+        assert _kept(chunks, 100_000) == chunks[:MAX_PASSAGES]
         assert MAX_PASSAGES == 50
 
     def test_first_passage_always_kept(self):
         chunks = [{"chunk_id": "a", "content": "x" * 10_000}, {"chunk_id": "b", "content": "short"}]
 
-        assert pack_passages(chunks, 100) == chunks[:1]
-        assert pack_passages([], 100) == []
+        assert _kept(chunks, 100) == chunks[:1]
+        assert _kept([], 100) == []
 
     def test_packing_stops_at_the_first_passage_over_budget(self):
         chunks = [
@@ -200,7 +248,33 @@ class TestPacking:
             {"chunk_id": "c", "content": "c" * 4},
         ]
 
-        assert pack_passages(chunks, 200) == chunks[:1]
+        assert _kept(chunks, 200) == chunks[:1]
+
+    def test_take_within_budget(self):
+        items = iter([3, 4, 5, 1, 1])
+
+        assert take_within_budget(items, lambda n: n, 8) == [3, 4]
+        # It read the 5 that stopped it and nothing after
+        assert list(items) == [1, 1]
+        assert take_within_budget([10, 1], lambda n: n, 5) == [10]
+        assert take_within_budget([], lambda n: n, 5) == []
+
+    @pytest.mark.parametrize("budget", [1, 100, 1500, 100_000])
+    def test_reading_window_loses_nothing(self, budget):
+        chunks, document = _stored_chunks(60)
+        # Mixed lengths, a long label and a chunk without a document
+        for i, chunk in enumerate(chunks):
+            chunk["content"] = chunk["content"][: 5 + (i * 37) % 100]
+            chunk["char_end"] = chunk["char_start"] + len(chunk["content"])
+        chunks[3] = {**chunks[3], "document_id": None, "char_start": None, "char_end": None}
+        documents = {1: {**document, "replaced_by": "old/" + "x" * 200 + ".md"}}
+
+        window = reading_window(chunks, budget)
+
+        assert pack_passages(window, budget, documents) == pack_passages(chunks, budget, documents)
+        assert pack_passages(chunks, budget, documents)[1] == build_passages(
+            pack_passages(chunks, budget, documents)[0], documents
+        )
 
 
 class TestRefAndCitation:
@@ -618,7 +692,7 @@ class TestAskResponse:
 
     async def test_budget_trims_the_response(self, server, settings):
         # Each passage costs 250 tokens of text plus its id, ref and citation
-        cost = passage_cost({
+        cost = _listed({
             "chunk_id": "c0", "content": "x" * 1000, "source_file": "c0.md",
             "layer": "docs", "metadata": {"section_path": ["Master agreement", "7 Termination"]},
         })
@@ -630,6 +704,51 @@ class TestAskResponse:
         assert [c["chunk_id"] for c in response["retrieved_chunks"]] == ["c0", "c1"]
         assert response["total_chunks"] == 2
         assert [p["id"] for p in response["passages"]] == ["S1", "S2"]
+        await _delete_interaction(settings.database_url, response["interaction_id"])
+
+    async def test_grounded_answer_fits_its_real_cost(self, server, settings):
+        chunks, document = _stored_chunks(20)
+        # Exactly what the 20 passages cost as the response lists them
+        settings.answer_token_budget = sum(
+            listed_cost(p) for p in build_passages(chunks, {1: document})
+        )
+
+        with patch(
+            "stratakb.rag.tools._cited_documents", AsyncMock(return_value={1: document})
+        ):
+            response = await _ask(
+                server, _stored_results(chunks), layers=["docs"], top_k=20
+            )
+
+        assert [p["id"] for p in response["passages"]] == [f"S{i}" for i in range(1, 21)]
+        await _delete_interaction(settings.database_url, response["interaction_id"])
+
+    @pytest.mark.parametrize(("budget_share", "expected"), [(1.0, 20), (0.5, None)])
+    async def test_passages_are_built_once(self, server, settings, budget_share, expected):
+        from stratakb.knowledge.documents import locate
+
+        chunks, document = _stored_chunks(20)
+        full = sum(listed_cost(p) for p in build_passages(chunks, {1: document}))
+        settings.answer_token_budget = int(full * budget_share)
+        cited = AsyncMock(return_value={1: document})
+
+        with (
+            patch("stratakb.rag.tools._cited_documents", cited),
+            patch("stratakb.rag.passages.locate", side_effect=locate) as counted,
+        ):
+            response = await _ask(
+                server, _stored_results(chunks), layers=["docs"], top_k=20
+            )
+
+        kept = len(response["passages"])
+        if expected is not None:
+            assert kept == expected
+            assert counted.call_count == kept
+        else:
+            assert 1 < kept < 20
+            # The kept passages, and the one that stopped packing
+            assert counted.call_count == kept + 1
+        cited.assert_awaited_once()
         await _delete_interaction(settings.database_url, response["interaction_id"])
 
     async def test_not_found_has_next_step(self, server, settings):

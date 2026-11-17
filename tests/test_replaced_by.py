@@ -380,11 +380,11 @@ def test_grounded_budget_counts_the_label():
     chunks, labelled = _labelled_chunks(6)
     budget = 1000
 
-    kept = pack_passages(chunks, budget, documents={1: labelled})
-    passages = build_passages(kept, {1: labelled})
+    kept, passages = pack_passages(chunks, budget, {1: labelled})
 
-    # The estimate made before documents are read leaves the label out
-    assert pack_passages(chunks, budget) == chunks
+    # Without the label every chunk fits; the label is what leaves some out
+    assert pack_passages(chunks, budget, {1: {**labelled, "replaced_by": None}})[0] == chunks
+    assert passages == build_passages(kept, {1: labelled})
     assert all(p["citation"]["replaced_by"] == labelled["replaced_by"] for p in passages)
     assert _passages_tokens(passages) <= budget
     assert 1 < len(kept) < len(chunks)

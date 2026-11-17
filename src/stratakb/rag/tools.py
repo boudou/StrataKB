@@ -49,10 +49,10 @@ from stratakb.rag.passages import (
     ToolFailure,
     ask_chunk,
     basis_score,
-    build_passages,
     cut_clause_note,
     left_out_note,
     pack_passages,
+    reading_window,
     sources_from,
 )
 from stratakb.rag.receipts import issue_receipt
@@ -683,24 +683,19 @@ def register_rag_tools(
                 database_url, question, layers, _settings.answer_token_budget
             )
             exact = matches.chunks
-            # The best chunks that fit the answer budget; confidence is judged
-            # on the reranked chunks, the answer status on what is returned
-            chunks = pack_passages(
-                exact + without_exact_spans(collected.chunks, exact),
-                _settings.answer_token_budget,
-            )
+            budget = _settings.answer_token_budget
+            candidates = exact + without_exact_spans(collected.chunks, exact)
+            # Read for every chunk that could fit and every named clause past them
+            window = reading_window(candidates, budget)
+            documents = await _cited_documents(database_url, window + exact[len(window):])
+            # The best chunks whose passages, as the client gets them (replaced_by
+            # labels too), fit the answer budget; confidence is judged on the
+            # reranked chunks, the answer status on what is returned
+            chunks, passages = pack_passages(candidates, budget, documents)
             confidence = collected.confidence
             basis = confidence.basis
-            # Read for every chunk packed and every named clause past them
-            documents = await _cited_documents(database_url, chunks + exact[len(chunks):])
-            # The citations are known now, replaced_by labels too: the passages as
-            # the client gets them must fit, so the last that no longer fit are dropped
-            chunks = pack_passages(
-                chunks, _settings.answer_token_budget, documents=documents
-            )
             # Packing keeps a prefix, so the named clauses past it did not fit
             left_out = exact[len(chunks):]
-            passages = build_passages(chunks, documents)
             omitted = _join_notes(
                 left_out_note(left_out, documents), cap_note(matches, layer_named)
             )

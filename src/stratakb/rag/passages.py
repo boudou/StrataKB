@@ -7,9 +7,10 @@ of the stored document text it holds, and a citation a developer can open:
 the file's relative path, the page, the line range, the clause path and
 the document's date, the file that says it replaces this one when there is
 one, and a label when the file's layer marks it as archived.
-The budget counts each passage's id, ref and citation with its text, and an
-answer holds at most MAX_PASSAGES passages, all of which the learning loop
-stores, so feedback by passage id resolves for every one.
+The budget counts each passage's id, ref and citation with its text, as the
+response lists it, once the documents are read; an answer holds at most
+MAX_PASSAGES passages, all of which the learning loop stores, so feedback by
+passage id resolves for every one.
 
 The typed results of strata_ask and strata_search live here too: AskResult,
 SearchResponse and the ToolFailure either can return. All three say whether
@@ -21,6 +22,7 @@ from __future__ import annotations
 import json
 import math
 import re
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from typing import Any, ClassVar, Literal
 
@@ -37,15 +39,16 @@ AnswerMode = Literal["grounded", "extractive"]
 MAX_PASSAGES = 50
 # Characters per token in estimate_tokens' rough count
 CHARS_PER_TOKEN = 4
-# The estimate of what a passage costs in the response beyond its own indent-2
-# JSON, used before the documents are read (pack_passages without documents,
-# and clause_lookup through passage_cost): the deeper indentation inside the
-# response's passages list and the page, lines, page_end, the date and
-# date_source values and the archived key a stored document adds (measured on
-# FastMCP's indent-2 JSON with six-digit spans and three-digit pages: about
-# 133 characters). A replaced_by label is not in it: strata_ask packs again
-# with the real citations once the documents are read
-RESPONSE_SLACK_TOKENS = 34
+# The spaces each line of a list item is indented by in the response: the
+# list sits in the response's top-level object, two indent-2 levels deep
+LIST_ITEM_INDENT = 4
+# What a stored document adds to a passage's citation, used by passage_cost
+# before the documents are read (clause_lookup trims named clauses on it): the
+# page, lines, page_end, date, date_source and archived values (measured on
+# FastMCP's indent-2 JSON with six-digit spans, three-digit pages and an
+# archived label). listed_cost counts the indentation; a replaced_by label is
+# not in it, the real pack in strata_ask counts it once the documents are read
+RESPONSE_SLACK_TOKENS = 19
 
 _PASSAGE_ID = re.compile(r"[Ss]([1-9][0-9]*)")
 
@@ -130,48 +133,75 @@ def chars_for_tokens(tokens: int) -> int:
 def listed_cost(item: dict[str, Any]) -> int:
     """The tokens item costs as one element of a list in the response.
 
-    Its own indent-2 JSON, each line indented 4 spaces deeper (a list in the
-    response's top-level object), and the comma and newline before the next.
+    Its own indent-2 JSON, each line indented LIST_ITEM_INDENT spaces deeper,
+    and the comma and newline before the next.
     """
     text = json.dumps(item, indent=2, ensure_ascii=False)
-    return estimate_tokens(text + " " * (4 * (text.count("\n") + 1)) + ",\n")
+    return estimate_tokens(text + " " * (LIST_ITEM_INDENT * (text.count("\n") + 1)) + ",\n")
+
+
+def take_within_budget[T](
+    items: Iterable[T], cost_of: Callable[[T], int], budget: int
+) -> list[T]:
+    """The leading items whose costs fit the token budget together.
+
+    Taking stops before the item that would pass the budget; the first item is
+    always kept, however much it costs. items is read one at a time, so nothing
+    past the item that stopped taking is read.
+    """
+    kept: list[T] = []
+    used = 0
+    for item in items:
+        cost = cost_of(item)
+        if kept and used + cost > budget:
+            break
+        kept.append(item)
+        used += cost
+    return kept
 
 
 def passage_cost(chunk: dict[str, Any]) -> int:
-    """The tokens a chunk costs as a passage: its id, ref, text and citation as JSON."""
-    passage = json.dumps(build_passages([chunk], {})[0], indent=2, ensure_ascii=False)
-    return estimate_tokens(passage) + RESPONSE_SLACK_TOKENS
+    """The tokens a chunk costs as a passage before its document is read.
+
+    Its passage as the response lists it with the file name only, plus the
+    slack a stored document's citation adds. An upper bound of the real cost
+    unless the document carries a replaced_by label.
+    """
+    return listed_cost(build_passage(1, chunk, {})) + RESPONSE_SLACK_TOKENS
+
+
+def reading_window(chunks: list[dict[str, Any]], budget: int) -> list[dict[str, Any]]:
+    """The leading chunks that could still be in the packed answer: read their documents.
+
+    A passage costs at least its text (its JSON holds the text, and escaping
+    only lengthens it), so the leading chunks whose text alone fits the budget
+    hold every chunk pack_passages can keep, whatever the documents say.
+    """
+    return take_within_budget(
+        chunks[:MAX_PASSAGES], lambda chunk: estimate_tokens(chunk["content"]), budget
+    )
 
 
 def pack_passages(
     chunks: list[dict[str, Any]],
     budget: int,
-    *,
-    documents: dict[int, dict[str, Any]] | None = None,
-) -> list[dict[str, Any]]:
-    """The leading chunks, in order, whose passages fit the token budget.
+    documents: dict[int, dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """The leading chunks, in order, whose passages fit the token budget, and those passages.
 
-    Without documents each passage costs the estimate made before they are
-    read (passage_cost: its text, id, ref and citation, and the slack a stored
-    document adds). With documents, an empty dict too, each costs its passage
-    as the response lists it (listed_cost), with its real id and citation,
-    replaced_by label included. Packing stops before the chunk that would pass
-    the budget, and after MAX_PASSAGES passages; the first chunk is always
-    kept, however long.
+    Each passage costs what the response lists (listed_cost), with its real
+    id and citation, replaced_by label included; a chunk whose document is not
+    in documents is cited by its file name. Packing stops before the chunk
+    that would pass the budget, and after MAX_PASSAGES passages; the first
+    chunk is always kept, however long. Each passage is built once, and only
+    the one that stopped packing is built and not kept.
     """
-    candidates = chunks[:MAX_PASSAGES]
-    if documents is None:
-        costs = [passage_cost(chunk) for chunk in candidates]
-    else:
-        costs = [listed_cost(p) for p in build_passages(candidates, documents)]
-    kept: list[dict[str, Any]] = []
-    used = 0
-    for chunk, cost in zip(candidates, costs, strict=True):
-        if kept and used + cost > budget:
-            break
-        kept.append(chunk)
-        used += cost
-    return kept
+    pairs = (
+        (chunk, build_passage(n, chunk, documents))
+        for n, chunk in enumerate(chunks[:MAX_PASSAGES], start=1)
+    )
+    kept = take_within_budget(pairs, lambda pair: listed_cost(pair[1]), budget)
+    return [chunk for chunk, _ in kept], [passage for _, passage in kept]
 
 
 def passage_ref(chunk: dict[str, Any]) -> str:
@@ -264,19 +294,23 @@ def cite(chunk: dict[str, Any], document: dict[str, Any] | None) -> dict[str, An
     return citation
 
 
+def build_passage(
+    n: int, chunk: dict[str, Any], documents: dict[int, dict[str, Any]]
+) -> dict[str, Any]:
+    """The n-th passage: its id, ref, the chunk's text and its citation."""
+    return {
+        "id": passage_id(n),
+        "ref": passage_ref(chunk),
+        "text": chunk["content"],
+        "citation": cite(chunk, documents.get(chunk.get("document_id"))),
+    }
+
+
 def build_passages(
     chunks: list[dict[str, Any]], documents: dict[int, dict[str, Any]]
 ) -> list[dict[str, Any]]:
     """One passage per chunk, in order: id, ref, the chunk's text and its citation."""
-    return [
-        {
-            "id": passage_id(n),
-            "ref": passage_ref(chunk),
-            "text": chunk["content"],
-            "citation": cite(chunk, documents.get(chunk.get("document_id"))),
-        }
-        for n, chunk in enumerate(chunks, start=1)
-    ]
+    return [build_passage(n, chunk, documents) for n, chunk in enumerate(chunks, start=1)]
 
 
 def cut_clause_note(
