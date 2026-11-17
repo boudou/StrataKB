@@ -161,6 +161,16 @@ class TestGrounded:
         assert response["status"] == "partly_found"
         assert response["note"] == "Not in any passage: `AC99`."
 
+    async def test_one_setting_of_a_list_absent_is_partly_found(self, server):
+        response = await _ask(
+            server,
+            [_hit("docs", "PGHOST names the host.")],
+            "Are the PGHOST and PGPORT variables read?",
+        )
+
+        assert response["status"] == "partly_found"
+        assert response["note"] == "Not in any passage: `PGPORT`."
+
     async def test_name_differing_in_case_and_spacing_is_present(self, server):
         response = await _ask(
             server, [_hit("docs", "The task pool limits workers.")], "How does TaskPool work?"
@@ -192,6 +202,8 @@ class TestGrounded:
         [
             "Does HTTP send JSON?",
             "What does PEP 8 say about SEPA?",
+            "How do I export JSON?",
+            "What does the TLS setting do?",
         ],
     )
     async def test_acronyms_keep_the_status(self, server, question):

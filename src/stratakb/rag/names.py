@@ -12,13 +12,17 @@ capitals written as a setting or long enough not to be an acronym.
   except an emphasis word such as REQUIRED, OPTIONAL, MANDATORY or
   IMPORTANT (see _EMPHASIS).
 - A shorter word in capitals is an acronym (HTTP, JSON, SEPA) unless it is
-  written as a setting: after $, ${, %, export or unset ($PGHOST,
-  %APPDATA%), or before =, "variable", "var", "env var", "environment
-  variable" or "setting". A bare "set PGHOST" does not count.
+  written as a setting. With a sign, after $, ${ or % or before = ($PGHOST,
+  %APPDATA%, PGHOST=), it counts at any length. In words, after export or
+  unset, or before "variable", "var", "env var", "environment variable" or
+  "setting", plural too and also for each name of a list ("the PGHOST and
+  PGPORT variables"), it counts unless it is a common acronym (export JSON,
+  the TLS setting; see _ACRONYMS). A bare "set PGHOST" does not count.
 - In a question written in capitals (2 or more function words such as HOW,
   WHAT or THE in capitals, or 3 words or more and none with a lowercase
-  letter) no word counts for being 8 capitals or more. Acronyms do not make
-  a question written in capitals.
+  letter) only a setting written with a sign counts ($PYTHONHASHSEED): no
+  word counts for being 8 capitals or more or for a setting written in words
+  (EXPORT THE FILE). Acronyms do not make a question written in capitals.
 
 Clause references ("clause 2.2", "7.2.1") belong to the exact clause
 lookup, and IBAN-shaped values are account data: neither is ever a name.
@@ -60,15 +64,37 @@ _EMPHASIS = frozenset(
         "ABSOLUTELY", "DEFINITELY",
     }
 )
-# A short word in capitals written as a setting: after $, ${, %, export or
-# unset, or before =, "variable", "var", "env var" or "setting"
+# A word in capitals written as a setting with a sign: after $, ${ or %, or
+# before =; any length, and in every question
 _SETTING = (
-    re.compile(r"(?:\$\{?|%|(?<![\w])(?i:export|unset)\s+)([A-Z]{2,7})(?![\w])"),
+    re.compile(r"(?:\$\{?|%)([A-Z]{2,})(?![\w])"),
+    re.compile(r"(?<![\w$%])([A-Z]{2,})(?=\s*=)"),
+)
+# Between the names of a list: ",", ", and", ", or", " and" or " or"; each
+# alternative starts with a different character, so a long list is read once
+_LIST_SEPARATOR = r"(?:,\s*(?:(?i:and|or)\s+)?|\s+(?i:and|or)\s+)"
+# A word in capitals written as a setting in words: after export or unset, or
+# before "variable", "var", "env var", "environment variable" or "setting",
+# plural too, alone or in a list (the PGHOST and PGPORT variables)
+_SETTING_WORDS = (
+    re.compile(r"(?<![\w])(?i:export|unset)\s+([A-Z]{2,})(?![\w])"),
     re.compile(
-        r"(?<![\w$%])([A-Z]{2,7})(?=\s*="
-        r"|\s+(?i:(?:environment|env)\s+)?(?i:variable|var)\b"
-        r"|\s+(?i:setting)\b)"
+        r"(?<![\w$%])([A-Z]{2,})"
+        rf"(?=(?:{_LIST_SEPARATOR}[A-Z]{{2,}})*"
+        r"\s+(?:(?i:(?:environment|env)\s+)?(?i:variable|var)"
+        r"|(?i:setting))(?i:s)?\b)"
     ),
+)
+# Common acronyms, never a setting written in words (export JSON, the TLS setting)
+_ACRONYMS = frozenset(
+    {
+        "API", "ASCII", "CLI", "CPU", "CSS", "CSV", "DNS", "DOCX", "FTP",
+        "GIF", "GPU", "GUI", "HTML", "HTTP", "HTTPS", "ID", "IP", "JPEG",
+        "JPG", "JSON", "JWT", "MD", "PDF", "PNG", "RAM", "REST", "RPC", "SDK",
+        "SMTP", "SQL", "SSH", "SSL", "SVG", "TCP", "TLS", "TOML", "TXT",
+        "UDP", "UI", "URI", "URL", "UTF", "UUID", "XLSX", "XML", "YAML",
+        "YML", "ZIP",
+    }
 )
 # Words that, written in capitals, show a question is written in capitals;
 # none is also an acronym (so not WHO, IT or CAN)
@@ -178,7 +204,9 @@ def _shouted(text: str) -> bool:
 
 
 def find_names(question: str) -> list[Name]:
-    """The code-like names and numbered references in question, in question order.
+    """The code-like names, numbered references and settings in capitals in question, in order.
+
+    A word in capitals counts when written as a setting or 8 capitals long.
 
     Read over the same prefix as the layer patterns. Each kind of match is
     blanked before the next is looked for; account numbers and clause
@@ -214,7 +242,12 @@ def find_names(question: str) -> list[Name]:
     for pattern in _SETTING:
         for m in _take(work, pattern):
             found.append((m.start(1), _plain(m.group(1))))
-    if not _shouted(text):
+    shouted = _shouted(text)
+    for pattern in _SETTING_WORDS:
+        for m in _take(work, pattern):
+            if not shouted and m.group(1) not in _ACRONYMS:
+                found.append((m.start(1), _plain(m.group(1))))
+    if not shouted:
         for m in _take(work, _CAPITALS):
             if m.group(0) not in _EMPHASIS:
                 found.append((m.start(), _plain(m.group(0))))
