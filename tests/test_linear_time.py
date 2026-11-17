@@ -4,17 +4,22 @@ A line of a document can hold 100,000 blanks or brackets, and the re module
 holds the GIL, so one quadratic pattern stalls the whole server. This test
 collects the compiled patterns of the modules that read document text and
 times each on hostile lines, so a pattern added later is covered without a new
-test. The rules for writing such patterns are in the comment at the top of
+test. A literal pattern in these modules lives at module level, where the
+probes reach it; a test fails on one compiled inside a function or class. The
+rules for writing such patterns are in the comment at the top of
 stratakb/knowledge/structure.py.
 """
 
 from __future__ import annotations
 
+import ast
 import importlib
 import re
 import string
 import time
+import types
 from collections.abc import Callable, Iterator
+from pathlib import Path
 
 import pytest
 
@@ -27,6 +32,8 @@ MODULES = (
     "stratakb.knowledge.document_dates",
     "stratakb.knowledge.parsers.markdown_parser",
     "stratakb.knowledge.parsers.docx_parser",
+    # The text fallback for a page with no section text
+    "stratakb.knowledge.parsers.html_parser",
     "stratakb.knowledge.add_folder",
     "stratakb.rag.extractive",
     # strata_verify runs these on the stored passage text as well as the draft
@@ -83,29 +90,47 @@ def _collect() -> list[tuple[str, re.Pattern[str]]]:
 PATTERNS = _collect()
 
 
-def _literal_punctuation(pattern: re.Pattern[str]) -> set[str]:
-    """The punctuation the pattern looks for in the text, not its regex syntax.
+# The type of the parser's opcodes; plain ints in the tree (code points, repeat
+# counts) are not instances of it
+_OPCODE = type(re._constants.LITERAL)
 
-    Read from the parse tree (re._parser, Python 3.11+): single characters and
-    the ranges of character classes.
-    """
-    found: set[int] = set()
 
-    def walk(node: object) -> None:
+def _nodes(pattern: re.Pattern[str]) -> Iterator[tuple[object, object]]:
+    """Every (opcode, argument) node of the pattern's parse tree (re._parser, Python 3.11+)."""
+
+    def walk(node: object) -> Iterator[tuple[object, object]]:
         if isinstance(node, re._parser.SubPattern):
             node = node.data
         if not isinstance(node, list | tuple):
             return
-        if len(node) == 2 and node[0] in (re._constants.LITERAL, re._constants.NOT_LITERAL):
-            found.add(node[1])
-        elif len(node) == 2 and node[0] is re._constants.RANGE:
-            found.update(range(node[1][0], node[1][1] + 1))
-        else:
-            for item in node:
-                walk(item)
+        if len(node) == 2 and isinstance(node[0], _OPCODE):
+            yield node[0], node[1]
+        for item in node:
+            yield from walk(item)
 
-    walk(re._parser.parse(pattern.pattern, pattern.flags))
+    yield from walk(re._parser.parse(pattern.pattern, pattern.flags))
+
+
+def _literal_punctuation(pattern: re.Pattern[str]) -> set[str]:
+    """The punctuation the pattern looks for in the text, not its regex syntax.
+
+    Single characters and the ranges of character classes.
+    """
+    found: set[int] = set()
+    for op, argument in _nodes(pattern):
+        if op is re._constants.LITERAL or op is re._constants.NOT_LITERAL:
+            found.add(argument)
+        elif op is re._constants.RANGE:
+            found.update(range(argument[0], argument[1] + 1))
     return {char for char in string.punctuation if ord(char) in found}
+
+
+def _is_anchored(pattern: re.Pattern[str]) -> bool:
+    """True for a pattern anchored to a line or text start ('^', '\\A') or a MULTILINE one."""
+    starts = {re._constants.AT_BEGINNING, re._constants.AT_BEGINNING_STRING}
+    return bool(pattern.flags & re.MULTILINE) or any(
+        op is re._constants.AT and argument in starts for op, argument in _nodes(pattern)
+    )
 
 
 def _hostile_lines(pattern: re.Pattern[str]) -> Iterator[str]:
@@ -133,7 +158,7 @@ def _hostile_lines(pattern: re.Pattern[str]) -> Iterator[str]:
 
 def _probes(pattern: re.Pattern[str]) -> Iterator[str]:
     """Each hostile line as it is and, for a pattern anchored to a line, inside front matter."""
-    anchored = "^" in pattern.pattern or "\\A" in pattern.pattern or pattern.flags & re.MULTILINE
+    anchored = _is_anchored(pattern)
     for line in _hostile_lines(pattern):
         yield line
         if anchored:
@@ -165,5 +190,87 @@ def test_the_named_patterns_are_collected() -> None:
         "stratakb.rag.verify._QUANTITY",
         "stratakb.rag.verify._DATES[0]",
         "stratakb.rag.verify_tools._LEGACY_PREFIX",
+        "stratakb.knowledge.parsers.html_parser._TAG",
+        "stratakb.knowledge.parsers.html_parser._RAW_OPEN",
+        "stratakb.knowledge.parsers.html_parser._RAW_CLOSE",
     }
     assert named | set(CALLED_AS) <= labels
+
+
+def test_the_parse_tree_helpers_read_the_tree() -> None:
+    # A change in re._parser's tree shape fails here, not by probing nothing
+    assert _literal_punctuation(re.compile(r"<[^<>]+>")) == {"<", ">"}
+    assert _literal_punctuation(re.compile(r"[!-#]")) == {"!", '"', "#"}
+    assert not _is_anchored(re.compile(r"[^\n]x"))
+    assert _is_anchored(re.compile(r"^x"))
+    assert _is_anchored(re.compile(r"\Ax"))
+    assert _is_anchored(re.compile(r"x", re.MULTILINE))
+
+
+_RE_FUNCTIONS = {
+    "compile", "search", "match", "fullmatch", "sub", "subn", "split", "findall", "finditer",
+}
+
+
+def _function_local_lines(source: str, namespace: dict[str, object]) -> list[int]:
+    """Lines of re calls with a literal pattern inside a function, lambda or class body.
+
+    A literal pattern is a string constant or a name the module binds to a str.
+    """
+    hits: set[int] = set()
+    scopes = ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda | ast.ClassDef
+    for scope in ast.walk(ast.parse(source)):
+        if not isinstance(scope, scopes):
+            continue
+        body = scope.body if isinstance(scope.body, list) else [scope.body]
+        for statement in body:
+            for node in ast.walk(statement):
+                if not (
+                    isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Attribute)
+                    and node.func.attr in _RE_FUNCTIONS
+                    and isinstance(node.func.value, ast.Name)
+                    and node.func.value.id == "re"
+                ):
+                    continue
+                pattern = node.args[0] if node.args else next(
+                    (keyword.value for keyword in node.keywords if keyword.arg == "pattern"), None
+                )
+                literal = isinstance(pattern, ast.Constant) and isinstance(pattern.value, str)
+                bound = isinstance(pattern, ast.Name) and isinstance(namespace.get(pattern.id), str)
+                if literal or bound:
+                    hits.add(node.lineno)
+    return sorted(hits)
+
+
+def _function_local_patterns(module: types.ModuleType) -> list[str]:
+    """'<module>:<line>' for each literal pattern the module compiles inside a function."""
+    source = Path(module.__file__).read_text(encoding="utf-8")
+    return [f"{module.__name__}:{line}" for line in _function_local_lines(source, vars(module))]
+
+
+def test_no_function_local_literal_patterns() -> None:
+    # _collect reads module attributes only, so a pattern inside a function is
+    # never probed (rule 4 of the linear-time rules)
+    found = [
+        hit
+        for module_name in MODULES
+        for hit in _function_local_patterns(importlib.import_module(module_name))
+    ]
+    assert found == []
+
+
+def test_a_function_local_literal_pattern_is_reported() -> None:
+    source = (
+        "import re\n"
+        "_KEY = r'k+'\n"
+        "_TOP = re.compile(r'b+')\n"
+        "def f(x):\n"
+        "    return re.sub(r'a+', '', x)\n"
+        "def g(x, p):\n"
+        "    return re.search(_KEY, x) or re.search(pattern=r'c', string=x) or re.compile(p)\n"
+        "class C:\n"
+        "    PATTERN = re.compile(r'd')\n"
+        "h = lambda x: re.match(r'e', x)\n"
+    )
+    assert _function_local_lines(source, {"_KEY": "k+"}) == [5, 7, 9, 10]

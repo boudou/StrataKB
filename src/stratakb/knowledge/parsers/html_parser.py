@@ -16,6 +16,14 @@ from stratakb.knowledge.parsers.document import ParsedDocument, ParsedPage
 
 logger = structlog.get_logger()
 
+# Patterns of the text fallback, linear on markup that never closes (the rules
+# in knowledge/structure.py): a tag does not scan past a '<', and a raw block's
+# opening and closing tags are found one at a time (_strip_tags)
+_WHITESPACE = re.compile(r"\s+")
+_TAG = re.compile(r"<[^<>]+>")
+_RAW_OPEN = re.compile(r"<(?:(script)|(style)|(title))[^<>]*>", re.IGNORECASE)
+_RAW_CLOSE = re.compile(r"</(?:(script)|(style)|(title))>", re.IGNORECASE)
+
 
 def parse_html(file_path: str | Path) -> ParsedDocument:
     """Parse an HTML file, stripping tags and chunking by headings.
@@ -156,7 +164,7 @@ class _SectionParser(HTMLParser):
         elif tag == "title" and self._in_page_title:
             self._in_page_title = False
             if not self.title:
-                self.title = re.sub(r"\s+", " ", "".join(self._title_parts)).strip()
+                self.title = _WHITESPACE.sub(" ", "".join(self._title_parts)).strip()
             return
         if tag in self._skip_tags:
             self._skip_depth = max(0, self._skip_depth - 1)
@@ -228,11 +236,34 @@ class _SectionParser(HTMLParser):
 
 
 def _strip_tags(html: str) -> str:
-    """Remove all HTML tags and return clean text."""
-    # Remove script/style/title content
-    html = re.sub(r"<(script|style|title)[^>]*>.*?</\1>", "", html, flags=re.IGNORECASE | re.DOTALL)
-    # Remove tags
-    text = re.sub(r"<[^>]+>", " ", html)
-    # Collapse whitespace
-    text = re.sub(r"\s+", " ", text)
-    return text.strip()
+    """Remove all HTML tags, and script, style and title content, and return clean text.
+
+    Each raw block runs from its opening tag to the first closing tag of the same
+    element (a closer of another element inside it is skipped). An element with
+    no closer left is never searched for again, so the scan stays linear.
+    """
+    kept: list[str] = []
+    unclosed: set[int] = set()
+    pos = 0
+    while opening := _RAW_OPEN.search(html, pos):
+        element = opening.lastindex
+        closing = None
+        if element not in unclosed:
+            search_from = opening.end()
+            while (candidate := _RAW_CLOSE.search(html, search_from)) is not None:
+                if candidate.lastindex == element:
+                    closing = candidate
+                    break
+                search_from = candidate.end()
+        if closing is None:
+            # Kept as text; pass 2 strips the tag
+            unclosed.add(element)
+            kept.append(html[pos:opening.end()])
+            pos = opening.end()
+        else:
+            kept.append(html[pos:opening.start()])
+            pos = closing.end()
+    kept.append(html[pos:])
+    # Remove tags after the blocks: removing a block can join two halves of a tag
+    text = _TAG.sub(" ", "".join(kept))
+    return _WHITESPACE.sub(" ", text).strip()

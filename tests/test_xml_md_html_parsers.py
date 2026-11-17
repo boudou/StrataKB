@@ -11,7 +11,9 @@ Tests cover:
 
 from __future__ import annotations
 
+import re
 import tempfile
+import time
 from pathlib import Path
 
 import pytest
@@ -726,6 +728,68 @@ class TestHTMLParser:
         )
         assert result.total_pages == 1
         assert result.pages[0].section_path == []
+
+    # A page with no section text falls back to stripping its tags, which must
+    # stay linear on markup that never closes
+
+    def test_unclosed_scripts_parse_in_linear_time(self, tmp_path):
+        began = time.perf_counter()
+        result = self._parse(tmp_path, "<script>" * 100_000)
+        assert time.perf_counter() - began < 1.0
+        assert result.pages == []
+
+    def test_run_of_open_brackets_parses_in_linear_time(self, tmp_path):
+        began = time.perf_counter()
+        result = self._parse(tmp_path, "<nav>" + "<" * 200_000)
+        assert time.perf_counter() - began < 1.0
+        assert [p.text for p in result.pages] == ["<" * 200_000]
+
+    @pytest.mark.parametrize("html", ["<nav>" + "<" * 1_000_000, "<script>" * 125_000])
+    def test_strip_tags_reads_a_megabyte_in_linear_time(self, html):
+        from stratakb.knowledge.parsers.html_parser import _strip_tags
+
+        began = time.perf_counter()
+        _strip_tags(html)
+        assert time.perf_counter() - began < 1.0
+
+    @pytest.mark.parametrize("html", [
+        TEST_HTML.read_text(encoding="utf-8"),
+        "<SCRIPT>x</script>after",
+        "<Script type='a'>x</SCRIPT>after",
+        "<script>a</style>b</script>c",
+        "before<script>never closed",
+        "<style>a<script>b</style>c</script>d",
+        "<script>a</script>b<script>c",
+        "<title>T</title><p>text</p><title>U</title>v",
+        "a < b and c > d",
+        "<>",
+        "<titlex>q</title>r",
+        "<p>one</p>\n\n<p>two</p>",
+        "<style>x</style><style>y",
+        "",
+    ])
+    def test_strip_tags_matches_the_regex_version(self, html):
+        from stratakb.knowledge.parsers.html_parser import _strip_tags
+
+        assert _strip_tags(html) == _old_strip_tags(html)
+
+    def test_strip_tags_accepted_differences_on_malformed_markup(self):
+        from stratakb.knowledge.parsers.html_parser import _strip_tags
+
+        # A tag no longer spans a '<'
+        assert _old_strip_tags("x<a<b>y") == "x y"
+        assert _strip_tags("x<a<b>y") == "x<a y"
+        # An opening tag with a '<' inside is not a raw block: its text stays
+        assert _old_strip_tags('<script x="<">code</script>after') == "after"
+        assert _strip_tags('<script x="<">code</script>after') == '<script x=" code after'
+
+
+def _old_strip_tags(html: str) -> str:
+    """The regex version of _strip_tags that #265 replaced, as the oracle."""
+    html = re.sub(r"<(script|style|title)[^>]*>.*?</\1>", "", html, flags=re.IGNORECASE | re.DOTALL)
+    text = re.sub(r"<[^>]+>", " ", html)
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
 
 
 class TestHTMLErrors:

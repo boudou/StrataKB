@@ -107,6 +107,8 @@ _POSIX_SYSTEM_DIRS = (
 # a run of brackets is read in linear time (the rules in knowledge/structure.py).
 _LINK = re.compile(r"\[([^\[\]]*)\]\([^)\[\]]*\)")
 _RULE_LINE = re.compile(r"^[=\-~^*+#_`]+$")
+_DRIVE_ROOT = re.compile(r"[A-Za-z]:")
+_NOT_SLUG = re.compile(r"[^a-z0-9]+")
 
 
 @dataclass
@@ -242,7 +244,7 @@ def broad_reason(root: str) -> str | None:
     """Why root is too broad to add without --allow-broad, or None."""
     fold = _fold_enabled()
     stripped = root.replace("\\", "/").rstrip("/")
-    if stripped == "" or re.fullmatch(r"[A-Za-z]:", stripped):
+    if stripped == "" or _DRIVE_ROOT.fullmatch(stripped):
         return "a drive root"
     key = root_key(root, fold)
     home_key = root_key(Path.home().resolve().as_posix(), fold)
@@ -263,7 +265,7 @@ def is_broad(root: str) -> bool:
 
 def slugify(folder_name: str, root: str | None = None) -> str:
     """A layer name from a folder name; a hash of root when nothing usable is left."""
-    slug = re.sub(r"[^a-z0-9]+", "_", folder_name.lower()).strip("_")
+    slug = _NOT_SLUG.sub("_", folder_name.lower()).strip("_")
     if slug[:1].isdigit():
         slug = "d_" + slug
     if len(slug) < 3:

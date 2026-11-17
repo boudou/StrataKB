@@ -46,6 +46,10 @@ _TRANSLATE = str.maketrans(
         "…": "...",
     }
 )
+_SPACES = re.compile(r"[^\S\n]+")
+_LINE_BREAK = re.compile(r" ?\n[\s]*")
+_WHITESPACE = re.compile(r"\s+")
+_WORD_CHAR = re.compile(r"\w")
 
 
 def normalise_text(text: str, *, keep_lines: bool = False) -> str:
@@ -56,9 +60,9 @@ def normalise_text(text: str, *, keep_lines: bool = False) -> str:
     """
     text = text.translate(_TRANSLATE)
     if keep_lines:
-        text = re.sub(r"[^\S\n]+", " ", text)
-        return re.sub(r" ?\n[\s]*", "\n", text).strip()
-    return re.sub(r"\s+", " ", text).strip()
+        text = _SPACES.sub(" ", text)
+        return _LINE_BREAK.sub("\n", text).strip()
+    return _WHITESPACE.sub(" ", text).strip()
 
 
 # A numbered list's markers (1., 2) ...) are layout, not facts
@@ -338,10 +342,18 @@ def verdict(result: CheckResult, extra_flags: int = 0) -> str:
     return "verified"
 
 
+_WORD_SPLIT = re.compile(r"[\s-]+")
+_ORDINAL_SUFFIX = re.compile(r"(st|nd|rd|th)$")
+_DIGITS_RE = re.compile(_DIGITS)
+_EUROPEAN_AMOUNT = re.compile(r"\d{1,3}(?:\.\d{3})+,\d{1,2}")
+_COMMA_DECIMAL = re.compile(r"\d+,\d{1,2}")
+_BUSINESS_PREFIX = re.compile(r"^(working|banking) ")
+
+
 def _words_value(text: str) -> int:
     """The value of a number in words, such as "one hundred and twenty"."""
     total = current = 0
-    for word in re.split(r"[\s-]+", text.lower()):
+    for word in _WORD_SPLIT.split(text.lower()):
         if word in _SMALL:
             current += _SMALL[word]
         elif word == "hundred":
@@ -355,14 +367,14 @@ def _words_value(text: str) -> int:
 def _decimal(text: str) -> Decimal | None:
     """A number in digits (English separators, ordinal suffix allowed)."""
     try:
-        return Decimal(re.sub(r"(st|nd|rd|th)$", "", text).replace(",", ""))
+        return Decimal(_ORDINAL_SUFFIX.sub("", text).replace(",", ""))
     except InvalidOperation:
         return None
 
 
 def _number_value(text: str) -> Decimal | None:
     """The value of a number in digits, words or both; the digits win."""
-    digits = re.search(_DIGITS, text)
+    digits = _DIGITS_RE.search(text)
     if digits:
         return _decimal(digits.group(0))
     return Decimal(_words_value(text))
@@ -370,20 +382,20 @@ def _number_value(text: str) -> Decimal | None:
 
 def _amount_value(text: str) -> Decimal | None:
     """An amount's value: 1.000,00 (European) or 1,000.00 (English)."""
-    if re.fullmatch(r"\d{1,3}(?:\.\d{3})+,\d{1,2}", text):
+    if _EUROPEAN_AMOUNT.fullmatch(text):
         text = text.replace(".", "").replace(",", ".")
-    elif re.fullmatch(r"\d+,\d{1,2}", text):
+    elif _COMMA_DECIMAL.fullmatch(text):
         text = text.replace(",", ".")
     return _decimal(text)
 
 
 def _unit(text: str) -> str:
     """A unit in canonical form: day, business day, month, %."""
-    unit = re.sub(r"\s+", " ", text.lower())
+    unit = _WHITESPACE.sub(" ", text.lower())
     if unit.replace(" ", "") == "percent":
         return "%"
     unit = unit.removeprefix("calendar ")
-    unit = re.sub(r"^(working|banking) ", "business ", unit)
+    unit = _BUSINESS_PREFIX.sub("business ", unit)
     return unit.removesuffix("s")
 
 
@@ -574,7 +586,7 @@ def _uncovered_sentences(lines: str, starts: list[int], covered: list[bool]) -> 
         if is_covered:
             continue
         text = normalise_text(lines[start:end])
-        if re.search(r"\w", _CITATION.sub(" ", text)):
+        if _WORD_CHAR.search(_CITATION.sub(" ", text)):
             yield text
 
 
@@ -661,7 +673,7 @@ def _check_quotes(
         masked[m.start():m.end()] = " " * (m.end() - m.start())
         inner = len(m.group(1).rstrip(" .!?"))
         scoped[m.start(1):m.start(1) + inner] = " " * inner
-        if not re.search(r"\w", quote):
+        if not _WORD_CHAR.search(quote):
             continue
         quotes += 1
         quote_starts.append(m.start())

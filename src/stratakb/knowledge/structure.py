@@ -58,6 +58,9 @@ PATH_SEPARATOR = " > "
 #    opening character out of what it scans ('\[[^\[\]]*\]').
 # 3. A pattern called only on a line start (.match) or on a bounded window is
 #    listed with that call in the test, which then probes it the same way.
+# 4. A literal pattern in these modules is compiled at module level, never
+#    inside a function or class, so the test finds and probes it; the test
+#    fails on a function-local one.
 
 # The heading patterns take their text greedily up to its last non-space
 # character and own their blank runs with '++' (rule 1).
@@ -131,6 +134,8 @@ _SENTENCE_END_RE = re.compile(r"[.:;!?)\]\"'”]$")
 # The longest heading text a numbered or keyword line may carry as its title;
 # a longer rest of the line is the clause's own text
 _MAX_TITLE_CHARS = 60
+# Punctuation then a blank inside a title: the line reads as prose
+_CLAUSE_PROSE_RE = re.compile(r"[.;:,!?]\s")
 
 # The longest line taken as a heading above an adornment or after a keyword
 _MAX_HEADING_CHARS = 120
@@ -296,7 +301,7 @@ def _short_title(rest: str | None) -> str | None:
         return None
     rest = rest.strip()
     title = rest.removesuffix(".")
-    if len(title) > _MAX_TITLE_CHARS or re.search(r"[.;:,!?]\s", title) or title.endswith(
+    if len(title) > _MAX_TITLE_CHARS or _CLAUSE_PROSE_RE.search(title) or title.endswith(
         (";", ":", ",")
     ):
         return None
