@@ -79,7 +79,7 @@ All three scripts print their usage with `--help`, or when an argument is missin
 
 ### Score extractive answers
 
-`--mode extractive` asks every question in extractive mode, whatever the layer's own mode; `--mode grounded` asks for grounded answers, which a layer in extractive mode still answers extractively. Without `--mode` the layer's mode decides. Each row records the `mode` the answer came in.
+`--mode extractive` asks every question in extractive mode, whatever the layer's own mode; `--mode grounded` asks for grounded answers, which a layer in extractive mode still answers extractively whenever passages come back (a question with no passages is answered in the mode asked for). Without `--mode` the layer's mode decides. Each row records the `mode` the answer came in.
 
 An extractive answer quotes a sentence when its score reaches the reranker profile's medium threshold, the `mark` in `run.answer.extractive`: 0.5 for the default model, 0.86 for `Alibaba-NLP/gte-reranker-modernbert-base`. Extractive answers score with that model even when reranking is off. To choose the mark from one results file, each extractive row also holds:
 

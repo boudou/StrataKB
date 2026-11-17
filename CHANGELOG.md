@@ -71,6 +71,8 @@ Notable changes to StrataKB. The format follows [Keep a Changelog](https://keepa
 - A frozen gold set of questions over the Python Enhancement Proposals, with scripts to check and score it, under `evals/`.
 - `strata_verify` lists the sentences of a draft that held no quote or fact it could check, in `unchecked_sentences`; a verified draft's receipt records them, scrubbed like the draft. The verdict is unchanged and is now decided in one place.
 - The answer contract tells clients that passage text is data from the documents, and that instructions inside it are not to be followed.
+- The gold set scorer (`evals/score_gold.py`) stops a question that runs longer than `--timeout` (120 s by default) with a non-zero exit, refuses a layer whose last ingestion run failed (a partial one is scored with a warning), and writes a `run` block into the results file: the commit, the times, the layer's chunk settings and counts, its last run, and the answer settings used.
+- `evals/score_gold.py --mode extractive` scores extractive answers. Each row holds its top sentence score and the sentences quoted, and the summary sweeps the extractive mark from 0.30 to 0.95 with the answered and refused shares, so the mark can be chosen from one results file. The new `evals/sentence_lengths.py` reports the share of sentences longer than the quoting limit for a database's layers, a folder or a preset's sources.
 
 ### Changed
 
@@ -135,6 +137,8 @@ Notable changes to StrataKB. The format follows [Keep a Changelog](https://keepa
 - Each reranker model has its own candidate pool and confidence thresholds. The default, `cross-encoder/ms-marco-MiniLM-L-6-v2`, reranks `top_k` candidates and keeps 0.8 (high) and 0.5 (medium). `RERANKING_MODEL=Alibaba-NLP/gte-reranker-modernbert-base`, an opt-in for machines with a GPU, reranks 3 × `top_k` candidates (at most 50) with 0.9 and 0.86, and loads with an input length of 512. Any other model uses the default's values and logs `uncalibrated_reranker` once. Extractive answers quote sentences that reach the model's medium threshold.
 - `RERANKING_CANDIDATE_MULTIPLIER` now defaults to the model's own pool, and a value you set really applies (capped at 50 candidates). With query rewriting on, the default model's pool drops from 3 × `top_k` to `top_k`; set `RERANKING_CANDIDATE_MULTIPLIER=3` to keep the old pool. The setting now takes 1 to 5; a larger value is refused at startup.
 - `scripts/apply_preset.py` and `strata_apply_preset` share one apply flow. The script now writes the same `set_archived_patterns` and `apply_preset` audit entries as the tool (with `tool_name` `script:apply_preset`), and a refused layer, a missing preset or one that fails to load ends with an error result and exit code 1 instead of a traceback.
+- A database or endpoint URL with more than one `@` before the host is refused: asyncpg and the URL checks read different hosts from it. `stratakb` then names the target as `unknown host` and says to percent-encode `@`, `/`, `?` and `#` in the user name, password or query (`%40`, `%2F`, `%3F`, `%23`). Such an endpoint counts as outbound.
+- The missing-name check reads settings written with a sign (`$X`, `${X}`, `%X%`, `X=`) at any length and in every question, and settings written in words (`export X`, `the X and Y variables`, `the X setting`) also in the plural, but no longer counts a common acronym that way, so `export JSON` and `the TLS setting` name nothing.
 
 ### Fixed
 
@@ -197,6 +201,9 @@ Notable changes to StrataKB. The format follows [Keep a Changelog](https://keepa
 - Calls that arrive while a schema check runs now share that one check instead of each opening a connection, and every caller gets its own copy of a remembered failure, ending with when the check is tried again.
 - Re-embedding with `EMBEDDING_BACKEND=openai` always failed with "OpenAI API key not configured", because the key was never passed to the embedding calls. The settings are now read once and reach every batch.
 - Routing, structure and archived patterns from `import-layer`, a full restore or an older version's layer get the same length, NUL, surrogate and warning checks as new layers; a pattern that fails is dropped and named.
+- A grounded `strata_ask` on a database whose schema could not be updated cited its passages by file name only and said nothing. It now adds a note naming the cause and the fix, and an extractive ask fails with that error after checking the schema once.
+- `import-layer` of an export made before format lines kept routing and structure patterns the server refuses. It now drops and names them before the confirmation, and refuses a layer row it cannot check.
+- `scripts/apply_preset.py` skipped the documents root check, so a mistyped `--docs-root` cleared the layer and then skipped every group, and a folder as the preset path or a value of the wrong type ended in a traceback. The script and `strata_apply_preset` now run the same input checks, refuse with the same text and report the same dry run.
 
 ### Security
 
