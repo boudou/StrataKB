@@ -88,7 +88,9 @@ class Settings(BaseSettings):
     # Reranking
     reranking_enabled: bool = True
     reranking_model: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"
-    reranking_candidate_multiplier: int = 3  # over-retrieve factor (top_k * this)
+    # strata_ask reranks top_k * this many candidates (at most 50). None uses
+    # the model's own pool (reranker.reranker_profile); a value overrides it
+    reranking_candidate_multiplier: int | None = Field(default=None, ge=1, le=5)
 
     # Answers: strata_ask returns the best passages that fit this many tokens
     # (about four characters each); the first passage always comes back

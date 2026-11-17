@@ -645,7 +645,12 @@ class TestModeFromPassages:
 
         grounded, grounded_id = await make_layer("grounded")
         extractive, extractive_id = await make_layer("extractive")
-        reranking = build_server(settings.model_copy(update={"reranking_enabled": True}))
+        # A pool of two, so the reranker sees both hits and trims one
+        reranking = build_server(
+            settings.model_copy(
+                update={"reranking_enabled": True, "reranking_candidate_multiplier": 2}
+            )
+        )
         hits = [
             replace(_hit(extractive, extractive_id), content="an unrelated passage"),
             replace(_hit(grounded, grounded_id), content="the passage on ending it"),

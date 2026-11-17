@@ -6,10 +6,12 @@ to push the most relevant results to the top.
 from __future__ import annotations
 
 import threading
+from dataclasses import dataclass
 
 import structlog
 
-from stratakb.knowledge.embeddings import ModelKind, load_cached_first
+from stratakb.knowledge.embeddings import ModelKind, _hub_repo, load_cached_first
+from stratakb.rag.confidence import RERANK_THRESHOLDS, ConfidenceThresholds
 
 logger = structlog.get_logger()
 
@@ -18,11 +20,63 @@ _RERANKING_MODEL_KIND = ModelKind(
     "reranking", "RERANKING_MODEL", "cross-encoder", "set RERANKING_ENABLED=false"
 )
 
+DEFAULT_RERANKING_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+
+
+@dataclass(frozen=True)
+class RerankerProfile:
+    """What one reranker model was measured with.
+
+    Attributes:
+        thresholds: Its confidence thresholds, on its relevance probability.
+        pool_multiplier: strata_ask reranks top_k times this many candidates.
+        max_length: The input length it loads with; None keeps the model's own.
+    """
+
+    thresholds: ConfidenceThresholds
+    pool_multiplier: int = 1
+    max_length: int | None = None
+
+
+_DEFAULT_PROFILE = RerankerProfile(RERANK_THRESHOLDS)
+
+# Measured on the PEP gold set (165 answerable and 50 must-refuse questions).
+# The default gains little from a larger pool, so it keeps top_k; gte ranks
+# better with a pool of 3 x top_k, at about 2 passages a second on a laptop CPU,
+# and was measured at 512 tokens (its tokenizer allows 8192).
+_PROFILES = {
+    DEFAULT_RERANKING_MODEL: _DEFAULT_PROFILE,
+    "Alibaba-NLP/gte-reranker-modernbert-base": RerankerProfile(
+        ConfidenceThresholds(high_score=0.9, medium_score=0.86),
+        pool_multiplier=3,
+        max_length=512,
+    ),
+}
+
+_uncalibrated_warned: set[str] = set()
+
+
+def reranker_profile(model_name: str) -> RerankerProfile:
+    """The profile of a reranker model; any other model gets the default's.
+
+    A bare name is looked up as CrossEncoder loads it, with "cross-encoder/"
+    before it. A model without a profile, a folder path included, logs
+    uncalibrated_reranker once per name.
+    """
+    profile = _PROFILES.get(_hub_repo(model_name, _RERANKING_MODEL_KIND.organization))
+    if profile is not None:
+        return profile
+    if model_name not in _uncalibrated_warned:
+        _uncalibrated_warned.add(model_name)
+        logger.warning("uncalibrated_reranker", model=model_name)
+    return _DEFAULT_PROFILE
+
+
 _reranker = None
 _reranker_lock = threading.Lock()
 
 
-def _get_reranker(model_name: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"):
+def _get_reranker(model_name: str = DEFAULT_RERANKING_MODEL):
     """Lazy-load the cross-encoder model (singleton, thread-safe)."""
     global _reranker
     if _reranker is not None:
@@ -33,7 +87,11 @@ def _get_reranker(model_name: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"):
         from sentence_transformers import CrossEncoder
 
         logger.info("loading_reranker_model", model=model_name)
-        _reranker = load_cached_first(CrossEncoder, model_name, _RERANKING_MODEL_KIND)
+        max_length = reranker_profile(model_name).max_length
+        model_kwargs = {} if max_length is None else {"max_length": max_length}
+        _reranker = load_cached_first(
+            CrossEncoder, model_name, _RERANKING_MODEL_KIND, **model_kwargs
+        )
         logger.info("reranker_model_loaded", model=model_name)
     return _reranker
 
@@ -41,7 +99,7 @@ def _get_reranker(model_name: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"):
 def score_pairs(
     query: str,
     texts: list[str],
-    model_name: str = "cross-encoder/ms-marco-MiniLM-L-6-v2",
+    model_name: str = DEFAULT_RERANKING_MODEL,
 ) -> list[float]:
     """Score each text against the query as a relevance probability (0-1).
 
@@ -59,7 +117,7 @@ def rerank_results(
     query: str,
     chunks: list[dict],
     top_k: int = 10,
-    model_name: str = "cross-encoder/ms-marco-MiniLM-L-6-v2",
+    model_name: str = DEFAULT_RERANKING_MODEL,
 ) -> list[dict]:
     """Rerank chunks using a cross-encoder model.
 

@@ -17,6 +17,7 @@ import re
 import threading
 from collections.abc import Callable
 from dataclasses import dataclass
+from typing import Any
 
 import structlog
 
@@ -170,19 +171,21 @@ def is_model_cached(model_name: str, kind: ModelKind) -> bool:
         return False
 
 
-def load_cached_first[T](model_cls: Callable[..., T], model_name: str, kind: ModelKind) -> T:
+def load_cached_first[T](
+    model_cls: Callable[..., T], model_name: str, kind: ModelKind, **model_kwargs: Any
+) -> T:
     """Load a sentence-transformers model, from local files when it is cached.
 
     A cached model loads without HTTP checks. On a cache miss the model is
     loaded again with the network, which downloads it, except when the name
     is a folder (a folder cannot be downloaded), STRATA_LOCAL_ONLY is on, or
     HF_HUB_OFFLINE / TRANSFORMERS_OFFLINE is set: then the miss raises a
-    RuntimeError that says what to do.
+    RuntimeError that says what to do. model_kwargs go to both loads.
     """
     from stratakb.config import get_settings
 
     try:
-        return model_cls(model_name, local_files_only=True)
+        return model_cls(model_name, local_files_only=True, **model_kwargs)
     except Exception as e:
         if _is_folder_path(model_name):
             raise RuntimeError(_folder_error(model_name, kind)) from e
@@ -195,7 +198,7 @@ def load_cached_first[T](model_cls: Callable[..., T], model_name: str, kind: Mod
         if hf_constants.is_offline_mode():
             raise RuntimeError(_offline_error(model_name, kind)) from e
         logger.info("retrying_model_load_online", model=model_name)
-        return model_cls(model_name)
+        return model_cls(model_name, **model_kwargs)
 
 
 # Singleton for local model (loaded once, reused)

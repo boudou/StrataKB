@@ -249,11 +249,14 @@ class TestConfidenceScoring:
         with pytest.raises(TypeError):
             ConfidenceThresholds()
 
-    def test_thresholds_cannot_be_passed(self):
+    def test_no_thresholds_keep_the_basis_default(self):
+        """A reranker model passes its own thresholds; None keeps the basis default."""
         from stratakb.rag.confidence import score_confidence
 
-        with pytest.raises(TypeError):
-            score_confidence([0.9], basis="similarity", thresholds=None)
+        scores = [0.9, 0.7, 0.65]
+        assert score_confidence(scores, basis="similarity", thresholds=None) == (
+            score_confidence(scores, basis="similarity")
+        )
 
     def test_single_high_result(self):
         from stratakb.rag.confidence import score_confidence

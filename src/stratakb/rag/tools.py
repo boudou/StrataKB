@@ -24,7 +24,6 @@ from stratakb.rag.clause_lookup import (
 )
 from stratakb.rag.clause_lookup import lookup as lookup_clauses
 from stratakb.rag.confidence import (
-    EXTRACTIVE_SENTENCE_THRESHOLD,
     Confidence,
     answer_status,
     score_confidence,
@@ -57,12 +56,16 @@ from stratakb.rag.passages import (
     sources_from,
 )
 from stratakb.rag.receipts import issue_receipt
+from stratakb.rag.reranker import reranker_profile
 
 if TYPE_CHECKING:
     from stratakb.config import Settings
     from stratakb.rag.retriever import SearchResult
 
 logger = structlog.get_logger()
+
+# search_chunks returns at most this many results, so no rerank pool is larger
+_MAX_RERANK_POOL = 50
 
 
 async def _detect_layers(database_url: str, query: str, learning_enabled: bool) -> list[str]:
@@ -298,13 +301,14 @@ async def _extract_answer(
     the answer is not_found, before any receipt; when some are missing, a found
     answer becomes partly_found. The note names the missing ones.
     """
+    thresholds = reranker_profile(model_name).thresholds
     ends = _cited_ends(chunks, SENTENCE_REACH)
     documents = await _read_cited_documents(database_url, ends) if ends else {}
     # Splitting and scoring are CPU-bound: kept off the event loop
     candidates = await asyncio.to_thread(candidate_sentences, chunks, documents, ends)
     try:
         sentences = await asyncio.to_thread(
-            select_sentences, question, candidates, EXTRACTIVE_SENTENCE_THRESHOLD, model_name
+            select_sentences, question, candidates, thresholds.medium_score, model_name
         )
     except Exception as e:
         logger.warning("extractive_scoring_failed", error_type=type(e).__name__)
@@ -343,7 +347,7 @@ async def _extract_answer(
         ],
         tool_name="strata_ask",
     )
-    status = answer_status(max(s.score for s in sentences), "rerank")
+    status = answer_status(max(s.score for s in sentences), "rerank", thresholds)
     gap_note = await asyncio.to_thread(clause_gap_note, chunks, documents, ends, sentences)
     if (names_note or gap_note or omitted_note) and status == "found":
         status = "partly_found"
@@ -616,23 +620,31 @@ def register_rag_tools(
                 settings=_settings,
             )
 
+            # The reranker's candidate pool: the model's own multiple of top_k
+            # unless the setting overrides it, never more than a search returns
+            pool = top_k
+            rerank_thresholds = None
+            if _settings.reranking_enabled:
+                profile = reranker_profile(_settings.reranking_model)
+                rerank_thresholds = profile.thresholds
+                multiplier = (
+                    _settings.reranking_candidate_multiplier or profile.pool_multiplier
+                )
+                pool = min(top_k * multiplier, _MAX_RERANK_POOL)
+
             async def _collect(
                 search_layers: list[str] | None,
             ) -> _Collected:
                 async def _run_search(q: str) -> list[SearchResult]:
                     return await search_chunks(
                         database_url, openai_api_key, q,
-                        layers=search_layers, top_k=top_k, settings=_settings,
+                        layers=search_layers, top_k=pool, settings=_settings,
                     )
 
                 batch_results = await asyncio.gather(*(_run_search(q) for q in queries))
                 fused = _fuse_query_results(list(batch_results), _settings.hybrid_rrf_k)
 
-                rerank_limit = (
-                    top_k * _settings.reranking_candidate_multiplier
-                    if _settings.reranking_enabled else top_k
-                )
-                candidates = [_ask_chunk(r, s) for r, s in fused[:rerank_limit]]
+                candidates = [_ask_chunk(r, s) for r, s in fused[:pool]]
                 if _settings.reranking_enabled and candidates:
                     from stratakb.rag.reranker import rerank_results
 
@@ -642,13 +654,17 @@ def register_rag_tools(
                     )
                     # The reranker's relevance probabilities (0-1)
                     basis = "rerank"
+                    thresholds = rerank_thresholds
                 else:
                     # Cosine similarity, never a fused score: that one is
                     # normalized so the top result is always 1.0
                     chunks = candidates
                     basis = "similarity"
+                    thresholds = None
                 confidence = score_confidence(
-                    [basis_score(c, basis) for c in chunks], basis=basis
+                    [basis_score(c, basis) for c in chunks],
+                    basis=basis,
+                    thresholds=thresholds,
                 )
                 return _Collected(len(candidates), chunks, confidence)
 
@@ -689,7 +705,9 @@ def register_rag_tools(
                 left_out_note(left_out, documents), cap_note(matches, layer_named)
             )
             status = answer_status(
-                max((basis_score(c, basis) for c in chunks), default=0.0), basis
+                max((basis_score(c, basis) for c in chunks), default=0.0),
+                basis,
+                rerank_thresholds if basis == "rerank" else None,
             )
             sources = sources_from(chunks, basis) if include_sources else None
             # The names the question asks about must be in what goes back; a

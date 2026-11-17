@@ -51,16 +51,18 @@ class ConfidenceThresholds:
     medium_min_sources: int = 1
 
 
-# Provisional thresholds, one set per score scale. They are not measured yet:
-# the evaluation suite's abstention tier sets the final values.
+# One set of thresholds per score scale.
 # Cosine similarity between query and chunk embeddings (all-mpnet-base-v2).
+# Provisional, not measured yet.
 SIMILARITY_THRESHOLDS = ConfidenceThresholds(high_score=0.6, medium_score=0.45)
 # Cross-encoder relevance probability (sigmoid over the logits; 0.5 is logit 0).
+# These are the default reranker's values (ms-marco-MiniLM-L-6-v2), measured on
+# the gold set; other models take theirs from reranker.reranker_profile.
 RERANK_THRESHOLDS = ConfidenceThresholds(high_score=0.8, medium_score=0.5)
 # The score a sentence needs before an extractive answer quotes it, on the same
-# relevance probability. Provisional like the rest, not measured: it is the
-# medium threshold, so a quote never scores below what answer_status calls
-# partly found. The evaluation suite's abstention tier sets the final value.
+# relevance probability: the default reranker's medium threshold, so a quote
+# never scores below what answer_status calls partly found. Sentence scores were
+# not measured; another model uses its own passage medium by the same rule.
 EXTRACTIVE_SENTENCE_THRESHOLD = RERANK_THRESHOLDS.medium_score
 
 _BASIS_THRESHOLDS = {
@@ -80,7 +82,9 @@ def similarity_or_zero(similarity: float | None) -> float:
     return 0.0 if similarity is None else similarity
 
 
-def score_confidence(scores: list[float], *, basis: str) -> Confidence:
+def score_confidence(
+    scores: list[float], *, basis: str, thresholds: ConfidenceThresholds | None = None
+) -> Confidence:
     """Compute confidence level from search result scores.
 
     Args:
@@ -88,6 +92,8 @@ def score_confidence(scores: list[float], *, basis: str) -> Confidence:
         basis: "similarity" (query/chunk cosine similarity) or "rerank"
             (cross-encoder relevance probability, 0-1). Required: it picks the
             thresholds, and the result reports it.
+        thresholds: The thresholds to judge by, such as a reranker model's own.
+            None keeps the basis default.
 
     Returns:
         Confidence with level (high/medium/low), top_score, relevant_sources
@@ -98,7 +104,8 @@ def score_confidence(scores: list[float], *, basis: str) -> Confidence:
     """
     if basis not in _BASIS_THRESHOLDS:
         raise ValueError(f"Unknown confidence basis: {basis!r}")
-    thresholds = _BASIS_THRESHOLDS[basis]
+    if thresholds is None:
+        thresholds = _BASIS_THRESHOLDS[basis]
 
     if not scores:
         level, top_score, relevant = "low", 0.0, 0
@@ -119,15 +126,19 @@ def score_confidence(scores: list[float], *, basis: str) -> Confidence:
     return Confidence(level, round(top_score, 4), relevant, basis, warning)
 
 
-def answer_status(top_score: float, basis: str) -> AnswerStatus:
+def answer_status(
+    top_score: float, basis: str, thresholds: ConfidenceThresholds | None = None
+) -> AnswerStatus:
     """found, partly_found or not_found, judged on the best passage's score.
 
     top_score is on the scale named by basis and rounded as score_confidence
     rounds it. The best passage clearing the high threshold is found, the
     medium one partly found; anything below is not found. No passage at all
-    has a top score of 0.0, below every threshold.
+    has a top score of 0.0, below every threshold. thresholds, when given,
+    replace the basis default, as in score_confidence.
     """
-    thresholds = _BASIS_THRESHOLDS[basis]
+    if thresholds is None:
+        thresholds = _BASIS_THRESHOLDS[basis]
     top_score = round(top_score, 4)
     if top_score >= thresholds.high_score:
         return "found"
