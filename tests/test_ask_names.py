@@ -192,7 +192,6 @@ class TestGrounded:
         [
             "Does HTTP send JSON?",
             "What does PEP 8 say about SEPA?",
-            "HOW DO I SET PYTHONQUILLMODE?",
         ],
     )
     async def test_acronyms_keep_the_status(self, server, question):
@@ -202,6 +201,34 @@ class TestGrounded:
 
         assert response["status"] == "found"
         assert "note" not in response
+
+    async def test_a_question_in_capitals_keeps_the_status(self, server):
+        response = await _ask(
+            server,
+            [_hit("docs", "PEP 8 says tasks run in a pool of workers.")],
+            "HOW DO I SET PYTHONQUILLMODE?",
+        )
+
+        assert response["status"] == "found"
+        assert "note" not in response
+
+    async def test_emphasis_words_keep_the_status(self, server):
+        response = await _ask(
+            server,
+            [_hit("docs", "The field is Mandatory.")],
+            "Is the field REQUIRED or OPTIONAL?",
+        )
+
+        assert response["status"] == "found"
+        assert "note" not in response
+
+    async def test_absent_setting_is_not_found(self, server):
+        response = await _ask(
+            server, [_hit("docs", "PGUSER names the user.")], "What does $PGHOST hold?"
+        )
+
+        assert response["status"] == "not_found"
+        assert "`PGHOST`" in response["note"]
 
     async def test_question_without_names_keeps_its_status(self, server):
         response = await _ask(server, [_hit("docs")], "q")

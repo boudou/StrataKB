@@ -794,9 +794,10 @@ def register_rag_tools(
         clauses left out and their files, and counting the sections not read.
         References past the first 10 are not looked up; the note names them.
         A name the question asks about (asyncio.TaskPool, PyConfig_Merge,
-        AC04, PEP 8) must be in a passage returned: when none is, the status
-        is not_found and the passages are only related text; when some are
-        missing, a found answer becomes partly_found. The note names them.
+        PYTHONHASHSEED, $PGHOST, AC04, PEP 8) must be in a passage returned:
+        when none is, the status is not_found and the passages are only
+        related text; when some are missing, a found answer becomes
+        partly_found. The note names them.
 
         The response: status is found, partly_found or not_found, with a
         next_step for the last two; mode is the mode used; passages lists S1,

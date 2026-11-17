@@ -5,13 +5,23 @@ __match_kwargs__, config["timeout"], AC04, PEP 9123) is answered only by a
 passage that holds the name. find_names picks out code-like names and
 numbered references; check_names looks for them in the text going back to
 the caller. Ordinary words never count as names: a name needs a digit, an
-underscore, a dot, brackets or a capital inside a word, or is a word of 8
-or more capitals (PYTHONHASHSEED, HEALTHCHECK). Shorter capitals are
-acronyms (HTTP, JSON, SEPA), and in a question written in capitals (3
-capital words or more, and most of its words) no word counts for being in
-capitals. Clause references
-("clause 2.2", "7.2.1") belong to the exact clause lookup, and IBAN-shaped
-values are account data: neither is ever a name.
+underscore, a dot, brackets or a capital inside a word, or is a word in
+capitals written as a setting or long enough not to be an acronym.
+
+- A word of 8 or more capitals is a name (PYTHONHASHSEED, HEALTHCHECK),
+  except an emphasis word such as REQUIRED, OPTIONAL, MANDATORY or
+  IMPORTANT (see _EMPHASIS).
+- A shorter word in capitals is an acronym (HTTP, JSON, SEPA) unless it is
+  written as a setting: after $, ${, %, export or unset ($PGHOST,
+  %APPDATA%), or before =, "variable", "var", "env var", "environment
+  variable" or "setting". A bare "set PGHOST" does not count.
+- In a question written in capitals (2 or more function words such as HOW,
+  WHAT or THE in capitals, or 3 words or more and none with a lowercase
+  letter) no word counts for being 8 capitals or more. Acronyms do not make
+  a question written in capitals.
+
+Clause references ("clause 2.2", "7.2.1") belong to the exact clause
+lookup, and IBAN-shaped values are account data: neither is ever a name.
 
 When a rule is unsure, a name counts as present, which keeps the status as
 it was.
@@ -42,6 +52,33 @@ _CAMEL = re.compile(r"(?<![\w])\w*[a-z][A-Z]\w*(?![\w])")
 _NUMBERED = re.compile(r"(?<![\w])([A-Z]{2,8})[\s:#-]?(\d+)(?!\w|\.\d)")
 # A word in capitals long enough not to be an acronym, such as PYTHONHASHSEED
 _CAPITALS = re.compile(r"(?<![\w])[A-Z]{8,}(?![\w])")
+# Words of 8 capitals or more written for emphasis, never names
+_EMPHASIS = frozenset(
+    {
+        "REQUIRED", "OPTIONAL", "RECOMMENDED", "MANDATORY", "CONDITIONAL",
+        "IMPORTANT", "DEPRECATED", "OBSOLETE", "CRITICAL", "ATTENTION",
+        "ABSOLUTELY", "DEFINITELY",
+    }
+)
+# A short word in capitals written as a setting: after $, ${, %, export or
+# unset, or before =, "variable", "var", "env var" or "setting"
+_SETTING = (
+    re.compile(r"(?:\$\{?|%|(?<![\w])(?i:export|unset)\s+)([A-Z]{2,7})(?![\w])"),
+    re.compile(
+        r"(?<![\w$%])([A-Z]{2,7})(?=\s*="
+        r"|\s+(?i:(?:environment|env)\s+)?(?i:variable|var)\b"
+        r"|\s+(?i:setting)\b)"
+    ),
+)
+# Words that, written in capitals, show a question is written in capitals;
+# none is also an acronym (so not WHO, IT or CAN)
+_FUNCTION_WORDS = frozenset(
+    {
+        "WHAT", "WHICH", "WHY", "WHEN", "WHERE", "HOW", "IS", "ARE", "WAS",
+        "WERE", "DO", "DOES", "DID", "THE", "AN", "OF", "TO", "IN", "ON",
+        "FOR", "WITH", "FROM", "AND", "OR", "NOT", "THIS", "THAT", "BETWEEN",
+    }
+)
 # A passage id pasted back into a follow-up question, such as [S1]
 _PASSAGE_ID = re.compile(r"[Ss]\d+")
 # Letters and a number, read apart so PEP 8 is found as PEP8 or pep-0008
@@ -133,10 +170,11 @@ def _identifier(text: str) -> Name | None:
 
 
 def _shouted(text: str) -> bool:
-    """Whether text is written in capitals: 3 words or more, and most of its words."""
+    """Whether text is written in capitals: 2 function words, or 3 words or more, all capitals."""
     words = re.findall(r"[A-Za-z]{2,}", text)
-    capitals = sum(w.isupper() for w in words)
-    return capitals >= 3 and capitals * 2 > len(words)
+    if sum(w in _FUNCTION_WORDS for w in words) >= 2:
+        return True
+    return len(words) >= 3 and all(w.isupper() for w in words)
 
 
 def find_names(question: str) -> list[Name]:
@@ -173,9 +211,13 @@ def find_names(question: str) -> list[Name]:
     for m in _take(work, _NUMBERED):
         if m.group(1).upper() not in _CLAUSE_KEYWORDS:
             found.append((m.start(), _numbered(m.group(0), m.group(1), m.group(2))))
+    for pattern in _SETTING:
+        for m in _take(work, pattern):
+            found.append((m.start(1), _plain(m.group(1))))
     if not _shouted(text):
         for m in _take(work, _CAPITALS):
-            found.append((m.start(), _plain(m.group(0))))
+            if m.group(0) not in _EMPHASIS:
+                found.append((m.start(), _plain(m.group(0))))
 
     names: list[Name] = []
     seen: set[str] = set()
