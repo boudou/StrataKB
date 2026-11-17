@@ -5,7 +5,12 @@ cross-refusals file and all refusals must be refused.
 On peps_full: every question but the refusals is answerable; refusals must be refused.
 
 Of the files, only the --out file is written, and only by a run that finished. Learning is off
-whatever the settings say, so a question writes only its audit row: see evals/README.md.
+whatever the settings say, so a question writes only its audit row, and an extractive answer
+that quotes also its receipt: see evals/README.md.
+
+With --mode extractive, each row also records the top score of the sentences the server scored
+for its question, quoted or not, and the summary says what share would be answered and refused
+at each candidate mark, so the extractive mark can be chosen from one results file.
 
 Stops with a non-zero exit before any question on a layer that is missing, empty or whose last
 ingestion run failed, and at the first question that fails or takes longer than --timeout.
@@ -14,6 +19,7 @@ and counts, and the answer settings, so two results files say whether they can b
 """
 import argparse
 import asyncio
+import contextlib
 import dataclasses
 import json
 import os
@@ -31,6 +37,9 @@ REPO = Path(__file__).resolve().parent.parent
 TOP_K = 10
 RESPONSE_FORMAT = "detailed"
 DEFAULT_TIMEOUT = 120.0
+MODES = ("grounded", "extractive")
+# The candidate extractive marks the summary sweeps, with the run's own mark added
+MARKS = [round(0.30 + 0.05 * i, 2) for i in range(14)]
 
 
 class RunStoppedError(Exception):
@@ -58,6 +67,11 @@ def parse_args(argv):
         type=float,
         default=DEFAULT_TIMEOUT,
         help=f"seconds one question may take before the run stops (default: {DEFAULT_TIMEOUT:g})",
+    )
+    parser.add_argument(
+        "--mode",
+        choices=MODES,
+        help="the answer mode to ask for (default: none, so the layer's own mode decides)",
     )
     args = parser.parse_args(argv)
     if not args.timeout > 0:
@@ -102,7 +116,38 @@ def pct(n, d):
     return round(100 * n / d, 1) if d else None
 
 
-def summary(rows):
+def quoted_at(row, mark):
+    """Whether an extractive row would quote at mark: a named clause, or a score reaching it."""
+    score = row["top_sentence_score"]
+    return row["named_clause"] or (score is not None and score >= mark)
+
+
+def marks(rows, mark):
+    """For each candidate mark, the % of answerable rows quoted and of each refuse group not.
+
+    Judged by the score alone: a row the server refused for another reason (none of the
+    names the question asks about is in the documents) still counts as quoted here.
+    """
+    rows = [r for r in rows if r["mode"] == "extractive"]
+    ans = [r for r in rows if r["want"] == "answer"]
+    ref = [r for r in rows if r["want"] == "refuse"]
+    groups = [("not_in_corpus", [r for r in ref if r["group"] != "other_layer"])] + [
+        (k, [r for r in ref if r["group"] == k]) for k in sorted({r["group"] for r in ref})
+    ]
+    return [
+        {
+            "mark": m,
+            "answered": {"all": pct(sum(quoted_at(r, m) for r in ans), len(ans))},
+            "refused": {
+                name: pct(sum(not quoted_at(r, m) for r in group), len(group))
+                for name, group in groups
+            },
+        }
+        for m in sorted({*MARKS, mark})
+    ]
+
+
+def summary(rows, mark=None):
     out_ = {}
     ans = [r for r in rows if r["want"] == "answer"]
     for name, group in [("all", ans), ("random_sample", [r for r in ans if r["sampled"]])] + [
@@ -148,6 +193,8 @@ def summary(rows):
         "median_s": round(statistics.median(lat), 2) if lat else None,
         "p95_s": round(lat[int(0.95 * (len(lat) - 1))], 2) if lat else None,
     }
+    if any(r["mode"] == "extractive" for r in rows):
+        out_["marks"] = marks(rows, mark)
     return out_
 
 
@@ -213,7 +260,17 @@ def commit():
     return f"{head}-dirty" if changes else head
 
 
-def run_block(settings, layer, checked, timeout, started):
+def extractive_mark(settings):
+    """The sentence score an extractive answer quotes at: the reranker profile's medium score.
+
+    Extractive answers score with the reranking model even when reranking is off.
+    """
+    from stratakb.rag.reranker import reranker_profile
+
+    return reranker_profile(settings.reranking_model).thresholds.medium_score
+
+
+def run_block(settings, layer, checked, timeout, started, mode=None):
     """What was scored and how: enough to tell whether two results files compare."""
     from stratakb.knowledge.layers import DEFAULT_CHUNK_OVERLAP, DEFAULT_CHUNK_SIZE
     from stratakb.rag.query_rewriter import rewrite_configured
@@ -237,6 +294,7 @@ def run_block(settings, layer, checked, timeout, started):
             "answer_mode": status.get("answer_mode"),
         },
         "answer": {
+            "mode": mode,
             "top_k": TOP_K,
             "response_format": RESPONSE_FORMAT,
             "answer_token_budget": settings.answer_token_budget,
@@ -248,16 +306,80 @@ def run_block(settings, layer, checked, timeout, started):
             "thresholds": dataclasses.asdict(thresholds),
             "query_rewrite": rewrite_configured(settings),
             "learning_enabled": settings.learning_enabled,
+            "extractive": {
+                "reranking_model": settings.reranking_model,
+                "mark": extractive_mark(settings),
+            },
         },
         "timeout_s": timeout,
     }
 
 
-async def ask(server, row, layer, timeout=DEFAULT_TIMEOUT):
-    call = asyncio.ensure_future(server.call_tool("strata_ask", {
+@contextlib.contextmanager
+def sentence_scores():
+    """Record the sentence scores of each extractive answer while the block runs.
+
+    Yields a dict: "top" is the highest score the cross-encoder gave a sentence (None when
+    none was scored) and "exact" whether a candidate was a named clause, quoted without a
+    score. Clear it before each question. strata_ask returns only the sentences it quotes,
+    so this wraps select_sentences and records what score_pairs returns inside it: the
+    sentences are scored once, by the server itself. Both names are put back on the way
+    out, however the block ends.
+    """
+    from stratakb.rag import reranker, tools
+
+    record = {"top": None, "exact": False}
+    original = tools.select_sentences
+
+    def select(question, candidates, *args, **kwargs):
+        record["exact"] = record["exact"] or any(c.exact for c in candidates)
+        scoring = reranker.score_pairs
+
+        def recorder(*a, **k):
+            scores = scoring(*a, **k)
+            if len(scores):
+                top = max(scores)
+                record["top"] = top if record["top"] is None else max(record["top"], top)
+            return scores
+
+        reranker.score_pairs = recorder
+        try:
+            return original(question, candidates, *args, **kwargs)
+        finally:
+            reranker.score_pairs = scoring
+
+    tools.select_sentences = select
+    try:
+        yield record
+    finally:
+        tools.select_sentences = original
+
+
+def extractive_fields(r, record):
+    """The row keys of an extractive answer: its top sentence score and what it quoted."""
+    top = record["top"]
+    return {
+        "top_sentence_score": None if top is None else round(float(top), 4),
+        "named_clause": record["exact"],
+        "quoted": [
+            {
+                "file": (item.get("citation") or {}).get("file"),
+                "text": (item.get("text") or "")[:300],
+                "score": item.get("score"),
+            }
+            for item in (r.get("answer") or [])[:3]
+        ],
+    }
+
+
+async def ask(server, row, layer, timeout=DEFAULT_TIMEOUT, mode=None):
+    arguments = {
         "question": row["question"], "layers": [layer], "top_k": TOP_K,
         "response_format": RESPONSE_FORMAT,
-    }))
+    }
+    if mode is not None:
+        arguments["mode"] = mode
+    call = asyncio.ensure_future(server.call_tool("strata_ask", arguments))
     # asyncio.wait, not wait_for: a TimeoutError the tool raises itself is a failure, not this
     done, _ = await asyncio.wait({call}, timeout=timeout)
     if not done:
@@ -272,7 +394,7 @@ async def ask(server, row, layer, timeout=DEFAULT_TIMEOUT):
     return r
 
 
-async def score(gold, layer, cross, out, timeout=DEFAULT_TIMEOUT):
+async def score(gold, layer, cross, out, timeout=DEFAULT_TIMEOUT, *, mode=None):
     from stratakb.config import get_settings
     from stratakb.core.database import close_pool
     from stratakb.mcp_server import build_server
@@ -286,32 +408,35 @@ async def score(gold, layer, cross, out, timeout=DEFAULT_TIMEOUT):
         # From here on, a file at --out can only be this run's, written when it finishes
         out.unlink(missing_ok=True)
         server = build_server(settings)
-        for row in gold:
-            want, group = expected(row, layer, cross)
-            if want is None:
-                continue
-            t = time.perf_counter()
-            r = await ask(server, row, layer, timeout)
-            seconds = time.perf_counter() - t
-            ps = r.get("passages") or []
-            rows.append({
-                "id": row["id"], "question": row["question"], "want": want, "group": group,
-                "sampled": row.get("sampled", False),
-                "status": r["answer_status"], "seconds": round(seconds, 2),
-                "rank": rank(row, ps) if want == "answer" else None,
-                "top": [
-                    {
-                        "file": (p.get("citation") or {}).get("file"),
-                        "text": (p.get("text") or "")[:300],
-                    }
-                    for p in ps[:3]
-                ],
-                "n_passages": len(ps),
-            })
+        with sentence_scores() as record:
+            for row in gold:
+                want, group = expected(row, layer, cross)
+                if want is None:
+                    continue
+                record.update(top=None, exact=False)
+                t = time.perf_counter()
+                r = await ask(server, row, layer, timeout, mode)
+                seconds = time.perf_counter() - t
+                ps = r.get("passages") or []
+                rows.append({
+                    "id": row["id"], "question": row["question"], "want": want, "group": group,
+                    "sampled": row.get("sampled", False), "mode": r.get("mode"),
+                    "status": r["answer_status"], "seconds": round(seconds, 2),
+                    "rank": rank(row, ps) if want == "answer" else None,
+                    "top": [
+                        {
+                            "file": (p.get("citation") or {}).get("file"),
+                            "text": (p.get("text") or "")[:300],
+                        }
+                        for p in ps[:3]
+                    ],
+                    "n_passages": len(ps),
+                    **(extractive_fields(r, record) if r.get("mode") == "extractive" else {}),
+                })
     finally:
         await close_pool()
-    s = summary(rows)
-    run = run_block(settings, layer, checked, timeout, started)
+    s = summary(rows, extractive_mark(settings))
+    run = run_block(settings, layer, checked, timeout, started, mode)
     result = {"layer": layer, "run": run, "summary": s, "rows": rows}
     out.write_text(json.dumps(result, ensure_ascii=False, indent=1), encoding="utf-8")
     print(json.dumps(s, indent=1))
@@ -342,7 +467,7 @@ def main(argv=None):
 
     configure_logging("ERROR")
     try:
-        run_loop(score(gold, args.layer, cross, args.out, args.timeout))
+        run_loop(score(gold, args.layer, cross, args.out, args.timeout, mode=args.mode))
     except QuestionTimeoutError as e:
         # The interpreter would wait on the way out for a thread the timed-out question
         # left running, so leave without waiting

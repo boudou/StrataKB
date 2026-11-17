@@ -16,7 +16,7 @@ Report refusals per group, never as one total. Batch 2's refusals were written b
 
 ## Run it
 
-Run these from the repository root. They keep the corpus and every result outside the repository; `evals/gold/` stays frozen, and both scripts refuse to write under it.
+Run these from the repository root. They keep the corpus and every result outside the repository; `evals/gold/` stays frozen, and the scripts refuse to write under it.
 
 **1. Get the corpus at the pinned commit.**
 
@@ -72,10 +72,50 @@ The results file opens with a `run` block, so two files say whether they can be 
 | --- | --- |
 | `commit`, `started`, `finished` | The repository's `HEAD`, with `-dirty` when tracked files have changes, and the UTC start and end of the run |
 | `layer` | The layer's `chunk_size` and `chunk_overlap`, document and chunk counts, last ingest time, last ingestion run and `answer_mode` |
-| `answer` | What `strata_ask` was asked and with which settings: `top_k`, `response_format`, `answer_token_budget`, embedding and reranking models, the reranker's candidate multiplier, the confidence `thresholds`, whether hybrid search, query rewriting and learning were on |
+| `answer` | What `strata_ask` was asked and with which settings: the `mode` asked for (null without `--mode`), `top_k`, `response_format`, `answer_token_budget`, embedding and reranking models, the reranker's candidate multiplier, the confidence `thresholds`, whether hybrid search, query rewriting and learning were on, and under `extractive` the model extractive answers score sentences with and its `mark` |
 | `timeout_s` | The per-question timeout |
 
-Both scripts print their usage with `--help`, or when an argument is missing, and stop before doing anything else.
+All three scripts print their usage with `--help`, or when an argument is missing, and stop before doing anything else.
+
+### Score extractive answers
+
+`--mode extractive` asks every question in extractive mode, whatever the layer's own mode; `--mode grounded` asks for grounded answers, which a layer in extractive mode still answers extractively. Without `--mode` the layer's mode decides. Each row records the `mode` the answer came in.
+
+An extractive answer quotes a sentence when its score reaches the reranker profile's medium threshold, the `mark` in `run.answer.extractive`: 0.5 for the default model, 0.86 for `Alibaba-NLP/gte-reranker-modernbert-base`. Extractive answers score with that model even when reranking is off. To choose the mark from one results file, each extractive row also holds:
+
+| Key | What it holds |
+| --- | --- |
+| `top_sentence_score` | The highest score the server gave a sentence for that question, quoted or not, rounded to 4 decimals; null when no sentence was scored |
+| `named_clause` | Whether a sentence came from a clause the question names, which is quoted without a score |
+| `quoted` | Up to 3 quoted sentences: `file`, the first 300 characters of `text`, and `score` |
+
+The sentences are scored once, by the server itself: the scorer records the scores `strata_ask` computes while the run lasts, and puts its hook back when the run ends or stops.
+
+The summary then has `marks`: for each candidate mark from 0.30 to 0.95 in steps of 0.05, plus the run's own mark, the % of answerable questions that would be quoted (`answered.all`) and the % of each refusal group that would be refused (`refused`, with `not_in_corpus` and each group on its own). A row counts as quoted at a mark when `named_clause` is true or `top_sentence_score` reaches the mark. That is judged by the score alone: the server also refuses when none of the names the question asks about is in the documents, and turns `found` into `partly_found` when a clause or a name is missing, so a row's `status` can differ from what `marks` says.
+
+### Count the sentences too long to quote
+
+An extractive answer never quotes a sentence longer than 2,000 characters (`MAX_SENTENCE_CHARS`). `evals/sentence_lengths.py` counts them, and the named clauses (sections) holding one, so the share a layer cannot quote is known. Give it one input:
+
+```bash
+uv run python evals/sentence_lengths.py --database --layer peps_full   # --layer repeatable; omit for every layer
+uv run python evals/sentence_lengths.py --folder ../contracts          # add --preset P for P's structure_patterns
+uv run python evals/sentence_lengths.py --preset examples/sepa/preset.yaml
+```
+
+`--database` reads the layers of the database in `DATABASE_URL`, using only the document versions their chunks cite: the exact view of what was ingested. It only reads, and a `--layer` that does not exist stops it before any output. `--folder` reads every file the preset dry run would, which can be more than `stratakb add` keeps (build files, ignored paths). `--preset` alone reads each of the preset's source folders and names a missing one on stderr. Files with secret-looking names are never opened, and a file that fails to parse counts under `failed` and is named on stderr.
+
+It prints JSON on stdout, and `--out` writes it to a file too (never under `evals/gold/`). The report holds `max_sentence_chars` and one entry under `sources` per layer, folder or preset source:
+
+| Key | What it holds |
+| --- | --- |
+| `name`, `documents` | The layer, folder or source group, and the documents read; `failed` counts the files that did not parse (folder and preset only) |
+| `sentences`, `long_sentences`, `long_pct` | The sentences, those longer than the limit, and their % |
+| `clauses`, `clauses_with_long`, `clauses_with_long_pct` | The sections, those holding a long sentence, and their %. A section covers its subsections, so the sections enclosing a long clause count too |
+| `longest` | The `file` and `chars` of the longest sentence, or null |
+| `chunks_without_document` | Chunks ingested before stored documents existed, whose sentences cannot be counted (database only) |
+
+A percentage is null when there is nothing to count, and has 2 decimals, so one long sentence in a large layer does not show as 0.
 
 ## What scoring writes
 
@@ -84,4 +124,6 @@ Each question goes through the real `strata_ask`, with learning turned off by th
 | Table | Written | When |
 | --- | --- | --- |
 | `strata_core.audit_log` | One row per question | Always |
-| `strata_core.receipts`, `strata_core.receipt_documents` | One receipt per extractive answer | Only on a layer with `answer_mode: extractive`, which the layers above are not |
+| `strata_core.receipts`, `strata_core.receipt_documents` | One receipt per extractive answer that quotes | With `--mode extractive`, or on a layer with `answer_mode: extractive`, which the layers above are not |
+
+`sentence_lengths.py` writes nothing to the database.

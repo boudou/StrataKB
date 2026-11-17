@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import os
 from unittest.mock import patch
 from urllib.parse import urlsplit, urlunsplit
@@ -13,7 +14,7 @@ import asyncpg
 import pytest
 
 # Asserts in the shared helpers report like asserts in a test module.
-pytest.register_assert_rewrite("tests.helpers")
+pytest.register_assert_rewrite("tests.helpers", "tests.gold_helpers")
 
 
 @pytest.fixture(autouse=True)
@@ -247,3 +248,41 @@ async def _reset_db_pool():
     yield
     from stratakb.core.database import close_pool
     await close_pool()
+
+
+@pytest.fixture
+def scorer_input(tmp_path):
+    """A small gold file and its cross-refusals in one folder; yields that folder."""
+    rows = [
+        {"id": "s1", "kind": "concept", "tier": "small", "question": "small?",
+         "evidence": ["needle"], "sampled": True},
+        {"id": "f1", "kind": "concept", "tier": "full", "question": "other layer?",
+         "evidence": ["needle"]},
+        {"id": "f2", "kind": "identifier", "tier": "full", "question": "in both layers?",
+         "evidence": ["needle"]},
+        {"id": "r1", "kind": "refusal", "group": "off_domain", "question": "refuse?",
+         "absent": ["nothing"]},
+    ]
+    folder = tmp_path / "input"
+    folder.mkdir()
+    (folder / "gold.jsonl").write_text(
+        "\n".join(json.dumps(row) for row in rows), encoding="utf-8"
+    )
+    (folder / "cross_refusals.json").write_text('["f1"]', encoding="utf-8")
+    return folder
+
+
+@pytest.fixture
+async def filled_layer(db_url, cleanup):
+    """A layer on the test database whose counts say it holds chunks."""
+    from stratakb.core.database import get_pool
+    from stratakb.knowledge.layers import create_layer
+
+    name = f"test_gold_{uuid4().hex[:10]}"
+    cleanup.append(name)
+    await create_layer(db_url, name=name, display_name="Test Gold")
+    pool = await get_pool(db_url)
+    await pool.execute(
+        "UPDATE strata_core.knowledge_layers SET chunk_count = 1 WHERE name = $1", name
+    )
+    return name

@@ -6,9 +6,7 @@ the scorer on a stub server. Only the tests named so use the test database.
 
 from __future__ import annotations
 
-import asyncio
 import hashlib
-import importlib.util
 import json
 import re
 import subprocess
@@ -19,18 +17,15 @@ from uuid import uuid4
 
 import pytest
 
+from tests.gold_helpers import EVALS, HANG, SCORER, _last_run, _load, _score
 from tests.helpers import REPO_DIR
 
-EVALS = REPO_DIR / "evals"
 GOLD_DIR = EVALS / "gold"
 CHECKER = EVALS / "check_gold.py"
-SCORER = EVALS / "score_gold.py"
+SENTENCES = EVALS / "sentence_lengths.py"
 
 # sha256 and row count of every frozen file. A label corrected under the rule in
 # evals/README.md changes these and the README's table in the same commit.
-# A stub strata_ask call that never returns
-HANG = object()
-
 PINNED = {
     "batch1/gold.jsonl": (
         "b98bb221db2ba95cbeb5077cb7df6f1cda686c150e71da0a6107a358aa104ce4", 125,
@@ -51,13 +46,6 @@ BATCHES = ["batch1", "batch2"]
 REQUIRED = {"id", "kind", "question"}
 REQUIRED_REFUSAL = REQUIRED | {"group", "absent"}
 REQUIRED_ANSWERABLE = REQUIRED | {"tier", "evidence", "source"}
-
-
-def _load(path):
-    spec = importlib.util.spec_from_file_location(path.stem, path)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
 
 
 def _rows(batch):
@@ -216,10 +204,10 @@ CHECKER_ARGS = {"--gold": "g", "--corpus": "c", "--small": "s", "--out": "o"}
 SCORER_ARGS = {"--gold": "g", "--layer": "peps_small", "--out": "o"}
 MISSING = [(CHECKER, CHECKER_ARGS, flag) for flag in CHECKER_ARGS] + [
     (SCORER, SCORER_ARGS, flag) for flag in SCORER_ARGS
-]
+] + [(SENTENCES, {"--database": None}, "--database")]
 
 
-@pytest.mark.parametrize("script", [CHECKER, SCORER], ids=lambda p: p.stem)
+@pytest.mark.parametrize("script", [CHECKER, SCORER, SENTENCES], ids=lambda p: p.stem)
 def test_no_arguments_prints_usage(script):
     done = subprocess.run([sys.executable, str(script)], capture_output=True, text=True)
     assert done.returncode != 0
@@ -241,19 +229,20 @@ def test_a_missing_argument_prints_usage(script, arguments, flag, capsys):
     build_server.assert_not_called()
 
 
-@pytest.mark.parametrize("script", [CHECKER, SCORER], ids=lambda p: p.stem)
+@pytest.mark.parametrize("script", [CHECKER, SCORER, SENTENCES], ids=lambda p: p.stem)
 def test_output_under_the_gold_folder_is_refused(script, tmp_path, capsys):
     target = GOLD_DIR / "batch1" / "cross_refusals.json"
+    gold = ["--gold", str(GOLD_DIR / "batch1" / "gold.jsonl")]
     if script == CHECKER:
         full, small = _stub_corpus(tmp_path)
-        argv = ["--corpus", str(full), "--small", str(small)]
+        argv = [*gold, "--corpus", str(full), "--small", str(small)]
+    elif script == SCORER:
+        argv = [*gold, "--layer", "peps_small"]
     else:
-        argv = ["--layer", "peps_small"]
+        argv = ["--folder", str(tmp_path)]
     before = _snapshot()
     with pytest.raises(SystemExit) as e:
-        _load(script).main(
-            ["--gold", str(GOLD_DIR / "batch1" / "gold.jsonl"), "--out", str(target), *argv]
-        )
+        _load(script).main([*argv, "--out", str(target)])
     assert e.value.code != 0
     assert "frozen" in capsys.readouterr().err
     assert _snapshot() == before
@@ -272,77 +261,6 @@ def test_checker_refuses_a_folder_without_peps(tmp_path, capsys):
         ])
     assert e.value.code != 0
     assert "--small" in capsys.readouterr().err
-
-
-@pytest.fixture
-def scorer_input(tmp_path):
-    """A small gold file and its cross-refusals in one folder; yields that folder."""
-    rows = [
-        {"id": "s1", "kind": "concept", "tier": "small", "question": "small?",
-         "evidence": ["needle"], "sampled": True},
-        {"id": "f1", "kind": "concept", "tier": "full", "question": "other layer?",
-         "evidence": ["needle"]},
-        {"id": "f2", "kind": "identifier", "tier": "full", "question": "in both layers?",
-         "evidence": ["needle"]},
-        {"id": "r1", "kind": "refusal", "group": "off_domain", "question": "refuse?",
-         "absent": ["nothing"]},
-    ]
-    folder = tmp_path / "input"
-    folder.mkdir()
-    (folder / "gold.jsonl").write_text(
-        "\n".join(json.dumps(row) for row in rows), encoding="utf-8"
-    )
-    (folder / "cross_refusals.json").write_text('["f1"]', encoding="utf-8")
-    return folder
-
-
-def _last_run(runs=None):
-    """The layer's latest ingestion run stubbed: `runs` (default: none recorded)."""
-    return patch("stratakb.knowledge.layers.last_ingestion_run", AsyncMock(return_value=runs))
-
-
-def _score(folder, layer, out, *extra, failing=None, layer_status=None, asked=None, runs=None):
-    """Run the scorer on a stub server; returns the questions it asked and the layers.
-
-    `failing` maps a question to a reply to return, an exception to raise, or HANG
-    for a call that never returns.
-    `layer_status` replaces the check of the layer, which otherwise passes.
-    `asked` is a list to collect the questions in, for a run that stops.
-    `runs` is the layer's latest ingestion run (default: none recorded).
-    """
-
-    async def call_tool(name, arguments):
-        assert name == "strata_ask"
-        calls.append((arguments["question"], arguments["layers"]))
-        failure = (failing or {}).get(arguments["question"])
-        if failure is HANG:
-            await asyncio.Event().wait()
-        if isinstance(failure, Exception):
-            raise failure
-        if failure:
-            return failure
-        found = arguments["question"] != "refuse?"
-        return {
-            "status": "ok",
-            "answer_status": "found" if found else "not_found",
-            "passages": [{"text": "a  needle", "citation": {"file": "a.rst"}}] if found else [],
-        }
-
-    calls = [] if asked is None else asked
-    server = MagicMock(call_tool=AsyncMock(side_effect=call_tool))
-    with (
-        patch("stratakb.mcp_server.build_server", return_value=server),
-        patch("stratakb.core.logging.configure_logging"),
-        patch(
-            "stratakb.knowledge.layers.get_layer_status",
-            layer_status or AsyncMock(return_value={"id": "layer-id", "chunk_count": 3}),
-        ),
-        _last_run(runs),
-    ):
-        _load(SCORER).main(
-            ["--gold", str(folder / "gold.jsonl"), "--layer", layer, "--out", str(out), *extra]
-        )
-    return calls
 
 
 @pytest.mark.parametrize(
@@ -637,23 +555,6 @@ def test_a_layer_without_chunk_settings_records_the_defaults(scorer_input, tmp_p
     assert (layer["chunk_size"], layer["chunk_overlap"]) == (
         DEFAULT_CHUNK_SIZE, DEFAULT_CHUNK_OVERLAP
     )
-
-
-@pytest.fixture
-async def filled_layer(db_url, cleanup):
-    """A layer on the test database whose counts say it holds chunks."""
-    from stratakb.core.database import get_pool
-    from stratakb.knowledge.layers import create_layer
-
-    name = f"test_gold_{uuid4().hex[:10]}"
-    cleanup.append(name)
-    await create_layer(db_url, name=name, display_name="Test Gold")
-    pool = await get_pool(db_url)
-    await pool.execute(
-        "UPDATE strata_core.knowledge_layers SET chunk_count = 1 WHERE name = $1", name
-    )
-    return name
-
 
 async def _learning_row_counts(db_url):
     """The row count of every table in the strata_learning schema."""
