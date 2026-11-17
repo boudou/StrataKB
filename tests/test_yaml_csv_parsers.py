@@ -225,6 +225,40 @@ class TestOpenAPISchemaCut:
         assert result.flag is None
         assert "child (object)" in result.pages[1].text
 
+    def test_ref_and_deep_schemas_not_counted(self, tmp_path):
+        import yaml
+
+        from stratakb.knowledge.parsers.yaml_parser import parse_yaml
+
+        # A $ref schema is shown by name, and its properties are not counted
+        spec = {
+            "openapi": "3.0.0",
+            "info": {"title": "Ref API", "version": "1.0"},
+            "paths": {"/items": {"post": {
+                "operationId": "createItem",
+                "requestBody": {"content": {"application/json": {
+                    "schema": {"$ref": "#/components/schemas/Big"},
+                }}},
+                "responses": {"200": {"description": "OK"}},
+            }}},
+            "components": {"schemas": {"Big": {"type": "object", "properties": _props(30)}}},
+        }
+        ref_path = tmp_path / "ref.yaml"
+        ref_path.write_text(yaml.safe_dump(spec, sort_keys=False), encoding="utf-8")
+        result = parse_yaml(ref_path)
+        assert result.error is None
+        assert result.flag is None
+        assert "Big" in result.pages[1].text
+
+        # Three typeless levels down, the summary stops: nothing listed or counted
+        deep = {"properties": {"b": {"properties": {"c": {"properties": _props(30)}}}}}
+        deep_path = _write_openapi(
+            tmp_path / "deep.yaml", {"type": "object", "properties": {"a": deep}},
+        )
+        result = parse_yaml(deep_path)
+        assert result.error is None
+        assert result.flag is None
+
     def test_schemas_that_fit_not_flagged(self, tmp_path):
         from stratakb.knowledge.parsers.yaml_parser import parse_yaml
 

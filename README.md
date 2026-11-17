@@ -188,7 +188,7 @@ StrataKB cannot control what your MCP client's language model does with the retr
 
 ## Layers and presets
 
-Make a layer per folder or domain. A preset is a YAML file that names a layer and lists its folders; apply it with `scripts/apply_preset.py` or the `strata_apply_preset` tool. Ready-made presets are in [examples/](examples/README.md), and every key is described in the [wiki](https://github.com/boudou/StrataKB/wiki/Layers-and-Presets#presets).
+Make a layer per folder or domain. A preset is a YAML file that names a layer and lists its folders; apply it with `scripts/apply_preset.py` or the `strata_apply_preset` tool. A preset run lists, per source folder, the files it stored but flagged (cut at a limit, or probably scanned), as `strata_ingest_documents` does. Ready-made presets are in [examples/](examples/README.md), and every key is described in the [wiki](https://github.com/boudou/StrataKB/wiki/Layers-and-Presets#presets).
 
 **Archived files.** A layer can hold a list of path patterns saying which of its files are archived, and citations of those files then say so ([what the label means](#answers-you-can-prove)). `strata_set_archived_patterns` (admin) sets them, in `.gitignore` style, at most three wildcards and 500 characters each, no `[[:alpha:]]` classes; an empty list clears them. A preset sets them with `archived_patterns: ['archive/', '*-2024.md', '!keep.md']`, quoted, since YAML treats a leading `*` or `!` specially. A preset without the key leaves the layer's patterns alone, and `[]` clears them. Patterns match the path relative to the folder ingested, case-sensitively: with several source groups, write `archive/`, not `rulebooks/archive/`. This differs from the layer-wide `archived` status.
 

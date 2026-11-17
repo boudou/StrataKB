@@ -709,6 +709,42 @@ def test_tool_description_names_the_csv_row_limit():
         assert "A CSV over 1,234 rows" in description()
 
 
+def test_tool_description_names_every_flag_cause():
+    from typing import get_args
+
+    from mcp.server.fastmcp import FastMCP
+
+    from stratakb.knowledge.parsers import csv_parser, pdf_parser, yaml_parser
+    from stratakb.knowledge.parsers.document import FlagReason
+    from stratakb.knowledge.tools import register_knowledge_tools
+
+    def description() -> str:
+        mcp = FastMCP("test")
+        register_knowledge_tools(mcp, "postgresql://unused")
+        return mcp._tool_manager.get_tool("strata_ingest_documents").description
+
+    text = description()
+    for reason in get_args(FlagReason):
+        assert f'"{reason}"' in text
+    assert "A CSV over 10,000 rows" in text
+    assert "10,000 entries" in text
+    assert "9 levels" in text
+    assert "15 properties" in text
+    assert "$ref" in text
+
+    with (
+        patch.object(csv_parser, "MAX_ROWS", 1_234),
+        patch.object(pdf_parser, "MAX_OUTLINE_ENTRIES", 4_321),
+        patch.object(pdf_parser, "MAX_OUTLINE_DEPTH", 7),
+        patch.object(yaml_parser, "MAX_SCHEMA_PROPERTIES", 11),
+    ):
+        text = description()
+    assert "A CSV over 1,234 rows" in text
+    assert "4,321 entries" in text
+    assert "7 levels" in text
+    assert "11 properties" in text
+
+
 def _entries(root: Path, *relative_paths: str, carry_hash: bool = False) -> list:
     """FileEntry objects for files under root, optionally with their real SHA-256."""
     from stratakb.knowledge.selection import FileEntry

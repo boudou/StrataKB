@@ -923,3 +923,99 @@ class TestPresetToolRegistration:
         tool_names = [t.name for t in server._tool_manager.list_tools()]
         assert "strata_apply_preset" in tool_names
         assert "strata_setup_sepa_layer" not in tool_names
+
+
+TWO_GROUPS_YAML = (
+    "name: test_preset_flagged\n"
+    "display_name: Flagged\n"
+    "description: Two source groups\n"
+    "sources:\n"
+    "  - {name: codes, path: codes}\n"
+    "  - {name: docs, path: docs}\n"
+)
+
+
+class TestIngestPresetFlagged:
+    """A preset run lists, per group, the files stored but flagged."""
+
+    async def test_groups_report_flagged_files(self, tmp_path):
+        from stratakb.knowledge.ingestion import FileOutcome, IngestionResult
+        from stratakb.knowledge.presets import ingest_preset
+
+        (tmp_path / "codes").mkdir()
+        (tmp_path / "docs").mkdir()
+        preset = load_preset(_write_preset(tmp_path, TWO_GROUPS_YAML))
+        per_group = [
+            IngestionResult("test_preset_flagged", "completed", files=[
+                FileOutcome("codes.csv", "flagged", "truncated", 3, stored="added"),
+                FileOutcome("readme.md", "added"),
+            ]),
+            IngestionResult("test_preset_flagged", "completed", files=[
+                FileOutcome("guide.md", "added"),
+            ]),
+        ]
+        with (
+            patch("stratakb.knowledge.ingestion.clear_layer", new_callable=AsyncMock),
+            patch(
+                "stratakb.knowledge.ingestion.ingest_documents",
+                new_callable=AsyncMock, side_effect=per_group,
+            ),
+        ):
+            result = await ingest_preset("postgresql://test", "", preset, tmp_path)
+
+        codes, docs = result["groups"]["codes"], result["groups"]["docs"]
+        assert codes["flagged"] == [{"file": "codes.csv", "reason": "truncated", "count": 3}]
+        assert codes["files_flagged"] == 1
+        assert codes["docs_processed"] == 2
+        assert docs["flagged"] is None
+        assert docs["files_flagged"] == 0
+        assert result["total_flagged"] == 1
+
+    async def test_skipped_group_has_no_flagged_keys(self, tmp_path):
+        from stratakb.knowledge.ingestion import IngestionResult
+        from stratakb.knowledge.presets import ingest_preset
+
+        (tmp_path / "codes").mkdir()  # docs is missing
+        preset = load_preset(_write_preset(tmp_path, TWO_GROUPS_YAML))
+        with (
+            patch("stratakb.knowledge.ingestion.clear_layer", new_callable=AsyncMock),
+            patch(
+                "stratakb.knowledge.ingestion.ingest_documents", new_callable=AsyncMock,
+                return_value=IngestionResult("test_preset_flagged", "completed"),
+            ),
+        ):
+            result = await ingest_preset("postgresql://test", "", preset, tmp_path)
+
+        assert result["groups"]["docs"]["status"] == "skipped"
+        assert "flagged" not in result["groups"]["docs"]
+        assert result["total_flagged"] == 0
+
+    async def test_real_ingest_flags_a_cut_csv(self, db_url, cleanup, tmp_path):
+        from stratakb.config import get_settings
+        from stratakb.knowledge.parsers import csv_parser
+        from stratakb.knowledge.presets import ingest_preset
+
+        name = "test_preset_flagged_csv"
+        cleanup.append(name)
+        path = _write_preset(tmp_path, RUNBOOKS_YAML.format(
+            name=name, description="Cut CSV", chunk_size=800, pattern="'\\bcodes\\b'",
+        ))
+        preset = load_preset(path)
+        assert (await create_preset_layer(db_url, preset))["status"] in ("created", "updated")
+        (tmp_path / "docs").mkdir()
+        rows = "".join(f"C{i},Reason {i}\n" for i in range(5))
+        (tmp_path / "docs" / "codes.csv").write_text("code,name\n" + rows, encoding="utf-8")
+        vector = [0.01] * get_settings().embedding_dimensions
+
+        with (
+            patch("stratakb.knowledge.ingestion.embed_texts", new_callable=AsyncMock) as mock,
+            patch.object(csv_parser, "MAX_ROWS", 2),
+        ):
+            mock.side_effect = lambda texts, **_: [vector for _ in texts]
+            result = await ingest_preset(db_url, "fake-key", preset, tmp_path)
+
+        docs = result["groups"]["docs"]
+        assert docs["status"] == "completed"
+        assert docs["flagged"] == [{"file": "codes.csv", "reason": "truncated", "count": 3}]
+        assert docs["files_flagged"] == 1
+        assert result["total_flagged"] == 1
