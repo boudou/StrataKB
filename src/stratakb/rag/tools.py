@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any, NamedTuple
 
 import structlog
 from mcp.server.fastmcp import FastMCP
+from mcp.types import ToolAnnotations
 
 from stratakb.core.audit import write_audit_log
 from stratakb.core.auth import require_role
@@ -533,7 +534,7 @@ def register_rag_tools(
         except Exception as e:
             return ToolFailure(str(e))
 
-    @mcp.tool()
+    @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False))
     @require_role("viewer")
     @log_tool_call
     async def strata_search(
@@ -808,7 +809,7 @@ def register_rag_tools(
         except Exception as e:
             return ToolFailure(str(e))
 
-    @mcp.tool()
+    @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False))
     @require_role("viewer")
     @log_tool_call
     async def strata_ask(

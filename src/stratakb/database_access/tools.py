@@ -13,6 +13,7 @@ import asyncpg
 import structlog
 from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.exceptions import ToolError
+from mcp.types import ToolAnnotations
 
 from stratakb.core.audit import write_audit_log
 from stratakb.core.auth import require_role
@@ -190,7 +191,7 @@ def register_database_tools(mcp: FastMCP, database_url: str, query_database_url:
     checks the role behind it at startup.
     """
 
-    @mcp.tool()
+    @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False))
     @require_role("viewer")
     @log_tool_call
     async def strata_db_schema(
@@ -300,7 +301,7 @@ def register_database_tools(mcp: FastMCP, database_url: str, query_database_url:
         except Exception as e:
             return {"status": "error", "error": str(e)}
 
-    @mcp.tool()
+    @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False))
     @require_role("viewer")
     @log_tool_call
     async def strata_db_vector_stats() -> dict:
@@ -367,7 +368,7 @@ def register_database_tools(mcp: FastMCP, database_url: str, query_database_url:
         except Exception as e:
             return {"status": "error", "error": str(e)}
 
-    @mcp.tool()
+    @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False))
     @require_role("viewer")
     @log_tool_call
     async def strata_db_sample_chunks(
@@ -442,7 +443,7 @@ def _register_sql_tools(mcp: FastMCP, database_url: str, query_database_url: str
     """
     _record_sql_tools_enabled()
 
-    @mcp.tool()
+    @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False))
     @require_role("operator")
     @log_tool_call
     async def strata_db_query(
@@ -512,7 +513,7 @@ def _register_sql_tools(mcp: FastMCP, database_url: str, query_database_url: str
         except Exception as e:
             return {"status": "error", "error": _query_error(e)}
 
-    @mcp.tool()
+    @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False))
     @require_role("operator")
     @log_tool_call
     async def strata_db_explain(

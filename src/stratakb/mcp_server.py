@@ -17,6 +17,7 @@ from typing import Annotated
 
 import structlog
 from mcp.server.fastmcp import FastMCP
+from mcp.types import ToolAnnotations
 from pydantic import Field
 
 # get_settings is imported where it is called, never here: a module-level binding
@@ -269,7 +270,7 @@ def _register_admin_tools(mcp: FastMCP, settings: Settings) -> None:
     # Admin Tools
     # ==========================================
 
-    @mcp.tool()
+    @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False))
     @require_role("viewer")
     @log_tool_call
     async def strata_admin_health() -> dict:
@@ -323,7 +324,7 @@ def _register_admin_tools(mcp: FastMCP, settings: Settings) -> None:
 
         return result
 
-    @mcp.tool()
+    @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False))
     @require_role("admin")
     @log_tool_call
     async def strata_admin_audit_log(
@@ -370,7 +371,7 @@ def _register_admin_tools(mcp: FastMCP, settings: Settings) -> None:
     # User Management Tools
     # ==========================================
 
-    @mcp.tool()
+    @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False))
     @require_role("viewer")
     @log_tool_call
     async def strata_whoami() -> dict:
@@ -389,7 +390,7 @@ def _register_admin_tools(mcp: FastMCP, settings: Settings) -> None:
         except Exception as e:
             return {"status": "error", "error": str(e)}
 
-    @mcp.tool()
+    @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False))
     @require_role("admin")
     @log_tool_call
     async def strata_admin_list_users() -> dict:
@@ -403,7 +404,14 @@ def _register_admin_tools(mcp: FastMCP, settings: Settings) -> None:
         except Exception as e:
             return {"status": "error", "error": str(e)}
 
-    @mcp.tool()
+    @mcp.tool(
+        annotations=ToolAnnotations(
+            readOnlyHint=False,
+            destructiveHint=True,
+            idempotentHint=True,
+            openWorldHint=False,
+        ),
+    )
     @require_role("admin")
     @log_tool_call
     async def strata_admin_update_role(

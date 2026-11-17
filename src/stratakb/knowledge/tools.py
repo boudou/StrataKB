@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING
 
 import structlog
 from mcp.server.fastmcp import FastMCP
+from mcp.types import ToolAnnotations
 
 from stratakb.core.audit import write_audit_log
 from stratakb.core.auth import check_role, get_current_user, require_role
@@ -150,7 +151,7 @@ def register_knowledge_tools(
 
         return get_settings()
 
-    @mcp.tool()
+    @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False))
     @require_role("viewer")
     @log_tool_call
     async def strata_list_knowledge_layers() -> dict:
@@ -167,7 +168,14 @@ def register_knowledge_tools(
             "total": len(layers),
         }
 
-    @mcp.tool()
+    @mcp.tool(
+        annotations=ToolAnnotations(
+            readOnlyHint=False,
+            destructiveHint=False,
+            idempotentHint=True,
+            openWorldHint=False,
+        ),
+    )
     @require_role("admin")
     @log_tool_call
     async def strata_create_knowledge_layer(
@@ -230,7 +238,7 @@ def register_knowledge_tools(
         except LayerValidationError as e:
             return {"status": "error", "error": str(e)}
 
-    @mcp.tool()
+    @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False))
     @require_role("viewer")
     @log_tool_call
     async def strata_get_layer_status(name: str) -> dict:
@@ -248,7 +256,14 @@ def register_knowledge_tools(
         except LayerNotFoundError as e:
             return {"status": "error", "error": str(e)}
 
-    @mcp.tool()
+    @mcp.tool(
+        annotations=ToolAnnotations(
+            readOnlyHint=False,
+            destructiveHint=True,
+            idempotentHint=True,
+            openWorldHint=False,
+        ),
+    )
     @require_role("admin")
     @log_tool_call
     async def strata_delete_knowledge_layer(name: str) -> dict:
@@ -273,7 +288,14 @@ def register_knowledge_tools(
         except LayerNotFoundError as e:
             return {"status": "error", "error": str(e)}
 
-    @mcp.tool()
+    @mcp.tool(
+        annotations=ToolAnnotations(
+            readOnlyHint=False,
+            destructiveHint=True,
+            idempotentHint=True,
+            openWorldHint=False,
+        ),
+    )
     @require_role("admin")
     @log_tool_call
     async def strata_set_archived_patterns(layer_name: str, patterns: list[str]) -> dict:
@@ -302,7 +324,15 @@ def register_knowledge_tools(
         )
         return {"status": "updated", "layer": _serialize(layer)}
 
-    @mcp.tool(description=_ingest_description())
+    @mcp.tool(
+        description=_ingest_description(),
+        annotations=ToolAnnotations(
+            readOnlyHint=False,
+            destructiveHint=True,
+            idempotentHint=True,
+            openWorldHint=False,
+        ),
+    )
     @require_role("admin")
     @log_tool_call
     async def strata_ingest_documents(
@@ -361,7 +391,14 @@ def register_knowledge_tools(
         except Exception as e:
             return {"status": "error", "error": str(e)}
 
-    @mcp.tool()
+    @mcp.tool(
+        annotations=ToolAnnotations(
+            readOnlyHint=False,
+            destructiveHint=True,
+            idempotentHint=True,
+            openWorldHint=False,
+        ),
+    )
     @require_role("admin")
     @log_tool_call
     async def strata_apply_preset(

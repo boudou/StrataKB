@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 
 from mcp.server.fastmcp import FastMCP
+from mcp.types import ToolAnnotations
 
 from stratakb.core.auth import PermissionDeniedError, check_role, get_current_user, require_role
 from stratakb.core.logging import log_tool_call
@@ -16,7 +17,7 @@ RECEIPT_URI = "strata://receipts/{receipt_id}"
 def register_receipt_tools(mcp: FastMCP, database_url: str) -> None:
     """Register the receipt tool and resource on the MCP server."""
 
-    @mcp.tool()
+    @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False))
     @require_role("viewer")
     @log_tool_call
     async def strata_get_receipt(receipt_id: str) -> dict:
