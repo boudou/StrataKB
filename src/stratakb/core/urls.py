@@ -1,4 +1,12 @@
-"""Reading URLs: the one place in src/ that parses them. Standard library only."""
+"""Reading URLs: the one place in src/ that parses them. Standard library only.
+
+One "@" at most in the authority. asyncpg splits the authority at the first
+"@", urlsplit at the last; the two read the same host only when there is one.
+A URL with an unencoded "@" in its user name or password
+("postgresql://me:p@ss@db.example/strata") is therefore read by no function
+here: each gives what it gives for an unparsable URL. Write "@" in a user name
+or password as "%40", as "/", "?" and "#" must be written "%2F", "%3F", "%23".
+"""
 
 from __future__ import annotations
 
@@ -40,21 +48,25 @@ def _at_after_authority(url: str) -> bool:
 
 
 def _split(url: str) -> SplitResult | None:
-    """url split into its parts, or None when an "@" sits after the authority
-    or it cannot be split. Every reader below starts here."""
+    """url split into its parts, or None when an "@" sits after the authority,
+    the authority holds more than one "@", or it cannot be split. Every reader
+    below starts here."""
     if _at_after_authority(url):
         return None
     try:
-        return urlsplit(url)
+        parts = urlsplit(url)
     except ValueError:
         return None
+    # asyncpg would read the host from the credentials: see the module docstring
+    return parts if parts.netloc.count("@") <= 1 else None
 
 
 def url_parts(url: str) -> UrlParts | None:
     """The parts of url, or None when it cannot be parsed (an invalid port included).
 
-    None too when an "@" sits after the authority: the host, port and user
-    would then be read from the credentials.
+    None too when an "@" sits after the authority or the authority holds more
+    than one "@": the host, port and user would then be read from the
+    credentials, by StrataKB or by asyncpg.
     """
     parts = _split(url)
     if parts is None:
@@ -75,7 +87,9 @@ def url_host(url: str) -> str:
     """The host of url, or "" when it names none or cannot be parsed.
 
     The port is not read, so an invalid port does not hide the host. An "@"
-    after the authority gives "", as the host would be read from the user name.
+    after the authority gives "", as the host would be read from the user name,
+    and so do two "@" in the authority, though an HTTP client reads the host
+    after the last one: such an endpoint then counts as outbound (failing safe).
     """
     parts = _split(url)
     return (parts.hostname or "") if parts is not None else ""
@@ -90,9 +104,10 @@ def url_host_port(database_url: str) -> str:
     ",", IPv6 hosts in brackets ("[::1]:6543"). "unknown host" whenever the
     target cannot be read: not a postgresql:// URL, an invalid or out-of-range
     port, an unclosed bracket, an empty host in a list, ports that do not match
-    the hosts (an implicit localhost counts as one), or an "@" after the
-    authority. Only the URL is read, not PGHOST/PGPORT, a service file or
-    asyncpg's Unix-socket defaults, so a URL with no host shows localhost.
+    the hosts (an implicit localhost counts as one), an "@" after the
+    authority, or more than one "@" in it. Only the URL is read, not
+    PGHOST/PGPORT, a service file or asyncpg's Unix-socket defaults, so a URL
+    with no host shows localhost.
     """
     targets = url_targets(database_url)
     if targets is None:

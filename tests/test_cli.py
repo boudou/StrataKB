@@ -850,7 +850,17 @@ def test_db_up_bad_port_exits_2(capsys):
         ("postgresql://strata:strata_dev_password@/strata?port=5433", False),
         ("postgresql://strata:strata_dev_password@127.0.0.1:5433/strata?options=a@b", False),
         ("postgresql://strata:strata_dev_password@localhost:5433,db.example:5433/strata", False),
+        # An unencoded "@" in the password: no host is read from the URL
+        ("postgresql://strata:strata_dev_password@x@127.0.0.1:5433/strata", False),
     ],
 )
 def test_points_here(url, expected):
     assert local_db.points_here(url, 5433) is expected
+
+
+def test_unreachable_message_hints_at_percent_encoding():
+    unread = cli._unreachable_message("unknown host", OSError())
+    assert "Can't reach the database at unknown host (OSError). " in unread
+    assert "%40" in unread
+    assert unread.endswith(local_db.START_HINT)
+    assert "%40" not in cli._unreachable_message("db.example:5433", OSError())

@@ -589,8 +589,14 @@ def _unreachable_message(target: str, error: BaseException) -> str:
     from stratakb.core.local_db import START_HINT
 
     files = ", ".join(str(path) for path in config_files()) or "none"
+    unread = (
+        "DATABASE_URL could not be read: write @, /, ? and # in the user name, "
+        "password or query percent-encoded (%40, %2F, %3F, %23). "
+        if target == "unknown host"
+        else ""
+    )
     return (
-        f"Can't reach the database at {target} ({type(error).__name__}). "
+        f"Can't reach the database at {target} ({type(error).__name__}). {unread}"
         f"Config files read: {files}. Set DATABASE_URL or STRATAKB_CONFIG. {START_HINT}"
     )
 

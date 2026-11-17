@@ -34,13 +34,18 @@ READONLY_READABLE = (
 
 # Unencoded "/", "?" or "#" in the password: urlsplit reads the user as the
 # host and the start of the password as the port. core/urls.py reads no host
-# from any of them.
+# from any of them. An unencoded "@" in the user name or password gives two
+# "@" in the authority, which asyncpg splits at the first and urlsplit at the
+# last, so the two read different hosts: core/urls.py refuses those too.
 MALFORMED_URLS = [
     "postgresql://app:123/x@db/strata",
     "postgresql://app:99/secret@db:5432/s",
     "postgresql://app:123?x@db/s",
     "postgresql://app:123#x@db/s",
     "https://user:12/x@api.example",
+    "postgresql://app:pw@7319@db.example/strata",
+    "postgresql://me@corp:pw-7319@db.example/strata",
+    "https://user:pw@7319@api.example",
 ]
 
 # The example presets

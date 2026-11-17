@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import inspect
 import re
 import subprocess
 import sys
-from urllib.parse import unquote
+from urllib.parse import unquote, urlsplit
 
 import pytest
+from asyncpg import connect_utils
 
 from stratakb.core.urls import url_host, url_host_port, url_parts, url_targets
 from tests.helpers import MALFORMED_URLS
@@ -209,6 +211,23 @@ class TestUrlParsing:
             "postgresql:///strata?host=127.0.0.1&port=5433", implicit_localhost=False
         ) == [("127.0.0.1", 5433)]
 
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "postgresql://app:pw@7319@db.example/strata",
+            "postgresql://me@corp:pw-7319@db.example/strata",
+        ],
+    )
+    def test_two_ats_in_the_authority_are_refused(self, url):
+        shown = [url_host_port(url), url_host(url), repr(url_parts(url)), repr(url_targets(url))]
+        assert shown == ["unknown host", "", "None", "None"]
+        for text in shown:
+            assert "7319" not in text
+
+    def test_local_database_check_reads_no_host_after_a_second_at(self):
+        url = "postgresql://strata:strata_dev_password@x@127.0.0.1:5433/strata"
+        assert url_targets(url, implicit_localhost=False) is None
+
     def test_every_url_case_has_its_password_checked(self):
         # Guards _password_of: a case list it reads nothing from would pass silently.
         assert len(_PASSWORD_CASES) >= 15
@@ -225,6 +244,39 @@ class TestUrlParsing:
         for secret in {password, unquote(password)}:
             for text in shown:
                 assert secret not in text
+
+
+def _asyncpg_targets(url: str) -> list:
+    """The addresses asyncpg reads from url (a private function, called by keyword)."""
+    parse = connect_utils._parse_connect_dsn_and_args
+    arguments = {name: None for name in inspect.signature(parse).parameters} | {"dsn": url}
+    return parse(**arguments)[0]
+
+
+def test_asyncpg_reads_two_ats_differently(monkeypatch):
+    # asyncpg splits the authority at the first "@", urlsplit at the last, so
+    # they read different hosts; core/urls.py reads none.
+    monkeypatch.delenv("PGPORT", raising=False)
+    url = "postgresql://app:pw@7319@db.example/strata"
+    assert _asyncpg_targets(url) == [("7319@db.example", 5432)]
+    assert urlsplit(url).hostname == "db.example"
+    assert url_parts(url) is None
+    assert url_host_port(url) == "unknown host"
+
+
+# The rows whose authority names a host: asyncpg's Unix-socket and
+# environment defaults apply to the others, which url_targets does not read
+_AUTHORITY_HOST_URLS = [
+    url
+    for url, _ in [*WELL_FORMED_HOST_PORTS, *ASYNCPG_TARGETS]
+    if urlsplit(url).netloc.rpartition("@")[2]
+]
+
+
+@pytest.mark.parametrize("url", _AUTHORITY_HOST_URLS)
+def test_url_targets_agree_with_asyncpg(monkeypatch, url):
+    monkeypatch.delenv("PGPORT", raising=False)
+    assert url_targets(url) == [tuple(address) for address in _asyncpg_targets(url)]
 
 
 def test_egress_does_not_import_the_database_module():

@@ -72,6 +72,8 @@ Add the server to your client's MCP configuration (for example a project `.mcp.j
 
 Replace /path/to/StrataKB with the folder you cloned into, then restart the client. It starts StrataKB itself.
 
+If the user name or password in `DATABASE_URL` holds `@`, `/`, `?` or `#`, write it percent-encoded (`%40`, `%2F`, `%3F`, `%23`). Otherwise StrataKB cannot read the URL, and its messages and logs show `unknown host`.
+
 ### 4. Ask
 
 Ask your client a question about the documents, for example *"How do we fail over the database?"*. The client calls StrataKB's `strata_ask` tool, gets back the passages that match and the files they come from, and writes the answer. The server tells the client to answer only from those passages, cite them and check the answer, and a checked answer comes with a receipt you can open with `uv run stratakb receipt <id>`.
