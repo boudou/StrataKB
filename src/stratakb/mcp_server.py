@@ -11,6 +11,8 @@ import asyncio
 import contextlib
 import functools
 import json
+import os
+import sys
 import threading
 from contextlib import asynccontextmanager
 from typing import Annotated
@@ -464,9 +466,33 @@ def main(settings: Settings | None = None) -> None:
         role=settings.strata_role,
     )
 
+    _detach_stdin_from_std_handle()
+
     # lifespan warms up the DB, then starts the embedding model load in the
     # background so the client gets its first answer at once
     build_server(settings).run(transport="stdio")
+
+
+def _detach_stdin_from_std_handle() -> None:
+    """On Windows, read MCP messages from a duplicate of stdin and point fd 0 at NUL.
+
+    The stdio transport reads stdin with a blocking read in a worker thread.
+    While that read is pending, Windows blocks GetFileType on the same pipe,
+    and native DLLs that numpy and torch load query the standard handles as
+    they initialise, so the background model import hung forever and every
+    search waited on it. With the standard input handle on NUL, those queries
+    return at once; the transport still reads the client's pipe.
+    """
+    if sys.platform != "win32" or sys.stdin is None:
+        return
+    try:
+        pipe_fd = os.dup(sys.stdin.fileno())
+        null_fd = os.open(os.devnull, os.O_RDONLY)
+        os.dup2(null_fd, 0)  # also updates STD_INPUT_HANDLE
+        os.close(null_fd)
+        sys.stdin = open(pipe_fd, encoding="utf-8", closefd=True)  # noqa: SIM115
+    except OSError as e:
+        logger.warning("stdin_detach_failed", error=str(e))
 
 
 if __name__ == "__main__":

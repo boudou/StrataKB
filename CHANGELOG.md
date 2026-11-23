@@ -142,6 +142,7 @@ Notable changes to StrataKB. The format follows [Keep a Changelog](https://keepa
 
 ### Fixed
 
+- On Windows, the MCP server over stdio no longer hangs on the first search with the local embedding backend. The background model load stalled while numpy's and torch's DLLs queried the standard input handle, which Windows blocks while the transport's read on the stdin pipe is pending. The server now reads MCP messages from a duplicate of stdin and points the standard input handle at `NUL`. Other platforms are unchanged.
 - A layer's document and chunk counts are recounted from the database after every ingestion, instead of showing only the last run's numbers.
 - Resuming an ingestion no longer skips a file because another file with the same name, in a different folder, was already ingested.
 - The keyword leg of hybrid search found almost nothing for natural-language questions, because it required every word of the question. It now matches any word of the question (stemmed, with stopwords dropped by PostgreSQL), keeps the best-ranked matches when more match than it returns, and keeps the strict web-search syntax for queries with quoted phrases, `OR` or `-exclusions`.
