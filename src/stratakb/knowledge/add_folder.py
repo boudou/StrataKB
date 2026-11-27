@@ -188,6 +188,14 @@ def _zero_counts() -> dict[str, int]:
     return dict.fromkeys(OUTCOME_KEYS, 0)
 
 
+def _excluded_report(
+    pairs: Collection[tuple[str, str]],
+) -> tuple[list[dict], dict[str, int]]:
+    """The excluded rows of a report and their count per reason."""
+    rows = [{"path": rel, "reason": reason} for rel, reason in pairs]
+    return rows, dict(Counter(reason for _, reason in pairs))
+
+
 def refused(
     reason: str,
     hint: str,
@@ -197,8 +205,10 @@ def refused(
     mode: str | None = None,
     db_target: str = "",
     exit_code: int = 2,
+    excluded: Collection[tuple[str, str]] = (),
 ) -> Report:
     """The report of a refused run: nothing written, zero counts."""
+    excluded_rows, excluded_by_reason = _excluded_report(excluded)
     return Report(
         run_id=uuid4().hex,
         layer=layer,
@@ -207,9 +217,9 @@ def refused(
         mode=mode,
         counts=_zero_counts(),
         skipped_by_reason={},
-        excluded_by_reason={},
+        excluded_by_reason=excluded_by_reason,
         files=[],
-        excluded=[],
+        excluded=excluded_rows,
         notes=[],
         reason=reason,
         exit_code=exit_code,
@@ -567,15 +577,29 @@ async def _compare_with_tracked(result: Plan, tracked: dict[str, asyncpg.Record]
         result.needs.add("large_run")
 
 
+def _nothing_to_add_hint(root: str, selection: SelectionResult | None) -> str:
+    """Why a new layer gets no file: git's ignore rules when they hide them all."""
+    ignored = 0
+    git_root = None
+    if selection is not None and selection.mode == "git":
+        ignored = sum(1 for _, reason in selection.excluded if reason == "ignored_by_gitignore")
+        git_root = selection.git_root
+    if ignored == 0:
+        return f"No file in {root} can be added: every file is excluded or skipped."
+    files = "1 file" if ignored == 1 else f"{ignored} files"
+    repository = f" of the repository at {git_root}" if git_root else ""
+    return (
+        f"No file in {root} can be added: git ignores {files} here, by the ignore rules"
+        f"{repository} (git check-ignore -v <file> names the rule). To add them, track them"
+        " with git add -f, change those rules, or copy the folder outside the repository."
+    )
+
+
 def _finish(result: Plan, options: Options) -> None:
     """Refuse a new layer without files; set the display name and description."""
     root = result.root
     if result.action == "create" and not result.entries:
-        _refuse(
-            result,
-            "nothing_to_add",
-            f"No file in {root} can be added: every file is excluded or skipped.",
-        )
+        _refuse(result, "nothing_to_add", _nothing_to_add_hint(root, result.selection))
         return
     if result.action == "create":
         result.display_name = Path(root).name[:_DISPLAY_NAME_MAX] or slugify("", root)
@@ -718,14 +742,13 @@ async def apply(
         raise LayerError(result.errors[0].get("error", "ingestion failed"))
 
     files = _file_rows(plan, result)
-    excluded = [{"path": rel, "reason": reason} for rel, reason in selection.excluded]
+    excluded, excluded_by_reason = _excluded_report(selection.excluded)
     counts = _zero_counts()
     for row in files:
         counts[row["outcome"]] = counts.get(row["outcome"], 0) + 1
     skipped_by_reason = dict(
         Counter(row["reason"] for row in files if row["outcome"] == "skipped")
     )
-    excluded_by_reason = dict(Counter(reason for _, reason in selection.excluded))
     notes = list(selection.notes) + _error_notes(files, result)
 
     run_id = uuid4().hex

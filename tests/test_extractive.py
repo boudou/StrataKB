@@ -17,24 +17,30 @@ import pytest
 from stratakb.knowledge.layers import ANSWER_MODES
 from stratakb.rag.extractive import (
     GROUNDED_REFUSED_NOTE,
+    MAX_NOTED_SENTENCES,
     MAX_SENTENCE_CHARS,
     MAX_SENTENCES,
     OCR_WARNING,
+    SENTENCE_REACH,
     Sentence,
     answer_item,
     candidate_sentences,
     clause_gap_note,
     effective_mode,
     fit_to_answer_budget,
+    heading_only_note,
     select_sentences,
     split_sentences,
+    too_long_note,
 )
 from stratakb.rag.passages import (
+    TOO_LONG_STEP,
     AnswerMode,
     AskResult,
     ExtractiveAnswer,
     estimate_tokens,
     listed_cost,
+    next_step,
 )
 from tests.helpers import BLOCK_HIT, DOC_TEXT, LETTER, LONG_BLOCK, NINETY
 
@@ -56,7 +62,6 @@ class TestSplitSentences:
             ("Use a form, i.e. Form Blue. Done.", ["Use a form, i.e. Form Blue.", "Done."]),
             # A single letter reads as an initial: too long a quote, never half a one
             ("J. Smith signs. Done.", ["J. Smith signs.", "Done."]),
-            ("See Annex A. It applies.", ["See Annex A. It applies."]),
             ("See No. 7 here. Next.", ["See No. 7 here.", "Next."]),
             ("See Art. 5 of the law. Next.", ["See Art. 5 of the law.", "Next."]),
             ("Under clause 7.2 it ends. Next.", ["Under clause 7.2 it ends.", "Next."]),
@@ -113,6 +118,29 @@ class TestSplitSentences:
     def test_long_token_before_a_dot_still_ends_the_sentence(self):
         word = "a" * 200
         assert _texts(f"{word}. Next one.") == [f"{word}.", "Next one."]
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "See Annex A. It applies.",
+            "See Appendix B. It applies.",
+            "See Schedule C. It applies.",
+            'See ("Exhibit D. It applies.',
+        ],
+    )
+    def test_letter_after_a_label_ends_the_sentence(self, text):
+        assert len(split_sentences(text)) == 2
+
+    @pytest.mark.parametrize(
+        ("text", "expected"),
+        [
+            ("Ask J. Smith. Then go.", ["Ask J. Smith.", "Then go."]),
+            # The label rule needs the letter alone after it
+            ("See Annex U.S. Then go.", ["See Annex U.S. Then go."]),
+        ],
+    )
+    def test_initial_stays_inside(self, text, expected):
+        assert _texts(text) == expected
 
 
 class TestEffectiveMode:
@@ -232,6 +260,20 @@ class TestCandidateSentences:
         )
         assert [(s.text, s.exact) for s in sentences] == [(NINETY, True)]
 
+    def test_long_sentence_within_reach_is_quoted(self):
+        # 1,503 characters: over the old reach of 1,000, under MAX_SENTENCE_CHARS
+        text = (
+            "Intro here. The supplier shall " + "word " * 296 + "end."
+            + " Next one is short." * 200
+        )
+        end = 20 + SENTENCE_REACH
+
+        sentences = candidate_sentences(
+            [_chunk(0, 20)], {1: {"text": text[:end]}}, {1: end}
+        )
+
+        assert [len(s.text) for s in sentences] == [11, 1503]
+
 
 class TestClauseGapNote:
     TEXT = f"{INVOICES} {'word ' * 450}end. {INTEREST}\n"
@@ -285,6 +327,91 @@ class TestClauseGapNote:
 
     def test_scored_chunk_needs_no_note(self):
         assert self._note(_chunk(0, len(self.TEXT)), kept=[]) is None
+
+
+def _long_documents(text: str, page_map=None) -> dict:
+    return {1: {"text": text, "relative_path": "a.md", "page_map": page_map}}
+
+
+class TestTooLongNote:
+    LONG = "word " * 450 + "end."
+
+    def test_one_sentence_is_located(self):
+        text = f"Intro.\n\n{self.LONG}\n\nShort one.\n"
+        documents = _long_documents(text)
+
+        note = too_long_note([_chunk(0, len(text))], documents, {1: len(text) + 1})
+
+        assert note == (
+            "A sentence too long to quote word for word may answer this: "
+            "it starts at a.md line 3."
+        )
+
+    def test_more_than_the_cap_are_counted(self):
+        text = "".join(f"{self.LONG}\n\n" for _ in range(MAX_NOTED_SENTENCES + 1)) + "End.\n"
+        documents = _long_documents(text)
+
+        note = too_long_note([_chunk(0, len(text))], documents, {1: len(text) + 1})
+
+        assert note == (
+            "Sentences too long to quote word for word may answer this: they start at "
+            "a.md line 1; a.md line 3; a.md line 5, and 1 more."
+        )
+
+    def test_overlapping_chunks_name_each_start_once(self):
+        text = f"{self.LONG}\n\nShort one.\n"
+        documents = _long_documents(text)
+
+        note = too_long_note(
+            [_chunk(0, 50), _chunk(10, 60)], documents, {1: len(text) + 1}
+        )
+
+        assert note.count("a.md line 1") == 1
+        assert note.startswith("A sentence")
+
+    def test_no_long_sentence_gives_none(self):
+        documents = _long_documents(DOC_TEXT)
+        assert too_long_note([_chunk(0, len(DOC_TEXT))], documents, {1: len(DOC_TEXT) + 1}) is None
+
+    def test_sentence_cut_by_the_read_is_located(self):
+        text = "First one here. Second one is cut"
+        documents = _long_documents(text)
+
+        note = too_long_note([_chunk(0, len(text))], documents, {1: len(text)})
+
+        assert note.endswith("it starts at a.md line 1.")
+
+    def test_page_is_named(self):
+        text = f"Intro.\n\n{self.LONG}\n"
+        documents = _long_documents(text, page_map=[[0, 1], [8, 2]])
+
+        note = too_long_note([_chunk(8, 40)], documents, {1: len(text) + 1})
+
+        assert note.endswith("it starts at a.md line 1, page 2.")
+
+    def test_missing_document_is_skipped(self):
+        assert too_long_note([_chunk(0, 10, document_id=2)], _long_documents("x"), {}) is None
+
+
+class TestHeadingOnlyNote:
+    TEXT = "## 7 Payment\n\n## 8 Interest\n\nLate payment carries interest.\n"
+    DOCUMENTS = {1: {"text": TEXT, "relative_path": "terms.md"}}
+    HEADING = _chunk(0, TEXT.index("## 8"), match="exact", clause_path="7 Payment")
+
+    def test_heading_only_clause_is_named(self):
+        assert heading_only_note([self.HEADING], self.DOCUMENTS) == (
+            "7 Payment in terms.md holds only its heading: there is no text under it to quote."
+        )
+
+    def test_cut_clause_gives_none(self):
+        assert heading_only_note([{**self.HEADING, "cut": True}], self.DOCUMENTS) is None
+
+    def test_scored_chunk_gives_none(self):
+        assert heading_only_note([{**self.HEADING, "match": None}], self.DOCUMENTS) is None
+
+    def test_clause_with_text_gives_none(self):
+        chunk = _chunk(self.TEXT.index("## 8"), len(self.TEXT), match="exact")
+        assert heading_only_note([chunk], self.DOCUMENTS) is None
 
 
 def _sentence(text: str, *, exact: bool = False, start: int = 0) -> Sentence:
@@ -445,6 +572,30 @@ class TestAskResultExtractive:
 
         assert list(result.concise()) == ["status", "mode", "passages"]
         assert not {"answer", "receipt_id", "note"} & set(result.detailed())
+
+    def test_too_long_step_only_on_not_found(self):
+        assert next_step("not_found", "extractive", too_long=True) == TOO_LONG_STEP
+        assert next_step("found", "extractive", too_long=True) is None
+        assert "stratakb add" in next_step("not_found", "extractive")
+
+    def test_too_long_extraction_gives_its_step_in_both_formats(self):
+        result = self._answer(
+            status="not_found",
+            extraction=ExtractiveAnswer([], None, "not_found", "where", too_long=True),
+        )
+
+        assert result.concise()["next_step"] == TOO_LONG_STEP
+        assert result.detailed()["next_step"] == TOO_LONG_STEP
+
+    def test_detailed_not_found_keeps_passages(self):
+        # Detailed is for debugging: everything; concise, read by default, leaves them out
+        result = self._answer(
+            status="not_found",
+            extraction=ExtractiveAnswer([], None, "not_found", None),
+        )
+
+        assert result.detailed()["passages"] == [{"id": "S1"}]
+        assert "passages" not in result.concise()
 
     def test_partly_found_step_speaks_of_quotes(self):
         assert "quotes" in self._answer(status="partly_found").concise()["next_step"]

@@ -7,6 +7,8 @@ rules: symbolic links are excluded, a built-in skip list of folder names
 (dot folders, node_modules, venv, ...) is excluded, and the root
 .strataignore applies. Folders are decided top-down, as git does, and an
 excluded folder is reported once, as "dir/", with none of the files below it.
+When git keeps no file, the files git ignores there are listed as excluded,
+so the report can say why.
 
 No database access, no logging: the caller reports the result.
 """
@@ -57,6 +59,7 @@ class SelectionResult:
     nested_gitignores: int = 0
     mode: Literal["git", "walk"] = "walk"
     notes: list[str] = field(default_factory=list)
+    git_root: str | None = None
 
 
 class _GitUnavailableError(Exception):
@@ -201,6 +204,21 @@ def _select_git(root: Path, paths: list[str], result: SelectionResult) -> None:
         _add_entry(result, root, rel)
 
 
+def _add_git_ignored(root: Path, result: SelectionResult) -> None:
+    """List the files git ignores in root as excluded, with the repository's top level."""
+    try:
+        top = _git(root, "rev-parse", "--show-toplevel")
+        ignored = _split_z(
+            _git(root, "ls-files", "-z", "--others", "--ignored", "--exclude-standard")
+        )
+    except _GitUnavailableError:
+        return
+    result.excluded.extend(
+        (rel, "ignored_by_gitignore") for rel in ignored if not rel.endswith("/")
+    )
+    result.git_root = top.decode("utf-8", errors="replace").strip() or None
+
+
 def _select_walk(root: Path, result: SelectionResult) -> None:
     rules = _Rules(root, walk=True)
 
@@ -266,6 +284,8 @@ def select_files(root: Path) -> SelectionResult:
     else:
         result.mode = "git"
         _select_git(root, paths, result)
+        if not result.entries:
+            _add_git_ignored(root, result)
 
     result.entries.sort(key=lambda e: e.relative_path)
     result.excluded.sort(key=lambda item: item[0])

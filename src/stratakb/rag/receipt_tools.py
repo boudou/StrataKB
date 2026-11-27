@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 
 from mcp.server.fastmcp import FastMCP
+from mcp.types import ToolAnnotations
 
 from stratakb.core.auth import PermissionDeniedError, check_role, get_current_user, require_role
 from stratakb.core.logging import log_tool_call
@@ -16,7 +17,7 @@ RECEIPT_URI = "strata://receipts/{receipt_id}"
 def register_receipt_tools(mcp: FastMCP, database_url: str) -> None:
     """Register the receipt tool and resource on the MCP server."""
 
-    @mcp.tool()
+    @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False))
     @require_role("viewer")
     @log_tool_call
     async def strata_get_receipt(receipt_id: str) -> dict:
@@ -28,7 +29,8 @@ def register_receipt_tools(mcp: FastMCP, database_url: str) -> None:
         v2"); or gone, when its file was removed from its folder or its layer
         was deleted. A changed or gone quote still shows the original text. Open
         to the person who asked, to admins and to anyone who may read every
-        cited layer.
+        cited layer. On a verify receipt, verification is the check made when
+        it was issued; each quote's status is worked out now.
 
         Args:
             receipt_id: The receipt id: rcpt_ and 22 URL-safe characters.

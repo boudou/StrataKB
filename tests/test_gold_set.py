@@ -495,19 +495,39 @@ def test_a_layer_whose_last_ingest_did_not_complete_stops_before_any_question(
     assert out.read_text(encoding="utf-8") == "an earlier run"
 
 
-def test_a_partly_ingested_layer_is_scored_with_a_warning(scorer_input, tmp_path, capsys):
-    run = {
-        "status": "partial", "docs_processed": 7, "docs_failed": 1,
-        "started_at": "2026-11-01T09:00:00+00:00", "completed_at": "2026-11-01T10:00:00+00:00",
-    }
+PARTIAL_RUN = {
+    "status": "partial", "docs_processed": 7, "docs_failed": 1,
+    "started_at": "2026-11-01T09:00:00+00:00", "completed_at": "2026-11-01T10:00:00+00:00",
+}
+
+
+def test_a_partly_ingested_layer_stops_before_any_question(scorer_input, tmp_path):
+    out = tmp_path / "out.json"
+    out.write_text("an earlier run", encoding="utf-8")
+    asked = []
+
+    with pytest.raises(SystemExit) as e:
+        _score(scorer_input, "peps_small", out, asked=asked, runs=PARTIAL_RUN)
+
+    assert "is partial, 1 documents failed" in str(e.value.code)
+    assert "--allow-partial" in str(e.value.code)
+    assert asked == []
+    assert out.read_text(encoding="utf-8") == "an earlier run"
+
+
+def test_allow_partial_scores_a_partly_ingested_layer_with_a_warning(
+    scorer_input, tmp_path, capsys
+):
     out = tmp_path / "out.json"
 
-    _score(scorer_input, "peps_small", out, runs=run)
+    _score(scorer_input, "peps_small", out, "--allow-partial", runs=PARTIAL_RUN)
 
     err = capsys.readouterr().err
     assert "last run partial at 2026-11-01T10:00:00+00:00" in err
     assert "1 documents failed" in err
-    assert json.loads(out.read_text(encoding="utf-8"))["run"]["layer"]["last_run"] == run
+    layer = json.loads(out.read_text(encoding="utf-8"))["run"]["layer"]
+    assert layer["last_run"] == PARTIAL_RUN
+    assert layer["allow_partial"] is True
 
 
 def test_results_say_what_was_scored(scorer_input, tmp_path, monkeypatch, capsys):
@@ -533,7 +553,7 @@ def test_results_say_what_was_scored(scorer_input, tmp_path, monkeypatch, capsys
     assert run["layer"] == {
         "name": "peps_small", "chunk_size": 1500, "chunk_overlap": 100,
         "doc_count": 8, "chunk_count": 412, "last_ingested": "2026-11-01T10:00:00+00:00",
-        "last_run": None, "answer_mode": "grounded",
+        "last_run": None, "allow_partial": False, "answer_mode": "grounded",
     }
     answer = run["answer"]
     assert answer["answer_token_budget"] == 1234

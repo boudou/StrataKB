@@ -83,16 +83,32 @@ class TestCustomEndpoint:
         assert "extra_headers" not in create_kwargs
 
     @pytest.mark.asyncio
-    async def test_custom_endpoint_never_receives_openai_key(self):
+    @pytest.mark.parametrize("api_key", ["", "sk-openai"])
+    async def test_custom_endpoint_never_receives_openai_key(self, api_key):
         client_kwargs, _, _ = await _embed(
             openai_settings(
                 embedding_base_url=BASE_URL,
                 embedding_model="nomic-embed-text",
                 openai_api_key="sk-openai",
             ),
-            api_key="sk-openai",
+            api_key=api_key,
         )
         assert client_kwargs["api_key"] == PLACEHOLDER_API_KEY
+
+    @pytest.mark.asyncio
+    async def test_settings_alone_carry_the_openai_key(self):
+        """Without api_key, embed_texts sends the key the settings passed in hold."""
+        from stratakb.knowledge.embeddings import embed_texts
+
+        client = fake_openai_client(768)
+        env_settings = MagicMock()
+        with (
+            patch("stratakb.config.get_settings", env_settings),
+            patch("openai.AsyncOpenAI", return_value=client) as client_cls,
+        ):
+            await embed_texts(["x"], settings=openai_settings(openai_api_key="sk-settings"))
+        assert client_cls.call_args.kwargs == {"api_key": "sk-settings", "base_url": None}
+        env_settings.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_openai_default_model_and_dimensions(self):
@@ -117,7 +133,10 @@ class TestCustomEndpoint:
         from stratakb.knowledge.embeddings import embed_texts
 
         with (
-            patch("stratakb.config.get_settings", return_value=openai_settings()),
+            patch(
+                "stratakb.config.get_settings",
+                return_value=openai_settings(openai_api_key="", embedding_base_url=""),
+            ),
             pytest.raises(ValueError, match="API key"),
         ):
             await embed_texts(["x"], api_key="", backend="openai")

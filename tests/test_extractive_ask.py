@@ -21,7 +21,7 @@ from structlog.testing import capture_logs
 from stratakb.rag.clause_lookup import ClauseMatches
 from stratakb.rag.confidence import RERANK_THRESHOLDS
 from stratakb.rag.extractive import GROUNDED_REFUSED_NOTE, LEGACY_ONLY_NOTE, OCR_WARNING
-from stratakb.rag.passages import ask_chunk
+from stratakb.rag.passages import TOO_LONG_STEP, ask_chunk
 from stratakb.rag.retriever import SearchResult
 from tests.helpers import (
     BLOCK_HIT,
@@ -297,7 +297,7 @@ class TestAskExtractive:
         assert response["answer"] == []
         assert "receipt_id" not in response
         assert "passages" not in response
-        assert response["next_step"]
+        assert "stratakb add" in response["next_step"]
 
     async def test_long_block_is_not_found_and_issues_no_receipt(self, server, make_layer):
         text = f"{LONG_BLOCK}\n\nA short line on something else.\n"
@@ -310,6 +310,8 @@ class TestAskExtractive:
 
         assert response["status"] == "not_found"
         assert response["answer"] == []
+        assert response["next_step"] == TOO_LONG_STEP
+        assert "contracts/acme-msa.md line 1." in response["note"]
         issue.assert_not_called()
 
     async def test_named_clause_in_a_long_block_is_not_found(self, server, make_layer):
@@ -324,11 +326,51 @@ class TestAskExtractive:
         )
         chunk["match"] = "exact"
 
+        with (
+            _looked_up(chunk),
+            patch("stratakb.rag.tools.issue_receipt", AsyncMock()) as issue,
+        ):
+            response = await _ask(server, [], layers=[layer])
+
+        assert response["status"] == "not_found"
+        assert response["answer"] == []
+        assert response["next_step"] == TOO_LONG_STEP
+        assert "contracts/acme-msa.md line 1." in response["note"]
+        issue.assert_not_called()
+
+    async def test_long_sentence_past_the_old_reach_is_quoted(self, server, make_layer):
+        text = (
+            "Intro here. The supplier shall " + "word " * 296 + "end."
+            + " Next one is short." * 200
+        )
+        layer, document_id = await make_layer("extractive", text=text)
+
+        response = await _ask(
+            server, [_hit(layer, document_id, (0, 20))], _relevant("supplier"), layers=[layer]
+        )
+
+        assert response["status"] == "found"
+        assert [len(item["text"]) for item in response["answer"]] == [1503]
+
+    async def test_heading_only_clause_is_not_found_with_a_note(self, server, make_layer):
+        text = "## 7 Payment\n\n## 8 Interest\n\nLate payment carries interest.\n"
+        layer, document_id = await make_layer("extractive", text=text)
+        heading = "## 7 Payment\n"
+        chunk = ask_chunk(
+            chunk_id=None, content=heading.rstrip(), score=1.0, similarity=None, layer=layer,
+            source_file="contracts/acme-msa.md", section="7 Payment", doc_type="markdown",
+            metadata={}, document_id=document_id, char_start=0, char_end=len(heading),
+            clause_path="7 Payment",
+        )
+        chunk["match"] = "exact"
+
         with _looked_up(chunk):
             response = await _ask(server, [], layers=[layer])
 
         assert response["status"] == "not_found"
         assert response["answer"] == []
+        assert "7 Payment in contracts/acme-msa.md holds only its heading" in response["note"]
+        assert "stratakb add" in response["next_step"]
 
     @staticmethod
     def _exact_chunk(layer, document_id, text):
@@ -500,6 +542,23 @@ class TestAskExtractive:
 
         assert response["status"] == "error"
         assert "Extractive mode needs the reranker model" in response["error"]
+
+    async def test_reranker_load_failure_names_the_model(self, server, settings, make_layer):
+        layer, document_id = await make_layer("extractive")
+        settings.reranking_enabled = True
+
+        def no_model(*_):
+            raise OSError("model not found")
+
+        with capture_logs() as logs:
+            response = await _ask(server, [_hit(layer, document_id)], no_model, layers=[layer])
+
+        assert response["status"] == "error"
+        assert response["error"].startswith("Reranking needs the reranker model")
+        assert "model not found" in response["error"]
+        failed = [e for e in logs if e["event"] == "reranking_failed"]
+        assert failed == [{"event": "reranking_failed", "error_type": "OSError",
+                           "log_level": "warning"}]
 
     async def test_invalid_mode_refused(self, server, make_layer):
         layer, document_id = await make_layer("extractive")

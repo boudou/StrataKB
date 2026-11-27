@@ -10,7 +10,9 @@
 Each subcommand is a subparser and a handler; a new one adds both and
 nothing else. The command owns the terminal (prompts, progress, the report
 and the exit code); add_folder makes every decision. stdout carries only
-the report; prompts, progress and hints go to stderr. `add` and `receipt`
+the report; prompts, progress and hints go to stderr. Both writers escape
+unprintable characters (core.terminal_text.visible), so a folder name or an
+error message cannot send escape codes to the terminal. `add` and `receipt`
 never import the server.
 """
 
@@ -21,7 +23,7 @@ import asyncio
 import contextlib
 import os
 import sys
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Collection, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NamedTuple
 
@@ -236,12 +238,12 @@ def _usage_error(error: _UsageError, argv: list[str]) -> int:
 
 
 def _out(text: str) -> None:
-    sys.stdout.write(text + "\n")
+    sys.stdout.write(visible(text) + "\n")
     sys.stdout.flush()
 
 
-def _err(text: str) -> None:
-    sys.stderr.write(text + "\n")
+def _err(text: str, end: str = "\n") -> None:
+    sys.stderr.write(visible(text) + end)
     sys.stderr.flush()
 
 
@@ -271,12 +273,12 @@ def _stdin_is_tty() -> bool:
 
 def _confirm(question: str) -> bool:
     """Ask on stderr and read one line from stdin; only y or yes confirms."""
-    sys.stderr.write(f"{question} [y/N] ")
-    sys.stderr.flush()
+    # One line by construction: a newline in a folder name must not fake another prompt
+    _err(f"{one_line(question)} [y/N] ", end="")
     answer = sys.stdin.readline()
     if not answer.endswith("\n"):
         # End of input: finish the prompt line
-        sys.stderr.write("\n")
+        _err("")
     return answer.strip().lower() in ("y", "yes")
 
 
@@ -298,6 +300,7 @@ class _Progress:
         self.shown = False
 
     def __call__(self, done: int, total: int) -> None:
+        # Raw on purpose: the \r is layout and the text is two integers
         sys.stderr.write(f"\rembedding {done}/{total}")
         sys.stderr.flush()
         self.shown = True
@@ -483,7 +486,11 @@ async def _add(args: argparse.Namespace, settings: Any, root: str) -> Report:
     layer: str | None = None
 
     def refuse(
-        reason: str, hint: str, exit_code: int = EXIT_REFUSED, mode: str | None = None
+        reason: str,
+        hint: str,
+        exit_code: int = EXIT_REFUSED,
+        mode: str | None = None,
+        excluded: Collection[tuple[str, str]] = (),
     ) -> Report:
         return add_folder.refused(
             reason,
@@ -493,6 +500,7 @@ async def _add(args: argparse.Namespace, settings: Any, root: str) -> Report:
             mode=mode,
             db_target=target,
             exit_code=exit_code,
+            excluded=excluded,
         )
 
     options = add_folder.Options(
@@ -514,7 +522,13 @@ async def _add(args: argparse.Namespace, settings: Any, root: str) -> Report:
         if plan.refusal is not None:
             reason, hint = plan.refusal
             mode = plan.selection.mode if plan.selection is not None else None
-            return refuse(reason, hint, mode=mode)
+            # Only nothing_to_add explains itself through the exclusions
+            excluded = (
+                plan.selection.excluded
+                if reason == "nothing_to_add" and plan.selection is not None
+                else ()
+            )
+            return refuse(reason, hint, mode=mode, excluded=excluded)
 
         confirmed, refusal = _confirmations(plan, options)
         if refusal is not None:
@@ -678,7 +692,7 @@ async def _open_receipt(url: str, receipt_id: str, user_id: str, role: str) -> d
 
 def _receipt_failed(message: str, args: argparse.Namespace, exit_code: int) -> int:
     """One line on stderr; with --json, the tool's error form on stdout too."""
-    _err(visible(message))
+    _err(message)
     if args.json:
         _out(terminal_safe_json({"status": "error", "error": message}))
     return exit_code
@@ -752,12 +766,16 @@ def render_text(report: Report) -> str:
     return "\n".join(one_line(line) for line in lines)
 
 
-def _verification_line(verification: dict[str, Any]) -> str:
-    """The stored result of strata_verify, as --json carries it."""
+def _verification_line(verification: dict[str, Any], issued_on: str) -> str:
+    """The check strata_verify made when the receipt was issued.
+
+    Quote statuses are worked out on opening. No flags count: strata_verify
+    issues a receipt only when nothing was flagged.
+    """
     return (
-        f"Verification: {verification['result']} "
-        f"(quotes checked: {verification['quotes']}, facts checked: {verification['facts']}, "
-        f"flags: {verification['flags']})"
+        f"Verification when issued, {issued_on}: {verification['result']} "
+        f"(quotes checked: {verification['quotes']}, facts checked: {verification['facts']}); "
+        "each quote's status below is checked now"
     )
 
 
@@ -778,7 +796,7 @@ def render_receipt(receipt: dict) -> str:
         lines.append(f"Draft: {receipt['draft']}")
     verification = receipt.get("verification") or {}
     if verification:
-        lines.append(_verification_line(verification))
+        lines.append(_verification_line(verification, str(receipt["issued_at"])[:10]))
     if receipt.get("verification_note"):
         lines.append(receipt["verification_note"])
     if verification.get("unchecked_sentences"):

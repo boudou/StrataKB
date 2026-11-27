@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING
 
 import structlog
 from mcp.server.fastmcp import FastMCP
+from mcp.types import ToolAnnotations
 
 from stratakb.core.audit import write_audit_log
 from stratakb.core.auth import get_current_user, require_role
@@ -322,7 +323,7 @@ def register_verify_tools(
     without, from the environment's settings.
     """
 
-    @mcp.tool()
+    @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False))
     @require_role("viewer")
     @log_tool_call
     async def strata_verify(draft: str, passages: list[str]) -> dict:
